@@ -8,6 +8,7 @@
 flappy.py                 Flappy Bird 环境
 live_core.py              节点、稀疏边、状态与动作循环
 latent_world.py           延迟 Flappy 世界和测量辅助函数
+recall_world.py           节点/稀疏边网络的延迟回忆实验
 substrate_rules.py        不变量、决定性与规则层
 substrate_search.py       基函数、滞后列和确定性搜索
 predict_layer.py          预测层 / 真实层；残差驱动的在线更新
@@ -25,6 +26,7 @@ python substrate_sandbox_search.py
 python substrate_selfdelay.py
 python substrate_signals.py
 python substrate_signals_noise.py
+python recall_world.py 200 600 0
 ```
 
 脚本是独立的实验/验证器；它们不是一个已集成的生产运行时，也不会自动训练出通用策略。
@@ -33,6 +35,8 @@ python substrate_signals_noise.py
 
 - 在合成延迟世界中，预测误差能学到三帧滞后和约 `0.020` 的动作增益。
 - `u` 是 RC 型泄漏积分；`signal_bank.py` 提供节点级候选信号，均值器默认不启用。
+- `recall_world.py` 的 recall 是“线索只出现一次、随后输入静默 d 步、最后报告线索符号”的延迟回忆任务，不是通用文本检索。它对照节点痕迹 `u`、每边转移残留 `res`、稀疏联想记忆 `M` 和递归权重学习。
+- 节点痕迹与边残留分开：`u` 保存节点激活的衰减痕迹；`res` 让刚用过的边暂时更容易通过；`M` 用共激活关联补全回忆模式。它们是实验臂，尚未全部集成进 Flappy 沙盒控制循环。
 - 沙盒脚本枚举短动作序列，用学到的转移模型检查整段轨迹、执行首个动作，再用真实转移更新模型。
 - 最近一次沙盒测量：8 个种子平均存活约 1027 帧，中位数 659，范围 123–3491；学习到的滞后为 3，增益约 `0.020`。这仍明显低于手工推导的参考控制器，不能视为策略学习已解决。
 - 沙盒反事实 rollout 单独记录为搜索经验，不作为真实状态转移训练世界模型；只有实践中观察到的转移更新模型。
