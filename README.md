@@ -27,6 +27,7 @@ python substrate_selfdelay.py
 python substrate_signals.py
 python substrate_signals_noise.py
 python recall_world.py 200 600 0
+python math_memory_search.py
 ```
 
 脚本是独立的实验/验证器；它们不是一个已集成的生产运行时，也不会自动训练出通用策略。
@@ -40,6 +41,60 @@ python recall_world.py 200 600 0
 - 沙盒脚本枚举短动作序列，用学到的转移模型检查整段轨迹、执行首个动作，再用真实转移更新模型。
 - 最近一次沙盒测量：8 个种子平均存活约 1027 帧，中位数 659，范围 123–3491；学习到的滞后为 3，增益约 `0.020`。这仍明显低于手工推导的参考控制器，不能视为策略学习已解决。
 - 沙盒反事实 rollout 单独记录为搜索经验，不作为真实状态转移训练世界模型；只有实践中观察到的转移更新模型。
+
+## 加法/乘法：原始输入实验
+
+`raw_math_experiment.py` 生成两阶段字符流，只包含题目和最终答案：
+
+```text
+3+7=10
+4*6=24
+```
+
+不包含偏积、进位过程或解法步骤。答案由外部算术 oracle 生成，这是监督信号，不是模型内部规则。
+nanoGPT 使用现有 `model.py` 和训练器的普通堆叠路径（`n_loop=0`，其他扩展关闭）；没有写入加法或乘法代码。
+
+复现命令示意（先在 `algo_core` 生成数据，再从 `nanogpt-eval` 调用原训练器）：
+
+```powershell
+$raw = "C:\temp\raw_arith"
+$run = "C:\temp\raw_arith_run"
+python ..\algo_core\raw_math_experiment.py prepare $raw
+
+python train.py config/baseline.py "--dataset=$raw/memory" "--out_dir=$run" `
+  --device=cuda --dtype=bfloat16 --compile=False --block_size=64 `
+  --batch_size=64 --max_iters=600 --lr_decay_iters=600 `
+  --always_save_checkpoint=True --init_from=scratch --n_loop=0
+
+python train.py config/baseline.py "--dataset=$raw/form" "--out_dir=$run" `
+  --device=cuda --dtype=bfloat16 --compile=False --block_size=64 `
+  --batch_size=64 --max_iters=5000 --lr_decay_iters=5000 `
+  --always_save_checkpoint=True --init_from=resume --n_loop=0
+```
+
+最近一次运行的训练顺序和独立随机探测（每个长度格 64 题）：
+
+```text
+阶段 1  记忆：全部 200 个一位数加/乘映射，打乱重复 64 次
+        一位数加法 64/64；一位数乘法 64/64
+        两位数及以上 0/64
+
+阶段 2  形式：120,000 条随机二至三位数原始等式，继续训练，不含中间步骤
+        位数       加法 exact       乘法 exact
+        1          0/64             0/64      <- 阶段 1 的事实被遗忘
+        2         59/64             2/64
+        3         49/64             0/64
+        4+         0/64             0/64
+```
+
+这是字符级 GPT 的基线，不应解释成显式节点记忆或策略搜索。它显示了事实记忆能形成，但后续训练会遗忘；
+原始等式样本让加法在未见过的三位数组合上有一定泛化，乘法没有，位数外推也没有。
+每格 64 个随机 probe；结果是当前一次种子运行，不是多种子均值。
+
+`math_memory_search.py` 是另一项、数值输入上的机制隔离实验：关联存储记住一位数事实；`substrate_search`
+再从通用候选基（原值、变换和两两乘积）选择关系。它恢复 `a+b` 和 `a*b`，并在无记忆命中的二至六位数上
+逐题预测正确。这个结果只证明**给定数值输入和该候选基时**的关系搜索；解析字符、候选算子范围以及
+把这种搜索接回 nanoGPT/节点网络，仍未解决。候选基包含乘积这一通用算子，因此也不能宣称系统从零发明了乘法。
 
 ## 边界与纪律
 
