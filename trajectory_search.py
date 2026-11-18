@@ -69,6 +69,31 @@ def _lexicographic_order(scores, indices):
     return np.lexsort(keys)
 
 
+def _combine_modes(combine, columns):
+    if isinstance(combine, str):
+        modes = (combine,) * columns
+    else:
+        modes = tuple(combine)
+        if len(modes) != columns:
+            raise ValueError("score_combine must have one mode per objective")
+    if any(mode not in ("sum", "max") for mode in modes):
+        raise ValueError("score_combine modes must be 'sum' or 'max'")
+    return modes
+
+
+def _combine_scores(current, increment, modes):
+    if current is None:
+        return increment.copy()
+    if current.shape != increment.shape:
+        raise ValueError("score objective count changed during the rollout")
+    for column, mode in enumerate(modes):
+        if mode == "max":
+            current[:, column] = np.maximum(current[:, column], increment[:, column])
+        else:
+            current[:, column] += increment[:, column]
+    return current
+
+
 def exhaustive_search(
     initial_state: np.ndarray,
     action_space: Iterable,
@@ -81,6 +106,7 @@ def exhaustive_search(
     evaluate_terminal: Optional[Callable[
         [np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]
     ]] = None,
+    score_combine: Union[str, Sequence[str]] = "sum",
 ) -> SearchResult:
     """Enumerate action sequences and select plans using supplied model/evaluator callbacks.
 
@@ -139,10 +165,10 @@ def exhaustive_search(
                     "evaluate_step must return one feasibility flag per plan"
                 )
             if scores is None:
-                scores = np.zeros_like(increments)
-            elif increments.shape[1] != scores.shape[1]:
-                raise ValueError("evaluate_step changed the number of score objectives")
-            scores += increments
+                modes = _combine_modes(score_combine, increments.shape[1])
+                scores = increments.copy()
+            else:
+                scores = _combine_scores(scores, increments, modes)
             feasible &= step_feasible
 
         if evaluate_terminal is not None:
@@ -154,10 +180,10 @@ def exhaustive_search(
                     "evaluate_terminal must return one feasibility flag per plan"
                 )
             if scores is None:
-                scores = np.zeros_like(increments)
-            elif increments.shape[1] != scores.shape[1]:
-                raise ValueError("evaluate_terminal changed the number of score objectives")
-            scores += increments
+                modes = _combine_modes(score_combine, increments.shape[1])
+                scores = increments.copy()
+            else:
+                scores = _combine_scores(scores, increments, modes)
             feasible &= terminal_feasible
 
         if scores is None:
@@ -220,6 +246,7 @@ def beam_search(
         [np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]
     ]] = None,
     beam_width: int = 256,
+    score_combine: Union[str, Sequence[str]] = "sum",
 ) -> SearchResult:
     """Beam-limited version of exhaustive_search for long horizons.
 
@@ -277,13 +304,12 @@ def beam_search(
             else np.repeat(first_states, width, axis=0)
         )
         if scores is None:
-            candidate_scores = increments
+            modes = _combine_modes(score_combine, increments.shape[1])
+            candidate_scores = increments.copy()
         else:
-            if increments.shape[1] != scores.shape[1]:
-                raise ValueError(
-                    "evaluate_step changed the number of score objectives"
-                )
-            candidate_scores = np.repeat(scores, width, axis=0) + increments
+            candidate_scores = _combine_scores(
+                np.repeat(scores, width, axis=0), increments, modes
+            )
         candidate_feasible = np.repeat(feasible, width) & step_feasible
         feasible_checks += int(candidate_feasible.sum())
         finite = np.isfinite(candidate_scores).all(axis=1)
@@ -306,11 +332,7 @@ def beam_search(
         increments, terminal_feasible = evaluate_terminal(states, sequences)
         increments = _score_matrix(increments, len(states), "evaluate_terminal")
         terminal_feasible = np.asarray(terminal_feasible, dtype=bool).reshape(-1)
-        if increments.shape[1] != scores.shape[1]:
-            raise ValueError(
-                "evaluate_terminal changed the number of score objectives"
-            )
-        scores = scores + increments
+        scores = _combine_scores(scores, increments, modes)
         feasible = feasible & terminal_feasible
 
     finite = np.isfinite(scores).all(axis=1)

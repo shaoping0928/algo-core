@@ -202,7 +202,7 @@ def score_text(score):
 
 def rollout_candidates(
     env, b, f, lag, lp, feedback_head, risk_head, novelty, value_mode,
-    engine, horizon, beam_width,
+    engine, horizon, beam_width, risk_aggregate="terminal",
 ):
     """Bind the learned transition and selected value evaluator to the generic search core."""
     pending = np.asarray(env.pending()[:lag], dtype=float)
@@ -244,9 +244,9 @@ def rollout_candidates(
     def evaluate_step(states, sequences, step):
         if value_mode == "feedback":
             features = feedback_features(states, sequences, step + 1)
-            if engine == "beam":
-                # Per-step pain probability prunes unsafe prefixes during long-horizon
-                # beam search; terminal V still supplies the longer-horizon return.
+            if engine == "beam" or risk_aggregate in ("sum", "max"):
+                # Per-step pain probability can prune unsafe prefixes; terminal V
+                # still supplies the longer-horizon return.
                 risk = risk_head.probability(features)
                 zeros = np.zeros(len(states))
                 scores = np.column_stack([risk, zeros, zeros])
@@ -273,6 +273,7 @@ def rollout_candidates(
         scores = np.column_stack([risk, values[:, 1], -values[:, 0]])
         return scores, np.isfinite(features).all(axis=1)
 
+    combine = ("max", "sum", "sum") if risk_aggregate == "max" else "sum"
     if engine == "beam":
         result = beam_search(
             initial_state=initial_state,
@@ -282,6 +283,7 @@ def rollout_candidates(
             evaluate_step=evaluate_step,
             evaluate_terminal=evaluate_terminal,
             beam_width=beam_width,
+            score_combine=combine,
         )
     else:
         result = exhaustive_search(
@@ -292,6 +294,7 @@ def rollout_candidates(
             evaluate_step=evaluate_step,
             evaluate_terminal=evaluate_terminal if value_mode == "feedback" else None,
             batch_size=len(ACTION_SPACE) ** horizon,
+            score_combine=combine,
         )
     return result, gc
 
@@ -299,7 +302,8 @@ def rollout_candidates(
 def run(seed, value_mode="feedback", engine="exhaustive", horizon=H,
         beam_width=BEAM_WIDTH, practice_steps=PRACTICE,
         value_updates=VALUE_UPDATES, risk_updates=RISK_UPDATES,
-        terminal_fraction=TERMINAL_FRACTION, show=False):
+        terminal_fraction=TERMINAL_FRACTION, risk_aggregate="terminal",
+        show=False):
     if value_mode == "task" and engine != "exhaustive":
         raise ValueError("the task baseline uses exhaustive search")
     lp, lag, f, feedback_head, risk_head, novelty, probe, replay, coverage = practice(
@@ -318,6 +322,7 @@ def run(seed, value_mode="feedback", engine="exhaustive", horizon=H,
         plan, gc = rollout_candidates(
             env, b, f, lag, lp, feedback_head, risk_head, novelty,
             value_mode, engine, horizon, beam_width,
+            risk_aggregate=risk_aggregate,
         )
         searches += 1
         feasible_total += plan.feasible_count
@@ -490,6 +495,8 @@ def main(argv=None):
     parser.add_argument("--risk-updates", type=int, default=RISK_UPDATES)
     parser.add_argument("--terminal-fraction", type=float,
                         default=TERMINAL_FRACTION)
+    parser.add_argument("--risk-aggregate", choices=("terminal", "sum", "max"),
+                        default="terminal")
     args = parser.parse_args(argv)
 
     value_mode = "task" if args.task_baseline else "feedback"
@@ -509,16 +516,18 @@ def main(argv=None):
     print("sandbox engine: %s; horizon=%d; beam_width=%d; jobs=%d"
           % (engine, horizon, args.beam_width, args.jobs))
     print("practice=%d real steps/seed; value_updates=%d; risk_updates=%d; "
-          "terminal_fraction=%.2f; sandbox predictions are not training samples\n"
+          "terminal_fraction=%.2f; risk_aggregate=%s; sandbox predictions are "
+          "not training samples\n"
           % (args.practice_steps, args.value_updates, args.risk_updates,
-             args.terminal_fraction))
+             args.terminal_fraction, args.risk_aggregate))
 
     tasks = [
         dict(
             seed=seed, value_mode=value_mode, engine=engine, horizon=horizon,
             beam_width=args.beam_width, practice_steps=args.practice_steps,
             value_updates=args.value_updates, risk_updates=args.risk_updates,
-            terminal_fraction=args.terminal_fraction, show=(seed == SEEDS[0]),
+            terminal_fraction=args.terminal_fraction,
+            risk_aggregate=args.risk_aggregate, show=(seed == SEEDS[0]),
         )
         for seed in SEEDS[:args.seeds]
     ]

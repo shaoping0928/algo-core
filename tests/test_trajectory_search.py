@@ -101,6 +101,26 @@ class TrajectorySearchTests(unittest.TestCase):
         self.assertEqual(result.final_state[0], 2.0)
         self.assertGreater(result.candidate_count, 0)
 
+    def test_max_combine_penalizes_the_worst_step(self):
+        def evaluate_step(_states, sequences, step):
+            raised = sequences[:, 0] > 0.5
+            if step == 0:
+                return np.where(raised, 5.0, 0.0), np.ones(len(sequences), dtype=bool)
+            return np.where(raised, 5.0, 10.0), np.ones(len(sequences), dtype=bool)
+
+        kwargs = dict(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=2,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+        )
+        summed = exhaustive_search(**kwargs)
+        maxed = exhaustive_search(**kwargs, score_combine="max")
+        self.assertEqual(int(summed.actions[0]), 0)
+        self.assertEqual(int(maxed.actions[0]), 1)
+        self.assertEqual(maxed.score, 5.0)
+
     def test_beam_search_matches_exhaustive_when_width_is_large(self):
         def evaluate_step(states, sequences, step):
             score = np.abs(states[:, 0] - 2.0) + 0.01 * sequences[:, 0]

@@ -14,7 +14,8 @@ substrate_search.py       基函数、滞后列和确定性搜索
 predict_layer.py          预测层 / 真实层；残差驱动的在线更新
 trajectory_search.py      通用批量 rollout、可行性筛选与词典序方案选择
 substrate_sandbox_search.py Flappy 适配器：学习世界反馈；可选 gap 基线
-substrate_value.py        从世界反馈通道学习 dopamine / pain 价值预测
+substrate_value.py        从世界反馈通道学习 dopamine / pain 价值与终止风险
+trace_feedback.py         追踪管道附近的动作/缺口方向与风险预测
 math_memory_search.py     算术事实记忆 + 关系搜索实验
 raw_math_experiment.py    nanoGPT 原始等式数据生成与实验
 signal_bank.py            每节点信号源：差分、积分/泄漏、逆泄漏、均值
@@ -52,6 +53,9 @@ python substrate_sandbox_search.py --task-baseline --jobs 8
 # 可选：长时域 beam 搜索对照
 python substrate_sandbox_search.py --engine beam --jobs 8
 
+# 追踪一个种子的管道附近动作/风险
+python trace_feedback.py 100
+
 python substrate_selfdelay.py
 python substrate_signals.py
 python substrate_signals_noise.py
@@ -84,6 +88,7 @@ python math_memory_search.py
 - **当前任务基线**（8 个种子，5000 步练习）：存活平均 **1026.9 帧**，中位数 659，范围 123–3491。它仍使用 gap-center 评分和碰撞可行性过滤，只作对照。
 - 长时域对照：beam H=78、宽度 256 在较早配置下约 105 帧，低于 exhaustive H=14；当前默认不启用 beam。
 - 练习覆盖（8 个种子）：平均 episode 约 43.1 帧；管道死亡 128 次、边界死亡 792 次、管道窗口 921 步。覆盖统计由 `substrate_sandbox_search.py` 输出。
+- **动作学习轨迹仍然是负结果**：`trace_feedback.py 100` 追踪到 139 个管道附近决策，按“缺口在上则拍翅、缺口在下则不拍”计，方向准确率约 `0.24`；需要上拍时拍翅率约 `0.09`。风险头对全不拍/全拍的平均风险为 `0.48/1.00`，从未认为全拍更安全。它学到的是“管道附近有终止风险”，不是“当前拍翅能对准缺口”；当前搜索仍主要靠延迟拍翅和避开边界延长存活。
 - 沙盒反事实 rollout 单独记录为搜索经验，不作为真实状态转移训练世界模型或价值头；只有实践中观察到的转移更新模型和价值。
 
 ## 加法/乘法：原始输入实验
