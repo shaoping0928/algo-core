@@ -17,6 +17,7 @@ substrate_sandbox_search.py Flappy 适配器：学习世界反馈；可选 gap �
 substrate_value.py        从世界反馈通道学习 dopamine / pain 价值与终止风险
 substrate_generic.py      任务无关原型：完整观测世界模型 + 通用搜索
 trace_feedback.py         追踪管道附近的动作/缺口方向与风险预测
+trace_generic_training.py 抽样追踪世界模型、价值和风险训练波次
 math_memory_search.py     算术事实记忆 + 关系搜索实验
 raw_math_experiment.py    nanoGPT 原始等式数据生成与实验
 signal_bank.py            每节点信号源：差分、积分/泄漏、逆泄漏、均值
@@ -56,6 +57,9 @@ python substrate_sandbox_search.py --engine beam --jobs 8
 
 # 任务无关原型：只通过 obs/step/feedback 交互
 python substrate_generic.py --seed 100
+
+# 抽样查看训练波次
+python trace_generic_training.py --seed 100 --coverage 0.1
 
 # 追踪一个种子的管道附近动作/风险
 python trace_feedback.py 100
@@ -118,6 +122,13 @@ obs_t, action_t, feedback_t, terminal_t
 的存活为 152/232/76 帧，单步留出误差约 `5e-3` 到 `1e-7`；seed 100 的最大训练误差约 `0.79`，
 来自管道生成造成的不连续事件，说明纯线性观测模型还不足。这个原型验证了接口分层，但还不是
 性能更好的默认路径；当前默认仍是 `substrate_sandbox_search.py`。
+
+`trace_generic_training.py` 抽样了 seed 100–102 的训练波次：价值/风险指标随更新稳定上升
+（pain AUC 约 `0.87→0.95`，risk AUC 约 `0.90→0.96`，near-pipe AUC 约 `0.88–0.92`），
+没有出现训练崩溃。不稳定的部分主要是数据覆盖和世界模型事件：每 500 步的近管道样本在
+`0–81` 之间波动，近管道实际拍翅样本在 `0–9` 之间；seed 100 的 `dx/gap` 留出误差约
+`1.6e-3/6e-5`，其他种子约 `1e-8`，对应管道生成的不连续事件。也就是说，学习器不是主要
+失效点，**数据覆盖和事件感知世界模型才是**。
 
 ## 加法/乘法：原始输入实验
 

@@ -107,11 +107,12 @@ def history_features(sequences, steps, prefix):
     return result
 
 
-def collect(seed, steps=PRACTICE):
+def collect(seed, steps=PRACTICE, coverage=0.0):
     """Collect real transitions using only observation/action/feedback."""
     lp = LayerPair(k_max=8)
     rng = np.random.RandomState(seed * 10000)
     transitions = []
+    action_counts = {}
     done = episode = 0
     while done < steps:
         env = latent[LAG](seed * 10000 + episode)
@@ -126,10 +127,20 @@ def collect(seed, steps=PRACTICE):
             else:
                 center = 0.1
             explore = 0.03 + 0.10 * (1.0 - confidence)
+            obs = np.asarray(env.obs(), dtype=float)
             action = int(rng.rand() < np.clip(
                 center + rng.uniform(-explore, explore), 0.0, 1.0
             ))
-            obs = np.asarray(env.obs(), dtype=float)
+            if coverage > 0.0 and rng.rand() < coverage:
+                # Generic action-coverage exploration: choose the less-used action
+                # in the current observation bucket. This uses no task geometry.
+                key = tuple(np.round(obs, 1))
+                counts = action_counts.setdefault(key, [0, 0])
+                action = int(counts[1] < counts[0] or (
+                    counts[1] == counts[0] and rng.rand() < 0.5
+                ))
+            key = tuple(np.round(obs, 1))
+            action_counts.setdefault(key, [0, 0])[action] += 1
             vy0 = env.vy
             history = np.asarray([action] + lp.hist[:LAG], dtype=float)
             env.step(action)
@@ -146,7 +157,7 @@ def collect(seed, steps=PRACTICE):
             ))
             done += 1
         episode += 1
-    return transitions
+    return transitions, action_counts
 
 
 def fit(transitions, seed):
@@ -238,15 +249,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=100)
     parser.add_argument("--steps", type=int, default=PRACTICE)
+    parser.add_argument("--coverage", type=float, default=0.0)
     args = parser.parse_args()
-    transitions = collect(args.seed, args.steps)
+    transitions, action_counts = collect(
+        args.seed, args.steps, coverage=args.coverage
+    )
     world, value_head, risk_head = fit(transitions, args.seed)
     frames, actions = evaluate(args.seed, world, value_head, risk_head)
+    both = sum(1 for counts in action_counts.values()
+               if counts[0] > 0 and counts[1] > 0)
     print("seed", args.seed, "transitions", len(transitions), "frames", frames)
     print("one-step max error train %.2e holdout %.2e"
           % (world.train_error, world.holdout_error))
     print("actions executed", len(actions), "flap rate %.3f"
           % (np.mean(actions) if actions else 0.0))
+    print("coverage buckets %d/%d have both actions"
+          % (both, len(action_counts)))
 
 
 if __name__ == "__main__":
