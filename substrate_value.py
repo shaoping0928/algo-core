@@ -287,7 +287,7 @@ def binary_auc(scores, labels):
     )
 
 
-def value_probe_metrics(records, head, risk_head=None):
+def value_probe_metrics(records, head, risk_head=None, gap=None):
     """Summarise a held-out set of real transitions without using their labels for training."""
     if not records:
         return {"n": 0}
@@ -322,6 +322,29 @@ def value_probe_metrics(records, head, risk_head=None):
             "risk_auc": binary_auc(risk, terminal),
             "risk_brier": float(np.mean((risk - terminal.astype(float)) ** 2)),
         })
+        near = np.asarray([
+            abs(row.get("pipe_dx", 1.0)) < 0.20
+            and row.get("pipe_dx", -1.0) > -0.10
+            for row in records
+        ], dtype=bool)
+        metrics["near_pipe_risk_auc"] = (
+            binary_auc(risk[near], terminal[near]) if near.any() else float("nan")
+        )
+        if gap is not None:
+            inside = np.asarray([
+                abs(row.get("gap_dy", 1.0)) <= gap / 2.0 for row in records
+            ], dtype=bool)
+            for name, mask in (
+                ("near_inside", near & inside),
+                ("near_outside", near & ~inside),
+            ):
+                metrics[name + "_n"] = int(mask.sum())
+                metrics[name + "_risk"] = (
+                    float(risk[mask].mean()) if mask.any() else float("nan")
+                )
+                metrics[name + "_terminal_rate"] = (
+                    float(terminal[mask].mean()) if mask.any() else float("nan")
+                )
     for name, predicate in (
         ("high_y", lambda row: row.get("y", 0.0) > 0.9),
         ("low_y", lambda row: row.get("y", 0.0) < 0.1),
@@ -349,12 +372,13 @@ class TransitionReplay:
     def __len__(self):
         return len(self.alive) + len(self.terminal)
 
-    def add(self, features, signals, next_features, terminal):
+    def add(self, features, signals, next_features, terminal, metadata=None):
         item = (
             np.asarray(features, dtype=float).reshape(-1),
             np.asarray(signals, dtype=float).reshape(-1),
             np.asarray(next_features, dtype=float).reshape(-1),
             bool(terminal),
+            dict(metadata or {}),
         )
         if item[3]:
             self.terminal.append(item)
@@ -367,27 +391,13 @@ class TransitionReplay:
         indices = self.rng.choice(len(pool), size=count, replace=replace)
         return [pool[int(index)] for index in indices]
 
-    def arrays(self):
-        """Return every stored transition as arrays, without sampling."""
-        items = list(self.alive) + list(self.terminal)
-        if not items:
-            return None
-        return (
-            np.asarray([item[0] for item in items], dtype=float),
-            np.asarray([item[1] for item in items], dtype=float),
-            np.asarray([item[2] for item in items], dtype=float),
-            np.asarray([item[3] for item in items], dtype=bool),
-        )
+    @staticmethod
+    def _near_pipe(item):
+        metadata = item[4]
+        pipe_dx = metadata.get("pipe_dx", 1.0)
+        return abs(pipe_dx) < 0.20 and pipe_dx > -0.10
 
-    def sample(self, batch_size, terminal_fraction=0.5):
-        batch_size = int(batch_size)
-        if batch_size < 1:
-            raise ValueError("batch_size must be positive")
-        if not 0.0 <= terminal_fraction <= 1.0:
-            raise ValueError("terminal_fraction must be in [0, 1]")
-        if not len(self):
-            return None
-
+    def _balanced_items(self, batch_size, terminal_fraction):
         terminal_count = min(
             len(self.terminal), int(round(batch_size * terminal_fraction))
         )
@@ -406,6 +416,49 @@ class TransitionReplay:
         selected += self._draw(
             self.alive, alive_count, alive_count > len(self.alive)
         )
+        return selected
+
+    def arrays(self):
+        """Return every stored transition as arrays, without sampling."""
+        items = list(self.alive) + list(self.terminal)
+        if not items:
+            return None
+        return (
+            np.asarray([item[0] for item in items], dtype=float),
+            np.asarray([item[1] for item in items], dtype=float),
+            np.asarray([item[2] for item in items], dtype=float),
+            np.asarray([item[3] for item in items], dtype=bool),
+        )
+
+    def sample(self, batch_size, terminal_fraction=0.5,
+               near_pipe_fraction=0.0):
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if not 0.0 <= terminal_fraction <= 1.0:
+            raise ValueError("terminal_fraction must be in [0, 1]")
+        if not 0.0 <= near_pipe_fraction <= 1.0:
+            raise ValueError("near_pipe_fraction must be in [0, 1]")
+        if not len(self):
+            return None
+
+        near_count = min(
+            batch_size, int(round(batch_size * near_pipe_fraction))
+        )
+        selected = self._balanced_items(
+            batch_size - near_count, terminal_fraction
+        )
+        if near_count:
+            near_items = [
+                item for pool in (self.alive, self.terminal)
+                for item in pool if self._near_pipe(item)
+            ]
+            if near_items:
+                selected += self._draw(
+                    near_items, near_count, near_count > len(near_items)
+                )
+            else:
+                selected += self._balanced_items(near_count, terminal_fraction)
         if not selected:
             return None
         order = self.rng.permutation(len(selected))
@@ -435,7 +488,8 @@ def fit_value_head(head, replay, updates, batch_size=128, terminal_fraction=0.5)
 class TerminalRiskHead:
     """Logistic readout of the world's pain label, giving a calibrated terminal risk."""
 
-    def __init__(self, feature_dim, learning_rate=0.05, l2=1e-4):
+    def __init__(self, feature_dim, learning_rate=0.05, l2=1e-4,
+                 interaction_dim=0):
         if feature_dim < 1:
             raise ValueError("feature_dim must be positive")
         if learning_rate <= 0.0:
@@ -443,11 +497,20 @@ class TerminalRiskHead:
         self.feature_dim = int(feature_dim)
         self.learning_rate = float(learning_rate)
         self.l2 = float(l2)
+        self.interaction_dim = min(max(int(interaction_dim), 0), self.feature_dim)
+        start = self.feature_dim - self.interaction_dim
+        self.interaction_pairs = [
+            (i - start, j - start)
+            for i in range(start, self.feature_dim)
+            for j in range(i + 1, self.feature_dim)
+        ]
         self.mean = np.zeros(self.feature_dim, dtype=float)
         self.scale = np.ones(self.feature_dim, dtype=float)
-        # Squared terms let the risk readout represent two-sided boundaries without
-        # task-specific boundary variables.
-        self.w = np.zeros(2 * self.feature_dim, dtype=float)
+        # Squared terms represent two-sided boundaries; pairwise products let the
+        # readout express pipe-distance x gap-offset interactions.
+        self.w = np.zeros(
+            2 * self.feature_dim + len(self.interaction_pairs), dtype=float
+        )
         self.b = 0.0
 
     def set_normalization(self, features):
@@ -463,7 +526,15 @@ class TerminalRiskHead:
         if features.ndim < 1 or features.shape[-1] != self.feature_dim:
             raise ValueError("feature dimension mismatch")
         x = (features - self.mean) / self.scale
-        return np.concatenate([x, x * x], axis=-1)
+        parts = [x, x * x]
+        if self.interaction_pairs:
+            block = x[..., -self.interaction_dim:]
+            parts.append(np.stack(
+                [block[..., i] * block[..., j]
+                 for i, j in self.interaction_pairs],
+                axis=-1,
+            ))
+        return np.concatenate(parts, axis=-1)
 
     def logits(self, features):
         return self._expand(features) @ self.w + self.b
@@ -488,15 +559,18 @@ class TerminalRiskHead:
         return len(features)
 
 
-def fit_terminal_risk(head, replay, updates, batch_size=128, terminal_fraction=0.5):
-    """Train the pain/terminal readout on replay batches with the same balanced sampler."""
+def fit_terminal_risk(head, replay, updates, batch_size=128,
+                      terminal_fraction=0.5, near_pipe_fraction=0.0):
+    """Train the pain/terminal readout on replay batches with balanced samplers."""
     data = replay.arrays()
     if data is None:
         return 0
     head.set_normalization(data[0])
     completed = 0
     for _ in range(int(updates)):
-        batch = replay.sample(batch_size, terminal_fraction)
+        batch = replay.sample(
+            batch_size, terminal_fraction, near_pipe_fraction
+        )
         if batch is None:
             break
         head.update_batch(batch[0], batch[3])

@@ -169,13 +169,42 @@ class SubstrateValueTests(unittest.TestCase):
                 return features[:, 1]
 
         records = [
-            {"features": np.array([1.0, 0.1]), "terminal": False},
-            {"features": np.array([1.0, 0.9]), "terminal": True},
+            {"features": np.array([1.0, 0.1]), "terminal": False,
+             "pipe_dx": 0.1, "gap_dy": 0.05},
+            {"features": np.array([1.0, 0.9]), "terminal": True,
+             "pipe_dx": 0.1, "gap_dy": 0.5},
         ]
-        metrics = value_probe_metrics(records, FixedHead(), FixedRisk())
+        metrics = value_probe_metrics(
+            records, FixedHead(), FixedRisk(), gap=0.34
+        )
         self.assertAlmostEqual(metrics["risk_auc"], 1.0)
         self.assertAlmostEqual(metrics["risk_safe"], 0.1)
         self.assertAlmostEqual(metrics["risk_terminal"], 0.9)
+        self.assertAlmostEqual(metrics["near_pipe_risk_auc"], 1.0)
+        self.assertAlmostEqual(metrics["near_inside_risk"], 0.1)
+        self.assertAlmostEqual(metrics["near_outside_risk"], 0.9)
+
+    def test_terminal_risk_interaction_features_learn_product_rule(self):
+        replay = TransitionReplay(capacity=200, seed=4)
+        corners = np.asarray([[-1.0, -1.0], [-1.0, 1.0],
+                              [1.0, -1.0], [1.0, 1.0]])
+        labels = [False, True, True, False]
+        for _ in range(20):
+            for features, label in zip(corners, labels):
+                replay.add(features, [1.0, 0.0], features, label)
+        head = TerminalRiskHead(
+            feature_dim=2, learning_rate=0.1, interaction_dim=2
+        )
+        completed = fit_terminal_risk(
+            head, replay, updates=1000, batch_size=32,
+            terminal_fraction=0.5,
+        )
+        self.assertEqual(completed, 1000)
+        probability = head.probability(corners)
+        self.assertGreater(probability[1], probability[0])
+        self.assertGreater(probability[2], probability[0])
+        self.assertLess(probability[3], probability[1])
+        self.assertLess(probability[3], probability[2])
 
 
 if __name__ == "__main__":

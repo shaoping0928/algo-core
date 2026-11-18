@@ -38,6 +38,8 @@ PRACTICE = 5000
 VALUE_UPDATES = 3000
 VALUE_BATCH = 128
 TERMINAL_FRACTION = 0.15
+NEAR_PIPE_FRACTION = 0.0
+RISK_INTERACTION_DIM = 0
 RISK_UPDATES = 8000
 ACTION_SPACE = (0, 1)
 DEFAULT_JOBS = min(8, os.cpu_count() or 1)
@@ -86,13 +88,17 @@ def observe_transition(
 
 
 def practice(seed, steps=PRACTICE, value_updates=VALUE_UPDATES,
-             risk_updates=RISK_UPDATES, terminal_fraction=TERMINAL_FRACTION):
+             risk_updates=RISK_UPDATES, terminal_fraction=TERMINAL_FRACTION,
+             near_pipe_fraction=NEAR_PIPE_FRACTION,
+             risk_interaction_dim=RISK_INTERACTION_DIM):
     lp = LayerPair(k_max=8)
     novelty = InputNovelty(feature_dim=len(lp.hist))
     sample_env = latent[LAG](seed * 10000)
     feature_dim = len(substrate_features(lp)) + len(sample_env.obs())
     feedback_head = WorldFeedbackValueHead(feature_dim=feature_dim, discount=0.99)
-    risk_head = TerminalRiskHead(feature_dim=feature_dim)
+    risk_head = TerminalRiskHead(
+        feature_dim=feature_dim, interaction_dim=risk_interaction_dim
+    )
     done = ep = 0
     probe = []
     replay = TransitionReplay(capacity=max(steps * 2, 1000), seed=seed)
@@ -154,6 +160,7 @@ def practice(seed, steps=PRACTICE, value_updates=VALUE_UPDATES,
                 replay.add(
                     transition["features"], transition["signals"],
                     transition["next_features"], transition["terminal"],
+                    metadata=dict(pipe_dx=pipe_dx, gap_dy=gap_dy, y=y0, t=t0),
                 )
                 episode_transitions.append(transition)
             done += 1
@@ -180,6 +187,7 @@ def practice(seed, steps=PRACTICE, value_updates=VALUE_UPDATES,
     fit_terminal_risk(
         risk_head, replay, risk_updates, batch_size=VALUE_BATCH,
         terminal_fraction=terminal_fraction,
+        near_pipe_fraction=near_pipe_fraction,
     )
     coverage["return_samples"] = len(return_replay)
     j = int(np.argmax(np.abs(lp.h)))
@@ -316,13 +324,17 @@ def rollout_candidates(
 def run(seed, value_mode="feedback", engine="exhaustive", horizon=H,
         beam_width=BEAM_WIDTH, practice_steps=PRACTICE,
         value_updates=VALUE_UPDATES, risk_updates=RISK_UPDATES,
-        terminal_fraction=TERMINAL_FRACTION, risk_aggregate="terminal",
-        show=False):
+        terminal_fraction=TERMINAL_FRACTION,
+        near_pipe_fraction=NEAR_PIPE_FRACTION,
+        risk_interaction_dim=RISK_INTERACTION_DIM,
+        risk_aggregate="terminal", show=False):
     if value_mode == "task" and engine != "exhaustive":
         raise ValueError("the task baseline uses exhaustive search")
     lp, lag, f, feedback_head, risk_head, novelty, probe, replay, coverage = practice(
         seed, steps=practice_steps, value_updates=value_updates,
         risk_updates=risk_updates, terminal_fraction=terminal_fraction,
+        near_pipe_fraction=near_pipe_fraction,
+        risk_interaction_dim=risk_interaction_dim,
     )
     b = lp.b
     env = latent[LAG](seed)
@@ -393,7 +405,9 @@ def run(seed, value_mode="feedback", engine="exhaustive", horizon=H,
                 no_feasible=no_feasible, model_error=max_model_error, selected=selected,
                 search_memory=search_memory, replay_size=len(replay),
                 coverage=coverage,
-                value_probe=value_probe_metrics(probe, feedback_head, risk_head))
+                value_probe=value_probe_metrics(
+                    probe, feedback_head, risk_head, gap=GAP
+                ))
 
 
 def report(rows, value_mode):
@@ -468,27 +482,29 @@ def report(rows, value_mode):
 
     print("\nValue holdout (every fifth practice episode is not used for value "
           "updates):")
-    print(" seed      n  terminal  pain AUC  risk AUC  risk safe  risk term  "
-          "risk Brier")
+    print(" seed      n  terminal  pain AUC  risk AUC  near AUC  near-in  "
+          "near-out  Brier")
     for seed, result in zip(seeds, rows):
         probe = result["value_probe"]
         if not probe["n"]:
-            print(" %4d     0      0       n/a       n/a        n/a        n/a"
-                  "         n/a" % seed)
+            print(" %4d     0      0       n/a       n/a       n/a      n/a"
+                  "       n/a    n/a" % seed)
             continue
-        print(" %4d  %5d  %8d  %8.3f  %8.3f  %9.3f  %9.3f  %10.3f"
+        print(" %4d  %5d  %8d  %8.3f  %8.3f  %8.3f  %8.3f  %8.3f  %6.3f"
               % (seed, probe["n"], probe["terminal"], probe["pain_auc"],
-                 probe["risk_auc"], probe["risk_safe"], probe["risk_terminal"],
+                 probe["risk_auc"], probe["near_pipe_risk_auc"],
+                 probe["near_inside_risk"], probe["near_outside_risk"],
                  probe["risk_brier"]))
     probes = [r["value_probe"] for r in rows if r["value_probe"]["n"]]
     if probes:
-        print("Q7  value holdout: pain AUC %.3f; risk AUC %.3f; risk Brier %.3f; "
-              "risk terminal-vs-safe %.3f vs %.3f"
+        print("Q7  value holdout: pain AUC %.3f; risk AUC %.3f; near-pipe risk "
+              "AUC %.3f; near-in/out risk %.3f/%.3f; risk Brier %.3f"
               % (np.nanmean([p["pain_auc"] for p in probes]),
                  np.nanmean([p["risk_auc"] for p in probes]),
-                 np.nanmean([p["risk_brier"] for p in probes]),
-                 np.nanmean([p["risk_terminal"] for p in probes]),
-                 np.nanmean([p["risk_safe"] for p in probes])))
+                 np.nanmean([p["near_pipe_risk_auc"] for p in probes]),
+                 np.nanmean([p["near_inside_risk"] for p in probes]),
+                 np.nanmean([p["near_outside_risk"] for p in probes]),
+                 np.nanmean([p["risk_brier"] for p in probes])))
 
 
 def _run_task(task):
@@ -509,6 +525,10 @@ def main(argv=None):
     parser.add_argument("--risk-updates", type=int, default=RISK_UPDATES)
     parser.add_argument("--terminal-fraction", type=float,
                         default=TERMINAL_FRACTION)
+    parser.add_argument("--near-pipe-fraction", type=float,
+                        default=NEAR_PIPE_FRACTION)
+    parser.add_argument("--risk-interaction-dim", type=int,
+                        default=RISK_INTERACTION_DIM)
     parser.add_argument("--risk-aggregate",
                         choices=("terminal", "sum", "max", "crossing"),
                         default="terminal")
@@ -531,10 +551,12 @@ def main(argv=None):
     print("sandbox engine: %s; horizon=%d; beam_width=%d; jobs=%d"
           % (engine, horizon, args.beam_width, args.jobs))
     print("practice=%d real steps/seed; value_updates=%d; risk_updates=%d; "
-          "terminal_fraction=%.2f; risk_aggregate=%s; sandbox predictions are "
+          "terminal_fraction=%.2f; near_pipe_fraction=%.2f; "
+          "risk_interaction_dim=%d; risk_aggregate=%s; sandbox predictions are "
           "not training samples\n"
           % (args.practice_steps, args.value_updates, args.risk_updates,
-             args.terminal_fraction, args.risk_aggregate))
+             args.terminal_fraction, args.near_pipe_fraction,
+             args.risk_interaction_dim, args.risk_aggregate))
 
     tasks = [
         dict(
@@ -542,6 +564,8 @@ def main(argv=None):
             beam_width=args.beam_width, practice_steps=args.practice_steps,
             value_updates=args.value_updates, risk_updates=args.risk_updates,
             terminal_fraction=args.terminal_fraction,
+            near_pipe_fraction=args.near_pipe_fraction,
+            risk_interaction_dim=args.risk_interaction_dim,
             risk_aggregate=args.risk_aggregate, show=(seed == SEEDS[0]),
         )
         for seed in SEEDS[:args.seeds]
