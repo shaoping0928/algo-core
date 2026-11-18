@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 
+from mixed_nodes import ContinuousMixedMemory
 from substrate_generic import LinearObservationModel, history_features
 from trace_signal_world import signal_features
 
@@ -47,6 +48,18 @@ class GenericWorldTests(unittest.TestCase):
         self.assertEqual(diff.shape[-1], 6)
         self.assertEqual(buffered.shape[-1], 12)
         self.assertEqual(all_signals.shape[-1], 16)
+
+    def test_continuous_mixed_memory_has_bounded_nodes_and_risk(self):
+        rng = np.random.RandomState(7)
+        observations = rng.normal(size=(200, 2))
+        pain = ((observations[:, 0] > 1.0)
+                & (observations[:, 1] > 1.0)).astype(float)
+        memory = ContinuousMixedMemory(capacity=8).fit(observations, pain)
+        self.assertGreater(len(memory.gates), 0)
+        self.assertLessEqual(len(memory.nodes), 8)
+        risk = memory.risk(observations)
+        self.assertEqual(risk.shape, (200,))
+        self.assertTrue(np.isfinite(risk).all())
 
 
 if __name__ == "__main__":
