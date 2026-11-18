@@ -95,6 +95,10 @@ class NodeGraphTests(unittest.TestCase):
         risk = memory.risk(rows)
         self.assertEqual(risk.shape, (len(rows),))
         self.assertTrue(np.isfinite(risk).all())
+        observations = np.asarray([row["obs"] for row in rows], dtype=float)
+        direct = memory.risk_states(observations[:5])
+        self.assertEqual(direct.shape, (5,))
+        self.assertTrue(np.isfinite(direct).all())
 
 
 if __name__ == "__main__":

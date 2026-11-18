@@ -121,5 +121,25 @@ class PrototypeGraphMemory:
             previous = concept
         return np.clip(np.asarray(result, dtype=float), 0.0, 1.0)
 
+    def risk_states(self, observations, previous_labels=None):
+        """Risk for arbitrary predicted observations, without episode boundaries."""
+        observations = np.asarray(observations, dtype=float)
+        labels = self.prototype(observations)
+        values = np.asarray(
+            [self.graph.nodes["concept_%d" % int(label)].value for label in labels],
+            dtype=float,
+        )
+        if previous_labels is not None:
+            previous_labels = np.asarray(previous_labels, dtype=int)
+            for index, (previous, current) in enumerate(zip(previous_labels, labels)):
+                edge_node = self.graph.edge_node(
+                    "concept_%d" % int(previous), "concept_%d" % int(current)
+                )
+                if edge_node is not None:
+                    values[index] = 0.5 * (
+                        values[index] + self.graph.nodes[edge_node].value
+                    )
+        return np.clip(values, 0.0, 1.0)
+
     def snapshot(self):
         return self.graph.snapshot()
