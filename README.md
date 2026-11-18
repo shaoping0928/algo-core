@@ -19,6 +19,7 @@ substrate_generic.py      任务无关原型：完整观测世界模型 + 通用
 trace_feedback.py         追踪管道附近的动作/缺口方向与风险预测
 trace_generic_training.py 抽样追踪世界模型、价值和风险训练波次
 trace_signal_world.py     对照 raw / 差分 / 缓冲观测信号的世界预测
+trace_sensitivity.py      扰动各输入维度，检查世界/价值/风险是否真的使用它
 math_memory_search.py     算术事实记忆 + 关系搜索实验
 raw_math_experiment.py    nanoGPT 原始等式数据生成与实验
 signal_bank.py            每节点信号源：差分、积分/泄漏、逆泄漏、均值
@@ -64,6 +65,9 @@ python trace_generic_training.py --seed 100 --coverage 0.1
 
 # 比较 raw / 差分 / 缓冲世界模型
 python trace_signal_world.py --seed 100 --coverage 0.1
+
+# 检查各输入维度的重要度
+python trace_sensitivity.py --seed 100 --coverage 0.1
 
 # 追踪一个种子的管道附近动作/风险
 python trace_feedback.py 100
@@ -135,6 +139,8 @@ obs_t, action_t, feedback_t, terminal_t
 失效点，**数据覆盖和事件感知世界模型才是**。
 
 `trace_signal_world.py` 对 raw、`d1/d2` 差分、多时间常数缓冲、以及全部信号做了同一批真实 episode 的对照：seed 100 的 raw 单步平均误差约 `6.20e-4`，差分约 `6.35e-4`，缓冲/全部约 `6.6e-4`；seed 101 的 raw/差分/缓冲/全部约 `1.0e-8/0.9e-8/1.1e-8/1.5e-8`。多步误差没有稳定改善，管道维度仍主要受生成/弹出事件限制。结论：当前完整观测下，缓冲和差分是冗余的，低通还会抹平事件边缘；不能替代事件/动作条件模型。
+
+`trace_sensitivity.py` 的扰动重要度更直接：世界模型对 `dx/gap/y/vy` 和滞后动作 `a3` 都敏感；风险头却几乎只依赖 `y`（打乱 `y` 使 AUC 下降约 `0.36–0.42`），`dx/gap` 和动作历史的贡献接近零；价值头主要依赖 `vy/y/gap`，动作贡献也很小。也就是说：**风险头有完整观测输入，但没有真正使用管道和动作信息。** 这不是输入缺失，而是训练目标/样本分布让“只看高度”就能获得较高全局 AUC。
 
 ## 加法/乘法：原始输入实验
 
