@@ -241,7 +241,8 @@ def trace(seed, risk_aggregate="terminal", distance=0.25, show_events=12):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("seed", nargs="?", type=int, default=100)
-    parser.add_argument("--risk-aggregate", choices=("terminal", "sum", "max"),
+    parser.add_argument("--risk-aggregate",
+                        choices=("terminal", "sum", "max", "crossing"),
                         default="terminal")
     parser.add_argument("--distance", type=float, default=0.25)
     parser.add_argument("--show-events", type=int, default=12)

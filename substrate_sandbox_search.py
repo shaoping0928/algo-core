@@ -244,12 +244,23 @@ def rollout_candidates(
     def evaluate_step(states, sequences, step):
         if value_mode == "feedback":
             features = feedback_features(states, sequences, step + 1)
-            if engine == "beam" or risk_aggregate in ("sum", "max"):
-                # Per-step pain probability can prune unsafe prefixes; terminal V
-                # still supplies the longer-horizon return.
-                risk = risk_head.probability(features)
-                zeros = np.zeros(len(states))
-                scores = np.column_stack([risk, zeros, zeros])
+            if risk_aggregate == "crossing":
+                steps = step + 1
+                crossing = any(
+                    abs(px - steps * SPEED - BIRD_X) < 0.06
+                    for px, _gap in env.pipes
+                )
+            else:
+                crossing = True
+            if engine == "beam" or risk_aggregate in ("sum", "max", "crossing"):
+                if crossing:
+                    # Query the learned pain/risk head at the predicted pipe-crossing
+                    # moment, not at every harmless step or only at the endpoint.
+                    risk = risk_head.probability(features)
+                    zeros = np.zeros(len(states))
+                    scores = np.column_stack([risk, zeros, zeros])
+                else:
+                    scores = np.zeros((len(states), 3))
             else:
                 scores = np.zeros((len(states), 3))
             return scores, np.isfinite(features).all(axis=1)
@@ -273,7 +284,10 @@ def rollout_candidates(
         scores = np.column_stack([risk, values[:, 1], -values[:, 0]])
         return scores, np.isfinite(features).all(axis=1)
 
-    combine = ("max", "sum", "sum") if risk_aggregate == "max" else "sum"
+    combine = (
+        ("max", "sum", "sum")
+        if risk_aggregate in ("max", "crossing") else "sum"
+    )
     if engine == "beam":
         result = beam_search(
             initial_state=initial_state,
@@ -495,7 +509,8 @@ def main(argv=None):
     parser.add_argument("--risk-updates", type=int, default=RISK_UPDATES)
     parser.add_argument("--terminal-fraction", type=float,
                         default=TERMINAL_FRACTION)
-    parser.add_argument("--risk-aggregate", choices=("terminal", "sum", "max"),
+    parser.add_argument("--risk-aggregate",
+                        choices=("terminal", "sum", "max", "crossing"),
                         default="terminal")
     args = parser.parse_args(argv)
 
