@@ -1,0 +1,83 @@
+import unittest
+
+import numpy as np
+
+from node_graph import (
+    ASSOCIATION,
+    EDGE,
+    MEMORY,
+    TRANSITION_EDGE,
+    NodeGraph,
+)
+
+
+class NodeGraphTests(unittest.TestCase):
+    def test_association_has_no_edge_node(self):
+        graph = NodeGraph()
+        a = graph.add_node("concept")
+        b = graph.add_node("concept")
+        edge = graph.add_association(a, b)
+        self.assertEqual(edge.kind, ASSOCIATION)
+        self.assertIsNone(edge.edge_node)
+        self.assertEqual(graph.snapshot()["edge_nodes"], 0)
+
+    def test_coactivation_forms_association_and_recall(self):
+        graph = NodeGraph()
+        a = graph.add_node("concept")
+        b = graph.add_node("concept")
+        graph.activate([a, b], [1.0, 1.0])
+        graph.observe_association([a, b], rate=0.5)
+        graph.observe_association([a, b], rate=0.5)
+        edge = graph.edges[(a, b, ASSOCIATION)]
+        self.assertGreater(edge.weight, 0.0)
+        recalled = graph.recall([a], steps=1)
+        self.assertGreater(recalled[b], 0.0)
+
+    def test_transition_creates_edge_node_and_participates_in_memory(self):
+        graph = NodeGraph()
+        a = graph.add_node("concept")
+        b = graph.add_node("concept")
+        graph.activate([a, b], [1.0, 1.0])
+        edge = graph.observe_transition(a, b, rate=0.5)
+        self.assertIsNotNone(edge.edge_node)
+        edge_node = graph.nodes[edge.edge_node]
+        self.assertEqual(edge_node.kind, EDGE)
+        context = graph.add_node("concept")
+        graph.add_association(edge.edge_node, context)
+        memory = graph.add_memory([a, edge.edge_node, b])
+        self.assertEqual(graph.nodes[memory].kind, MEMORY)
+        self.assertIn(edge.edge_node, graph.nodes[memory].members)
+
+    def test_derivation_depth_is_bounded(self):
+        graph = NodeGraph()
+        source = graph.add_node("concept")
+        first = graph.add_derived(source, max_depth=2)
+        second = graph.add_derived(first, max_depth=2)
+        with self.assertRaises(ValueError):
+            graph.add_derived(second, max_depth=2)
+
+    def test_prune_removes_low_weight_association(self):
+        graph = NodeGraph()
+        a = graph.add_node("concept")
+        b = graph.add_node("concept")
+        graph.add_association(a, b, weight=1e-6)
+        removed = graph.prune(min_association=1e-3)
+        self.assertEqual(len(removed), 1)
+        self.assertNotIn((a, b, ASSOCIATION), graph.edges)
+        self.assertNotIn((a, b, ASSOCIATION), graph.outgoing[a])
+        self.assertNotIn((a, b, ASSOCIATION), graph.incoming[a])
+
+    def test_transition_edge_node_can_be_forgotten(self):
+        graph = NodeGraph()
+        a = graph.add_node("concept")
+        b = graph.add_node("concept")
+        edge = graph.observe_transition(a, b, rate=0.5)
+        edge_node = edge.edge_node
+        graph.nodes[edge_node].trace = 0.0
+        removed = graph.prune(min_edge_trace=1e-4)
+        self.assertIn((a, b, TRANSITION_EDGE), removed)
+        self.assertNotIn(edge_node, graph.nodes)
+
+
+if __name__ == "__main__":
+    unittest.main()

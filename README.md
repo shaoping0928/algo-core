@@ -24,6 +24,7 @@ mixed_nodes.py            通用原始 gate + 混合节点 + 连续记忆/遗忘
 trace_mixed_nodes.py      比较全局风险头与混合节点风险记忆
 math_memory_search.py     算术事实记忆 + 关系搜索实验
 raw_math_experiment.py    nanoGPT 原始等式数据生成与实验
+node_graph.py             统一 Node/Edge 图：概念、转移边节点、记忆、派生
 signal_bank.py            每节点信号源：差分、积分/泄漏、逆泄漏、均值
 substrate_*.py            各算子、记忆、噪声、延迟和搜索的验证脚本
 tests/                    unittest 回归测试
@@ -146,6 +147,8 @@ obs_t, action_t, feedback_t, terminal_t
 `trace_signal_world.py` 对 raw、`d1/d2` 差分、多时间常数缓冲、以及全部信号做了同一批真实 episode 的对照：seed 100 的 raw 单步平均误差约 `6.20e-4`，差分约 `6.35e-4`，缓冲/全部约 `6.6e-4`；seed 101 的 raw/差分/缓冲/全部约 `1.0e-8/0.9e-8/1.1e-8/1.5e-8`。多步误差没有稳定改善，管道维度仍主要受生成/弹出事件限制。结论：当前完整观测下，缓冲和差分是冗余的，低通还会抹平事件边缘；不能替代事件/动作条件模型。
 
 `trace_sensitivity.py` 的扰动重要度更直接：世界模型对 `dx/gap/y/vy` 和滞后动作 `a3` 都敏感；风险头却几乎只依赖 `y`（打乱 `y` 使 AUC 下降约 `0.36–0.42`），`dx/gap` 和动作历史的贡献接近零；价值头主要依赖 `vy/y/gap`，动作贡献也很小。也就是说：**风险头有完整观测输入，但没有真正使用管道和动作信息。** 这不是输入缺失，而是训练目标/样本分布让“只看高度”就能获得较高全局 AUC。
+
+`node_graph.py` 把统一节点图落到基建层：所有节点共享激活/电容痕迹/关联/绑定；关联边不带边节点，只有真正的有向转移边才分配 `edge node`；记忆节点用 membership 绑定多个节点；派生节点有深度上限；图提供激活传播、回忆、衰减和按权重/痕迹剪枝。它是节点/边语义的基建原型，尚未替换现有线性世界模型控制器。
 
 混合节点原型（`mixed_nodes.py` / `trace_mixed_nodes.py`）：数据中确实存在
 `dx1 < 0.28 AND gap1 < -0.402` 的联合状态（support 48，pain rate 19.3%，base 2.5%）。

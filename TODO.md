@@ -56,6 +56,9 @@
   near AUC 约 `0.707`，Brier 约 `0.018`，`gap1/dx1` 敏感度约 `0.052/0.015`，但
   near-inside/outside 仍约 `0.016/0.040`。稀有槽位会选到低支持噪声节点；下一步要按
   验证增益/重建误差选稀有节点并做风险校准，而不是只按支持度/覆盖率。
+- 统一图基建：新增 `node_graph.py`，实现 concept/transition/memory/derived 节点，
+  association/transition/membership/derivation 边，转移边上的 edge node，
+  激活传播、痕迹、回忆、衰减和剪枝。当前只作为基建原型，尚未接入 Flappy 控制器。
 
 动作轨迹诊断（`trace_feedback.py 100`）：管道附近 139 个决策中，“缺口在上应拍翅、缺口在下不应拍”
 的方向准确率约 `0.24`；需要上拍时拍翅率约 `0.09`。风险头对全不拍/全拍的平均风险为
