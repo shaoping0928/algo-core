@@ -25,24 +25,26 @@ import time
 
 import numpy as np
 
-GENS = int(sys.argv[1]) if len(sys.argv) > 1 else 40
-import os as _os
-GRAVITY = float(_os.environ.get("FL_G", "0.0022"))
-FLAP = float(_os.environ.get("FL_FLAP", "0.045"))
-SPEED = float(_os.environ.get("FL_SPEED", "0.012"))
-GAP = float(_os.environ.get("FL_GAP", "0.30"))
-SPACING = float(_os.environ.get("FL_SPACING", "0.6"))
-DRAG = float(_os.environ.get("FL_DRAG", "0.0"))    # quadratic drag: vy += -DRAG*vy*|vy|
-KY = float(_os.environ.get("FL_KY", "0.0"))        # gravity grows off-centre: G*(1+KY*(y-0.5)^2)
-V0 = float(_os.environ.get("FL_V0", "0.0"))        # flap weakens while falling: F*exp(vy/V0) if vy<0
+DEFAULT_GENS = 40
+GRAVITY = float(os.environ.get("FL_G", "0.0022"))
+FLAP = float(os.environ.get("FL_FLAP", "0.045"))
+SPEED = float(os.environ.get("FL_SPEED", "0.012"))
+GAP = float(os.environ.get("FL_GAP", "0.30"))
+SPACING = float(os.environ.get("FL_SPACING", "0.6"))
+DRAG = float(os.environ.get("FL_DRAG", "0.0"))    # quadratic drag: vy += -DRAG*vy*|vy|
+KY = float(os.environ.get("FL_KY", "0.0"))        # gravity grows off-centre: G*(1+KY*(y-0.5)^2)
+V0 = float(os.environ.get("FL_V0", "0.0"))        # flap weakens while falling: F*exp(vy/V0) if vy<0
 BIRD_X = 0.22
 MAXT = 1200
 SEED = 21
 
 
 class Flappy:
-    def __init__(self, seed):
+    def __init__(self, seed, max_t=None):
         self.rng = np.random.RandomState(seed)
+        self.max_t = MAXT if max_t is None else int(max_t)
+        if self.max_t < 1:
+            raise ValueError("max_t must be a positive integer")
         self.reset()
 
     def reset(self):
@@ -81,13 +83,13 @@ class Flappy:
                 self.dead = True
         if self.y < 0.0 or self.y > 1.0:
             self.dead = True
-        if self.t >= MAXT:
+        if self.t >= self.max_t:
             self.dead = True
         return self.obs(), 1.0, self.dead
 
 
-def run(policy_fn, seed, cap=MAXT):
-    env = Flappy(seed)
+def run(policy_fn, seed, cap=None):
+    env = Flappy(seed, max_t=cap)
     total = 0.0
     while not env.dead:
         o, r, d = env.step(policy_fn(env.obs()))
@@ -109,7 +111,8 @@ def scripted(o):
 def scripted_lookahead(o, horizon=14):
     """flap if the bird will be below the gap after `horizon` frames of falling"""
     vy, dy = o[1] / 10.0, o[3]      # dy = gap - y, positive means gap above
-    drop = horizon * vy - 0.5 * GRAVITY * horizon * horizon
+    # Exact discrete sum when gravity is constant: each step updates vy before y.
+    drop = horizon * vy - GRAVITY * horizon * (horizon + 1) / 2.0
     return 1 if drop < dy - 0.02 else 0
 
 
@@ -124,7 +127,7 @@ def fitness(w, seeds):
     return float(np.mean([run(linear_policy(w), s) for s in seeds]))
 
 
-def es(gens=GENS, lam=16, sigma=0.4, seeds=(1, 2, 3)):
+def es(gens=DEFAULT_GENS, lam=16, sigma=0.4, seeds=(1, 2, 3)):
     rng = np.random.RandomState(SEED)
     w = np.zeros(7, np.float32)
     best = fitness(w, seeds)
@@ -139,17 +142,26 @@ def es(gens=GENS, lam=16, sigma=0.4, seeds=(1, 2, 3)):
     return w, best, curve
 
 
-t0 = time.time()
-print("flappy: gravity %.4f  flap %.3f  gap %.2f  cap %d frames" % (GRAVITY, FLAP, GAP, MAXT))
-print("\npolicy        mean survival (20 unseen seeds)")
-for name, fn in (("zero", zero_policy), ("scripted", scripted),
-                 ("lookahead", scripted_lookahead)):
-    sc = [run(fn, s) for s in range(100, 120)]
-    print("  %-10s %7.1f" % (name, float(np.mean(sc))))
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    gens = int(argv[0]) if argv else DEFAULT_GENS
 
-w, best, curve = es()
-sc = [run(linear_policy(w), s) for s in range(100, 120)]
-print("  %-10s %7.1f   (search fitness %.1f)" % ("learned", float(np.mean(sc)), best))
-print("\n  ES: fitness by generation %s" % " ".join("%.0f" % c[1] for c in curve[::max(1, len(curve) // 8)]))
-print("  weights %s" % np.round(w, 3).tolist())
-print("%.1fs" % (time.time() - t0))
+    t0 = time.time()
+    print("flappy: gravity %.4f  flap %.3f  gap %.2f  cap %d frames" % (GRAVITY, FLAP, GAP, MAXT))
+    print("\npolicy        mean survival (20 unseen seeds)")
+    for name, fn in (("zero", zero_policy), ("scripted", scripted),
+                     ("lookahead", scripted_lookahead)):
+        sc = [run(fn, s) for s in range(100, 120)]
+        print("  %-10s %7.1f" % (name, float(np.mean(sc))))
+
+    w, best, curve = es(gens=gens)
+    sc = [run(linear_policy(w), s) for s in range(100, 120)]
+    print("  %-10s %7.1f   (search fitness %.1f)" % ("learned", float(np.mean(sc)), best))
+    print("\n  ES: fitness by generation %s" % " ".join(
+        "%.0f" % c[1] for c in curve[::max(1, len(curve) // 8)]))
+    print("  weights %s" % np.round(w, 3).tolist())
+    print("%.1fs" % (time.time() - t0))
+
+
+if __name__ == "__main__":
+    main()

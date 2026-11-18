@@ -134,8 +134,7 @@ level = np.mean(np.abs(sig), 0)
 def predictable(j, kept):
     if not kept:
         return False
-    A = np.column_stack([np.ones(T)] + [sig[:, k] for k in kept])
-    return fit_resid([A[:, i] for i in range(A.shape[1])], sig[:, j]) < 1e-9 * max(
+    return fit_resid([sig[:, k] for k in kept], sig[:, j]) < 1e-9 * max(
         sig[:, j].std(), 1e-12)
 
 
@@ -145,15 +144,19 @@ for j in range(N):
         greedy.append(j)
 redundant = [j for j in range(N) if j not in greedy]
 keep_act = list(np.where(level >= np.quantile(level, 0.5))[0])
+quiet_unique = 10
+activity_drops_unique = quiet_unique not in keep_act
+redundancy_keeps_unique = quiet_unique in greedy
+unrecoverable = [j for j in redundant if not predictable(j, greedy)]
 
 print("    node   level    kept by greedy (independent subset)")
 for j in range(N):
     print("      %2d   %.4f    %s" % (j, level[j], "yes" if j in greedy else "no (redundant)"))
 print("    activity gate keeps   %s" % "".join("1" if j in keep_act else "." for j in range(N)))
 print("    redundancy gate keeps %s" % "".join("1" if j in greedy else "." for j in range(N)))
-lost_act = [j for j in keep_act if False] + [j for j in greedy if j not in keep_act]
-lost_red = [j for j in greedy if j not in greedy]
-print("    unique nodes dropped: activity %s, redundancy %s" % (lost_act, lost_red))
+print("    quiet unique node %d: activity keeps=%s, redundancy keeps=%s"
+      % (quiet_unique, not activity_drops_unique, redundancy_keeps_unique))
+print("    redundant nodes not recoverable from the independent subset: %s" % unrecoverable)
 
 print("\nL4  compute: signals per node = %d^depth" % len(OPS))
 for d in (1, 2, 3):
@@ -217,5 +220,5 @@ print("\nL0 %s   L1 %s   L2 %s   L3 %s   L5 %s"
       % ("ok" if err_di <= 1e-9 and err_id <= 1e-9 else "MISS",
          "ok" if abs(r1l - r2l) < 0.02 else "MISS",
          "ok" if r3n < 0.9 * r2n else "MISS",
-         "ok" if lost_act and not lost_red else "MISS",
+         "ok" if activity_drops_unique and redundancy_keeps_unique and not unrecoverable else "MISS",
          "ok" if res5[2][1][1] < 0.05 else "MISS"))

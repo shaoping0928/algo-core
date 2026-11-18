@@ -71,11 +71,12 @@ class Live:
                 _RULE_FNS[spec['name']] = spec['fn']
         self.rule_rows = []
         self.rule_thr = float(rule_thr)
-        # measured by rule_trigger.py: both true invariants hold from ~100 rows on this
-        # stream, and no false candidate ever holds, so 200 is not a guess.
-        self.rule_min = int(rule_min if rule_min is not None else 200)
+        # With the coverage guard in RuleBook, this stream needs about 1000 rows before
+        # both true invariants have enough repeated groups to pass.
+        self.rule_min = int(rule_min if rule_min is not None else 1000)
         self.rule_budget = int(rule_budget)
         self.scans = 0
+        self.last_scan_rows = 0
         self.rule_err = float('inf')
 
     # ---- surface used by the task loop -------------------------------------
@@ -86,13 +87,15 @@ class Live:
             self.rules.observe(row)          # the store the scan reads
             self.rule_rows.append(row)       # the window the residual is measured on
             if len(self.rule_rows) >= self.rule_min:
-                self.rule_err = self._rule_residual()
+                self.rule_err = (self._rule_residual()
+                                 if self.rules.all_invariants_hold() else float('inf'))
         if self.monitor_on and self.t % self.every == 0:
             if self._act(s, tr):          # the monitor only decides to act
                 s = self.measure(tr, te)  # report the state after acting
         if (self.rules is not None and self.monitor_on
                 and len(self.rule_rows) >= self.rule_min
                 and self.rule_err > self.rule_thr
+                and len(self.rule_rows) - self.last_scan_rows >= self.rule_min
                 and self.scans < self.rule_budget):
             self._scan()
         return s["held"]
@@ -110,7 +113,9 @@ class Live:
     def _scan(self):
         self.scans += 1
         self.rules.scan()
-        self.rule_err = 0.0 if self.rules.holding() else float('inf')
+        self.last_scan_rows = len(self.rule_rows)
+        self.rule_err = (self._rule_residual()
+                         if self.rules.all_invariants_hold() else float('inf'))
         self.actions.append('scan')
 
     def rule_signal(self):

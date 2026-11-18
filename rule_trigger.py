@@ -17,24 +17,16 @@ The stream is fixed (3000 rows of Flappy transitions) so every setting sees exac
 data; the only thing that changes is when the layer is allowed to look.
 """
 import os
-import sys
-
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-g = {"__name__": "w", "__file__": os.path.join(HERE, "flappy.py")}
-src = open(os.path.join(HERE, "flappy.py"), encoding="utf-8").read().split("t0 = time.time()")[0]
-old = sys.argv
-sys.argv = ["x", "1"]
-try:
-    exec(compile(src, "flappy.py", "exec"), g)
-finally:
-    sys.argv = old
+for _key, _value in (("FL_G", "0.0016"), ("FL_FLAP", "0.020"),
+                     ("FL_SPEED", "0.010"), ("FL_GAP", "0.34"),
+                     ("FL_SPACING", "0.80")):
+    os.environ.setdefault(_key, _value)
 
+from flappy import Flappy as Env
 from substrate_rules import RuleBook
 
-Env = g["Flappy"]
 NROWS = 3000
 rng = np.random.RandomState(5)
 rows = []
@@ -60,24 +52,24 @@ def book_for(subset):
 
 
 print("\n  resolution of the invariance test (same stream, growing prefix)")
-print("    rows    dy holds   ratio      dv holds   ratio      false candidate holds")
+print("    rows    dy holds   coverage   dv holds   coverage   false candidate holds")
 first = None
 for n in (50, 100, 200, 400, 600, 800, 1000, 1200, 1600, 2000, 2400, 3000):
     b = book_for(rows[:n])
     inv = {i.name: i for i in b.invariants}
     if first is None and inv["dy"].holds and inv["dv"].holds:
         first = n
-    print("    %4d      %-8s  %.1e   %-8s  %.1e   %s"
-          % (n, inv["dy"].holds, inv["dy"].ratio, inv["dv"].holds, inv["dv"].ratio,
-             inv["dy_no_vy"].holds))
+    print("    %4d      %-8s  %.3f      %-8s  %.3f      %s"
+          % (n, inv["dy"].holds, inv["dy"].coverage,
+             inv["dv"].holds, inv["dv"].coverage, inv["dy_no_vy"].holds))
 print("\n  first row count at which both true invariants hold: %s" % first)
 print("  the false candidate never holds: %s"
       % all(not book_for(rows[:n]).invariants[2].holds
             for n in (400, 800, 1200, 2000, 3000)))
 
-print("\n  cost of a trigger setting (scan on the same stream, 5 check points)")
+print("\n  cost of trigger settings (rescans separated by rule_min rows)")
 print("    rule_min  budget   scans   wasted   rows_to_first_hold   held_at_end")
-for rmin in (200, 400, 800, 1200, 2000):
+for rmin in (200, 400, 600, 800, 1000, 1200, 2000):
     for budget in (1, 3):
         scans = wasted = 0
         hold_at = None

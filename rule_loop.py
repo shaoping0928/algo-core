@@ -22,20 +22,14 @@ import sys
 
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-g = {"__name__": "w", "__file__": os.path.join(HERE, "flappy.py")}
-src = open(os.path.join(HERE, "flappy.py"), encoding="utf-8").read().split("t0 = time.time()")[0]
-old = sys.argv
-sys.argv = ["x", "1"]
-try:
-    exec(compile(src, "flappy.py", "exec"), g)
-finally:
-    sys.argv = old
+for _key, _value in (("FL_G", "0.0016"), ("FL_FLAP", "0.020"),
+                     ("FL_SPEED", "0.010"), ("FL_GAP", "0.34"),
+                     ("FL_SPACING", "0.80")):
+    os.environ.setdefault(_key, _value)
 
+from flappy import Flappy as Env
 from live_core import Live, make
 
-Env = g["Flappy"]
 ROWS = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
 
 SPECS = [

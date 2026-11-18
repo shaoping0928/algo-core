@@ -19,23 +19,16 @@ Criterion: it must recover both transitions with no help beyond the column names
 report no spurious combination on a shuffled version of the same data.
 """
 import os
-import sys
 from itertools import combinations
 
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-g = {"__name__": "w", "__file__": os.path.join(HERE, "flappy.py")}
-src = open(os.path.join(HERE, "flappy.py"), encoding="utf-8").read().split("t0 = time.time()")[0]
-old = sys.argv
-sys.argv = ["x", "1"]
-try:
-    exec(compile(src, "flappy.py", "exec"), g)
-finally:
-    sys.argv = old
+for _key, _value in (("FL_G", "0.0016"), ("FL_FLAP", "0.020"),
+                     ("FL_SPEED", "0.010"), ("FL_GAP", "0.34"),
+                     ("FL_SPACING", "0.80")):
+    os.environ.setdefault(_key, _value)
 
-Env = g["Flappy"]
+from flappy import Flappy as Env
 
 
 def find_constants(rows, names, max_predictors=4, tol=1e-9):

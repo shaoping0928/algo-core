@@ -22,25 +22,17 @@ Criterion written before the run:
         was never typed in
 """
 import os
-import sys
-
 import numpy as np
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-g = {"__name__": "w", "__file__": os.path.join(HERE, "flappy.py")}
-src = open(os.path.join(HERE, "flappy.py"), encoding="utf-8").read().split("t0 = time.time()")[0]
-old = sys.argv
-sys.argv = ["x", "1"]
-try:
-    exec(compile(src, "flappy.py", "exec"), g)
-finally:
-    sys.argv = old
+for _key, _value in (("FL_G", "0.0016"), ("FL_FLAP", "0.020"),
+                     ("FL_SPEED", "0.010"), ("FL_GAP", "0.34"),
+                     ("FL_SPACING", "0.80")):
+    os.environ.setdefault(_key, _value)
 
+from flappy import BIRD_X, FLAP, GRAVITY, SPEED, Flappy as Env
 from substrate_rules import RuleBook
 
-Env = g["Flappy"]
-GRAV, FLAP, SPEED, BIRD_X = g["GRAVITY"], g["FLAP"], g["SPEED"], g["BIRD_X"]
+GRAV = GRAVITY
 H = 12
 LO, HI = 0.35, 0.65
 

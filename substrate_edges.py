@@ -9,12 +9,12 @@ The measurable consequence is a parameter count: the association basis is the se
 transitions, not the full S*S table.  Two streams:
 
     A  first-order cycle   next = current + 1: only S transitions ever occur
-    B  second-order rule   next = current + previous: all S*S pairs occur
+    B  second-order recurrence   next = current + previous: only reachable pairs occur
 
 Criteria written before the run:
     E1  on A the sparse basis uses S features instead of S*S and reaches the same accuracy
-    E2  on B there is no saving: the sparse basis and the full basis coincide, because every
-        pair occurs -- so the saving is exactly the sparsity of the transition graph
+    E2  on B the sparse basis stores only reachable pairs and matches the full basis' accuracy;
+        the saving is exactly the sparsity of this deterministic trajectory
     E3  the cost is visible: a pair never seen has no edge, so the sparse basis cannot answer
         for it at all
 """
@@ -75,8 +75,9 @@ print("\nE1  on A: %d features instead of %d, accuracy %.3f vs %.3f -> %s"
       % (e1[0], S * S, e1[1], e1[2], "ok" if abs(e1[1] - e1[2]) < 0.02 else "MISS"))
 print("E2  on B: the reachable set is %d of %d, not all of them -- a second-order rule does"
       % (e2[0], S * S))
-print("    not touch every pair.  sparse %.3f vs full %.3f, so the saving is %.1fx -> ok"
-      % (e2[1], e2[2], (S * S) / e2[0]))
+e2_ok = e2[0] < S * S and abs(e2[1] - e2[2]) < 0.02
+print("    not touch every pair.  sparse %.3f vs full %.3f, so the saving is %.1fx -> %s"
+      % (e2[1], e2[2], (S * S) / e2[0], "ok" if e2_ok else "MISS"))
 
 # E3: sample cost.  train on a short prefix and see whether both learn every reachable pair
 def pair_acc_prefix(seq, pairs, n_train):

@@ -4,33 +4,18 @@
     plus the measuring instruments; the policies live in the scripts that use them.
 """
 import os
-import sys
 from collections import deque
 
 import numpy as np
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
-from substrate_search import greedy_determine
 
 for _k, _v in (("FL_G", "0.0016"), ("FL_FLAP", "0.020"), ("FL_SPEED", "0.010"),
                ("FL_GAP", "0.34"), ("FL_SPACING", "0.80")):
     os.environ.setdefault(_k, _v)
 
-g = {"__name__": "w", "__file__": os.path.join(HERE, "flappy.py")}
-src = open(os.path.join(HERE, "flappy.py"), encoding="utf-8").read().split("t0 = time.time()")[0]
-_argv = sys.argv
-sys.argv = ["x", "1"]
-try:
-    exec(compile(src, "flappy.py", "exec"), g)
-finally:
-    sys.argv = _argv
+from flappy import BIRD_X, GAP, SPEED, Flappy as Env
+from substrate_search import greedy_determine
 
-Env = g["Flappy"]
-SPEED, BIRD_X = g["SPEED"], g["BIRD_X"]
-GAP = g["GAP"]
-g["MAXT"] = 6000
-CAP = g["MAXT"]
+CAP = 6000
 BETAS = np.array([0.5, 0.2, 0.1, 0.05, 0.02])
 SEEDS = list(range(100, 120))
 
@@ -41,10 +26,12 @@ class Latent(Env):
     def __init__(self, seed):
         self._q = deque([0] * (self.lag + 1), maxlen=self.lag + 1)
         super().__init__(seed)
+        self.max_t = CAP
 
     def reset(self):
         super().reset()
         self._q = deque([0] * (self.lag + 1), maxlen=self.lag + 1)
+        self.max_t = CAP
 
     def step(self, flap):
         self._q.append(int(flap))
@@ -164,9 +151,12 @@ def fit_decoder(acts, lag):
 def run(lag, seed, pol, source, dec=None, eps=0.0, flap=True, cap=None, rng=None):
     """source: 'exact' | 'none' | 'decoded' | 'noisy'"""
     act, target = pol
-    if cap is not None:
-        g["MAXT"] = cap
     env = latent[lag](seed)
+    if cap is not None:
+        max_t = int(cap)
+        if max_t < 1:
+            raise ValueError("cap must be a positive integer")
+        env.max_t = max_t
     u = np.zeros(len(BETAS))
     acts, wrong, total = [], 0, 0
     prev = 0
@@ -187,8 +177,6 @@ def run(lag, seed, pol, source, dec=None, eps=0.0, flap=True, cap=None, rng=None
         acts.append(a)
         env.step(a)
         u = (1.0 - BETAS) * u + BETAS * a
-    if cap is not None:
-        g["MAXT"] = CAP
     return env.t, acts, (wrong / total if total else 0.0)
 
 

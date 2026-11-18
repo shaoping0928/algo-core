@@ -54,6 +54,7 @@ class Invariant:
     holds: bool
     coeffs: Optional[np.ndarray] = None
     groups: int = 0
+    coverage: float = 0.0
 
     def predict(self, row: Mapping[str, float]) -> float:
         if self.coeffs is None:
@@ -71,8 +72,9 @@ class Invariant:
         body = "%.6f" % self.coeffs[0]
         for n, c in zip(self.allowed, self.coeffs[1:]):
             body += " %+.6f*%s" % (c, n)
-        return "  %-6s = %-42s [invariant to %s, ratio %.1e, %d groups]" % (
-            self.name, body, ",".join(self.vary) or "-", self.ratio, self.groups)
+        return "  %-6s = %-42s [invariant to %s, ratio %.1e, %d groups, coverage %.3f]" % (
+            self.name, body, ",".join(self.vary) or "-", self.ratio, self.groups,
+            self.coverage)
 
 
 @dataclass
@@ -94,9 +96,13 @@ class Determinant:
 class RuleBook:
     """A set of candidate tests over a trace, plus the ones that hold."""
 
-    def __init__(self, tol: float = 1e-9, min_group: int = 5):
+    def __init__(self, tol: float = 1e-9, min_group: int = 5,
+                 min_coverage: float = 0.8):
         self.tol = float(tol)
         self.min_group = int(min_group)
+        if not 0.0 <= min_coverage <= 1.0:
+            raise ValueError("min_coverage must be between 0 and 1")
+        self.min_coverage = float(min_coverage)
         self._rows: List[Dict[str, float]] = []
         self._inv_specs: List[Tuple[str, Callable, Sequence[str], Sequence[str]]] = []
         self._det_specs: List[Tuple[str, Callable, Sequence[str]]] = []
@@ -131,13 +137,24 @@ class RuleBook:
                 continue
             keys = [tuple(round(float(r[g]), 6) for g in allowed) for r in self._rows]
             groups: Dict[Tuple, List[float]] = {}
-            for k, v in zip(keys, vals):
+            group_rows: Dict[Tuple, List[Mapping[str, float]]] = {}
+            for k, v, row in zip(keys, vals, self._rows):
                 groups.setdefault(k, []).append(v)
-            spreads = [float(np.std(v)) for v in groups.values() if len(v) >= self.min_group]
+                group_rows.setdefault(k, []).append(row)
+            eligible = [k for k, v in groups.items() if len(v) >= self.min_group]
+            covered = sum(len(groups[k]) for k in eligible)
+            coverage = covered / max(1, n)
+            spreads = [float(np.std(groups[k])) for k in eligible]
             overall = float(np.std(vals))
             within = float(np.mean(spreads)) if spreads else overall
             ratio = within / overall if overall > 0 else 0.0
-            holds = bool(spreads) and ratio <= self.tol
+            vary_observed = all(
+                any(len({round(float(r[v]), 6) for r in group_rows[k]}) > 1
+                    for k in eligible)
+                for v in vary
+            )
+            holds = (bool(spreads) and coverage >= self.min_coverage
+                     and vary_observed and ratio <= self.tol)
             coeffs = None
             if holds:
                 X = np.stack([[1.0] + [float(r[g]) for g in allowed] for r in self._rows])
@@ -145,7 +162,7 @@ class RuleBook:
                 if float(np.abs(X @ c - vals).max()) <= 1e-9 * max(1.0, float(np.abs(vals).max())):
                     coeffs = c
             self.invariants.append(Invariant(name, allowed, vary, ratio, holds, coeffs,
-                                             len(groups)))
+                                             len(groups), coverage))
 
         self.determinants = []
         for name, fn, variables in self._det_specs:
@@ -162,16 +179,24 @@ class RuleBook:
             # an outcome with no variance at all is "determined" by any variable set, which
             # says nothing.  Require both classes to be present before calling it a rule.
             overall = float(np.std(vals))
-            exact = (spread <= self.tol) and (overall > self.tol)
+            covered = float(sum(len(v) for v in groups.values()
+                                if len(v) >= self.min_group))
+            coverage = covered / max(1, len(vals))
+            exact = ((spread <= self.tol) and (overall > self.tol)
+                     and coverage >= self.min_coverage)
             table = {k: float(np.mean(v)) for k, v in groups.items()}
-            covered = float(sum(len(v) for v in groups.values() if len(v) >= self.min_group))
             self.determinants.append(Determinant(name, variables, table, exact, spread,
-                                                 covered / max(1, len(vals))))
+                                                 coverage))
         return self.invariants, self.determinants
 
     # ------------------------------------------------------------------ readout
     def holding(self) -> List[Invariant]:
         return [i for i in self.invariants if i.holds and i.coeffs is not None]
+
+    def all_invariants_hold(self) -> bool:
+        """Whether every registered candidate has enough data and a valid closed form."""
+        return (len(self.invariants) == len(self._inv_specs)
+                and all(i.holds and i.coeffs is not None for i in self.invariants))
 
     def exact_determinants(self) -> List[Determinant]:
         return [d for d in self.determinants if d.exact]

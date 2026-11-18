@@ -89,9 +89,8 @@ Pin = rng.normal(0, 1.0, size=(N, S)).astype(np.float32)
 src = rng.randint(0, N, size=(N, K)).astype(np.int32)
 w0 = rng.normal(0, 0.05, size=(N, K)).astype(np.float32)
 Wo0 = np.zeros((S, N), dtype=np.float32)
-ALIVE = np.zeros(N, dtype=bool)
-ALIVE[:int(0.85 * N)] = True
-ERRU = np.zeros(N, dtype=np.float32)
+ALIVE0 = np.zeros(N, dtype=bool)
+ALIVE0[:int(0.85 * N)] = True
 n_split = [0]
 # 0 = E, 1 = I, 2 = F
 NT = np.zeros(N, dtype=np.int8)
@@ -114,27 +113,43 @@ def softmax(z):
     return e / e.sum()
 
 
-def split(st):
+def split(st, alive, erru, tr, u, res, M, h, rng):
     w, src_, Wo = st["w"], st["src"], st["Wo"]
-    live = np.where(ALIVE)[0]
-    dead = np.where(~ALIVE)[0]
+    live = np.where(alive)[0]
+    dead = np.where(~alive)[0]
     if not len(dead):
         weakest = live[np.argmin(np.abs(Wo[:, live]).sum(axis=0))]
-        ALIVE[weakest] = False
+        alive[weakest] = False
         Wo[:, weakest] = 0.0
         dead = np.array([weakest])
-    i = live[np.argmax(ERRU[live])]
+        live = np.where(alive)[0]
     j = dead[0]
+    i = live[np.argmax(erru[live])]
+
+    # A recycled slot must not carry traces or associations from its former identity.
+    old_source_edges = src_ == j
+    tr[old_source_edges] = 0.0
+    res[old_source_edges] = 0.0
+    M[old_source_edges] = 0.0
+    tr[j] = 0.0
+    res[j] = 0.0
+    M[j] = 0.0
+    u[j] = 0.0
+    h[j] = 0.0
+
     src_[j] = src_[i]
     w[j] = w[i] + rng.normal(0, 0.02, size=K).astype(np.float32)
     Wo[:, j] = 0.0
-    ALIVE[j] = True
-    ERRU[j] = ERRU[i]
+    alive[j] = True
+    erru[j] = erru[i]
     n_split[0] += 1
 
 
 def run(arm, d, episodes, probe=None):
     st = dict(w=w0.copy(), src=src.copy(), Wo=Wo0.copy(), h=np.zeros(N, np.float32))
+    alive = ALIVE0.copy()
+    erru = np.zeros(N, dtype=np.float32)
+    split_rng = np.random.RandomState(SEED + 104729 * d)
     tr = np.zeros((N, K), dtype=np.float32)   # eligibility trace of input activity
     u = np.zeros(N, dtype=np.float32)         # activation intensity (memory carrier)
     res = np.zeros((N, K), dtype=np.float32)  # per-edge transition residue
@@ -162,6 +177,7 @@ def run(arm, d, episodes, probe=None):
     scalar_eps = [0]
     nz_acc = [0.0, 0]          # fraction of units that are non-zero
     t = 0
+    next_split = SPLIT_EVERY
     for ep in range(episodes):
         s = r.randint(0, S)
         hist = []          # per-episode activity, for the backward trace
@@ -222,9 +238,10 @@ def run(arm, d, episodes, probe=None):
                                 acc += (GAMMA ** (len(hist) - 1 - k)) * hist[k]
                             w += ETA_T * (acc / max(1, len(hist))) * g[:, None]
                             np.clip(w, -0.5, 0.5, out=w)
-                        ERRU[:] = 0.99 * ERRU + 0.01 * np.abs(g)
-                    if SPLIT and arm == "all+split" and t and t % SPLIT_EVERY == 0:
-                        split(st)
+                        erru[:] = 0.99 * erru + 0.01 * np.abs(g)
+                    if SPLIT and arm == "all+split" and t >= next_split:
+                        split(st, alive, erru, tr, u, res, M, h, split_rng)
+                        next_split += SPLIT_EVERY
             tr = GAMMA * tr + h[src_]
             gain = 1.0 + (RES_GAIN * res if use_res else 0.0)
             if use_res and use_typed:
@@ -247,7 +264,8 @@ def run(arm, d, episodes, probe=None):
             if HNOISE:
                 drive = drive + r.normal(0, HNOISE, size=N).astype(np.float32)
             h = sparsify(np.tanh(drive), TOP_A, SOFT)
-            h[~ALIVE] = 0.0
+            h[~alive] = 0.0
+            st["h"] = h
             nz_acc[0] += float(np.count_nonzero(h))
             nz_acc[1] += 1
             if use_res:
@@ -288,6 +306,8 @@ if TYPES:
     arms.insert(4, "all+typed")
     arms.append("all+typed+residue")
     arms.append("all+typed+assoc")
+if SPLIT:
+    arms.append("all+split")
 if os.environ.get("OMNI_ARMS"):
     arms = [a for a in os.environ["OMNI_ARMS"].split(",") if a]
 print("\n%-10s %s" % ("arm", "  ".join("d=%-3d" % d for d in D_LIST)))

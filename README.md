@@ -19,7 +19,22 @@ docs/substrate.md         A.1–A.28 机制与实验记录
 
 ## 快速运行
 
-需要 Python 3 和 NumPy。在本目录中运行：
+需要 Python 3 和 NumPy。本目录的唯一第三方运行依赖列在 `requirements.txt` 中：
+
+```bash
+python -m venv .venv
+# Windows PowerShell: .\.venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+快速检查（使用 Python 自带的 unittest）：
+
+```bash
+python -m unittest discover -s tests
+```
+
+然后在本目录中运行：
 
 ```bash
 python substrate_sandbox_search.py
