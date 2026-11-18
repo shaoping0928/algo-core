@@ -9,7 +9,11 @@ import argparse
 import numpy as np
 
 from latent_world import GAP
-from mixed_nodes import ContinuousMixedMemory, MixedNodeRiskMemory
+from mixed_nodes import (
+    ContinuousMixedMemory,
+    LayeredMixedMemory,
+    MixedNodeRiskMemory,
+)
 from substrate_generic import collect
 from substrate_value import (
     TerminalRiskHead,
@@ -66,6 +70,10 @@ def run(seed, steps, coverage):
     mixed_risk = memory.risk(held_obs)
     continuous = ContinuousMixedMemory(capacity=64).fit(train_obs, train_pain)
     continuous_risk = continuous.risk(held_obs)
+    layered = LayeredMixedMemory(
+        common_capacity=48, rare_capacity=16
+    ).fit(train_obs, train_pain)
+    layered_risk = layered.risk(held_obs)
 
     global_head = TerminalRiskHead(feature_dim=train_obs.shape[1])
     replay = TransitionReplay(capacity=len(train) + 1, seed=seed)
@@ -87,15 +95,17 @@ def run(seed, steps, coverage):
 
     print(
         "seed=%d train=%d held=%d nodes=%d gates=%d residual_nodes=%d "
-        "continuous=%d created=%d forgotten=%d"
+        "continuous=%d created=%d forgotten=%d layered=%d rare=%d"
         % (seed, len(train), len(held), len(memory.nodes), len(memory.gates),
            len(residual_memory.nodes), len(continuous.nodes),
-           continuous.created, continuous.forgotten)
+           continuous.created, continuous.forgotten, len(layered.nodes),
+           layered.rare_nodes)
     )
     report_metrics("global", global_risk, held_pain, held_near, held_inside)
     report_metrics("mixed", mixed_risk, held_pain, held_near, held_inside)
     report_metrics("residual", residual_risk, held_pain, held_near, held_inside)
     report_metrics("continuous", continuous_risk, held_pain, held_near, held_inside)
+    report_metrics("layered", layered_risk, held_pain, held_near, held_inside)
 
     rng = np.random.RandomState(seed + 900)
     permutation_importance(
@@ -114,7 +124,16 @@ def run(seed, steps, coverage):
         "continuous", continuous.risk, held_obs, held_pain,
         np.random.RandomState(seed + 903),
     )
+    permutation_importance(
+        "layered", layered.risk, held_obs, held_pain,
+        np.random.RandomState(seed + 904),
+    )
 
+    print("\nlayered nodes (highest valence):")
+    for row in layered.describe(OBS_NAMES, limit=16):
+        print("  %-18s x %-18s v=%.3f support=%.0f pain=%.3f lift=%.3f"
+              % (row["first"], row["second"], row["valence"], row["support"],
+                 row["pain_rate"], row["lift"]))
     print("\ncontinuous nodes (highest valence):")
     for row in continuous.describe(OBS_NAMES, limit=12):
         print("  %-18s x %-18s v=%.3f support=%.0f pain=%.3f lift=%.3f"

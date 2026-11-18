@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from mixed_nodes import ContinuousMixedMemory
+from mixed_nodes import ContinuousMixedMemory, LayeredMixedMemory
 from substrate_generic import LinearObservationModel, history_features
 from trace_signal_world import signal_features
 
@@ -59,6 +59,20 @@ class GenericWorldTests(unittest.TestCase):
         self.assertLessEqual(len(memory.nodes), 8)
         risk = memory.risk(observations)
         self.assertEqual(risk.shape, (200,))
+        self.assertTrue(np.isfinite(risk).all())
+
+    def test_layered_memory_reserves_rare_slots(self):
+        rng = np.random.RandomState(8)
+        observations = rng.normal(size=(300, 2))
+        pain = ((observations[:, 0] > 0.8)
+                & (observations[:, 1] < -0.8)).astype(float)
+        memory = LayeredMixedMemory(
+            common_capacity=4, rare_capacity=3, min_support=4.0
+        ).fit(observations, pain)
+        self.assertLessEqual(len(memory.nodes), 7)
+        self.assertLessEqual(memory.rare_nodes, 3)
+        risk = memory.risk(observations)
+        self.assertEqual(risk.shape, (300,))
         self.assertTrue(np.isfinite(risk).all())
 
 

@@ -95,7 +95,11 @@ class ContinuousMixedMemory:
         self._build_gates(observations)
         activations = self._gate_matrix(observations)
         self.base_rate = float(pain.mean()) if len(pain) else 0.0
-        pair_indices = list(combinations(range(len(self.gates)), 2))
+        pair_indices = [
+            (first, second)
+            for first, second in combinations(range(len(self.gates)), 2)
+            if self.gates[first].channel != self.gates[second].channel
+        ]
         pair_activations = np.column_stack(
             [activations[:, first] * activations[:, second]
              for first, second in pair_indices]
@@ -177,6 +181,125 @@ class ContinuousMixedMemory:
                 lift=node.lift,
             ))
         return rows
+
+
+class LayeredMixedMemory(ContinuousMixedMemory):
+    """Coverage nodes plus protected rare-event nodes.
+
+    Birth is still pain-free: common nodes are chosen by coverage, rare nodes by
+    novelty/specificity. Pain only assigns valence. Forgetting removes unselected
+    candidates and merges redundant common nodes, while a reserved rare-node budget
+    protects low-support conjunctions from support-based pruning.
+    """
+
+    def __init__(self, common_capacity=48, rare_capacity=16,
+                 rare_max_support=160.0, merge_overlap=0.96,
+                 quantiles=(0.1, 0.25, 0.5, 0.75, 0.9),
+                 min_support=8.0, prior=2.0):
+        super().__init__(
+            quantiles=quantiles, min_support=min_support,
+            capacity=common_capacity + rare_capacity, prior=prior,
+            forgetting_overlap=1.0,
+        )
+        self.common_capacity = int(common_capacity)
+        self.rare_capacity = int(rare_capacity)
+        self.rare_max_support = float(rare_max_support)
+        self.merge_overlap = float(merge_overlap)
+        self.rare_nodes = 0
+
+    def fit(self, observations, pain):
+        observations = np.asarray(observations, dtype=float)
+        pain = np.asarray(pain, dtype=float).reshape(-1)
+        if observations.ndim != 2 or len(observations) != len(pain):
+            raise ValueError("observations and pain must have matching rows")
+        self._build_gates(observations)
+        activations = self._gate_matrix(observations)
+        self.base_rate = float(pain.mean()) if len(pain) else 0.0
+        pair_indices = [
+            (first, second)
+            for first, second in combinations(range(len(self.gates)), 2)
+            if self.gates[first].channel != self.gates[second].channel
+        ]
+        pair_activations = np.column_stack(
+            [activations[:, first] * activations[:, second]
+             for first, second in pair_indices]
+        ) if pair_indices else np.zeros((len(observations), 0))
+        support = pair_activations.sum(axis=0)
+        viable = np.flatnonzero(support >= self.min_support)
+        if not len(viable):
+            return self
+
+        covered = np.zeros(len(observations), dtype=float)
+        selected = []
+        available = viable.copy()
+        for _ in range(min(self.common_capacity, len(available))):
+            residual = pair_activations[:, available] * (1.0 - covered[:, None])
+            gains = residual.sum(axis=0)
+            best = int(np.argmax(gains))
+            if gains[best] <= 0.0:
+                break
+            index = int(available[best])
+            selected.append(index)
+            covered = np.maximum(covered, pair_activations[:, index])
+            available = np.delete(available, best)
+
+        # Rare-event birth: specificity plus novelty against already covered mass.
+        rare_pool = [index for index in viable if index not in selected
+                     and support[index] <= self.rare_max_support]
+        rare_scores = []
+        for index in rare_pool:
+            conjunction = pair_activations[:, index]
+            novelty = float((conjunction * (1.0 - covered)).sum())
+            specificity = 1.0 / (1.0 + float(support[index]))
+            rare_scores.append((novelty * specificity, index))
+        rare_scores.sort(reverse=True)
+        rare_selected = [index for _score, index in rare_scores[:self.rare_capacity]]
+        self.rare_nodes = len(rare_selected)
+        selected.extend(rare_selected)
+        self.created = len(selected)
+        self.forgotten = len(viable) - len(selected)
+
+        candidates = []
+        for index in selected:
+            first, second = pair_indices[index]
+            conjunction = pair_activations[:, index]
+            count = float(conjunction.sum())
+            pain_sum = float(conjunction @ pain)
+            valence = (
+                pain_sum + self.base_rate * self.prior
+            ) / (count + self.prior)
+            candidates.append(MixedNode(
+                first, second, valence, count,
+                pain_sum / max(count, 1.0),
+                pain_sum / max(count, 1.0) - self.base_rate,
+            ))
+
+        # Merge only highly redundant common nodes; retain rare nodes as separate slots.
+        rare_set = set(rare_selected)
+        kept = []
+        for index, node in sorted(
+            zip(selected, candidates),
+            key=lambda item: abs(item[1].valence - self.base_rate)
+            * np.sqrt(max(item[1].support, 1.0)),
+            reverse=True,
+        ):
+            a = pair_activations[:, index]
+            redundant = False
+            if index not in rare_set:
+                for child_index, child in kept:
+                    if child_index in rare_set:
+                        continue
+                    b = pair_activations[:, child_index]
+                    overlap = float(np.minimum(a, b).sum())
+                    if overlap > self.merge_overlap * min(a.sum(), b.sum()):
+                        redundant = True
+                        break
+            if redundant:
+                self.forgotten += 1
+            else:
+                kept.append((index, node))
+        self.nodes = [node for _index, node in kept]
+        return self
 
 
 class MixedNodeRiskMemory:
