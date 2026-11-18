@@ -33,6 +33,11 @@ P0 尝试（`--risk-interaction-dim 6` + `--near-pipe-fraction 0.4`/`0.0`）：�
 `risk_interaction_dim=0`、`near_pipe_fraction=0.0`，保留这些选项用于后续实验。
 这说明增加交互特征/近管道采样并不是瓶颈；下一步应直接做动作条件化的碰撞/风险模型。
 
+动作历史输入尝试（`--risk-action-dim 4`）：近管道 AUC 约 `0.733`，平均存活约 `170.1` 帧；
+与 `--risk-aggregate crossing` 组合约 `103.5` 帧，仍低于默认 `209.9`。默认已恢复
+`risk_action_dim=0`。结论：仅在风险头拼接最近动作历史不足以学会“拍翅避免撞管”，需要
+动作条件的 n-step 风险、`Q(s,a)` 或完整碰撞模型。
+
 ## P0：先让价值头可验证
 
 - [x] 建立价值评估集：每 5 个练习 episode 留出 1 个，分别统计终止状态与存活状态的预测疼痛。

@@ -42,7 +42,22 @@ NEAR_PIPE_FRACTION = 0.0
 RISK_INTERACTION_DIM = 0
 RISK_UPDATES = 8000
 ACTION_SPACE = (0, 1)
+ACTION_DIM = LAG + 1
+RISK_ACTION_DIM = 0
 DEFAULT_JOBS = min(8, os.cpu_count() or 1)
+
+
+def action_history(sequences, steps):
+    """Latest action, then previous actions; shape (n, ACTION_DIM)."""
+    sequences = np.asarray(sequences, dtype=float)
+    if sequences.ndim != 2:
+        raise ValueError("sequences must have shape (candidates, horizon)")
+    result = np.zeros((len(sequences), ACTION_DIM), dtype=float)
+    for offset in range(ACTION_DIM):
+        index = steps - 1 - offset
+        if index >= 0:
+            result[:, offset] = sequences[:, index]
+    return result
 
 
 def nearest_pipe(env):
@@ -53,7 +68,8 @@ def nearest_pipe(env):
 
 def observe_transition(
     lp, feedback_head, novelty, delta, event, observation, next_observation,
-    world_feedback, terminal=False, learn_value=True, learn_novelty=True
+    world_feedback, terminal=False, learn_value=True, learn_novelty=True,
+    action_history_vector=None,
 ):
     """Learn only from the world feedback attached to a real transition."""
     novelty_score = (
@@ -74,10 +90,17 @@ def observe_transition(
     signals = np.asarray(
         [world_feedback["dopamine"], world_feedback["pain"]], dtype=float
     )
+    if action_history_vector is None:
+        risk_features = next_feedback_features
+    else:
+        risk_features = np.concatenate(
+            [next_feedback_features, np.asarray(action_history_vector, dtype=float)]
+        )
     transition = dict(
         features=feedback_features,
         signals=signals,
         next_features=next_feedback_features,
+        risk_features=risk_features,
         terminal=bool(terminal),
     )
     if learn_value:
@@ -90,14 +113,16 @@ def observe_transition(
 def practice(seed, steps=PRACTICE, value_updates=VALUE_UPDATES,
              risk_updates=RISK_UPDATES, terminal_fraction=TERMINAL_FRACTION,
              near_pipe_fraction=NEAR_PIPE_FRACTION,
-             risk_interaction_dim=RISK_INTERACTION_DIM):
+             risk_interaction_dim=RISK_INTERACTION_DIM,
+             risk_action_dim=RISK_ACTION_DIM):
     lp = LayerPair(k_max=8)
     novelty = InputNovelty(feature_dim=len(lp.hist))
     sample_env = latent[LAG](seed * 10000)
     feature_dim = len(substrate_features(lp)) + len(sample_env.obs())
+    risk_feature_dim = feature_dim + risk_action_dim
     feedback_head = WorldFeedbackValueHead(feature_dim=feature_dim, discount=0.99)
     risk_head = TerminalRiskHead(
-        feature_dim=feature_dim, interaction_dim=risk_interaction_dim
+        feature_dim=risk_feature_dim, interaction_dim=risk_interaction_dim
     )
     done = ep = 0
     probe = []
@@ -146,20 +171,33 @@ def practice(seed, steps=PRACTICE, value_updates=VALUE_UPDATES,
             env.step(action)
             next_observation = env.obs()
             world_feedback = env.feedback()
+            history_vector = None
+            if risk_action_dim:
+                history_vector = np.concatenate(
+                    [[float(action)], np.asarray(lp.hist[:LAG], dtype=float)]
+                )[:risk_action_dim]
             _error, transition = observe_transition(
                 lp, feedback_head, novelty, env.vy - vy0, float(action),
                 observation, next_observation, world_feedback, env.dead,
                 learn_value=False, learn_novelty=not holdout,
+                action_history_vector=history_vector,
+            )
+            risk_features = (
+                transition["risk_features"] if risk_action_dim
+                else transition["features"]
             )
             if holdout:
                 probe.append(dict(
-                    features=transition["features"], terminal=transition["terminal"],
-                    y=y0, vy=vy0, t=t0, pipe_dx=pipe_dx, gap_dy=gap_dy, episode=ep,
+                    features=transition["features"],
+                    risk_features=risk_features,
+                    terminal=transition["terminal"],
+                    y=y0, vy=vy0, t=t0, pipe_dx=pipe_dx, gap_dy=gap_dy,
+                    episode=ep,
                 ))
             else:
                 replay.add(
-                    transition["features"], transition["signals"],
-                    transition["next_features"], transition["terminal"],
+                    risk_features, transition["signals"],
+                    risk_features, transition["terminal"],
                     metadata=dict(pipe_dx=pipe_dx, gap_dy=gap_dy, y=y0, t=t0),
                 )
                 episode_transitions.append(transition)
@@ -211,6 +249,7 @@ def score_text(score):
 def rollout_candidates(
     env, b, f, lag, lp, feedback_head, risk_head, novelty, value_mode,
     engine, horizon, beam_width, risk_aggregate="terminal",
+    risk_action_dim=RISK_ACTION_DIM,
 ):
     """Bind the learned transition and selected value evaluator to the generic search core."""
     pending = np.asarray(env.pending()[:lag], dtype=float)
@@ -249,9 +288,18 @@ def rollout_candidates(
         )
         return np.concatenate([features, observations], axis=1)
 
+    def risk_features(states, sequences, steps):
+        base = feedback_features(states, sequences, steps)
+        if not risk_action_dim:
+            return base
+        return np.concatenate(
+            [base, action_history(sequences, steps)[:, :risk_action_dim]],
+            axis=1,
+        )
+
     def evaluate_step(states, sequences, step):
         if value_mode == "feedback":
-            features = feedback_features(states, sequences, step + 1)
+            features = risk_features(states, sequences, step + 1)
             if risk_aggregate == "crossing":
                 steps = step + 1
                 crossing = any(
@@ -286,7 +334,7 @@ def rollout_candidates(
 
     def evaluate_terminal(states, sequences):
         features = feedback_features(states, sequences, horizon)
-        risk = risk_head.probability(features)
+        risk = risk_head.probability(risk_features(states, sequences, horizon))
         values = feedback_head.value(features)
         # Immediate pain first, then the longer-horizon pain return, then dopamine.
         scores = np.column_stack([risk, values[:, 1], -values[:, 0]])
@@ -327,6 +375,7 @@ def run(seed, value_mode="feedback", engine="exhaustive", horizon=H,
         terminal_fraction=TERMINAL_FRACTION,
         near_pipe_fraction=NEAR_PIPE_FRACTION,
         risk_interaction_dim=RISK_INTERACTION_DIM,
+        risk_action_dim=RISK_ACTION_DIM,
         risk_aggregate="terminal", show=False):
     if value_mode == "task" and engine != "exhaustive":
         raise ValueError("the task baseline uses exhaustive search")
@@ -335,6 +384,7 @@ def run(seed, value_mode="feedback", engine="exhaustive", horizon=H,
         risk_updates=risk_updates, terminal_fraction=terminal_fraction,
         near_pipe_fraction=near_pipe_fraction,
         risk_interaction_dim=risk_interaction_dim,
+        risk_action_dim=risk_action_dim,
     )
     b = lp.b
     env = latent[LAG](seed)
@@ -348,7 +398,7 @@ def run(seed, value_mode="feedback", engine="exhaustive", horizon=H,
         plan, gc = rollout_candidates(
             env, b, f, lag, lp, feedback_head, risk_head, novelty,
             value_mode, engine, horizon, beam_width,
-            risk_aggregate=risk_aggregate,
+            risk_aggregate=risk_aggregate, risk_action_dim=risk_action_dim,
         )
         searches += 1
         feasible_total += plan.feasible_count
@@ -529,6 +579,8 @@ def main(argv=None):
                         default=NEAR_PIPE_FRACTION)
     parser.add_argument("--risk-interaction-dim", type=int,
                         default=RISK_INTERACTION_DIM)
+    parser.add_argument("--risk-action-dim", type=int,
+                        default=RISK_ACTION_DIM)
     parser.add_argument("--risk-aggregate",
                         choices=("terminal", "sum", "max", "crossing"),
                         default="terminal")
@@ -552,11 +604,12 @@ def main(argv=None):
           % (engine, horizon, args.beam_width, args.jobs))
     print("practice=%d real steps/seed; value_updates=%d; risk_updates=%d; "
           "terminal_fraction=%.2f; near_pipe_fraction=%.2f; "
-          "risk_interaction_dim=%d; risk_aggregate=%s; sandbox predictions are "
-          "not training samples\n"
+          "risk_interaction_dim=%d; risk_action_dim=%d; risk_aggregate=%s; "
+          "sandbox predictions are not training samples\n"
           % (args.practice_steps, args.value_updates, args.risk_updates,
              args.terminal_fraction, args.near_pipe_fraction,
-             args.risk_interaction_dim, args.risk_aggregate))
+             args.risk_interaction_dim, args.risk_action_dim,
+             args.risk_aggregate))
 
     tasks = [
         dict(
@@ -566,6 +619,7 @@ def main(argv=None):
             terminal_fraction=args.terminal_fraction,
             near_pipe_fraction=args.near_pipe_fraction,
             risk_interaction_dim=args.risk_interaction_dim,
+            risk_action_dim=args.risk_action_dim,
             risk_aggregate=args.risk_aggregate, show=(seed == SEEDS[0]),
         )
         for seed in SEEDS[:args.seeds]

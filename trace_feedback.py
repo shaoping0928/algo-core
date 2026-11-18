@@ -21,6 +21,7 @@ from substrate_sandbox_search import (
     BEAM_WIDTH,
     H,
     LAG,
+    action_history,
     nearest_pipe,
     observe_transition,
     practice,
@@ -29,7 +30,8 @@ from substrate_sandbox_search import (
 from substrate_value import planned_substrate_features
 
 
-def endpoint_values(env, lp, feedback_head, risk_head, novelty, lag, b, f, seq):
+def endpoint_values(env, lp, feedback_head, risk_head, novelty, lag, b, f, seq,
+                    risk_action_dim=0):
     """Endpoint risk/value for one action sequence under the learned transition model."""
     pending = np.asarray(env.pending()[:lag], dtype=float)
     if len(pending) < lag:
@@ -52,9 +54,16 @@ def endpoint_values(env, lp, feedback_head, risk_head, novelty, lag, b, f, seq):
         pipe2[1] - y,
     ]])
     x = np.concatenate([features, observations], axis=1)
+    if risk_action_dim:
+        risk_x = np.concatenate(
+            [x, action_history(seq.reshape(1, -1), H)[:, :risk_action_dim]],
+            axis=1,
+        )
+    else:
+        risk_x = x
     return {
         "endpoint_y": y,
-        "risk": float(risk_head.probability(x)[0]),
+        "risk": float(risk_head.probability(risk_x)[0]),
         "value": feedback_head.value(x)[0].copy(),
     }
 
@@ -136,8 +145,11 @@ def directional_summary(events):
     }
 
 
-def trace(seed, risk_aggregate="terminal", distance=0.25, show_events=12):
-    lp, lag, f, feedback_head, risk_head, novelty, probe, replay, coverage = practice(seed)
+def trace(seed, risk_aggregate="terminal", distance=0.25, show_events=12,
+          risk_action_dim=0):
+    lp, lag, f, feedback_head, risk_head, novelty, probe, replay, coverage = practice(
+        seed, risk_action_dim=risk_action_dim
+    )
     b = lp.b
     env = latent[LAG](seed)
     lp.hist = [0.0] * 8
@@ -148,20 +160,20 @@ def trace(seed, risk_aggregate="terminal", distance=0.25, show_events=12):
         plan, _ = rollout_candidates(
             env, b, f, lag, lp, feedback_head, risk_head, novelty,
             "feedback", "exhaustive", H, BEAM_WIDTH,
-            risk_aggregate=risk_aggregate,
+            risk_aggregate=risk_aggregate, risk_action_dim=risk_action_dim,
         )
         action = int(plan.actions[0])
         zero = endpoint_values(
             env, lp, feedback_head, risk_head, novelty, lag, b, f,
-            np.zeros(H, dtype=float),
+            np.zeros(H, dtype=float), risk_action_dim=risk_action_dim,
         )
         one = endpoint_values(
             env, lp, feedback_head, risk_head, novelty, lag, b, f,
-            np.ones(H, dtype=float),
+            np.ones(H, dtype=float), risk_action_dim=risk_action_dim,
         )
         chosen = endpoint_values(
             env, lp, feedback_head, risk_head, novelty, lag, b, f,
-            plan.actions,
+            plan.actions, risk_action_dim=risk_action_dim,
         )
         zero_cross = crossing_values(env, lag, b, f, np.zeros(H))
         one_cross = crossing_values(env, lag, b, f, np.ones(H))
@@ -246,8 +258,10 @@ def main():
                         default="terminal")
     parser.add_argument("--distance", type=float, default=0.25)
     parser.add_argument("--show-events", type=int, default=12)
+    parser.add_argument("--risk-action-dim", type=int, default=0)
     args = parser.parse_args()
-    trace(args.seed, args.risk_aggregate, args.distance, args.show_events)
+    trace(args.seed, args.risk_aggregate, args.distance, args.show_events,
+          args.risk_action_dim)
 
 
 if __name__ == "__main__":

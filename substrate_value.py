@@ -313,7 +313,11 @@ def value_probe_metrics(records, head, risk_head=None, gap=None):
         "pain_auc": binary_auc(pain, terminal),
     }
     if risk_head is not None:
-        risk = risk_head.probability(features)
+        risk_features = np.asarray(
+            [row.get("risk_features", row["features"]) for row in records],
+            dtype=float,
+        )
+        risk = risk_head.probability(risk_features)
         metrics.update({
             "risk_safe": float(risk[safe].mean()) if safe.any() else float("nan"),
             "risk_terminal": (
