@@ -99,6 +99,9 @@ class NodeGraphTests(unittest.TestCase):
         direct = memory.risk_states(observations[:5])
         self.assertEqual(direct.shape, (5,))
         self.assertTrue(np.isfinite(direct).all())
+        values = memory.value_states(observations[:5])
+        self.assertEqual(values.shape, (5,))
+        self.assertTrue(np.isfinite(values).all())
 
 
 if __name__ == "__main__":

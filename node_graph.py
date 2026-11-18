@@ -47,6 +47,7 @@ class Node:
     depth: int = 0
     edge_key: Optional[Tuple[str, str]] = None
     value: float = 0.0
+    dopamine: float = 0.0
 
     def activate(self, value: float) -> float:
         self.activation = float(value)

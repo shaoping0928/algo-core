@@ -37,18 +37,29 @@ def fit(seed, steps, coverage, clusters):
 def policy_action(env, world, graph, prefix):
     initial = np.asarray(env.obs(), dtype=float)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
+    last_labels = None
 
     def predict_batch(states, sequences, step):
         history = history_features(sequences, step + 1, pending_prefix)
         return world.predict(states, history)
 
     def evaluate_step(states, sequences, step):
-        risk = graph.risk_states(states)
-        return risk, np.ones(len(states), dtype=bool)
+        nonlocal last_labels
+        labels = graph.prototype(states)
+        previous = None if step == 0 else last_labels
+        risk = graph.risk_labels(labels, previous)
+        last_labels = labels
+        return np.column_stack([risk, np.zeros(len(states))]), np.ones(
+            len(states), dtype=bool
+        )
 
     def evaluate_terminal(states, sequences):
-        risk = graph.risk_states(states)
-        return risk, np.ones(len(states), dtype=bool)
+        labels = graph.prototype(states)
+        risk = graph.risk_labels(labels, last_labels)
+        value = graph.value_labels(labels, last_labels)
+        return np.column_stack([risk, -value]), np.ones(
+            len(states), dtype=bool
+        )
 
     result = exhaustive_search(
         initial_state=initial,
@@ -58,7 +69,7 @@ def policy_action(env, world, graph, prefix):
         evaluate_step=evaluate_step,
         evaluate_terminal=evaluate_terminal,
         batch_size=2 ** H,
-        score_combine="max",
+        score_combine=("max", "sum"),
     )
     return int(result.actions[0])
 
