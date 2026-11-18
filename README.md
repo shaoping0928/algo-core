@@ -161,7 +161,7 @@ obs_t, action_t, feedback_t, terminal_t
 
 `graph_memory.py` 把真实 Flappy 观测原型接到该图上：原型成为概念节点，连续原型成为 transition edge + edge node，episode 成为 memory node；pain 只更新已存在节点的 value。seed 100 的图约有 48 个概念、218 个 edge node、98 个 memory；全局风险头 AUC `0.982/near 0.801`，图记忆风险 AUC `0.921/near 0.647`，但图记忆敏感度中 `gap1/gap2/dx1` 分别约 `0.061/0.053/0.023`，确实开始使用管道信息。
 
-`substrate_graph_search.py` 已把图记忆风险接入搜索：世界模型预测观测，概念/边节点同时学习 pain/dopamine，记忆节点价值参与事件级风险，搜索用图风险 + 全局风险 + 图价值，边节点资格参与边价值，搜索不读取管道/缺口常量。seed 100 原型存活 312 帧，图约 433 节点/2666 边；单独图风险只有约 79 帧，组合后接近 generic 的 316 帧，说明图记忆开始能作为全局风险的补充信号。
+`substrate_graph_search.py` 已把图记忆风险接入搜索：世界模型预测观测，概念/边节点同时学习 pain/dopamine，记忆节点价值参与事件级风险，搜索用图风险 + 全局风险 + 图价值，边节点资格参与边价值，搜索不读取管道/缺口常量。单独图风险 seed 100 约 79 帧；组合后 seed 100–103 为 312/232/480/312 帧（均值 334、中位数 312），说明图记忆作为全局风险补充有增益，但这不是纯图搜索，也不能只凭 4 个种子断言泛化。
 
 混合节点原型（`mixed_nodes.py` / `trace_mixed_nodes.py`）：数据中确实存在
 `dx1 < 0.28 AND gap1 < -0.402` 的联合状态（support 48，pain rate 19.3%，base 2.5%）。
