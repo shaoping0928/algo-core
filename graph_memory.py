@@ -12,6 +12,7 @@ import numpy as np
 from node_graph import (
     ASSOCIATION,
     EDGE,
+    MEMBERSHIP,
     MEMORY,
     TRANSITION_EDGE,
     NodeGraph,
@@ -40,10 +41,11 @@ def kmeans(observations, clusters, seed=0, iterations=25):
 
 
 class PrototypeGraphMemory:
-    def __init__(self, clusters=48, seed=0, rate=0.2):
+    def __init__(self, clusters=48, seed=0, rate=0.2, memory_weight=0.25):
         self.clusters = int(clusters)
         self.seed = int(seed)
         self.rate = float(rate)
+        self.memory_weight = float(memory_weight)
         self.centers = None
         self.graph = NodeGraph()
         self.base = 0.0
@@ -132,6 +134,34 @@ class PrototypeGraphMemory:
             previous = concept
         return np.clip(np.asarray(result, dtype=float), 0.0, 1.0)
 
+    def _memory_labels(self, labels, attribute):
+        labels = np.asarray(labels, dtype=int)
+        result = np.zeros(len(labels), dtype=float)
+        present = np.zeros(len(labels), dtype=bool)
+        for index, label in enumerate(labels):
+            concept = "concept_%d" % int(label)
+            memories = [
+                key[0] for key in self.graph.incoming.get(concept, [])
+                if key[2] == MEMBERSHIP
+            ]
+            if memories:
+                result[index] = float(np.mean([
+                    getattr(self.graph.nodes[memory], attribute)
+                    for memory in memories
+                ]))
+                present[index] = True
+        return result, present
+
+    def _combine_memory(self, values, labels, attribute):
+        memory, present = self._memory_labels(labels, attribute)
+        if present.any():
+            values = values.copy()
+            values[present] = (
+                (1.0 - self.memory_weight) * values[present]
+                + self.memory_weight * memory[present]
+            )
+        return values
+
     def risk_labels(self, labels, previous_labels=None):
         labels = np.asarray(labels, dtype=int)
         values = np.asarray(
@@ -148,6 +178,7 @@ class PrototypeGraphMemory:
                     values[index] = 0.5 * (
                         values[index] + self.graph.nodes[edge_node].value
                     )
+        values = self._combine_memory(values, labels, "value")
         return np.clip(values, 0.0, 1.0)
 
     def value_labels(self, labels, previous_labels=None):
@@ -166,7 +197,7 @@ class PrototypeGraphMemory:
                     values[index] = 0.5 * (
                         values[index] + self.graph.nodes[edge_node].dopamine
                     )
-        return values
+        return self._combine_memory(values, labels, "dopamine")
 
     def risk_states(self, observations, previous_labels=None):
         """Risk for arbitrary predicted observations, without episode boundaries."""

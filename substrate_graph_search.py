@@ -18,6 +18,11 @@ from substrate_generic import (
     collect,
     history_features,
 )
+from substrate_value import (
+    TerminalRiskHead,
+    TransitionReplay,
+    fit_terminal_risk,
+)
 from trajectory_search import exhaustive_search
 
 
@@ -31,10 +36,19 @@ def fit(seed, steps, coverage, clusters):
         [row["next_obs"] for row in transitions],
     )
     graph = PrototypeGraphMemory(clusters=clusters, seed=seed).fit(transitions)
-    return world, graph
+    risk = TerminalRiskHead(feature_dim=len(transitions[0]["obs"]))
+    replay = TransitionReplay(capacity=len(transitions) + 1, seed=seed)
+    for row in transitions:
+        obs = np.asarray(row["obs"], dtype=float)
+        pain = float(row["terminal"])
+        replay.add(obs, [1.0 - pain, pain], obs, bool(pain))
+    fit_terminal_risk(
+        risk, replay, 4000, batch_size=128, terminal_fraction=0.15
+    )
+    return world, graph, risk
 
 
-def policy_action(env, world, graph, prefix):
+def policy_action(env, world, graph, risk_head, prefix):
     initial = np.asarray(env.obs(), dtype=float)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
     last_labels = None
@@ -43,11 +57,16 @@ def policy_action(env, world, graph, prefix):
         history = history_features(sequences, step + 1, pending_prefix)
         return world.predict(states, history)
 
+    def combined_risk(states, labels, previous):
+        graph_risk = graph.risk_labels(labels, previous)
+        global_risk = risk_head.probability(states)
+        return 0.5 * (graph_risk + global_risk)
+
     def evaluate_step(states, sequences, step):
         nonlocal last_labels
         labels = graph.prototype(states)
         previous = None if step == 0 else last_labels
-        risk = graph.risk_labels(labels, previous)
+        risk = combined_risk(states, labels, previous)
         last_labels = labels
         return np.column_stack([risk, np.zeros(len(states))]), np.ones(
             len(states), dtype=bool
@@ -55,7 +74,7 @@ def policy_action(env, world, graph, prefix):
 
     def evaluate_terminal(states, sequences):
         labels = graph.prototype(states)
-        risk = graph.risk_labels(labels, last_labels)
+        risk = combined_risk(states, labels, last_labels)
         value = graph.value_labels(labels, last_labels)
         return np.column_stack([risk, -value]), np.ones(
             len(states), dtype=bool
@@ -74,12 +93,12 @@ def policy_action(env, world, graph, prefix):
     return int(result.actions[0])
 
 
-def evaluate(seed, world, graph, cap=6000):
+def evaluate(seed, world, graph, risk_head, cap=6000):
     env = latent[LAG](seed)
     prefix = np.zeros(LAG, dtype=float)
     actions = []
     while not env.dead and env.t < cap:
-        action = policy_action(env, world, graph, prefix)
+        action = policy_action(env, world, graph, risk_head, prefix)
         actions.append(action)
         prefix = np.concatenate([[float(action)], prefix[:-1]])
         env.step(action)
@@ -93,8 +112,10 @@ def main():
     parser.add_argument("--coverage", type=float, default=0.1)
     parser.add_argument("--clusters", type=int, default=48)
     args = parser.parse_args()
-    world, graph = fit(args.seed, args.steps, args.coverage, args.clusters)
-    frames, actions = evaluate(args.seed, world, graph)
+    world, graph, risk_head = fit(
+        args.seed, args.steps, args.coverage, args.clusters
+    )
+    frames, actions = evaluate(args.seed, world, graph, risk_head)
     print("seed", args.seed, "frames", frames, "graph", graph.snapshot())
     print("flap rate %.3f" % (np.mean(actions) if actions else 0.0))
 
