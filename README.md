@@ -15,6 +15,7 @@ predict_layer.py          预测层 / 真实层；残差驱动的在线更新
 trajectory_search.py      通用批量 rollout、可行性筛选与词典序方案选择
 substrate_sandbox_search.py Flappy 适配器：学习世界反馈；可选 gap 基线
 substrate_value.py        从世界反馈通道学习 dopamine / pain 价值与终止风险
+substrate_generic.py      任务无关原型：完整观测世界模型 + 通用搜索
 trace_feedback.py         追踪管道附近的动作/缺口方向与风险预测
 math_memory_search.py     算术事实记忆 + 关系搜索实验
 raw_math_experiment.py    nanoGPT 原始等式数据生成与实验
@@ -52,6 +53,9 @@ python substrate_sandbox_search.py --task-baseline --jobs 8
 
 # 可选：长时域 beam 搜索对照
 python substrate_sandbox_search.py --engine beam --jobs 8
+
+# 任务无关原型：只通过 obs/step/feedback 交互
+python substrate_generic.py --seed 100
 
 # 追踪一个种子的管道附近动作/风险
 python trace_feedback.py 100
@@ -95,6 +99,25 @@ python math_memory_search.py
 - **动作学习轨迹仍然是负结果**：`trace_feedback.py 100` 追踪到 139 个管道附近决策，按“缺口在上则拍翅、缺口在下则不拍”计，方向准确率约 `0.24`；需要上拍时拍翅率约 `0.09`。风险头对全不拍/全拍的平均风险为 `0.48/1.00`，从未认为全拍更安全。它学到的是“管道附近有终止风险”，不是“当前拍翅能对准缺口”。
 - 穿管时刻预测：seed 100 的选中计划/全不拍在缺口内的比例为 `0.82/0.75`，seed 103 为 `0.843/0.843`；平均穿管前拍翅 `0.37/0.34` 次。也就是说，选中计划只有轻微、种子相关的调整，不是稳定的方向性动作规则。当前搜索仍主要靠宽缺口、初始高度和延迟拍翅延长存活。
 - 沙盒反事实 rollout 单独记录为搜索经验，不作为真实状态转移训练世界模型或价值头；只有实践中观察到的转移更新模型和价值。
+
+## 任务无关世界模型原型
+
+`substrate_generic.py` 是独立原型：规划器只通过
+
+```text
+obs_t, action_t, feedback_t, terminal_t
+```
+
+与世界交互，不读取 `pipes`、`BIRD_X`、`GAP` 或 `SPEED`。`LinearObservationModel` 从真实转移学习
+
+```text
+(obs_t, action history) -> obs_{t+1}
+```
+
+价值/风险头只使用观测和动作历史；搜索用学到的完整观测模型做 rollout。当前 3 个种子（100–102）
+的存活为 152/232/76 帧，单步留出误差约 `5e-3` 到 `1e-7`；seed 100 的最大训练误差约 `0.79`，
+来自管道生成造成的不连续事件，说明纯线性观测模型还不足。这个原型验证了接口分层，但还不是
+性能更好的默认路径；当前默认仍是 `substrate_sandbox_search.py`。
 
 ## 加法/乘法：原始输入实验
 
