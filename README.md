@@ -25,6 +25,8 @@ trace_mixed_nodes.py      比较全局风险头与混合节点风险记忆
 math_memory_search.py     算术事实记忆 + 关系搜索实验
 raw_math_experiment.py    nanoGPT 原始等式数据生成与实验
 node_graph.py             统一 Node/Edge 图：概念、转移边节点、记忆、派生
+graph_memory.py           观测原型 -> 概念/转移边节点/事件记忆的原型图记忆
+trace_graph_memory.py     在真实 Flappy 转移上评估图记忆风险
 signal_bank.py            每节点信号源：差分、积分/泄漏、逆泄漏、均值
 substrate_*.py            各算子、记忆、噪声、延迟和搜索的验证脚本
 tests/                    unittest 回归测试
@@ -74,6 +76,9 @@ python trace_sensitivity.py --seed 100 --coverage 0.1
 
 # 比较混合节点风险记忆
 python trace_mixed_nodes.py --seed 100 --coverage 0.1
+
+# 评估原型图记忆
+python trace_graph_memory.py --seed 100 --coverage 0.1
 
 # 追踪一个种子的管道附近动作/风险
 python trace_feedback.py 100
@@ -149,6 +154,8 @@ obs_t, action_t, feedback_t, terminal_t
 `trace_sensitivity.py` 的扰动重要度更直接：世界模型对 `dx/gap/y/vy` 和滞后动作 `a3` 都敏感；风险头却几乎只依赖 `y`（打乱 `y` 使 AUC 下降约 `0.36–0.42`），`dx/gap` 和动作历史的贡献接近零；价值头主要依赖 `vy/y/gap`，动作贡献也很小。也就是说：**风险头有完整观测输入，但没有真正使用管道和动作信息。** 这不是输入缺失，而是训练目标/样本分布让“只看高度”就能获得较高全局 AUC。
 
 `node_graph.py` 把统一节点图落到基建层：所有节点共享激活/电容痕迹/关联/绑定；关联边不带边节点，只有真正的有向转移边才分配 `edge node`；记忆节点用 membership 绑定多个节点；派生节点有深度上限；图提供激活传播、回忆、衰减和按权重/痕迹剪枝。它是节点/边语义的基建原型，尚未替换现有线性世界模型控制器。
+
+`graph_memory.py` 把真实 Flappy 观测原型接到该图上：原型成为概念节点，连续原型成为 transition edge + edge node，episode 成为 memory node；pain 只更新已存在节点的 value。seed 100 的图约有 48 个概念、218 个 edge node、98 个 memory；全局风险头 AUC `0.982/near 0.801`，图记忆风险 AUC `0.921/near 0.647`，但图记忆敏感度中 `gap1/gap2/dx1` 分别约 `0.061/0.053/0.023`，确实开始使用管道信息。它仍是原型，尚未接入搜索。
 
 混合节点原型（`mixed_nodes.py` / `trace_mixed_nodes.py`）：数据中确实存在
 `dx1 < 0.28 AND gap1 < -0.402` 的联合状态（support 48，pain rate 19.3%，base 2.5%）。

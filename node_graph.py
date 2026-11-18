@@ -46,6 +46,7 @@ class Node:
     source: Optional[str] = None
     depth: int = 0
     edge_key: Optional[Tuple[str, str]] = None
+    value: float = 0.0
 
     def activate(self, value: float) -> float:
         self.activation = float(value)
@@ -143,6 +144,23 @@ class NodeGraph:
             self.outgoing[memory].append(key)
             self.incoming[member].append(key)
         return memory
+
+    def add_membership(self, memory_id: str, member_id: str) -> Edge:
+        if memory_id not in self.nodes or member_id not in self.nodes:
+            raise KeyError(memory_id if memory_id not in self.nodes else member_id)
+        memory = self.nodes[memory_id]
+        if memory.kind != MEMORY:
+            raise ValueError("not a memory node")
+        if member_id not in memory.members:
+            memory.members.append(member_id)
+        key = (memory_id, member_id, MEMBERSHIP)
+        if key not in self.edges:
+            edge = Edge(memory_id, member_id, MEMBERSHIP)
+            self.edges[key] = edge
+            self.outgoing[memory_id].append(key)
+            self.incoming[member_id].append(key)
+            return edge
+        return self.edges[key]
 
     def add_derived(self, source: str, kind: str = "component",
                     max_depth: int = 2, node_id: Optional[str] = None) -> str:

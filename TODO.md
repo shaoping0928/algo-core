@@ -59,6 +59,11 @@
 - 统一图基建：新增 `node_graph.py`，实现 concept/transition/memory/derived 节点，
   association/transition/membership/derivation 边，转移边上的 edge node，
   激活传播、痕迹、回忆、衰减和剪枝。当前只作为基建原型，尚未接入 Flappy 控制器。
+- 图记忆接入：`graph_memory.py` 将观测原型作为概念节点、连续原型作为 transition
+  edge node、episode 作为 memory node。seed 100 约有 48 概念/218 edge node/98 memory；
+  图记忆风险 AUC `0.921`、near `0.647`（全局 `0.982/0.801`），但敏感度中
+  `gap1/gap2/dx1` 约 `0.061/0.053/0.023`，比全局风险头更依赖管道信号。
+  下一步需要让图价值/风险参与搜索，而不是只做离线风险头。
 
 动作轨迹诊断（`trace_feedback.py 100`）：管道附近 139 个决策中，“缺口在上应拍翅、缺口在下不应拍”
 的方向准确率约 `0.24`；需要上拍时拍翅率约 `0.09`。风险头对全不拍/全拍的平均风险为

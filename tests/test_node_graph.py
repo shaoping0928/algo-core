@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 
+from graph_memory import PrototypeGraphMemory
 from node_graph import (
     ASSOCIATION,
     EDGE,
@@ -77,6 +78,23 @@ class NodeGraphTests(unittest.TestCase):
         removed = graph.prune(min_edge_trace=1e-4)
         self.assertIn((a, b, TRANSITION_EDGE), removed)
         self.assertNotIn(edge_node, graph.nodes)
+
+    def test_prototype_graph_memory_creates_memories_and_edge_nodes(self):
+        rows = []
+        for episode in range(4):
+            for step in range(6):
+                rows.append(dict(
+                    obs=np.asarray([float(step), float(episode)], dtype=float),
+                    terminal=step == 5,
+                    episode=episode,
+                ))
+        memory = PrototypeGraphMemory(clusters=3, seed=2).fit(rows)
+        snapshot = memory.snapshot()
+        self.assertGreater(snapshot["edge_nodes"], 0)
+        self.assertGreater(snapshot["memories"], 0)
+        risk = memory.risk(rows)
+        self.assertEqual(risk.shape, (len(rows),))
+        self.assertTrue(np.isfinite(risk).all())
 
 
 if __name__ == "__main__":
