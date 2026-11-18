@@ -73,20 +73,25 @@ def report_world(world, rows):
               % (name, errors[:, index].mean(), errors[:, index].max()))
 
 
-def build_training_replays(train):
+def build_training_replays(train, priorities=None):
     obs_dim = len(train[0]["obs"])
     value_replay = ReturnReplay(capacity=len(train) + 1, seed=11)
     risk_replay = TransitionReplay(capacity=len(train) + 1, seed=12)
     by_episode = {}
-    for row in train:
-        by_episode.setdefault(row["episode"], []).append(row)
+    for index, row in enumerate(train):
+        priority = 1.0 if priorities is None else float(priorities[index])
+        by_episode.setdefault(row["episode"], []).append((index, row))
         risk = np.concatenate([row["next_obs"], row["history"]])
-        risk_replay.add(risk, row["signals"], risk, row["terminal"])
+        risk_replay.add(
+            risk, row["signals"], risk, row["terminal"], priority=priority
+        )
     for episode in by_episode.values():
-        targets = discounted_returns(episode, 0.99)
-        for row, target in zip(episode, targets):
+        rows = [row for _index, row in episode]
+        targets = discounted_returns(rows, 0.99)
+        for (index, row), target in zip(episode, targets):
             value = np.concatenate([row["obs"], row["history"]])
-            value_replay.add(value, target)
+            priority = 1.0 if priorities is None else float(priorities[index])
+            value_replay.add(value, target, priority=priority)
     return value_replay, risk_replay, obs_dim
 
 

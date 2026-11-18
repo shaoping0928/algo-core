@@ -53,19 +53,36 @@ def report(name, deltas, names):
 def run(seed, steps, coverage, value_updates=3000, risk_updates=6000):
     rows, _counts = collect(seed, steps, coverage=coverage)
     train, held = split_episodes(rows)
-    value_replay, risk_replay, obs_dim = build_training_replays(train)
-    world = LinearObservationModel(obs_dim, ACTION_DIM).fit(
+    world = LinearObservationModel(
+        len(train[0]["obs"]), ACTION_DIM
+    ).fit(
         [row["obs"] for row in train],
         [row["history"] for row in train],
         [row["next_obs"] for row in train],
+    )
+    train_obs = np.asarray([row["obs"] for row in train], dtype=float)
+    train_hist = np.asarray([row["history"] for row in train], dtype=float)
+    train_next = np.asarray([row["next_obs"] for row in train], dtype=float)
+    errors = np.abs(
+        world.predict(train_obs, train_hist) - train_next
+    ).mean(axis=1)
+    scale = float(np.median(errors))
+    priorities = 1.0 + np.minimum(errors / max(scale, 1e-12), 10.0)
+    value_replay, risk_replay, obs_dim = build_training_replays(
+        train, priorities
     )
     value_head = WorldFeedbackValueHead(
         feature_dim=obs_dim + ACTION_DIM, discount=0.99
     )
     risk_head = TerminalRiskHead(feature_dim=obs_dim + ACTION_DIM)
-    fit_value_head_returns(value_head, value_replay, value_updates, batch_size=128)
-    fit_terminal_risk(risk_head, risk_replay, risk_updates, batch_size=128,
-                      terminal_fraction=0.15)
+    fit_value_head_returns(
+        value_head, value_replay, value_updates, batch_size=128,
+        priority_alpha=1.0,
+    )
+    fit_terminal_risk(
+        risk_head, risk_replay, risk_updates, batch_size=128,
+        terminal_fraction=0.15, priority_alpha=1.0,
+    )
     print("seed=%d held=%d" % (seed, len(held)))
 
     obs, hist, next_obs = (

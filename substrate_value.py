@@ -376,22 +376,34 @@ class TransitionReplay:
     def __len__(self):
         return len(self.alive) + len(self.terminal)
 
-    def add(self, features, signals, next_features, terminal, metadata=None):
+    def add(self, features, signals, next_features, terminal, metadata=None,
+            priority=1.0):
         item = (
             np.asarray(features, dtype=float).reshape(-1),
             np.asarray(signals, dtype=float).reshape(-1),
             np.asarray(next_features, dtype=float).reshape(-1),
             bool(terminal),
             dict(metadata or {}),
+            max(float(priority), 1e-12),
         )
         if item[3]:
             self.terminal.append(item)
         else:
             self.alive.append(item)
 
-    def _draw(self, pool, count, replace):
+    def _draw(self, pool, count, replace, priority_alpha=0.0):
         if count <= 0:
             return []
+        if priority_alpha > 0.0:
+            weights = np.asarray([item[5] for item in pool], dtype=float)
+            weights = np.power(weights, float(priority_alpha))
+            total = float(weights.sum())
+            if np.isfinite(total) and total > 0.0:
+                probabilities = weights / total
+                indices = self.rng.choice(
+                    len(pool), size=count, replace=replace, p=probabilities
+                )
+                return [pool[int(index)] for index in indices]
         indices = self.rng.choice(len(pool), size=count, replace=replace)
         return [pool[int(index)] for index in indices]
 
@@ -401,7 +413,7 @@ class TransitionReplay:
         pipe_dx = metadata.get("pipe_dx", 1.0)
         return abs(pipe_dx) < 0.20 and pipe_dx > -0.10
 
-    def _balanced_items(self, batch_size, terminal_fraction):
+    def _balanced_items(self, batch_size, terminal_fraction, priority_alpha=0.0):
         terminal_count = min(
             len(self.terminal), int(round(batch_size * terminal_fraction))
         )
@@ -415,10 +427,12 @@ class TransitionReplay:
             alive_count += min(remaining, len(self.alive) - alive_count)
 
         selected = self._draw(
-            self.terminal, terminal_count, terminal_count > len(self.terminal)
+            self.terminal, terminal_count, terminal_count > len(self.terminal),
+            priority_alpha,
         )
         selected += self._draw(
-            self.alive, alive_count, alive_count > len(self.alive)
+            self.alive, alive_count, alive_count > len(self.alive),
+            priority_alpha,
         )
         return selected
 
@@ -435,7 +449,7 @@ class TransitionReplay:
         )
 
     def sample(self, batch_size, terminal_fraction=0.5,
-               near_pipe_fraction=0.0):
+               near_pipe_fraction=0.0, priority_alpha=0.0):
         batch_size = int(batch_size)
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -443,6 +457,8 @@ class TransitionReplay:
             raise ValueError("terminal_fraction must be in [0, 1]")
         if not 0.0 <= near_pipe_fraction <= 1.0:
             raise ValueError("near_pipe_fraction must be in [0, 1]")
+        if priority_alpha < 0.0:
+            raise ValueError("priority_alpha must be non-negative")
         if not len(self):
             return None
 
@@ -450,7 +466,7 @@ class TransitionReplay:
             batch_size, int(round(batch_size * near_pipe_fraction))
         )
         selected = self._balanced_items(
-            batch_size - near_count, terminal_fraction
+            batch_size - near_count, terminal_fraction, priority_alpha
         )
         if near_count:
             near_items = [
@@ -459,10 +475,13 @@ class TransitionReplay:
             ]
             if near_items:
                 selected += self._draw(
-                    near_items, near_count, near_count > len(near_items)
+                    near_items, near_count, near_count > len(near_items),
+                    priority_alpha,
                 )
             else:
-                selected += self._balanced_items(near_count, terminal_fraction)
+                selected += self._balanced_items(
+                    near_count, terminal_fraction, priority_alpha
+                )
         if not selected:
             return None
         order = self.rng.permutation(len(selected))
@@ -475,13 +494,16 @@ class TransitionReplay:
         )
 
 
-def fit_value_head(head, replay, updates, batch_size=128, terminal_fraction=0.5):
+def fit_value_head(head, replay, updates, batch_size=128, terminal_fraction=0.5,
+                   priority_alpha=0.0):
     """Offline replay training after data collection; does not touch the world model."""
     if updates < 0:
         raise ValueError("updates must be non-negative")
     completed = 0
     for _ in range(int(updates)):
-        batch = replay.sample(batch_size, terminal_fraction)
+        batch = replay.sample(
+            batch_size, terminal_fraction, priority_alpha=priority_alpha
+        )
         if batch is None:
             break
         head.update_batch(*batch)
@@ -564,7 +586,8 @@ class TerminalRiskHead:
 
 
 def fit_terminal_risk(head, replay, updates, batch_size=128,
-                      terminal_fraction=0.5, near_pipe_fraction=0.0):
+                      terminal_fraction=0.5, near_pipe_fraction=0.0,
+                      priority_alpha=0.0):
     """Train the pain/terminal readout on replay batches with balanced samplers."""
     data = replay.arrays()
     if data is None:
@@ -573,7 +596,8 @@ def fit_terminal_risk(head, replay, updates, batch_size=128,
     completed = 0
     for _ in range(int(updates)):
         batch = replay.sample(
-            batch_size, terminal_fraction, near_pipe_fraction
+            batch_size, terminal_fraction, near_pipe_fraction,
+            priority_alpha=priority_alpha,
         )
         if batch is None:
             break
@@ -594,20 +618,39 @@ class ReturnReplay:
     def __len__(self):
         return len(self.data)
 
-    def add(self, features, target):
+    def add(self, features, target, priority=1.0):
         self.data.append((
             np.asarray(features, dtype=float).reshape(-1),
             np.asarray(target, dtype=float).reshape(-1),
+            max(float(priority), 1e-12),
         ))
 
-    def sample(self, batch_size):
+    def sample(self, batch_size, priority_alpha=0.0):
         batch_size = int(batch_size)
         if batch_size < 1:
             raise ValueError("batch_size must be positive")
+        if priority_alpha < 0.0:
+            raise ValueError("priority_alpha must be non-negative")
         if not self.data:
             return None
         replace = batch_size > len(self.data)
-        indices = self.rng.choice(len(self.data), size=batch_size, replace=replace)
+        if priority_alpha > 0.0:
+            weights = np.asarray([item[2] for item in self.data], dtype=float)
+            weights = np.power(weights, float(priority_alpha))
+            total = float(weights.sum())
+            if np.isfinite(total) and total > 0.0:
+                indices = self.rng.choice(
+                    len(self.data), size=batch_size, replace=replace,
+                    p=weights / total,
+                )
+            else:
+                indices = self.rng.choice(
+                    len(self.data), size=batch_size, replace=replace
+                )
+        else:
+            indices = self.rng.choice(
+                len(self.data), size=batch_size, replace=replace
+            )
         selected = [self.data[int(index)] for index in indices]
         return (
             np.asarray([item[0] for item in selected], dtype=float),
@@ -628,11 +671,12 @@ def discounted_returns(transitions, discount):
     return returns
 
 
-def fit_value_head_returns(head, replay, updates, batch_size=128):
+def fit_value_head_returns(head, replay, updates, batch_size=128,
+                           priority_alpha=0.0):
     """Train the value head against Monte-Carlo returns from real episodes."""
     completed = 0
     for _ in range(int(updates)):
-        batch = replay.sample(batch_size)
+        batch = replay.sample(batch_size, priority_alpha=priority_alpha)
         if batch is None:
             break
         features, targets = batch

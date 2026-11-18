@@ -184,6 +184,24 @@ class SubstrateValueTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["near_inside_risk"], 0.1)
         self.assertAlmostEqual(metrics["near_outside_risk"], 0.9)
 
+    def test_replay_priority_favours_high_error_transitions(self):
+        replay = TransitionReplay(capacity=2000, seed=5)
+        for _ in range(500):
+            replay.add([0.0], [1.0, 0.0], [0.0], False, priority=1.0)
+            replay.add([1.0], [1.0, 0.0], [1.0], False, priority=100.0)
+        batch = replay.sample(200, terminal_fraction=0.0, priority_alpha=2.0)
+        self.assertIsNotNone(batch)
+        features = batch[0][:, 0]
+        self.assertGreater(np.sum(features == 1.0), np.sum(features == 0.0))
+
+    def test_return_replay_priority_favours_high_error_targets(self):
+        replay = ReturnReplay(capacity=20, seed=6)
+        replay.add([0.0], [1.0, 0.0], priority=1.0)
+        replay.add([1.0], [2.0, 0.0], priority=100.0)
+        features, _targets = replay.sample(200, priority_alpha=2.0)
+        self.assertGreater(np.sum(features[:, 0] == 1.0),
+                           np.sum(features[:, 0] == 0.0))
+
     def test_terminal_risk_interaction_features_learn_product_rule(self):
         replay = TransitionReplay(capacity=200, seed=4)
         corners = np.asarray([[-1.0, -1.0], [-1.0, 1.0],

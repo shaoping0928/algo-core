@@ -38,6 +38,7 @@ VALUE_UPDATES = 3000
 VALUE_BATCH = 128
 RISK_UPDATES = 6000
 TERMINAL_FRACTION = 0.15
+PRIORITY_ALPHA = 1.0
 
 
 class LinearObservationModel:
@@ -167,6 +168,19 @@ def fit(transitions, seed):
         [row["history"] for row in transitions],
         [row["next_obs"] for row in transitions],
     )
+    observations = np.asarray([row["obs"] for row in transitions], dtype=float)
+    histories = np.asarray([row["history"] for row in transitions], dtype=float)
+    next_observations = np.asarray(
+        [row["next_obs"] for row in transitions], dtype=float
+    )
+    errors = np.abs(
+        world.predict(observations, histories) - next_observations
+    ).mean(axis=1)
+    scale = float(np.median(errors))
+    if not np.isfinite(scale) or scale <= 1e-12:
+        scale = 1.0
+    priorities = 1.0 + np.minimum(errors / scale, 10.0)
+
     value_replay = ReturnReplay(capacity=len(transitions) + 1, seed=seed)
     risk_replay = TransitionReplay(capacity=len(transitions) + 1, seed=seed)
     value_head = WorldFeedbackValueHead(
@@ -174,22 +188,28 @@ def fit(transitions, seed):
     )
     risk_head = TerminalRiskHead(feature_dim=obs_dim + ACTION_DIM)
     by_episode = {}
-    for row in transitions:
-        by_episode.setdefault(row["episode"], []).append(row)
-        value = np.concatenate([row["obs"], row["history"]])
+    for index, row in enumerate(transitions):
+        by_episode.setdefault(row["episode"], []).append((index, row))
         risk = np.concatenate([row["next_obs"], row["history"]])
-        risk_replay.add(risk, row["signals"], risk, row["terminal"])
+        risk_replay.add(
+            risk, row["signals"], risk, row["terminal"],
+            priority=float(priorities[index]),
+        )
     for episode in by_episode.values():
-        targets = discounted_returns(episode, value_head.discount)
-        for row, target in zip(episode, targets):
+        rows = [row for _index, row in episode]
+        targets = discounted_returns(rows, value_head.discount)
+        for (index, row), target in zip(episode, targets):
             value_head_features = np.concatenate([row["obs"], row["history"]])
-            value_replay.add(value_head_features, target)
+            value_replay.add(
+                value_head_features, target, priority=float(priorities[index])
+            )
     fit_value_head_returns(
-        value_head, value_replay, VALUE_UPDATES, batch_size=VALUE_BATCH
+        value_head, value_replay, VALUE_UPDATES, batch_size=VALUE_BATCH,
+        priority_alpha=PRIORITY_ALPHA,
     )
     fit_terminal_risk(
         risk_head, risk_replay, RISK_UPDATES, batch_size=VALUE_BATCH,
-        terminal_fraction=TERMINAL_FRACTION,
+        terminal_fraction=TERMINAL_FRACTION, priority_alpha=PRIORITY_ALPHA,
     )
     return world, value_head, risk_head
 
