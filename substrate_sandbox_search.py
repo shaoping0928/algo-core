@@ -191,6 +191,7 @@ def practice(seed, steps=PRACTICE, value_updates=VALUE_UPDATES,
                     features=transition["features"],
                     risk_features=risk_features,
                     terminal=transition["terminal"],
+                    action=int(action),
                     y=y0, vy=vy0, t=t0, pipe_dx=pipe_dx, gap_dy=gap_dy,
                     episode=ep,
                 ))
