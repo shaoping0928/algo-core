@@ -18,6 +18,7 @@ substrate_value.py        从世界反馈通道学习 dopamine / pain 价值与�
 substrate_generic.py      任务无关原型：完整观测世界模型 + 通用搜索
 trace_feedback.py         追踪管道附近的动作/缺口方向与风险预测
 trace_generic_training.py 抽样追踪世界模型、价值和风险训练波次
+trace_signal_world.py     对照 raw / 差分 / 缓冲观测信号的世界预测
 math_memory_search.py     算术事实记忆 + 关系搜索实验
 raw_math_experiment.py    nanoGPT 原始等式数据生成与实验
 signal_bank.py            每节点信号源：差分、积分/泄漏、逆泄漏、均值
@@ -60,6 +61,9 @@ python substrate_generic.py --seed 100
 
 # 抽样查看训练波次
 python trace_generic_training.py --seed 100 --coverage 0.1
+
+# 比较 raw / 差分 / 缓冲世界模型
+python trace_signal_world.py --seed 100 --coverage 0.1
 
 # 追踪一个种子的管道附近动作/风险
 python trace_feedback.py 100
@@ -129,6 +133,8 @@ obs_t, action_t, feedback_t, terminal_t
 `0–81` 之间波动，近管道实际拍翅样本在 `0–9` 之间；seed 100 的 `dx/gap` 留出误差约
 `1.6e-3/6e-5`，其他种子约 `1e-8`，对应管道生成的不连续事件。也就是说，学习器不是主要
 失效点，**数据覆盖和事件感知世界模型才是**。
+
+`trace_signal_world.py` 对 raw、`d1/d2` 差分、多时间常数缓冲、以及全部信号做了同一批真实 episode 的对照：seed 100 的 raw 单步平均误差约 `6.20e-4`，差分约 `6.35e-4`，缓冲/全部约 `6.6e-4`；seed 101 的 raw/差分/缓冲/全部约 `1.0e-8/0.9e-8/1.1e-8/1.5e-8`。多步误差没有稳定改善，管道维度仍主要受生成/弹出事件限制。结论：当前完整观测下，缓冲和差分是冗余的，低通还会抹平事件边缘；不能替代事件/动作条件模型。
 
 ## 加法/乘法：原始输入实验
 

@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from substrate_generic import LinearObservationModel, history_features
+from trace_signal_world import signal_features
 
 
 class GenericWorldTests(unittest.TestCase):
@@ -30,6 +31,22 @@ class GenericWorldTests(unittest.TestCase):
         prediction = model.predict(observations[:5], histories[:5])
         np.testing.assert_allclose(prediction, next_observations[:5], atol=1e-7)
         self.assertLess(model.holdout_error, 1e-7)
+
+    def test_signal_features_produce_parallel_channels(self):
+        window = np.asarray([[[1.0, 2.0], [2.0, 4.0], [3.0, 6.0],
+                              [4.0, 8.0], [5.0, 10.0]]])
+        raw = signal_features(window, "raw")
+        diff = signal_features(window, "diff")
+        buffered = signal_features(window, "buffer")
+        all_signals = signal_features(window, "all")
+        np.testing.assert_allclose(raw[0], [5.0, 10.0])
+        np.testing.assert_allclose(diff[0, :2], [5.0, 10.0])
+        np.testing.assert_allclose(diff[0, 2:4], [1.0, 2.0])
+        np.testing.assert_allclose(diff[0, 4:6], [0.0, 0.0])
+        self.assertEqual(raw.shape[-1], 2)
+        self.assertEqual(diff.shape[-1], 6)
+        self.assertEqual(buffered.shape[-1], 12)
+        self.assertEqual(all_signals.shape[-1], 16)
 
 
 if __name__ == "__main__":
