@@ -16,6 +16,13 @@ class FlappyTests(unittest.TestCase):
         _, _, done = env.step(0)
         self.assertTrue(done)
 
+    def test_world_emits_dopamine_and_pain_channels(self):
+        env = Flappy(seed=0, max_t=2)
+        env.step(0)
+        self.assertEqual(env.feedback(), {"dopamine": 1.0, "pain": 0.0})
+        env.step(0)
+        self.assertEqual(env.feedback(), {"dopamine": 0.0, "pain": 1.0})
+
     def test_non_positive_cap_is_rejected(self):
         with self.assertRaises(ValueError):
             Flappy(seed=0, max_t=0)

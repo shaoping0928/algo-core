@@ -53,6 +53,7 @@ class Flappy:
         self.pipes = [[1.0, self._gap()], [1.0 + SPACING, self._gap()]]
         self.t = 0
         self.dead = False
+        self._feedback = {"dopamine": 0.0, "pain": 0.0}
 
     def _gap(self):
         return float(self.rng.uniform(GAP / 2 + 0.05, 1 - GAP / 2 - 0.05))
@@ -85,7 +86,16 @@ class Flappy:
             self.dead = True
         if self.t >= self.max_t:
             self.dead = True
+        # World-provided valence channels; learners consume these as observations.
+        self._feedback = {
+            "dopamine": 0.0 if self.dead else 1.0,
+            "pain": 1.0 if self.dead else 0.0,
+        }
         return self.obs(), 1.0, self.dead
+
+    def feedback(self):
+        """Return the world-emitted valence channels from the most recent step."""
+        return dict(self._feedback)
 
 
 def run(policy_fn, seed, cap=None):

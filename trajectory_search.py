@@ -1,0 +1,201 @@
+"""Task-agnostic exhaustive receding-horizon search over action sequences.
+
+The search core knows only:
+  * an initial numeric state,
+  * a set of candidate actions,
+  * a batched one-step transition predictor, and
+  * a batched evaluator that returns heuristic scores and feasibility flags.
+
+Task-specific state encodings, learned models, goals, and constraints are supplied by adapters.
+"""
+from dataclasses import dataclass
+from itertools import product
+from typing import Callable, Iterable, Iterator, Optional, Sequence, Tuple, Union
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    actions: np.ndarray
+    score: Union[float, Tuple[float, ...]]
+    feasible: bool
+    feasible_count: int
+    candidate_count: int
+    first_state: np.ndarray
+    final_state: np.ndarray
+
+
+def _sequence_batches(
+    action_space: Sequence,
+    horizon: int,
+    batch_size: int,
+) -> Iterator[np.ndarray]:
+    batch = []
+    for sequence in product(action_space, repeat=horizon):
+        batch.append(sequence)
+        if len(batch) == batch_size:
+            yield np.asarray(batch, dtype=float)
+            batch = []
+    if batch:
+        yield np.asarray(batch, dtype=float)
+
+
+def _score_matrix(values, count, source):
+    scores = np.asarray(values, dtype=float)
+    if scores.ndim == 1:
+        scores = scores[:, None]
+    if scores.ndim != 2 or scores.shape[0] != count:
+        raise ValueError("%s must return one score row per candidate" % source)
+    return scores
+
+
+def _lexicographic_argmin(scores, mask):
+    remaining = np.flatnonzero(mask)
+    if not len(remaining):
+        raise ValueError("cannot select from an empty candidate set")
+    for column in range(scores.shape[1]):
+        best = np.min(scores[remaining, column])
+        remaining = remaining[scores[remaining, column] == best]
+        if len(remaining) == 1:
+            break
+    return int(remaining[0])
+
+
+def exhaustive_search(
+    initial_state: np.ndarray,
+    action_space: Iterable,
+    horizon: int,
+    transition_batch: Callable[[np.ndarray, np.ndarray, int], np.ndarray],
+    evaluate_step: Callable[
+        [np.ndarray, np.ndarray, int], Tuple[np.ndarray, np.ndarray]
+    ],
+    batch_size: int = 4096,
+    evaluate_terminal: Optional[Callable[
+        [np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]
+    ]] = None,
+) -> SearchResult:
+    """Enumerate action sequences and select plans using supplied model/evaluator callbacks.
+
+    `transition_batch(states, sequences, step)` predicts one step from batched states. The
+    complete candidate sequence is available so models with delayed actions can read its prefix.
+    `evaluate_step(states, sequences, step)` returns (score_increment, feasible). Scores may be
+    scalar or multi-objective; vector scores are minimized lexicographically. An optional
+    `evaluate_terminal(final_states, sequences)` adds a terminal score and feasibility check.
+    Lower scores are better. Only current, first, and final states are retained; the core does
+    not store every candidate's full trajectory.
+
+    If no candidate is feasible, the lowest-score candidate is returned with `feasible=False`,
+    allowing the task adapter to detect and handle that case.
+    """
+    state0 = np.asarray(initial_state, dtype=float)
+    if state0.ndim == 0:
+        state0 = state0.reshape(1)
+    actions = tuple(action_space)
+    if not actions:
+        raise ValueError("action_space must not be empty")
+    if horizon < 1:
+        raise ValueError("horizon must be a positive integer")
+    if batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+
+    best_feasible = None
+    best_any = None
+    feasible_count = 0
+    candidate_count = 0
+
+    for sequences in _sequence_batches(actions, horizon, batch_size):
+        count = len(sequences)
+        states = np.broadcast_to(state0, (count,) + state0.shape).copy()
+        scores = None
+        feasible = np.ones(count, dtype=bool)
+        first_states = None
+
+        for step in range(horizon):
+            states = np.asarray(
+                transition_batch(states, sequences, step), dtype=float
+            )
+            if states.shape != (count,) + state0.shape:
+                raise ValueError(
+                    "transition_batch must preserve the batched state shape; "
+                    "got %r, expected %r" % (states.shape, (count,) + state0.shape)
+                )
+            if step == 0:
+                first_states = states.copy()
+            increments, step_feasible = evaluate_step(
+                states, sequences, step
+            )
+            increments = _score_matrix(increments, count, "evaluate_step")
+            step_feasible = np.asarray(step_feasible, dtype=bool).reshape(-1)
+            if step_feasible.shape != (count,):
+                raise ValueError(
+                    "evaluate_step must return one feasibility flag per plan"
+                )
+            if scores is None:
+                scores = np.zeros_like(increments)
+            elif increments.shape[1] != scores.shape[1]:
+                raise ValueError("evaluate_step changed the number of score objectives")
+            scores += increments
+            feasible &= step_feasible
+
+        if evaluate_terminal is not None:
+            increments, terminal_feasible = evaluate_terminal(states, sequences)
+            increments = _score_matrix(increments, count, "evaluate_terminal")
+            terminal_feasible = np.asarray(terminal_feasible, dtype=bool).reshape(-1)
+            if terminal_feasible.shape != (count,):
+                raise ValueError(
+                    "evaluate_terminal must return one feasibility flag per plan"
+                )
+            if scores is None:
+                scores = np.zeros_like(increments)
+            elif increments.shape[1] != scores.shape[1]:
+                raise ValueError("evaluate_terminal changed the number of score objectives")
+            scores += increments
+            feasible &= terminal_feasible
+
+        if scores is None:
+            raise ValueError("at least one evaluator must provide a score")
+        finite = np.isfinite(scores).all(axis=1)
+        if not finite.any():
+            candidate_count += count
+            continue
+
+        feasible &= finite
+        feasible_count += int(feasible.sum())
+        candidate_count += count
+
+        any_index = _lexicographic_argmin(scores, finite)
+        any_candidate = (
+            tuple(float(value) for value in scores[any_index]),
+            sequences[any_index].copy(),
+            first_states[any_index].copy(),
+            states[any_index].copy(),
+        )
+        if best_any is None or any_candidate[0] < best_any[0]:
+            best_any = any_candidate
+
+        if feasible.any():
+            feasible_index = _lexicographic_argmin(scores, feasible)
+            feasible_candidate = (
+                tuple(float(value) for value in scores[feasible_index]),
+                sequences[feasible_index].copy(),
+                first_states[feasible_index].copy(),
+                states[feasible_index].copy(),
+            )
+            if best_feasible is None or feasible_candidate[0] < best_feasible[0]:
+                best_feasible = feasible_candidate
+
+    selected = best_feasible if best_feasible is not None else best_any
+    if selected is None:
+        raise ValueError("evaluators returned no finite score for any candidate")
+    score, sequence, first_state, final_state = selected
+    score = score[0] if len(score) == 1 else score
+    return SearchResult(
+        actions=sequence,
+        score=score,
+        feasible=best_feasible is not None,
+        feasible_count=feasible_count,
+        candidate_count=candidate_count,
+        first_state=first_state,
+        final_state=final_state,
+    )

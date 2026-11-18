@@ -12,6 +12,9 @@ recall_world.py           节点/稀疏边网络的延迟回忆实验
 substrate_rules.py        不变量、决定性与规则层
 substrate_search.py       基函数、滞后列和确定性搜索
 predict_layer.py          预测层 / 真实层；残差驱动的在线更新
+trajectory_search.py      通用批量 rollout、可行性筛选与启发式排序
+substrate_sandbox_search.py Flappy 适配器：学习世界反馈；可选 gap 基线
+substrate_value.py        根据世界 dopamine / pain 通道学习多目标价值
 signal_bank.py            每节点信号源：差分、积分/泄漏、逆泄漏、均值
 substrate_*.py            各算子、记忆、噪声、延迟和搜索的验证脚本
 docs/substrate.md         A.1–A.28 机制与实验记录
@@ -38,6 +41,7 @@ python -m unittest discover -s tests
 
 ```bash
 python substrate_sandbox_search.py
+python substrate_sandbox_search.py --task-baseline
 python substrate_selfdelay.py
 python substrate_signals.py
 python substrate_signals_noise.py
@@ -53,8 +57,9 @@ python math_memory_search.py
 - `u` 是 RC 型泄漏积分；`signal_bank.py` 提供节点级候选信号，均值器默认不启用。
 - `recall_world.py` 的 recall 是“线索只出现一次、随后输入静默 d 步、最后报告线索符号”的延迟回忆任务，不是通用文本检索。它对照节点痕迹 `u`、每边转移残留 `res`、稀疏联想记忆 `M` 和递归权重学习。
 - 节点痕迹与边残留分开：`u` 保存节点激活的衰减痕迹；`res` 让刚用过的边暂时更容易通过；`M` 用共激活关联补全回忆模式。它们是实验臂，尚未全部集成进 Flappy 沙盒控制循环。
-- 沙盒脚本枚举短动作序列，用学到的转移模型检查整段轨迹、执行首个动作，再用真实转移更新模型。
-- 最近一次沙盒测量：8 个种子平均存活约 1027 帧，中位数 659，范围 123–3491；学习到的滞后为 3，增益约 `0.020`。这仍明显低于手工推导的参考控制器，不能视为策略学习已解决。
+- 沙盒适配器调用通用搜索核心枚举方案；默认价值头通过真实交互学习世界输出的 dopamine / pain 通道，候选方案按“先避痛、再趋近 dopamine”排序。输入新颖度只是价值模型的一个特征，不直接变成奖励；反事实 rollout 不更新价值头。`--task-baseline` 可启用 Flappy gap 评分作对照。
+- 首次世界反馈价值评测（8 个种子）：存活平均 25 帧。lag 和动作增益已学对，但价值头仍偏好不拍翅，说明从当前练习数据中学到的延续价值排序不可靠；它还不能视为已解决存活偏好。
+- gap 任务基线的最近测量：8 个种子平均存活约 1027 帧，中位数 659，范围 123–3491；学习到的滞后为 3，增益约 `0.020`。存活率是外部评测，不是内在价值训练信号。
 - 沙盒反事实 rollout 单独记录为搜索经验，不作为真实状态转移训练世界模型；只有实践中观察到的转移更新模型。
 
 ## 加法/乘法：原始输入实验
