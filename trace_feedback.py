@@ -16,7 +16,7 @@ import argparse
 
 import numpy as np
 
-from latent_world import BIRD_X, SPEED, latent
+from latent_world import BIRD_X, GAP, SPEED, latent
 from substrate_sandbox_search import (
     BEAM_WIDTH,
     H,
@@ -56,6 +56,40 @@ def endpoint_values(env, lp, feedback_head, risk_head, novelty, lag, b, f, seq):
         "endpoint_y": y,
         "risk": float(risk_head.probability(x)[0]),
         "value": feedback_head.value(x)[0].copy(),
+    }
+
+
+def crossing_values(env, lag, b, f, seq):
+    """Predict the first pipe crossing within the plan horizon and its gap error."""
+    pending = np.asarray(env.pending()[:lag], dtype=float)
+    if len(pending) < lag:
+        pending = np.pad(pending, (0, lag - len(pending)))
+    pipe_x, gap = min(env.pipes, key=lambda pipe: abs(pipe[0] - BIRD_X))
+    y, vy = float(env.y), float(env.vy)
+    seq = np.asarray(seq, dtype=float).reshape(-1)
+    flaps = 0
+    for step in range(H):
+        if step < lag:
+            impulse = pending[step]
+        else:
+            impulse = seq[step - lag]
+            flaps += int(impulse > 0.5)
+        vy = vy + b + f * impulse
+        y = y + vy
+        pipe_x -= SPEED
+        if abs(pipe_x - BIRD_X) < 0.06:
+            return {
+                "crossed": True,
+                "step": step + 1,
+                "y": y,
+                "gap": gap,
+                "error": abs(y - gap),
+                "within": abs(y - gap) <= GAP / 2.0,
+                "flaps": flaps,
+            }
+    return {
+        "crossed": False, "step": H, "y": y, "gap": gap,
+        "error": abs(y - gap), "within": False, "flaps": flaps,
     }
 
 
@@ -129,6 +163,9 @@ def trace(seed, risk_aggregate="terminal", distance=0.25, show_events=12):
             env, lp, feedback_head, risk_head, novelty, lag, b, f,
             plan.actions,
         )
+        zero_cross = crossing_values(env, lag, b, f, np.zeros(H))
+        one_cross = crossing_values(env, lag, b, f, np.ones(H))
+        chosen_cross = crossing_values(env, lag, b, f, plan.actions)
         if abs(pipe_dx) < distance and pipe_dx > -0.15:
             events.append(dict(
                 t=t, y=float(env.y), vy=float(env.vy),
@@ -136,7 +173,8 @@ def trace(seed, risk_aggregate="terminal", distance=0.25, show_events=12):
                 chosen_risk=chosen["risk"], zero_risk=zero["risk"],
                 one_risk=one["risk"], zero_y=zero["endpoint_y"],
                 one_y=one["endpoint_y"], chosen_y=chosen["endpoint_y"],
-                score=plan.score,
+                zero_cross=zero_cross, one_cross=one_cross,
+                chosen_cross=chosen_cross, score=plan.score,
             ))
 
         vy0 = env.vy
@@ -154,6 +192,36 @@ def trace(seed, risk_aggregate="terminal", distance=0.25, show_events=12):
         t += 1
 
     summary = directional_summary(events)
+    crossed = [event for event in events if event["chosen_cross"]["crossed"]]
+    if crossed:
+        print(
+            "pipe-crossing plans: %d; within-gap chosen/zero/one %.3f/%.3f/%.3f"
+            % (
+                len(crossed),
+                np.mean([e["chosen_cross"]["within"] for e in crossed]),
+                np.mean([e["zero_cross"]["within"] for e in crossed]),
+                np.mean([e["one_cross"]["within"] for e in crossed]),
+            )
+        )
+        print(
+            "chosen flaps before crossing: mean %.2f; mean gap error %.4f"
+            % (
+                np.mean([e["chosen_cross"]["flaps"] for e in crossed]),
+                np.mean([e["chosen_cross"]["error"] for e in crossed]),
+            )
+        )
+        gap_above = [e for e in crossed if e["gap_dy"] > 0.02]
+        if gap_above:
+            print(
+                "when gap is above bird: n=%d chosen/zero within gap %.3f/%.3f; "
+                "chosen flaps %.2f"
+                % (
+                    len(gap_above),
+                    np.mean([e["chosen_cross"]["within"] for e in gap_above]),
+                    np.mean([e["zero_cross"]["within"] for e in gap_above]),
+                    np.mean([e["chosen_cross"]["flaps"] for e in gap_above]),
+                )
+            )
     print("seed %d: frames=%d near_pipe_events=%d" % (seed, env.t, len(events)))
     print("directional summary:", summary)
     print("first %d near-pipe decisions:" % show_events)
