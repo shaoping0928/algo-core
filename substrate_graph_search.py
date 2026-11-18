@@ -5,11 +5,13 @@ world model, and scores candidate trajectories with concept/transition-edge valu
 the prototype graph memory. It does not read pipes, gap centres, or collision windows.
 """
 import argparse
+import os
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
 from graph_memory import PrototypeGraphMemory
-from latent_world import latent
+from latent_world import SEEDS, latent
 from substrate_generic import (
     ACTION_DIM,
     H,
@@ -24,6 +26,8 @@ from substrate_value import (
     fit_terminal_risk,
 )
 from trajectory_search import exhaustive_search
+
+DEFAULT_JOBS = min(4, os.cpu_count() or 1)
 
 
 def fit(seed, steps, coverage, clusters):
@@ -105,19 +109,51 @@ def evaluate(seed, world, graph, risk_head, cap=6000):
     return env.t, actions
 
 
+def run_seed(task):
+    seed, steps, coverage, clusters = task
+    world, graph, risk_head = fit(seed, steps, coverage, clusters)
+    frames, actions = evaluate(seed, world, graph, risk_head)
+    return dict(
+        seed=seed, frames=frames,
+        flap_rate=float(np.mean(actions)) if actions else 0.0,
+        graph=graph.snapshot(),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=100)
+    parser.add_argument("--seeds", type=int, default=1)
+    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS)
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--coverage", type=float, default=0.1)
     parser.add_argument("--clusters", type=int, default=48)
     args = parser.parse_args()
-    world, graph, risk_head = fit(
-        args.seed, args.steps, args.coverage, args.clusters
-    )
-    frames, actions = evaluate(args.seed, world, graph, risk_head)
-    print("seed", args.seed, "frames", frames, "graph", graph.snapshot())
-    print("flap rate %.3f" % (np.mean(actions) if actions else 0.0))
+    if args.jobs < 1:
+        raise ValueError("--jobs must be positive")
+    if args.seeds < 1:
+        raise ValueError("--seeds must be positive")
+    seeds = [
+        seed for seed in SEEDS if seed >= args.seed
+    ][:args.seeds]
+    if len(seeds) < args.seeds:
+        seeds = list(range(args.seed, args.seed + args.seeds))
+    tasks = [(seed, args.steps, args.coverage, args.clusters) for seed in seeds]
+    if args.jobs == 1:
+        rows = [run_seed(task) for task in tasks]
+    else:
+        with ProcessPoolExecutor(max_workers=args.jobs) as pool:
+            rows = list(pool.map(run_seed, tasks))
+    print(" seed  frames  flap_rate  nodes  edges  edge_nodes  memories")
+    for row in rows:
+        graph = row["graph"]
+        print(" %4d  %6d  %9.3f  %5d  %5d  %10d  %8d"
+              % (row["seed"], row["frames"], row["flap_rate"],
+                 graph["nodes"], graph["edges"], graph["edge_nodes"],
+                 graph["memories"]))
+    print("frames mean %.1f median %.1f"
+          % (np.mean([row["frames"] for row in rows]),
+             np.median([row["frames"] for row in rows])))
 
 
 if __name__ == "__main__":

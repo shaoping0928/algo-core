@@ -81,8 +81,8 @@ python trace_mixed_nodes.py --seed 100 --coverage 0.1
 # 评估原型图记忆
 python trace_graph_memory.py --seed 100 --coverage 0.1
 
-# 图记忆风险驱动的搜索原型
-python substrate_graph_search.py --seed 100 --coverage 0.1
+# 图记忆风险驱动的搜索原型（按种子并行）
+python substrate_graph_search.py --seed 100 --seeds 4 --jobs 4 --coverage 0.1
 
 # 追踪一个种子的管道附近动作/风险
 python trace_feedback.py 100
