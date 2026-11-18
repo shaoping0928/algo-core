@@ -43,11 +43,14 @@ python -m unittest discover -s tests
 然后在本目录中运行：
 
 ```bash
-# 世界反馈价值默认模式
-python substrate_sandbox_search.py
+# 世界反馈价值默认模式；按种子并行
+python substrate_sandbox_search.py --jobs 8
 
 # 任务 gap 评分基线，仅用于对照
-python substrate_sandbox_search.py --task-baseline
+python substrate_sandbox_search.py --task-baseline --jobs 8
+
+# 可选：长时域 beam 搜索对照
+python substrate_sandbox_search.py --engine beam --jobs 8
 
 python substrate_selfdelay.py
 python substrate_signals.py
@@ -63,8 +66,10 @@ python math_memory_search.py
 目标是让系统从世界提供的反馈中学习价值，而不是在搜索器里写任务专用的评分公式。当前实现把这一责任拆成三层：
 
 1. **世界反馈**：`flappy.py` 每步输出 `dopamine` / `pain` 两个通道。它们只是环境输入，代码不根据缺口中心或管道位置推导价值。
-2. **价值学习**：`substrate_value.py` 的 `WorldFeedbackValueHead` 从真实交互学习两路未来反馈值。输入包含基座诊断量（预测误差、滞后分布、输入新颖度）和观测状态。反事实 rollout 不参与价值训练。
-3. **方案选择**：`trajectory_search.py` 是任务无关的批量搜索核心，支持多目标词典序比较。Flappy 适配器按“先预测痛觉、再预测 dopamine”排序候选；`--task-baseline` 才切换回 gap-center 评分与碰撞可行性过滤。
+2. **价值学习**：`substrate_value.py` 的 `WorldFeedbackValueHead` 从真实交互的 Monte-Carlo 回报学习 dopamine/pain 两路未来值；`TerminalRiskHead` 从同一 `pain` 标签学习终止风险。真实转移进入 replay，终止样本按比例采样；反事实 rollout 不参与价值或风险训练。
+3. **方案选择**：`trajectory_search.py` 提供任务无关的 exhaustive 和 beam 搜索，支持多目标词典序比较。Flappy 适配器默认先最小化预测疼痛/终止风险，再用 pain 回报和 dopamine 排序；`--task-baseline` 才切换回 gap-center 评分与碰撞可行性过滤。
+
+默认搜索是 `exhaustive H=14`；`--engine beam` 是长时域对照，不是当前最好配置。
 
 这不是“价值函数天然等于存活”：反馈通道的语义仍由世界提供。当前实现也没有把新颖度直接当作奖励，它只是价值模型的一个输入特征。
 
@@ -74,8 +79,11 @@ python math_memory_search.py
 - `u` 是 RC 型泄漏积分；`signal_bank.py` 提供节点级候选信号，均值器默认不启用。
 - `recall_world.py` 的 recall 是“线索只出现一次、随后输入静默 d 步、最后报告线索符号”的延迟回忆任务，不是通用文本检索。它对照节点痕迹 `u`、每边转移残留 `res`、稀疏联想记忆 `M` 和递归权重学习。
 - 节点痕迹与边残留分开：`u` 保存节点激活的衰减痕迹；`res` 让刚用过的边暂时更容易通过；`M` 用共激活关联补全回忆模式。它们是实验臂，尚未全部集成进 Flappy 沙盒控制循环。
-- **当前世界反馈模式**（8 个种子）：存活平均 25 帧；lag=3 与增益约 `0.020` 仍能学对。价值头尚未形成可靠的存活排序，行为偏向不拍翅。这是当前最重要的负结果。
-- **当前任务基线**（当前训练设置，seed 100）：存活 552 帧。历史 8 种子平均 1027 帧来自旧的 1000 步固定随机练习配置，不能与当前结果直接比较。
+- **当前世界反馈模式**（8 个种子，默认 exhaustive H=14）：存活平均 **209.9 帧**，中位数 232，范围 55–312；lag=3、增益约 `0.020`。这比最初的 14.5 帧明显提高，但仍远低于任务基线。
+- 价值留出评估（每 5 个练习 episode 留出 1 个）：pain AUC `0.899`；终止风险 AUC `0.971`，Brier `0.029`；风险均值终止状态 `0.715`、安全状态 `0.051`。风险头已能排序终止风险，剩余瓶颈是长时域管道对齐，而不是疼痛预测本身。
+- **当前任务基线**（8 个种子，5000 步练习）：存活平均 **1026.9 帧**，中位数 659，范围 123–3491。它仍使用 gap-center 评分和碰撞可行性过滤，只作对照。
+- 长时域对照：beam H=78、宽度 256 在较早配置下约 105 帧，低于 exhaustive H=14；当前默认不启用 beam。
+- 练习覆盖（8 个种子）：平均 episode 约 43.1 帧；管道死亡 128 次、边界死亡 792 次、管道窗口 921 步。覆盖统计由 `substrate_sandbox_search.py` 输出。
 - 沙盒反事实 rollout 单独记录为搜索经验，不作为真实状态转移训练世界模型或价值头；只有实践中观察到的转移更新模型和价值。
 
 ## 加法/乘法：原始输入实验

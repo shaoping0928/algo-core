@@ -7,94 +7,184 @@ The search core itself has no Flappy knowledge.
 
 Sandbox predictions are not fed to the world model; only real transitions update it.
 """
+import argparse
+import os
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
-import sys
 
 from latent_world import BIRD_X, GAP, SEEDS, SPEED, latent
 from predict_layer import LayerPair
 from substrate_value import (
     InputNovelty,
+    ReturnReplay,
+    TerminalRiskHead,
+    TransitionReplay,
     WorldFeedbackValueHead,
+    discounted_returns,
+    fit_terminal_risk,
+    fit_value_head_returns,
     planned_substrate_features,
     substrate_features,
+    value_probe_metrics,
 )
-from trajectory_search import exhaustive_search
+from trajectory_search import beam_search, exhaustive_search
 
 LAG = 3
 H = 14
+LONG_H = 78
+BEAM_WIDTH = 256
 PRACTICE = 5000
+VALUE_UPDATES = 3000
+VALUE_BATCH = 128
+TERMINAL_FRACTION = 0.15
+RISK_UPDATES = 8000
 ACTION_SPACE = (0, 1)
-VALUE_MODE = "task" if "--task-baseline" in sys.argv[1:] else "feedback"
+DEFAULT_JOBS = min(8, os.cpu_count() or 1)
+
+
+def nearest_pipe(env):
+    """Signed horizontal distance and gap offset of the nearest pipe."""
+    px, gap = min(env.pipes, key=lambda pipe: abs(pipe[0] - BIRD_X))
+    return float(px - BIRD_X), float(gap - env.y)
 
 
 def observe_transition(
     lp, feedback_head, novelty, delta, event, observation, next_observation,
-    world_feedback, terminal=False
+    world_feedback, terminal=False, learn_value=True, learn_novelty=True
 ):
     """Learn only from the world feedback attached to a real transition."""
-    novelty_score = novelty.observe(lp.hist)
+    novelty_score = (
+        novelty.observe(lp.hist) if learn_novelty else novelty.score(lp.hist)
+    )
     features = substrate_features(lp, novelty_score=novelty_score)
     feedback_features = np.concatenate(
         [features, np.asarray(observation, dtype=float).reshape(-1)]
     )
     error = float(delta - lp.predict())
     lp.observe(delta, event)
-    next_features = substrate_features(lp, novelty_score=novelty.score(lp.hist))
+    next_features = substrate_features(
+        lp, novelty_score=novelty.score(lp.hist)
+    )
     next_feedback_features = np.concatenate(
         [next_features, np.asarray(next_observation, dtype=float).reshape(-1)]
     )
     signals = np.asarray(
         [world_feedback["dopamine"], world_feedback["pain"]], dtype=float
     )
-    feedback_head.update(
-        feedback_features, signals, next_feedback_features, terminal=terminal
+    transition = dict(
+        features=feedback_features,
+        signals=signals,
+        next_features=next_feedback_features,
+        terminal=bool(terminal),
     )
-    return error
+    if learn_value:
+        feedback_head.update(
+            feedback_features, signals, next_feedback_features, terminal=terminal
+        )
+    return error, transition
 
 
-def practice(seed, steps=PRACTICE):
+def practice(seed, steps=PRACTICE, value_updates=VALUE_UPDATES,
+             risk_updates=RISK_UPDATES, terminal_fraction=TERMINAL_FRACTION):
     lp = LayerPair(k_max=8)
     novelty = InputNovelty(feature_dim=len(lp.hist))
     sample_env = latent[LAG](seed * 10000)
-    feedback_head = WorldFeedbackValueHead(
-        feature_dim=len(substrate_features(lp)) + len(sample_env.obs()),
-        discount=0.99,
-    )
+    feature_dim = len(substrate_features(lp)) + len(sample_env.obs())
+    feedback_head = WorldFeedbackValueHead(feature_dim=feature_dim, discount=0.99)
+    risk_head = TerminalRiskHead(feature_dim=feature_dim)
     done = ep = 0
+    probe = []
+    replay = TransitionReplay(capacity=max(steps * 2, 1000), seed=seed)
+    return_replay = ReturnReplay(capacity=max(steps * 2, 1000), seed=seed + 1)
+    coverage = dict(
+        episodes=0, frames=0, pipe_deaths=0, boundary_deaths=0,
+        cap_deaths=0, pipe_window_steps=0, high_y_steps=0, low_y_steps=0,
+        episode_lengths=[],
+    )
     while done < steps:
         env = latent[LAG](seed * 10000 + ep)
         rng = np.random.RandomState(seed * 10000 + ep)
         lp.hist = [0.0] * 8
+        holdout = (ep % 5 == 4)
+        episode_transitions = []
         while not env.dead and done < steps:
             gains = np.abs(lp.h)
             total_gain = float(gains.sum())
             confidence = float(gains.max() / total_gain) if total_gain > 1e-9 else 0.0
-            if lp.t >= 50 and confidence >= 0.5:
+            if total_gain > 1e-9 and (lp.t >= 20 or confidence >= 0.25):
                 lag_index = int(np.argmax(gains))
                 gain = float(lp.h[lag_index])
                 center_rate = float(np.clip(-lp.b / gain, 0.0, 1.0))
             else:
-                center_rate = 0.5
+                # A generic low flap-rate prior keeps early exploratory episodes alive
+                # long enough to reach later world events; it is not a goal or reward.
+                center_rate = 0.1
             # Explore around the model-implied neutral action rate; uncertainty widens the
             # exploration band. No task target or collision rule enters data collection.
-            explore = 0.05 + 0.20 * (1.0 - confidence)
+            explore = 0.03 + 0.10 * (1.0 - confidence)
             action_rate = float(np.clip(
                 center_rate + rng.uniform(-explore, explore), 0.0, 1.0
             ))
             action = int(rng.rand() < action_rate)
             vy0 = env.vy
+            y0, t0 = env.y, env.t
+            pipe_dx, gap_dy = nearest_pipe(env)
+            if abs(pipe_dx) < 0.1:
+                coverage["pipe_window_steps"] += 1
+            if y0 > 0.9:
+                coverage["high_y_steps"] += 1
+            elif y0 < 0.1:
+                coverage["low_y_steps"] += 1
             observation = env.obs()
             env.step(action)
             next_observation = env.obs()
             world_feedback = env.feedback()
-            observe_transition(
+            _error, transition = observe_transition(
                 lp, feedback_head, novelty, env.vy - vy0, float(action),
                 observation, next_observation, world_feedback, env.dead,
+                learn_value=False, learn_novelty=not holdout,
             )
+            if holdout:
+                probe.append(dict(
+                    features=transition["features"], terminal=transition["terminal"],
+                    y=y0, vy=vy0, t=t0, pipe_dx=pipe_dx, gap_dy=gap_dy, episode=ep,
+                ))
+            else:
+                replay.add(
+                    transition["features"], transition["signals"],
+                    transition["next_features"], transition["terminal"],
+                )
+                episode_transitions.append(transition)
             done += 1
+        if not holdout and episode_transitions:
+            returns = discounted_returns(
+                episode_transitions, feedback_head.discount
+            )
+            for transition, target in zip(episode_transitions, returns):
+                return_replay.add(transition["features"], target)
+        coverage["episodes"] += 1
+        coverage["frames"] += env.t
+        coverage["episode_lengths"].append(env.t)
+        if env.dead:
+            if env.t >= env.max_t:
+                coverage["cap_deaths"] += 1
+            elif env.y < 0.0 or env.y > 1.0:
+                coverage["boundary_deaths"] += 1
+            else:
+                coverage["pipe_deaths"] += 1
         ep += 1
+    fit_value_head_returns(
+        feedback_head, return_replay, value_updates, batch_size=VALUE_BATCH
+    )
+    fit_terminal_risk(
+        risk_head, replay, risk_updates, batch_size=VALUE_BATCH,
+        terminal_fraction=terminal_fraction,
+    )
+    coverage["return_samples"] = len(return_replay)
     j = int(np.argmax(np.abs(lp.h)))
-    return lp, j + 1, float(lp.h[j]), feedback_head, novelty
+    return (lp, j + 1, float(lp.h[j]), feedback_head, risk_head, novelty, probe,
+            replay, coverage)
 
 
 def target_gap(env):
@@ -111,7 +201,8 @@ def score_text(score):
 
 
 def rollout_candidates(
-    env, b, f, lag, lp, feedback_head, novelty, value_mode
+    env, b, f, lag, lp, feedback_head, risk_head, novelty, value_mode,
+    engine, horizon, beam_width,
 ):
     """Bind the learned transition and selected value evaluator to the generic search core."""
     pending = np.asarray(env.pending()[:lag], dtype=float)
@@ -130,31 +221,38 @@ def rollout_candidates(
         next_y = y + next_vy
         return np.column_stack([next_y, next_vy])
 
+    def feedback_features(states, sequences, steps):
+        features = planned_substrate_features(
+            lp, sequences[:, :steps], novelty
+        )
+        pipe1, pipe2 = env.pipes[0], env.pipes[-1]
+        pipe1_x = pipe1[0] - steps * SPEED
+        pipe2_x = pipe2[0] - steps * SPEED
+        ys, vys = states[:, 0], states[:, 1]
+        observations = np.column_stack(
+            [
+                ys - 0.5,
+                vys * 10.0,
+                np.full(len(states), pipe1_x - BIRD_X),
+                pipe1[1] - ys,
+                np.full(len(states), pipe2_x - BIRD_X),
+                pipe2[1] - ys,
+            ]
+        )
+        return np.concatenate([features, observations], axis=1)
+
     def evaluate_step(states, sequences, step):
         if value_mode == "feedback":
-            features = planned_substrate_features(
-                lp, sequences[:, :step + 1], novelty
-            )
-            pipe1, pipe2 = env.pipes[0], env.pipes[-1]
-            pipe1_x = pipe1[0] - (step + 1) * SPEED
-            pipe2_x = pipe2[0] - (step + 1) * SPEED
-            ys, vys = states[:, 0], states[:, 1]
-            observations = np.column_stack(
-                [
-                    ys - 0.5,
-                    vys * 10.0,
-                    np.full(len(states), pipe1_x - BIRD_X),
-                    pipe1[1] - ys,
-                    np.full(len(states), pipe2_x - BIRD_X),
-                    pipe2[1] - ys,
-                ]
-            )
-            feedback_features = np.concatenate(
-                [features, observations], axis=1
-            )
-            world_values = feedback_head.value(feedback_features)
-            scores = feedback_head.preference_scores(world_values)
-            return scores, np.isfinite(feedback_features).all(axis=1)
+            features = feedback_features(states, sequences, step + 1)
+            if engine == "beam":
+                # Per-step pain probability prunes unsafe prefixes during long-horizon
+                # beam search; terminal V still supplies the longer-horizon return.
+                risk = risk_head.probability(features)
+                zeros = np.zeros(len(states))
+                scores = np.column_stack([risk, zeros, zeros])
+            else:
+                scores = np.zeros((len(states), 3))
+            return scores, np.isfinite(features).all(axis=1)
 
         ys = states[:, 0]
         feasible = (ys >= 0.0) & (ys <= 1.0)
@@ -167,19 +265,47 @@ def rollout_candidates(
         cost = (ys - gc) ** 2
         return cost, feasible
 
-    result = exhaustive_search(
-        initial_state=initial_state,
-        action_space=ACTION_SPACE,
-        horizon=H,
-        transition_batch=predict_batch,
-        evaluate_step=evaluate_step,
-        batch_size=len(ACTION_SPACE) ** H,
-    )
+    def evaluate_terminal(states, sequences):
+        features = feedback_features(states, sequences, horizon)
+        risk = risk_head.probability(features)
+        values = feedback_head.value(features)
+        # Immediate pain first, then the longer-horizon pain return, then dopamine.
+        scores = np.column_stack([risk, values[:, 1], -values[:, 0]])
+        return scores, np.isfinite(features).all(axis=1)
+
+    if engine == "beam":
+        result = beam_search(
+            initial_state=initial_state,
+            action_space=ACTION_SPACE,
+            horizon=horizon,
+            transition_batch=predict_batch,
+            evaluate_step=evaluate_step,
+            evaluate_terminal=evaluate_terminal,
+            beam_width=beam_width,
+        )
+    else:
+        result = exhaustive_search(
+            initial_state=initial_state,
+            action_space=ACTION_SPACE,
+            horizon=horizon,
+            transition_batch=predict_batch,
+            evaluate_step=evaluate_step,
+            evaluate_terminal=evaluate_terminal if value_mode == "feedback" else None,
+            batch_size=len(ACTION_SPACE) ** horizon,
+        )
     return result, gc
 
 
-def run(seed, show=False):
-    lp, lag, f, feedback_head, novelty = practice(seed)
+def run(seed, value_mode="feedback", engine="exhaustive", horizon=H,
+        beam_width=BEAM_WIDTH, practice_steps=PRACTICE,
+        value_updates=VALUE_UPDATES, risk_updates=RISK_UPDATES,
+        terminal_fraction=TERMINAL_FRACTION, show=False):
+    if value_mode == "task" and engine != "exhaustive":
+        raise ValueError("the task baseline uses exhaustive search")
+    lp, lag, f, feedback_head, risk_head, novelty, probe, replay, coverage = practice(
+        seed, steps=practice_steps, value_updates=value_updates,
+        risk_updates=risk_updates, terminal_fraction=terminal_fraction,
+    )
     b = lp.b
     env = latent[LAG](seed)
     lp.hist = [0.0] * 8
@@ -190,8 +316,8 @@ def run(seed, show=False):
 
     while not env.dead and t < 6000:
         plan, gc = rollout_candidates(
-            env, b, f, lag, lp, feedback_head, novelty,
-            VALUE_MODE,
+            env, b, f, lag, lp, feedback_head, risk_head, novelty,
+            value_mode, engine, horizon, beam_width,
         )
         searches += 1
         feasible_total += plan.feasible_count
@@ -235,6 +361,7 @@ def run(seed, show=False):
         observe_transition(
             lp, feedback_head, novelty, observed_delta, float(action),
             observation, next_observation, world_feedback, env.dead,
+            learn_value=False,
         )
         # Refresh the learned parameters from real data only.
         j = int(np.argmax(np.abs(lp.h)))
@@ -242,53 +369,166 @@ def run(seed, show=False):
         t += 1
 
     return dict(frames=env.t, lag=lag, f=f, b=b, searches=searches,
+                search_engine=engine, search_horizon=horizon,
                 feasible_fraction=feasible_total / max(candidate_total, 1),
                 no_feasible=no_feasible, model_error=max_model_error, selected=selected,
-                search_memory=search_memory)
+                search_memory=search_memory, replay_size=len(replay),
+                coverage=coverage,
+                value_probe=value_probe_metrics(probe, feedback_head, risk_head))
 
 
-print("sandbox value mode: %s" % VALUE_MODE)
-print("sandbox: %d action sequences (H=%d); generic search core; execute first action; re-search"
-      % (len(ACTION_SPACE) ** H, H))
-print("practice=%d real steps/seed; sandbox predictions are not training samples\n" % PRACTICE)
-candidate_metric = "valid fraction" if VALUE_MODE == "feedback" else "feasible fraction"
-failure_metric = "invalid" if VALUE_MODE == "feedback" else "no-feasible"
-print(" seed   frames   lag   learned F   %-17s %s steps   max model error"
-      % (candidate_metric, failure_metric))
-rows = []
-for seed in SEEDS[:8]:
-    result = run(seed, show=(seed == SEEDS[0]))
-    rows.append(result)
-    print(" %4d   %6d   %3d   %.6f        %.3f              %5d             %.2e"
-          % (seed, result["frames"], result["lag"], result["f"],
-             result["feasible_fraction"], result["no_feasible"], result["model_error"]))
+def report(rows, value_mode):
+    seeds = SEEDS[:len(rows)]
+    candidate_metric = "finite fraction" if value_mode == "feedback" else "feasible fraction"
+    failure_metric = "nonfinite" if value_mode == "feedback" else "no-feasible"
+    print(" seed   frames   lag   learned F   %-17s %s steps   max model error"
+          % (candidate_metric, failure_metric))
+    for seed, result in zip(seeds, rows):
+        print(" %4d   %6d   %3d   %.6f        %.3f              %5d             %.2e"
+              % (seed, result["frames"], result["lag"], result["f"],
+                 result["feasible_fraction"], result["no_feasible"],
+                 result["model_error"]))
 
-selected_validity = "valid" if VALUE_MODE == "feedback" else "feasible"
-print("\nselected candidates from seed %d (prefix, predicted endpoint, value target, %s, score):"
-      % (SEEDS[0], selected_validity))
-for t, prefix, endpoint, gc, ok, score in rows[0]["selected"]:
-    target = "world-feedback" if gc is None else "gap=%.4f" % gc
-    print("  t=%3d  %s  y_pred=%.4f  %s  %s=%s  score=%s"
-          % (t, prefix, endpoint, target, selected_validity, ok, score_text(score)))
+    selected_validity = "finite" if value_mode == "feedback" else "feasible"
+    print("\nselected candidates from seed %d (prefix, predicted endpoint, "
+          "value target, %s, score):" % (seeds[0], selected_validity))
+    for t, prefix, endpoint, gc, ok, score in rows[0]["selected"]:
+        target = "world-feedback" if gc is None else "gap=%.4f" % gc
+        print("  t=%3d  %s  y_pred=%.4f  %s  %s=%s  score=%s"
+              % (t, prefix, endpoint, target, selected_validity, ok,
+                 score_text(score)))
 
-print("\nQ1  learned lag 3 and F=.020: %s (mean lag %.2f, F %.6f)"
-      % ("ok" if all(r["lag"] == LAG and abs(r["f"] - .02) < .002 for r in rows) else "MISS",
-         np.mean([r["lag"] for r in rows]), np.mean([r["f"] for r in rows])))
-print("Q2  candidate rollouts pass the active validity check: %s (mean fraction %.3f)"
-      % ("ok" if np.mean([r["feasible_fraction"] for r in rows]) > 0 else "MISS",
-         np.mean([r["feasible_fraction"] for r in rows])))
-print("Q3  steps with no candidate passing the validity check: %d across %d seeds"
-      % (sum(r["no_feasible"] for r in rows), len(rows)))
-print("Q4  external survival evaluation: mean %.1f, median %.1f frames; seed range %d-%d"
-      % (np.mean([r["frames"] for r in rows]),
-         np.median([r["frames"] for r in rows]),
-         min(r["frames"] for r in rows), max(r["frames"] for r in rows)))
-print("    reference only: the hand-derived exact-model rule scored 4887, but it is not a learned search policy")
-print("Q5  one-step model/world discrepancy: %.2e"
-      % max(r["model_error"] for r in rows))
-mem = [item for r in rows for item in r["search_memory"]]
-print("Q6  separate sandbox-memory records: %d; mean |predicted next y - real next y| %.2e"
-      % (len(mem), np.mean([abs(item["one_step_error"]) for item in mem])))
-print("    each record stores state, pending queue, candidate count, feasible count, selected plan,")
-print("    predicted endpoint, target, and the real one-step verification; only that real transition")
-print("    updates the world model.")
+    print("\nQ1  learned lag 3 and F=.020: %s (mean lag %.2f, F %.6f)"
+          % ("ok" if all(r["lag"] == LAG and abs(r["f"] - .02) < .002 for r in rows)
+             else "MISS", np.mean([r["lag"] for r in rows]),
+             np.mean([r["f"] for r in rows])))
+    print("Q2  candidate rollouts pass the active numeric/feasibility check: %s "
+          "(mean fraction %.3f)"
+          % ("ok" if np.mean([r["feasible_fraction"] for r in rows]) > 0 else "MISS",
+             np.mean([r["feasible_fraction"] for r in rows])))
+    print("Q3  steps with no candidate passing the active check: %d across %d seeds"
+          % (sum(r["no_feasible"] for r in rows), len(rows)))
+    print("Q4  external survival evaluation: mean %.1f, median %.1f frames; "
+          "seed range %d-%d"
+          % (np.mean([r["frames"] for r in rows]),
+             np.median([r["frames"] for r in rows]),
+             min(r["frames"] for r in rows), max(r["frames"] for r in rows)))
+    print("    reference only: the hand-derived exact-model rule scored 4887, "
+          "but it is not a learned search policy")
+    print("Q5  one-step model/world discrepancy: %.2e"
+          % max(r["model_error"] for r in rows))
+    mem = [item for r in rows for item in r["search_memory"]]
+    print("Q6  separate sandbox-memory records: %d; mean |predicted next y - real "
+          "next y| %.2e"
+          % (len(mem), np.mean([abs(item["one_step_error"]) for item in mem])))
+    print("    each record stores state, pending queue, candidate count, feasible "
+          "count, selected plan,")
+    print("    predicted endpoint, target, and the real one-step verification; only "
+          "that real transition")
+    print("    updates the world model.")
+
+    print("\nPractice coverage:")
+    print(" seed episodes mean_frames pipe_deaths boundary_deaths cap pipe-window "
+          "high-y low-y")
+    for seed, result in zip(seeds, rows):
+        coverage = result["coverage"]
+        lengths = coverage["episode_lengths"]
+        mean_frames = float(np.mean(lengths)) if lengths else 0.0
+        print(" %4d %8d %11.1f %11d %15d %3d %11d %6d %5d"
+              % (seed, coverage["episodes"], mean_frames,
+                 coverage["pipe_deaths"], coverage["boundary_deaths"],
+                 coverage["cap_deaths"], coverage["pipe_window_steps"],
+                 coverage["high_y_steps"], coverage["low_y_steps"]))
+    coverage_rows = [r["coverage"] for r in rows]
+    print("Q8  coverage: mean episode %.1f frames; pipe deaths %d; boundary "
+          "deaths %d; pipe-window steps %d"
+          % (np.mean([np.mean(c["episode_lengths"]) for c in coverage_rows]),
+             sum(c["pipe_deaths"] for c in coverage_rows),
+             sum(c["boundary_deaths"] for c in coverage_rows),
+             sum(c["pipe_window_steps"] for c in coverage_rows)))
+
+    print("\nValue holdout (every fifth practice episode is not used for value "
+          "updates):")
+    print(" seed      n  terminal  pain AUC  risk AUC  risk safe  risk term  "
+          "risk Brier")
+    for seed, result in zip(seeds, rows):
+        probe = result["value_probe"]
+        if not probe["n"]:
+            print(" %4d     0      0       n/a       n/a        n/a        n/a"
+                  "         n/a" % seed)
+            continue
+        print(" %4d  %5d  %8d  %8.3f  %8.3f  %9.3f  %9.3f  %10.3f"
+              % (seed, probe["n"], probe["terminal"], probe["pain_auc"],
+                 probe["risk_auc"], probe["risk_safe"], probe["risk_terminal"],
+                 probe["risk_brier"]))
+    probes = [r["value_probe"] for r in rows if r["value_probe"]["n"]]
+    if probes:
+        print("Q7  value holdout: pain AUC %.3f; risk AUC %.3f; risk Brier %.3f; "
+              "risk terminal-vs-safe %.3f vs %.3f"
+              % (np.nanmean([p["pain_auc"] for p in probes]),
+                 np.nanmean([p["risk_auc"] for p in probes]),
+                 np.nanmean([p["risk_brier"] for p in probes]),
+                 np.nanmean([p["risk_terminal"] for p in probes]),
+                 np.nanmean([p["risk_safe"] for p in probes])))
+
+
+def _run_task(task):
+    return run(**task)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task-baseline", action="store_true")
+    parser.add_argument("--engine", choices=("exhaustive", "beam"),
+                        default="exhaustive")
+    parser.add_argument("--horizon", type=int, default=None)
+    parser.add_argument("--beam-width", type=int, default=BEAM_WIDTH)
+    parser.add_argument("--jobs", type=int, default=DEFAULT_JOBS)
+    parser.add_argument("--seeds", type=int, default=8)
+    parser.add_argument("--practice-steps", type=int, default=PRACTICE)
+    parser.add_argument("--value-updates", type=int, default=VALUE_UPDATES)
+    parser.add_argument("--risk-updates", type=int, default=RISK_UPDATES)
+    parser.add_argument("--terminal-fraction", type=float,
+                        default=TERMINAL_FRACTION)
+    args = parser.parse_args(argv)
+
+    value_mode = "task" if args.task_baseline else "feedback"
+    engine = "exhaustive" if value_mode == "task" else args.engine
+    if args.horizon is not None:
+        horizon = args.horizon
+    elif engine == "beam":
+        horizon = LONG_H
+    else:
+        horizon = H
+    if args.jobs < 1:
+        raise ValueError("--jobs must be positive")
+    if args.seeds < 1:
+        raise ValueError("--seeds must be positive")
+
+    print("sandbox value mode: %s" % value_mode)
+    print("sandbox engine: %s; horizon=%d; beam_width=%d; jobs=%d"
+          % (engine, horizon, args.beam_width, args.jobs))
+    print("practice=%d real steps/seed; value_updates=%d; risk_updates=%d; "
+          "terminal_fraction=%.2f; sandbox predictions are not training samples\n"
+          % (args.practice_steps, args.value_updates, args.risk_updates,
+             args.terminal_fraction))
+
+    tasks = [
+        dict(
+            seed=seed, value_mode=value_mode, engine=engine, horizon=horizon,
+            beam_width=args.beam_width, practice_steps=args.practice_steps,
+            value_updates=args.value_updates, risk_updates=args.risk_updates,
+            terminal_fraction=args.terminal_fraction, show=(seed == SEEDS[0]),
+        )
+        for seed in SEEDS[:args.seeds]
+    ]
+    if args.jobs == 1:
+        rows = [_run_task(task) for task in tasks]
+    else:
+        with ProcessPoolExecutor(max_workers=args.jobs) as pool:
+            rows = list(pool.map(_run_task, tasks))
+    report(rows, value_mode)
+
+
+if __name__ == "__main__":
+    main()

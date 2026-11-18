@@ -1,5 +1,5 @@
 """Value learning from world-emitted dopamine and pain channels."""
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Iterable
 
 import numpy as np
@@ -134,6 +134,48 @@ class WorldFeedbackValueHead:
         self.b1 += learning_rate * hidden_error
         return td_error
 
+    def update_return(self, features, target):
+        """Supervised update to a Monte-Carlo return target for one state."""
+        x = self._features(features)
+        if x.ndim != 1:
+            raise ValueError("update_return expects one feature vector")
+        target = np.asarray(target, dtype=float).reshape(-1)
+        if target.shape != (2,) or not np.isfinite(target).all():
+            raise ValueError("return target must contain two finite channels")
+        hidden = np.tanh(x @ self.w1 + self.b1)
+        current = hidden @ self.w2 + self.b2
+        error = target - current
+        learning_rate = self.learning_rate / (1.0 + float(x @ x))
+        old_w2 = self.w2.copy()
+        self.w2 += learning_rate * np.outer(hidden, error)
+        self.b2 += learning_rate * error
+        hidden_error = (old_w2 @ error) * (1.0 - hidden * hidden)
+        self.w1 += learning_rate * np.outer(x, hidden_error)
+        self.b1 += learning_rate * hidden_error
+        return error
+
+    def update_batch(self, features, feedback, next_features, terminal):
+        """Apply the online update to a replay batch; returns the number of samples."""
+        features = np.asarray(features, dtype=float)
+        feedback = np.asarray(feedback, dtype=float)
+        next_features = np.asarray(next_features, dtype=float)
+        terminal = np.asarray(terminal, dtype=bool).reshape(-1)
+        count = len(features)
+        if count == 0:
+            return 0
+        if feedback.shape != (count, 2):
+            raise ValueError("feedback batch must have shape (n, 2)")
+        if next_features.shape != features.shape:
+            raise ValueError("next_features must match features")
+        if terminal.shape != (count,):
+            raise ValueError("terminal must have one flag per sample")
+        for index in range(count):
+            self.update(
+                features[index], feedback[index], next_features[index],
+                terminal=bool(terminal[index]),
+            )
+        return count
+
 
 def _lag_profile(model):
     gains = np.abs(np.asarray(model.h, dtype=float))
@@ -211,3 +253,312 @@ def planned_substrate_features(model, sequences, novelty_model=None):
     if novelty_model is not None:
         result[:, -1] = novelty_model.score_batch(recent[:, ::-1])
     return result
+
+
+def binary_auc(scores, labels):
+    """Rank-based AUC; ties receive the average rank."""
+    scores = np.asarray(scores, dtype=float).reshape(-1)
+    labels = np.asarray(labels, dtype=bool).reshape(-1)
+    if scores.shape != labels.shape:
+        raise ValueError("scores and labels must have the same length")
+    positive = scores[labels]
+    negative = scores[~labels]
+    if not len(positive) or not len(negative):
+        return float("nan")
+
+    combined = np.concatenate([positive, negative])
+    order = np.argsort(combined, kind="mergesort")
+    ranks = np.empty(len(combined), dtype=float)
+    ranks[order] = np.arange(1, len(combined) + 1, dtype=float)
+    ordered = combined[order]
+    start = 0
+    while start < len(ordered):
+        stop = start + 1
+        while stop < len(ordered) and ordered[stop] == ordered[start]:
+            stop += 1
+        if stop - start > 1:
+            ranks[order[start:stop]] = 0.5 * (start + 1 + stop)
+        start = stop
+
+    positive_rank_sum = ranks[:len(positive)].sum()
+    return float(
+        (positive_rank_sum - len(positive) * (len(positive) + 1) / 2.0)
+        / (len(positive) * len(negative))
+    )
+
+
+def value_probe_metrics(records, head, risk_head=None):
+    """Summarise a held-out set of real transitions without using their labels for training."""
+    if not records:
+        return {"n": 0}
+    features = np.asarray([row["features"] for row in records], dtype=float)
+    terminal = np.asarray([row["terminal"] for row in records], dtype=bool)
+    values = head.value(features)
+    pain, dopamine = values[:, 1], values[:, 0]
+    safe = ~terminal
+    metrics = {
+        "n": len(records),
+        "terminal": int(terminal.sum()),
+        "safe": int(safe.sum()),
+        "pain_safe": float(pain[safe].mean()) if safe.any() else float("nan"),
+        "pain_terminal": (
+            float(pain[terminal].mean()) if terminal.any() else float("nan")
+        ),
+        "dopamine_safe": (
+            float(dopamine[safe].mean()) if safe.any() else float("nan")
+        ),
+        "dopamine_terminal": (
+            float(dopamine[terminal].mean()) if terminal.any() else float("nan")
+        ),
+        "pain_auc": binary_auc(pain, terminal),
+    }
+    if risk_head is not None:
+        risk = risk_head.probability(features)
+        metrics.update({
+            "risk_safe": float(risk[safe].mean()) if safe.any() else float("nan"),
+            "risk_terminal": (
+                float(risk[terminal].mean()) if terminal.any() else float("nan")
+            ),
+            "risk_auc": binary_auc(risk, terminal),
+            "risk_brier": float(np.mean((risk - terminal.astype(float)) ** 2)),
+        })
+    for name, predicate in (
+        ("high_y", lambda row: row.get("y", 0.0) > 0.9),
+        ("low_y", lambda row: row.get("y", 0.0) < 0.1),
+        ("near_pipe", lambda row: abs(row.get("pipe_dx", 1.0)) < 0.08),
+    ):
+        mask = np.asarray([predicate(row) for row in records], dtype=bool)
+        metrics[name + "_n"] = int(mask.sum())
+        metrics[name + "_pain"] = (
+            float(pain[mask].mean()) if mask.any() else float("nan")
+        )
+    return metrics
+
+
+class TransitionReplay:
+    """Store real transitions by outcome class and sample without discarding terminal cases."""
+
+    def __init__(self, capacity=20000, seed=0):
+        if capacity < 2:
+            raise ValueError("capacity must allow at least two transitions")
+        half = int(capacity) // 2
+        self.alive = deque(maxlen=half)
+        self.terminal = deque(maxlen=int(capacity) - half)
+        self.rng = np.random.RandomState(seed)
+
+    def __len__(self):
+        return len(self.alive) + len(self.terminal)
+
+    def add(self, features, signals, next_features, terminal):
+        item = (
+            np.asarray(features, dtype=float).reshape(-1),
+            np.asarray(signals, dtype=float).reshape(-1),
+            np.asarray(next_features, dtype=float).reshape(-1),
+            bool(terminal),
+        )
+        if item[3]:
+            self.terminal.append(item)
+        else:
+            self.alive.append(item)
+
+    def _draw(self, pool, count, replace):
+        if count <= 0:
+            return []
+        indices = self.rng.choice(len(pool), size=count, replace=replace)
+        return [pool[int(index)] for index in indices]
+
+    def arrays(self):
+        """Return every stored transition as arrays, without sampling."""
+        items = list(self.alive) + list(self.terminal)
+        if not items:
+            return None
+        return (
+            np.asarray([item[0] for item in items], dtype=float),
+            np.asarray([item[1] for item in items], dtype=float),
+            np.asarray([item[2] for item in items], dtype=float),
+            np.asarray([item[3] for item in items], dtype=bool),
+        )
+
+    def sample(self, batch_size, terminal_fraction=0.5):
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if not 0.0 <= terminal_fraction <= 1.0:
+            raise ValueError("terminal_fraction must be in [0, 1]")
+        if not len(self):
+            return None
+
+        terminal_count = min(
+            len(self.terminal), int(round(batch_size * terminal_fraction))
+        )
+        alive_count = min(len(self.alive), batch_size - terminal_count)
+        remaining = batch_size - terminal_count - alive_count
+        if remaining:
+            extra_terminal = min(remaining, len(self.terminal) - terminal_count)
+            terminal_count += extra_terminal
+            remaining -= extra_terminal
+        if remaining:
+            alive_count += min(remaining, len(self.alive) - alive_count)
+
+        selected = self._draw(
+            self.terminal, terminal_count, terminal_count > len(self.terminal)
+        )
+        selected += self._draw(
+            self.alive, alive_count, alive_count > len(self.alive)
+        )
+        if not selected:
+            return None
+        order = self.rng.permutation(len(selected))
+        selected = [selected[int(index)] for index in order]
+        return (
+            np.asarray([item[0] for item in selected], dtype=float),
+            np.asarray([item[1] for item in selected], dtype=float),
+            np.asarray([item[2] for item in selected], dtype=float),
+            np.asarray([item[3] for item in selected], dtype=bool),
+        )
+
+
+def fit_value_head(head, replay, updates, batch_size=128, terminal_fraction=0.5):
+    """Offline replay training after data collection; does not touch the world model."""
+    if updates < 0:
+        raise ValueError("updates must be non-negative")
+    completed = 0
+    for _ in range(int(updates)):
+        batch = replay.sample(batch_size, terminal_fraction)
+        if batch is None:
+            break
+        head.update_batch(*batch)
+        completed += 1
+    return completed
+
+
+class TerminalRiskHead:
+    """Logistic readout of the world's pain label, giving a calibrated terminal risk."""
+
+    def __init__(self, feature_dim, learning_rate=0.05, l2=1e-4):
+        if feature_dim < 1:
+            raise ValueError("feature_dim must be positive")
+        if learning_rate <= 0.0:
+            raise ValueError("learning_rate must be positive")
+        self.feature_dim = int(feature_dim)
+        self.learning_rate = float(learning_rate)
+        self.l2 = float(l2)
+        self.mean = np.zeros(self.feature_dim, dtype=float)
+        self.scale = np.ones(self.feature_dim, dtype=float)
+        # Squared terms let the risk readout represent two-sided boundaries without
+        # task-specific boundary variables.
+        self.w = np.zeros(2 * self.feature_dim, dtype=float)
+        self.b = 0.0
+
+    def set_normalization(self, features):
+        features = np.asarray(features, dtype=float)
+        if features.ndim != 2 or features.shape[1] != self.feature_dim:
+            raise ValueError("expected a feature matrix with the configured width")
+        self.mean = features.mean(axis=0)
+        scale = features.std(axis=0)
+        self.scale = np.where(scale > 1e-8, scale, 1.0)
+
+    def _expand(self, features):
+        features = np.asarray(features, dtype=float)
+        if features.ndim < 1 or features.shape[-1] != self.feature_dim:
+            raise ValueError("feature dimension mismatch")
+        x = (features - self.mean) / self.scale
+        return np.concatenate([x, x * x], axis=-1)
+
+    def logits(self, features):
+        return self._expand(features) @ self.w + self.b
+
+    def probability(self, features):
+        z = np.clip(self.logits(features), -60.0, 60.0)
+        return 1.0 / (1.0 + np.exp(-z))
+
+    def update_batch(self, features, labels, learning_rate=None):
+        features = np.asarray(features, dtype=float)
+        labels = np.asarray(labels, dtype=float).reshape(-1)
+        if len(features) != len(labels):
+            raise ValueError("features and labels must have the same length")
+        if not len(features):
+            return 0
+        x = self._expand(features)
+        probability = self.probability(features)
+        error = (probability - labels) / len(labels)
+        rate = self.learning_rate if learning_rate is None else float(learning_rate)
+        self.w -= rate * (x.T @ error + self.l2 * self.w)
+        self.b -= rate * float(error.sum())
+        return len(features)
+
+
+def fit_terminal_risk(head, replay, updates, batch_size=128, terminal_fraction=0.5):
+    """Train the pain/terminal readout on replay batches with the same balanced sampler."""
+    data = replay.arrays()
+    if data is None:
+        return 0
+    head.set_normalization(data[0])
+    completed = 0
+    for _ in range(int(updates)):
+        batch = replay.sample(batch_size, terminal_fraction)
+        if batch is None:
+            break
+        head.update_batch(batch[0], batch[3])
+        completed += 1
+    return completed
+
+
+class ReturnReplay:
+    """Monte-Carlo state/return pairs from complete real episodes."""
+
+    def __init__(self, capacity=20000, seed=0):
+        if capacity < 1:
+            raise ValueError("capacity must be positive")
+        self.data = deque(maxlen=int(capacity))
+        self.rng = np.random.RandomState(seed)
+
+    def __len__(self):
+        return len(self.data)
+
+    def add(self, features, target):
+        self.data.append((
+            np.asarray(features, dtype=float).reshape(-1),
+            np.asarray(target, dtype=float).reshape(-1),
+        ))
+
+    def sample(self, batch_size):
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if not self.data:
+            return None
+        replace = batch_size > len(self.data)
+        indices = self.rng.choice(len(self.data), size=batch_size, replace=replace)
+        selected = [self.data[int(index)] for index in indices]
+        return (
+            np.asarray([item[0] for item in selected], dtype=float),
+            np.asarray([item[1] for item in selected], dtype=float),
+        )
+
+
+def discounted_returns(transitions, discount):
+    """Reverse accumulated world feedback for one real episode."""
+    returns = []
+    running = np.zeros(2, dtype=float)
+    for transition in reversed(transitions):
+        running = (
+            np.asarray(transition["signals"], dtype=float) + discount * running
+        )
+        returns.append(running.copy())
+    returns.reverse()
+    return returns
+
+
+def fit_value_head_returns(head, replay, updates, batch_size=128):
+    """Train the value head against Monte-Carlo returns from real episodes."""
+    completed = 0
+    for _ in range(int(updates)):
+        batch = replay.sample(batch_size)
+        if batch is None:
+            break
+        features, targets = batch
+        for index in range(len(features)):
+            head.update_return(features[index], targets[index])
+        completed += 1
+    return completed

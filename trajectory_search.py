@@ -62,6 +62,13 @@ def _lexicographic_argmin(scores, mask):
     return int(remaining[0])
 
 
+def _lexicographic_order(scores, indices):
+    """Order indices by column 0 first, then column 1, ...; lower is better."""
+    subset = scores[indices]
+    keys = tuple(subset[:, column] for column in reversed(range(subset.shape[1])))
+    return np.lexsort(keys)
+
+
 def exhaustive_search(
     initial_state: np.ndarray,
     action_space: Iterable,
@@ -198,4 +205,129 @@ def exhaustive_search(
         candidate_count=candidate_count,
         first_state=first_state,
         final_state=final_state,
+    )
+
+
+def beam_search(
+    initial_state: np.ndarray,
+    action_space: Iterable,
+    horizon: int,
+    transition_batch: Callable[[np.ndarray, np.ndarray, int], np.ndarray],
+    evaluate_step: Callable[
+        [np.ndarray, np.ndarray, int], Tuple[np.ndarray, np.ndarray]
+    ],
+    evaluate_terminal: Optional[Callable[
+        [np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]
+    ]] = None,
+    beam_width: int = 256,
+) -> SearchResult:
+    """Beam-limited version of exhaustive_search for long horizons.
+
+    At each depth it expands every live beam with every action, keeps the best
+    `beam_width` candidates by the same lexicographic objective, and then applies the
+    optional terminal evaluator. It is a search approximation, not a task-specific policy.
+    """
+    state0 = np.asarray(initial_state, dtype=float)
+    if state0.ndim == 0:
+        state0 = state0.reshape(1)
+    actions = tuple(action_space)
+    if not actions:
+        raise ValueError("action_space must not be empty")
+    if horizon < 1:
+        raise ValueError("horizon must be a positive integer")
+    if beam_width < 1:
+        raise ValueError("beam_width must be a positive integer")
+
+    states = state0.reshape(1, -1)
+    sequences = np.zeros((1, horizon), dtype=float)
+    scores = None
+    feasible = np.ones(1, dtype=bool)
+    first_states = None
+    candidate_count = 0
+    feasible_checks = 0
+    width = len(actions)
+
+    for step in range(horizon):
+        count = len(states)
+        next_states = np.repeat(states, width, axis=0)
+        next_sequences = np.repeat(sequences, width, axis=0)
+        next_sequences[:, step] = np.tile(
+            np.asarray(actions, dtype=float), count
+        )
+        next_states = np.asarray(
+            transition_batch(next_states, next_sequences, step), dtype=float
+        )
+        if next_states.shape != (count * width,) + state0.shape:
+            raise ValueError(
+                "transition_batch must preserve the batched state shape; got %r"
+                % (next_states.shape,)
+            )
+        increments, step_feasible = evaluate_step(
+            next_states, next_sequences, step
+        )
+        increments = _score_matrix(increments, count * width, "evaluate_step")
+        step_feasible = np.asarray(step_feasible, dtype=bool).reshape(-1)
+        if step_feasible.shape != (count * width,):
+            raise ValueError(
+                "evaluate_step must return one feasibility flag per candidate"
+            )
+
+        candidate_first_states = (
+            next_states.copy() if first_states is None
+            else np.repeat(first_states, width, axis=0)
+        )
+        if scores is None:
+            candidate_scores = increments
+        else:
+            if increments.shape[1] != scores.shape[1]:
+                raise ValueError(
+                    "evaluate_step changed the number of score objectives"
+                )
+            candidate_scores = np.repeat(scores, width, axis=0) + increments
+        candidate_feasible = np.repeat(feasible, width) & step_feasible
+        feasible_checks += int(candidate_feasible.sum())
+        finite = np.isfinite(candidate_scores).all(axis=1)
+        selectable = np.flatnonzero(finite & candidate_feasible)
+        if not len(selectable):
+            selectable = np.flatnonzero(finite)
+        if not len(selectable):
+            raise ValueError("evaluators returned no finite score for any candidate")
+
+        order = _lexicographic_order(candidate_scores, selectable)
+        keep = selectable[order[:beam_width]]
+        states = next_states[keep]
+        sequences = next_sequences[keep]
+        scores = candidate_scores[keep]
+        feasible = candidate_feasible[keep]
+        first_states = candidate_first_states[keep]
+        candidate_count += count * width
+
+    if evaluate_terminal is not None:
+        increments, terminal_feasible = evaluate_terminal(states, sequences)
+        increments = _score_matrix(increments, len(states), "evaluate_terminal")
+        terminal_feasible = np.asarray(terminal_feasible, dtype=bool).reshape(-1)
+        if increments.shape[1] != scores.shape[1]:
+            raise ValueError(
+                "evaluate_terminal changed the number of score objectives"
+            )
+        scores = scores + increments
+        feasible = feasible & terminal_feasible
+
+    finite = np.isfinite(scores).all(axis=1)
+    if not finite.any():
+        raise ValueError("evaluators returned no finite score for any candidate")
+    feasible_indices = np.flatnonzero(feasible & finite)
+    selectable = feasible_indices if len(feasible_indices) else np.flatnonzero(finite)
+    order = _lexicographic_order(scores, selectable)
+    index = int(selectable[order[0]])
+    score = tuple(float(value) for value in scores[index])
+    score = score[0] if len(score) == 1 else score
+    return SearchResult(
+        actions=sequences[index].copy(),
+        score=score,
+        feasible=bool(len(feasible_indices)),
+        feasible_count=feasible_checks,
+        candidate_count=candidate_count,
+        first_state=first_states[index].copy(),
+        final_state=states[index].copy(),
     )

@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from trajectory_search import exhaustive_search
+from trajectory_search import beam_search, exhaustive_search
 
 
 class TrajectorySearchTests(unittest.TestCase):
@@ -83,6 +83,40 @@ class TrajectorySearchTests(unittest.TestCase):
         )
         self.assertEqual(result.actions[0], 1.0)
         self.assertEqual(result.score, (-1.0, 100.0))
+
+    def test_beam_search_finds_the_same_short_horizon_plan(self):
+        def evaluate_step(states, _actions, _step):
+            return np.abs(states[:, 0] - 2.0), np.ones(len(states), dtype=bool)
+
+        result = beam_search(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=4,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            beam_width=3,
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(int(result.actions.sum()), 2)
+        self.assertEqual(result.final_state[0], 2.0)
+        self.assertGreater(result.candidate_count, 0)
+
+    def test_beam_search_matches_exhaustive_when_width_is_large(self):
+        def evaluate_step(states, sequences, step):
+            score = np.abs(states[:, 0] - 2.0) + 0.01 * sequences[:, 0]
+            return score, np.ones(len(states), dtype=bool)
+
+        kwargs = dict(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=3,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+        )
+        exhaustive = exhaustive_search(**kwargs)
+        beam = beam_search(**kwargs, beam_width=8)
+        np.testing.assert_allclose(beam.actions, exhaustive.actions)
+        self.assertAlmostEqual(beam.final_state[0], exhaustive.final_state[0])
 
 
 if __name__ == "__main__":
