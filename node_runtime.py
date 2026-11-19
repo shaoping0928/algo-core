@@ -77,6 +77,8 @@ class NodeRuntime:
         association_rate: float = 0.0,
         valence_rate: float = 0.2,
         feature_rate: float = 0.05,
+        action_temperature: float = 0.1,
+        action_uncertainty: float = 0.5,
         seed: int = 0,
         scales: Optional[Sequence[float]] = None,
     ):
@@ -130,6 +132,10 @@ class NodeRuntime:
             raise ValueError("valence_rate must be in (0, 1]")
         if not 0.0 < float(feature_rate) <= 1.0:
             raise ValueError("feature_rate must be in (0, 1]")
+        if float(action_temperature) < 0.0:
+            raise ValueError("action_temperature must be non-negative")
+        if float(action_uncertainty) < 0.0:
+            raise ValueError("action_uncertainty must be non-negative")
         actions = tuple(int(action) for action in action_space)
         if not actions:
             raise ValueError("action_space must not be empty")
@@ -164,6 +170,8 @@ class NodeRuntime:
         self.association_rate = float(association_rate)
         self.valence_rate = float(valence_rate)
         self.feature_rate = float(feature_rate)
+        self.action_temperature = float(action_temperature)
+        self.action_uncertainty = float(action_uncertainty)
         self.gated_edges: Dict[
             Tuple[str, Tuple[int, ...], int], Dict[str, dict]
         ] = {}
@@ -194,6 +202,13 @@ class NodeRuntime:
         self.dopamine_node = self.graph.add_node(
             CONCEPT, "valence:dopamine", role="valence"
         )
+        self.action_nodes = {
+            int(action): self.graph.add_node(
+                CONCEPT, "action:%d" % int(action), role="action"
+            )
+            for action in self.action_space
+        }
+        self.last_action_probs = (1.0, 0.0)
         self.rules = FeatureRuleBank()
         self.feature_ids: List[str] = []
         self._feature_all: List[str] = []
@@ -772,6 +787,39 @@ class NodeRuntime:
             node_id, state, sources=sources, signature=signature
         )
 
+    def _action_margin(self, scores) -> float:
+        actions = list(self.action_space)
+        if len(actions) < 2:
+            return 0.0
+        return float(
+            scores[actions[0]]["cost"] - scores[actions[1]]["cost"]
+        )
+
+    def _action_probability(self, scores) -> float:
+        """Probability of the second action from preference and confidence."""
+        actions = list(self.action_space)
+        if len(actions) < 2:
+            return 1.0
+        margin = self._action_margin(scores)
+        uncertainty = 0.5 * (
+            float(scores[actions[0]]["uncertainty"])
+            + float(scores[actions[1]]["uncertainty"])
+        )
+        temperature = (
+            self.action_temperature
+            + self.action_uncertainty * max(0.0, uncertainty)
+        )
+        if temperature <= 0.0:
+            return 1.0 if margin > 0.0 else 0.0
+        return float(1.0 / (1.0 + np.exp(-margin / temperature)))
+
+    def _set_action_nodes(self, margin: float) -> None:
+        actions = list(self.action_space)
+        if len(actions) < 2:
+            return
+        self.graph.activate([self.action_nodes[actions[0]]], [-margin])
+        self.graph.activate([self.action_nodes[actions[1]]], [margin])
+
     def act(self, observation, explore: bool = True) -> int:
         state = self.encode(observation)
         node_id = self._assign(state, create=True, count=True)
@@ -782,8 +830,16 @@ class NodeRuntime:
         scores = self._score_actions(
             node_id, state, sources=sources, signature=signature
         )
-        if explore and self.rng.rand() < self.exploration:
-            action = int(self.rng.choice(self.action_space))
+        actions = list(self.action_space)
+        margin = self._action_margin(scores)
+        probability = self._action_probability(scores)
+        self._set_action_nodes(margin)
+        self.last_action_probs = (1.0 - probability, probability)
+        if explore and len(actions) >= 2:
+            action = (
+                actions[1] if self.rng.rand() < probability
+                else actions[0]
+            )
         else:
             action = min(
                 scores,

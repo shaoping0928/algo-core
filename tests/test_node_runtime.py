@@ -18,6 +18,36 @@ class NodeRuntimeTests(unittest.TestCase):
         options.update(overrides)
         return NodeRuntime(**options)
 
+    def test_action_probability_flattens_at_zero_margin(self):
+        runtime = self.make_runtime()
+        scores = {
+            0: dict(cost=0.0, uncertainty=0.0, dopamine=0.0),
+            1: dict(cost=0.0, uncertainty=0.0, dopamine=0.0),
+        }
+        self.assertAlmostEqual(
+            runtime._action_probability(scores), 0.5, places=6
+        )
+        scores[1]["cost"] = 1.0
+        self.assertLess(runtime._action_probability(scores), 0.01)
+        scores[1]["cost"] = -1.0
+        self.assertGreater(runtime._action_probability(scores), 0.99)
+        scores[1]["cost"] = 0.0
+        scores[0]["uncertainty"] = 1.0
+        scores[1]["uncertainty"] = 1.0
+        self.assertAlmostEqual(
+            runtime._action_probability(scores), 0.5, places=6
+        )
+
+    def test_act_samples_both_actions_when_preference_is_flat(self):
+        runtime = self.make_runtime()
+        observed = {
+            runtime.act(np.asarray([0.0]), explore=True)
+            for _ in range(120)
+        }
+        self.assertEqual(observed, {0, 1})
+        self.assertIn(0, runtime.action_nodes)
+        self.assertIn(1, runtime.action_nodes)
+
     def test_action_edges_select_the_lower_pain_action(self):
         runtime = self.make_runtime()
         source = runtime._create_node(np.asarray([0.0]))
