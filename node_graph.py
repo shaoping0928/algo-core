@@ -6,7 +6,12 @@ derivation. Node kinds add semantics:
     concept       co-occurrence association
     transition    a directed transition, optionally hosted by an edge node
     memory        a hub binding several nodes into one event
-    derived       a component calculator derived from another node (bounded depth)
+    derived       a legacy numeric component calculator (bounded depth)
+
+Numeric components should normally live in ``node_components.ComponentBank``:
+the component stays runtime-only, and its +1/0/-1 output is represented by
+ordinary concept nodes.  `derived` remains for compatibility with older
+experiments.
 
 Edges are typed:
 
