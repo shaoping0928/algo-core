@@ -285,6 +285,79 @@ class NodeRuntimeTests(unittest.TestCase):
             runtime.graph.nodes[feature_id].value, 5.0 / 7.0
         )
 
+    def test_feature_action_stats_pair_with_the_acting_action(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        rows = [
+            dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
+                history=np.asarray([1.0, 0.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([1.0]), next_obs=np.asarray([2.0]),
+                history=np.asarray([0.0, 1.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([2.0]), next_obs=np.asarray([3.0]),
+                history=np.asarray([1.0, 0.0]),
+                signals=np.asarray([1.0, 1.0]), done=True, episode=0,
+            ),
+        ]
+        runtime.learn_episode(rows)
+        cells = runtime.feature_action_stats[feature_id]
+        # The action acting on the transition s_m -> s_{m+1} is
+        # history[lag]: row 0 acts with the pre-episode 0, row 1 acts with
+        # the action issued at row 0 (1.0).  The feature is inactive on the
+        # final state, so only two cells exist.  Hits carry the precursor
+        # label P_2: row 0 sees no death within its window, row 1 sees the
+        # terminal row 2.
+        self.assertEqual(cells[0], [1, 0.0])
+        self.assertEqual(cells[1], [1, 1.0])
+
+    def test_feature_risk_depends_on_the_acting_action(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        prior_value = 5.0 / 7.0
+        state_hold = np.asarray([0.0, 0.0])
+        state_flap = np.asarray([0.0, 1.0])
+        # Without data both pending actions fall back to the scalar value.
+        plain = runtime._feature_risk_batch(
+            np.vstack([state_hold, state_flap])
+        )
+        np.testing.assert_allclose(plain, prior_value)
+        # With data the same state separates by the acting action.
+        runtime.feature_action_stats[feature_id] = {
+            0: [10, 0.0], 1: [10, 10.0],
+        }
+        separated = runtime._feature_risk_batch(
+            np.vstack([state_hold, state_flap])
+        )
+        self.assertLess(separated[0], prior_value)
+        self.assertGreater(separated[1], prior_value)
+        self.assertGreater(separated[1], separated[0])
+
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()
         node = runtime._create_node(np.asarray([0.0]))

@@ -110,6 +110,7 @@ class NodeRuntime:
         association_rate: float = 0.0,
         valence_rate: float = 0.2,
         feature_rate: float = 0.05,
+        feature_action_prior: float = 2.0,
         action_temperature: float = 0.1,
         action_uncertainty: float = 0.5,
         seed: int = 0,
@@ -167,6 +168,8 @@ class NodeRuntime:
             raise ValueError("feature_rate must be in (0, 1]")
         if float(action_temperature) < 0.0:
             raise ValueError("action_temperature must be non-negative")
+        if float(feature_action_prior) < 0.0:
+            raise ValueError("feature_action_prior must be non-negative")
         if float(action_uncertainty) < 0.0:
             raise ValueError("action_uncertainty must be non-negative")
         actions = tuple(int(action) for action in action_space)
@@ -203,8 +206,14 @@ class NodeRuntime:
         self.association_rate = float(association_rate)
         self.valence_rate = float(valence_rate)
         self.feature_rate = float(feature_rate)
+        self.feature_action_prior = float(feature_action_prior)
         self.action_temperature = float(action_temperature)
         self.action_uncertainty = float(action_uncertainty)
+        # Per (feature root, acting action) pain statistics.  The acting
+        # action of the transition s_m -> s_{m+1} is the one issued `lag`
+        # steps earlier (`history[lag]`), which is also the first pending
+        # coordinate of the encoded state at decision time.
+        self.feature_action_stats = {}
         self.gated_edges: Dict[
             Tuple[str, Tuple[int, ...], int], Dict[str, dict]
         ] = {}
@@ -1154,6 +1163,17 @@ class NodeRuntime:
                 next_features=next_features,
             )
             self._update_feature_pain(current_active, labels[index])
+            # Action-conditioned statistics: the action acting on the
+            # transition s_m -> s_{m+1} was issued `lag` steps earlier
+            # (`history[lag]`) and is what the search controls per plan.
+            history_row = np.asarray(row["history"], dtype=float).reshape(-1)
+            if history_row.size > self.lag:
+                acting = int(round(float(history_row[self.lag])))
+                self._update_feature_action(
+                    [fid for fid in current_active if fid in self.feature_ids],
+                    acting,
+                    labels[index],
+                )
             entered = self.graph.nodes[next_node]
             entered.immediate_pain += self.alpha_now * (
                 signals[1] - entered.immediate_pain
@@ -1313,6 +1333,16 @@ class NodeRuntime:
             node.value += self.feature_rate * (pain - node.value)
             node.count += 1
 
+    def _update_feature_action(self, feature_ids, action: int,
+                               pain: float) -> None:
+        """Accumulate P(pain | feature active, acting action) cells."""
+        pain = float(pain)
+        for node_id in feature_ids:
+            cells = self.feature_action_stats.setdefault(node_id, {})
+            cell = cells.setdefault(int(action), [0, 0.0])
+            cell[0] += 1
+            cell[1] += pain
+
     def _activate_features(self, feature_ids) -> None:
         active = set(feature_ids)
         for node_id in self._feature_all:
@@ -1321,19 +1351,46 @@ class NodeRuntime:
                 node.activate(1.0 if node_id in active else 0.0)
 
     def _feature_risk_batch(self, states: np.ndarray) -> np.ndarray:
+        """Action-conditioned feature risk.
+
+        The readout is ``P(pain within lag+1 steps | feature, acting
+        action)``.  The acting action is the first pending coordinate of the
+        encoded state, so two plans whose pending actions differ receive
+        different risk at the same predicted state.  Observed
+        ``(feature, action)`` cells shrink toward the feature's scalar
+        precursor value with `feature_action_prior` pseudo-counts; cells
+        without data fall back to that scalar exactly as before.
+        """
         states = np.asarray(states, dtype=float)
         result = np.zeros(len(states), dtype=float)
         if not self.feature_ids:
             return result
         obs = states[:, :self.obs_dim]
+        acting = None
+        if states.shape[1] > self.obs_dim:
+            acting = np.rint(states[:, self.obs_dim]).astype(int)
         for node_id in self.feature_ids:
             feature = self._feature_objects.get(node_id)
             node = self.graph.nodes.get(node_id)
             if feature is None or node is None:
                 continue
-            result = np.maximum(
-                result, float(node.value) * feature.mask(obs)
-            )
+            mask = feature.mask(obs)
+            if not mask.any():
+                continue
+            base = float(node.value)
+            values = np.full(len(states), base)
+            if acting is not None:
+                for action_key, (count, hits) in (
+                    self.feature_action_stats.get(node_id, {}).items()
+                ):
+                    if count <= 0:
+                        continue
+                    selected = mask & (acting == int(action_key))
+                    if selected.any():
+                        values[selected] = (
+                            hits + self.feature_action_prior * base
+                        ) / (count + self.feature_action_prior)
+            result = np.maximum(result, np.where(mask, values, 0.0))
         return result
 
     def _feature_memory_risk_batch(self, states: np.ndarray) -> np.ndarray:

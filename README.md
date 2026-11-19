@@ -337,6 +337,32 @@ E1 把特征归纳和特征 pain 更新改到 `obs_t` 上，标签
 `pending[0]` 恰好就是它。特征节点按 `(feature, effective_action)` 维护
 count/mean，`_feature_risk_batch` 用 `pending[0]` 查表。
 
+### E2a 动作条件化读出（2026-11，已实现）
+
+`_feature_risk_batch` 现在读 `P(pain within lag+1 | feature, pending[0])`：
+格子 `(feature, history[lag])` 记 count/hits，用 `feature_action_prior=2.0`
+伪计数向标量前驱值收缩；无数据格子回退标量（行为与之前完全一致）。
+训练在 `learn_episode` 里逐行累积，测试覆盖配对（`history[lag]` 键控）
+和读出分离（同一状态不同 pending 风险不同）。
+
+覆盖与不对称（5000 步，seed 100，前驱标签窗口 4）：
+
+```text
+(|f1|>1.563 & 近边界)      a0 n=1756 rate=0.588 | a1 n=316 rate=0.848
+(|f2|<0.709 & f3<-0.367)   a0 n= 208 rate=0.673 | a1 n= 52 rate=0.923
+(f1>1.243 & |f2|<0.222)    a0 n=  40 rate=1.000 | a1 n=  0  ← 无反事实
+```
+
+不对称方向物理合理（缺口在下时拍翅更危险；近边界高速运动时拍翅更危险）；
+贴管上升快的 a1 格子是空的——这是 VOI 预算应该优先补的清单。
+
+结果：**存活逐种子完全不变**（fast 122.0、full 87.1）。原因（探针）：贴管接近段的
+预测状态上两个计划的 feat_risk 全程为 0——窗口 4 的标签没有给中段状态正覆盖，
+诱导不出"缺口对齐误差"类规则，读出在来得及决策的地方不说话。值的条件化
+改变不了"规则不触发"的地方。当前最优先实验改为 **pain_horizon 加长**（k=8），
+让接近段状态获得正标签、诱导出中段规则；条件化结构已就位，规则一旦在中段
+触发，动作分离立刻生效。
+
 ### 决策时实际参考什么
 
 `substrate_nodes.policy_result` 现在参考：

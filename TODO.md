@@ -75,12 +75,25 @@
 
 ### P2 结构（待 P0/E1 结果决定方向）
 
+- [x] **按有效动作条件化的特征统计**（`feature_action_stats`，2026-11）：格子
+  `(feature, history[lag])` 记 count/hits，读出 `P(pain within lag+1 | feature, pending[0])`，
+  无数据格子回退标量前驱值（`feature_action_prior=2.0` 伪计数收缩）。
+  验证：5000 步格子 n=40–1756/动作，不对称性物理合理
+  （近边界高 \|vy\|：不拍 0.588 vs 拍 0.848；贴管缺口在下：不拍 0.673 vs 拍 0.923）；
+  `f1>1.243 & \|f2\|<0.222` 的 a1 格子 n=0——反事实缺口被显式暴露。
+  **存活逐种子不变**（fast 122.0、full 87.1 与条件化前完全相同）：贴管探针显示
+  两个计划的 feat_risk 在中段全程为 0——值条件化救不了"规则根本不触发"的地方。
+- [ ] **pain_horizon 加长实验（下一步）**：窗口 lag+1=4 的标签让死亡前 4 步内的状态
+  成为正样本，但管道接近错误发生在 5–10 步之前，中段状态没有正覆盖 → 诱导不出
+  对齐类规则 → 读出在中段是哑的。把标签窗口开放为参数（默认 lag+1），测 k=8：
+  验收 = 中段规则出现（\|f3\| 类对齐规则）、risk_active_frac ↑、
+  paired frames ≥ instant 臂 119.6；若规则变宽导致更保守则回退。
 - [ ] 三套控制器收敛为一个 `ActionPolicy`（collect/eval/node 三模式），`act` 与
   `policy_result` 不再是平行宇宙。
 - [ ] 计划级后验 `p1 = Φ(Δ/se)`（se 来自世界模型残差 + 支撑度）替代固定温度；
   lag>0 时动作语义建在计划层，不建在 `Q(s_t, a_t)`。
 - [ ] VOI 反事实预算：`deficit × consequence × unresolved`，**叠加**在现有探索之上，
-  不替换采样器；记录 propensity。
+  不替换采样器；记录 propensity；空格子（如上 a1 n=0）就是预算的目标清单。
 - [ ] 规划器驱动 / DAgger 采集 + 惊讶门控节点出生，缩小 80–95% OOD。
 - [ ] 价值从 exemplar 迁到 predicate 统计（或删除装饰性 DERIVATION/组件机制）。
 
