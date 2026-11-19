@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 
+from node_graph import MEMBERSHIP
 from node_runtime import NodeRuntime
 from substrate_nodes import run_seed
 
@@ -124,6 +125,37 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertGreater(row["frames"], 0)
         self.assertGreaterEqual(row["graph"]["nodes"], 1)
         self.assertGreaterEqual(row["graph"]["action_edges"], 1)
+
+    def test_memory_is_reinforced_and_retrievable_from_members(self):
+        runtime = self.make_runtime(max_nodes=40)
+        first = runtime._create_node(np.asarray([0.0]))
+        second = runtime._create_node(np.asarray([1.0]))
+        runtime._interact(first, second, pain=1.0, dopamine=0.0)
+        memory_id = runtime.episode_memory
+        self.assertIsNotNone(memory_id)
+        memory = runtime.graph.nodes[memory_id]
+        self.assertGreater(memory.trace, 0.0)
+        self.assertGreater(memory.value, 0.0)
+        found = runtime.memories_for([second])
+        self.assertIn(memory_id, found)
+        self.assertGreater(found[memory_id], 0.0)
+        self.assertGreater(
+            runtime.graph.edges[(memory_id, second, MEMBERSHIP)].weight,
+            0.0,
+        )
+        activated = runtime.graph.recall([second], steps=1)
+        self.assertGreater(activated[memory_id], 0.0)
+
+    def test_low_support_memory_is_forgotten(self):
+        runtime = self.make_runtime(max_nodes=40)
+        first = runtime._create_node(np.asarray([0.0]))
+        second = runtime._create_node(np.asarray([1.0]))
+        runtime._interact(first, second, pain=1.0, dopamine=0.0)
+        memory_id = runtime.episode_memory
+        runtime.graph.nodes[memory_id].trace = 0.0
+        runtime.graph.nodes[memory_id].count = 1
+        runtime._forget_memories()
+        self.assertNotIn(memory_id, runtime.graph.nodes)
 
     def test_adaptive_event_memory_uses_valence_surprise(self):
         def rows(count, final_pain):

@@ -101,8 +101,10 @@
   整体双动作支撑 0.22、近管道 0.11；终止节点 60 个。
 - [x] 通用 interaction：每条真实转移建立 association/transition；event memory 的边界由
   `|Δpain|+|Δdopamine|` 的 running mean/std（surprise）自适应决定，没有 memory_mode/阈值配置；
-  重复 epoch 不重复建 memory。5000 步后 assoc/trans/mem = 2435/2439/215。
-- [ ] 让 association/transition/memory 真正参与价值回传或动作选择；当前只建立、不读取，
+  重复 epoch 不重复建 memory。5000 步后 assoc/trans/mem = 2435/2439/133。
+- [x] memory 通过 membership 关联；激活节点反查并加强 memory trace/value/count 和 membership
+  边；episode 结束 decay，低支持 memory 遗忘（mem 215 -> 133）。
+- [ ] 让 association/transition/memory 参与价值回传或动作选择；当前只建立/加强，不读取，
   所以存活仍是 107.9。
 - [ ] 节点生命周期：上限/剪枝/合并；避免新终止状态 alias 到安全节点。
 - [ ] 用 on-policy/DAgger 采集 MPC 自己产生的终止状态与近管道反事实动作，再重训价值/Q。

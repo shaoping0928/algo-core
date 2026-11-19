@@ -29,6 +29,7 @@ from node_components import ComponentBank
 from node_graph import (
     ASSOCIATION,
     CONCEPT,
+    MEMBERSHIP,
     MEMORY,
     TRANSITION_EDGE,
     NodeGraph,
@@ -64,6 +65,9 @@ class NodeRuntime:
         component_weight: float = 0.5,
         component_gating: bool = False,
         graph_rate: float = 0.1,
+        memory_rate: float = 0.2,
+        memory_decay: float = 0.9,
+        memory_min_strength: float = 0.02,
         seed: int = 0,
         scales: Optional[Sequence[float]] = None,
     ):
@@ -105,6 +109,12 @@ class NodeRuntime:
             raise ValueError("component_weight must be non-negative")
         if not 0.0 < float(graph_rate) <= 1.0:
             raise ValueError("graph_rate must be in (0, 1]")
+        if not 0.0 < float(memory_rate) <= 1.0:
+            raise ValueError("memory_rate must be in (0, 1]")
+        if not 0.0 < float(memory_decay) <= 1.0:
+            raise ValueError("memory_decay must be in (0, 1]")
+        if float(memory_min_strength) < 0.0:
+            raise ValueError("memory_min_strength must be non-negative")
         actions = tuple(int(action) for action in action_space)
         if not actions:
             raise ValueError("action_space must not be empty")
@@ -133,6 +143,9 @@ class NodeRuntime:
         self.component_weight = float(component_weight)
         self.component_gating = bool(component_gating)
         self.graph_rate = float(graph_rate)
+        self.memory_rate = float(memory_rate)
+        self.memory_decay = float(memory_decay)
+        self.memory_min_strength = float(memory_min_strength)
         self.gated_edges: Dict[
             Tuple[str, Tuple[int, ...], int], Dict[str, dict]
         ] = {}
@@ -333,6 +346,50 @@ class NodeRuntime:
                 )
         self.last_pain = pain
         self.last_dopamine = dopamine
+        self._reinforce_memories([current, next_node], pain, dopamine)
+
+    def memories_for(self, node_ids: Iterable[str]) -> Dict[str, float]:
+        """Find memory nodes through membership edges of active nodes."""
+        result: Dict[str, float] = {}
+        for node_id in dict.fromkeys(node_ids):
+            for key in self.graph.incoming.get(node_id, []):
+                if key[2] != MEMBERSHIP:
+                    continue
+                edge = self.graph.edges[key]
+                result[key[0]] = max(
+                    result.get(key[0], 0.0), float(edge.weight)
+                )
+        return result
+
+    def _reinforce_memories(self, node_ids: Iterable[str], pain: float,
+                            dopamine: float) -> None:
+        for memory_id in self.memories_for(node_ids):
+            memory = self.graph.nodes.get(memory_id)
+            if memory is None or memory.kind != MEMORY:
+                continue
+            self.graph.activate([memory_id], [1.0])
+            memory.value += self.memory_rate * (pain - memory.value)
+            memory.dopamine += self.memory_rate * (
+                dopamine - memory.dopamine
+            )
+            memory.count += 1
+            for key in self.graph.outgoing.get(memory_id, []):
+                if key[2] == MEMBERSHIP:
+                    edge = self.graph.edges[key]
+                    edge.weight += self.graph_rate * (1.0 - edge.weight)
+                    edge.eligibility = (
+                        (1.0 - self.graph_rate) * edge.eligibility
+                        + self.graph_rate
+                    )
+
+    def _forget_memories(self) -> None:
+        for memory in list(self.graph.nodes.values()):
+            if memory.kind != MEMORY:
+                continue
+            memory.trace *= self.memory_decay
+            if (memory.trace < self.memory_min_strength
+                    and memory.count <= 1):
+                self.graph._remove_node(memory.id)
 
     def _signature(self, node_id: str) -> Tuple[int, ...]:        return tuple(
             self.components.previous_sign[component_id]
@@ -750,6 +807,7 @@ class NodeRuntime:
                 )
             running_pain = return_pain
             running_dopamine = return_dopamine
+        self._forget_memories()
         self.reset()
 
     # ---- analysis ----------------------------------------------------------

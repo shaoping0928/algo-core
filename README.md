@@ -224,7 +224,7 @@ memory、derivation、action edge 的 round-trip 测试。`trace_graph_memory.py
 wave 1:  363 concepts,  485 action edges, assoc=356, trans=356, mem=19
 wave 10: 2000 concepts, 2776 action edges, assoc=2172, trans=2173, mem=177
 wave 22: 2000 concepts, 3117 action edges, assoc=2435, trans=2439, mem=215
-end:     2000 concepts, 3117 action edges, 60 terminal nodes
+end:     2000 concepts, 3117 action edges, assoc=2435, trans=2439, mem=133
 ```
 
 现在概念间 interaction 已经真正建立：
@@ -233,7 +233,11 @@ end:     2000 concepts, 3117 action edges, 60 terminal nodes
 - event memory 的边界由运行时统计决定：`|Δpain| + |Δdopamine|` 的 running mean/std
   超过 `mean + 2*std`（至少 8 个样本）时开启新 memory；没有 `memory_mode` 或人手阈值配置；
 - 重复 epoch 不再重复创建 memory（只有第一个 epoch 建 memory，后续只更新值与边）；
-- `trace_node_training.py` 的 `assoc/trans/mem` 现在为 2435/2439/215。
+- memory 通过 membership 关联到 concept/transition 节点；训练时由激活节点反查 memory，
+  强化 memory 的 trace/value/count 和 membership 边权重；
+- 每个 episode 结束对 memory 做 decay，低支持（trace 低、只被访问一次）的 memory 被遗忘；
+  所以 mem 从峰值 215 降到 133。
+- `trace_node_training.py` 的 `assoc/trans/mem` 现在为 2435/2439/133。
 
 但决策路径仍未读取这些 interaction：存活仍是 107.9 帧，和没有 interaction 时相同。节点图的
 结构已经存在，下一步要把 association/transition/memory 用于价值回传或动作选择，而不是只建立。
