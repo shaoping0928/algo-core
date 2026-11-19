@@ -1,5 +1,94 @@
 # TODO
 
+## 审计整合（2026-11，三份只读子 agent 报告）
+
+代码路径 / 学习可辨识性 / 架构设计三份审计交叉确认。测量基准：fast 协议 8 种子
+`sd=83.5, SE=29.5`，因此**帧数差异 <2 SE 一律不作结论**（131.6 vs 94.6 与
+131.6 vs 93.9 都只有 ~1.25 SE）。
+
+### 已确认的关键事实
+
+- 部署决策 `policy_result` 只读 `pain_signal_batch`/`valence_state_batch`；不读
+  action edge、action 节点、组件、`_score_actions`。`NodeRuntime.act` 只被测试调用
+  （把 `act`/`decision`/`_score_actions` monkeypatch 成 raise 后 `policy_result` 仍跑通）。
+- 行为策略是**状态无关** Bernoulli(≈0.14)：`corr(a, obs_i) ≤ 0.033`，`H(A)=0.411`、
+  `H(A|bucket)=0.211`。此前"动作几乎变成观测的函数"的说法**撤回**。
+- 分布错配：评估状态 **80–95%** 距最近原型超过 `birth_threshold`；训练死亡
+  112 边界/9 管道，评估死亡 **6 管道/2 边界**（方向相反）。
+- 风险读出稀疏：`pain_signal_batch` 在评估轨迹 0.3% 步骤非零，3/8 种子全程为 0，
+  管道死亡前 6 帧全为 0。
+- 特征是"死亡当帧分类器"：归纳用 `next_obs` + 当帧 pain；seed 100 死前
+  `f2=0.278` vs 阈值 `0.274`（差 0.004 未触发）。
+- 即使 50/50 采样，同状态也只有 ~80/2316 个双动作桶；`23/2316` 指标不可达，
+  不得作为验收门槛。
+- lag=3 下 action edge 按无效动作（`history[0]`）切分状态；有效动作是
+  `history[3]`（已在 `pending` 坐标里）。`NodeRuntime.act` 在 lag>0 时语义错误。
+- `exhaustive_search` 确实枚举两个动作且 lag 映射正确；问题是评分函数
+  （静态状态风险、无终止模型、`step_stride=2` 跳过第一个受影响预测点）。
+
+### 具体 bug（审计确认）
+
+- `memory.value` 只在创建时赋值，**从不更新**（恒 1.0）；`_forget_memories` 的
+  `value < median` 条件永不成立，遗忘从未生效；`_feature_memory_risk_batch`
+  命中即返回精确 1.0。
+- 特征值初始化 `node.value = max(value, rule.confidence)` 使用了 held-out test
+  统计 → 选择标签泄漏进预测器初值。
+- `_score_actions` 的未知动作是**惩罚**（`+unknown_penalty`）而非乐观；
+  已知 pain=0.9 的动作（0.92）会赢过未知动作（1.0）。
+- `_interact` 自环转移直接 return：pain 关联、memory、association 全部丢失，
+  但 MC 价值照常更新。
+- `graph.decay` 从不调用：pain association 单调饱和（10 epoch 后 0.812 仍在涨）。
+- 组件被喂常量 `1.0`、同一转移 step 两次、`observe_valence(active=None)` 会
+  credit 到上一个节点、`reset` 不清组件状态。"组件无效果"是接线同义反复。
+- TD bootstrap 缺 `next.immediate_pain`（生产 MC 路径不受影响）。
+- 搜索无终止/可行性模型：线性模型穿墙，唯一保护是越界后特征才触发。
+- `--lag 4` 会 KeyError（latent 只有 0..3）；物理常量依赖 import 顺序
+  （`latent_world` 的 env 覆盖可能不生效）。
+- 文档与代码矛盾：README 声称 memory value 事件局部学习、组件参与决策、
+  特征根作为决策候选源等，均与实际路径不符；0.977 offline AUC 不可复现。
+
+### P0 先修测量
+
+- [ ] `--no-features` / `--instant-labels` 开关贯通 `fit`/`run_seed`/CLI（消除"改代码才能消融"）。
+- [ ] `trace_node_runtime` 改为插桩部署路径：OOD 比例、决策状态风险激活率、死亡类型、
+  `P(death within k)` 前兆 AUC（k=1..lag+1）、kNN 双动作支撑（训练数据 k=8）、
+  滞后槽位识别（Δ_j argmax + 分离度）、与 zero/one 计划同尺度的对照。
+- [ ] `plan_score`：按 `policy_result` 同一目标给固定计划打分（供诊断与后续计划级后验复用）。
+- [ ] 评估协议：`--eval-seeds`/`--eval-episodes`、per-seed 中位数/IQR/bootstrap CI、
+  held-out 种子（如 120–139）。
+- [ ] 删除或标注不可复现的 0.977 AUC 与 n=2 的"验证"；README 增加"实现/训练/被控制器读取"三栏。
+
+### P1 正确性
+
+- [x] 特征值初始化改用 train 统计（Laplace 先验），不再用 held-out test confidence。
+- [ ] E1 前置标签：特征归纳与特征 pain 更新改在 `obs_t` 上，标签
+  `P_k(t) = max_{j≤lag} pain_{t+j}`（k=lag+1，截断于 done）；`--instant-labels` 回退。
+- [ ] `memory.value` 改为 pain 事件局部 EMA + 真实遗忘判据（回归测试：pain memory
+  复访安全步后 value 不再恒 1.0）。
+- [ ] 风险融合 max(association, feature, feature-memory) 统一量纲/校准后再融合。
+- [ ] 搜索加学到的终止/可行性（或拒绝支持外预测状态）；`step_stride` 覆盖首个受影响点。
+- [ ] 小修：自环转移保留 pain 关联；未知动作改乐观；episode 末调用 `graph.decay`；
+  组件单步/显式 credit/reset；TD bootstrap 补 immediate_pain；lag 合法值校验。
+
+### P2 结构（待 P0/E1 结果决定方向）
+
+- [ ] 三套控制器收敛为一个 `ActionPolicy`（collect/eval/node 三模式），`act` 与
+  `policy_result` 不再是平行宇宙。
+- [ ] 计划级后验 `p1 = Φ(Δ/se)`（se 来自世界模型残差 + 支撑度）替代固定温度；
+  lag>0 时动作语义建在计划层，不建在 `Q(s_t, a_t)`。
+- [ ] VOI 反事实预算：`deficit × consequence × unresolved`，**叠加**在现有探索之上，
+  不替换采样器；记录 propensity。
+- [ ] 规划器驱动 / DAgger 采集 + 惊讶门控节点出生，缩小 80–95% OOD。
+- [ ] 价值从 exemplar 迁到 predicate 统计（或删除装饰性 DERIVATION/组件机制）。
+
+### E1 验收（paired per-seed）
+
+- 前兆 AUC（t-3）≥0.75（当前 online 0.44）；`risk_active_frac` ≥0.30（当前 0.003–0.37）。
+- 方向准确率 ≥0.6（当前均值 0.408 且换种子变号）。
+- paired frames ≥131.6 基线，单种子跌幅 <20%；Brier <0.10。
+- 判读：AUC 升而 frames 不动 → 瓶颈是终端价值/horizon（R4），标签时机不是约束；
+  frames 也升 → 继续投入 VOI 采集（E2）。
+
 ## 当前状态
 
 默认 `substrate_sandbox_search.py`（世界反馈价值模式）最近一次 8 种子测量
