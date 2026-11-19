@@ -36,7 +36,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            component_kinds, component_min_count, max_components,
            component_weight, component_gating, memory_weight,
            association_rate, induce_features, precursor_labels,
-           pain_horizon, voi_target):
+           pain_horizon, voi_target, feature_value_weight):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -67,6 +67,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         association_rate=association_rate,
         pain_horizon=pain_horizon,
         voi_target=voi_target,
+        feature_value_weight=feature_value_weight,
     )
     episodes = {}
     for row in transitions:
@@ -144,7 +145,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         component_gating=False, memory_weight=0.1,
         association_rate=0.0, induce_features=True,
         precursor_labels=True, pain_horizon=None,
-        voi_fraction=0.0, voi_target=3):
+        voi_fraction=0.0, voi_target=3, feature_value_weight=0.02):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -171,6 +172,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("voi_fraction must be in [0, 1)")
     if int(voi_target) < 1:
         raise ValueError("voi_target must be positive")
+    if float(feature_value_weight) < 0.0:
+        raise ValueError("feature_value_weight must be non-negative")
     lag = int(lag)
     voi_fraction = float(voi_fraction)
     if voi_fraction > 0.0:
@@ -194,6 +197,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             precursor_labels=precursor_labels,
             pain_horizon=pain_horizon,
             voi_target=voi_target,
+            feature_value_weight=feature_value_weight,
         )
         propensities = []
         stage2, _counts2 = collect(
@@ -222,6 +226,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         precursor_labels=precursor_labels,
         pain_horizon=pain_horizon,
         voi_target=voi_target,
+        feature_value_weight=feature_value_weight,
     )
 
 
@@ -265,7 +270,12 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         encoded = np.concatenate([states, pending], axis=1) / agent.scales
         pain, dopamine = agent.valence_state_batch(encoded)
         risk = np.maximum(pain, agent.pain_signal_batch(encoded))
-        return np.column_stack([risk, -dopamine]), np.isfinite(encoded).all(
+        # Scalarized objective: accumulated hazard minus the sequence-level
+        # value of the endpoint, so a plan that accepts local risk in
+        # exchange for a long-survival alignment can win.
+        value = agent.feature_value_batch(encoded)
+        cost = risk - agent.feature_value_weight * value
+        return np.column_stack([cost, -dopamine]), np.isfinite(encoded).all(
             axis=1
         )
 
@@ -277,7 +287,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         evaluate_step=evaluate_step,
         evaluate_terminal=evaluate_terminal,
         batch_size=2 ** horizon,
-        score_combine=("max", "sum"),
+        score_combine=("sum", "sum"),
     )
     return result
 
@@ -295,10 +305,12 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
     """Score one fixed plan with the same objective as `policy_result`.
 
     Reproduces the `exhaustive_search` scoring under
-    ``score_combine=("max", "sum")``: column 0 is the worst `pain_signal`
-    risk over the strided predicted states and the terminal state, column 1
+    ``score_combine=("sum", "sum")``: column 0 is the accumulated
+    `pain_signal` hazard over the strided predicted states plus the
+    terminal risk, minus the sequence-level value of the endpoint; column 1
     is the negative terminal dopamine.  Used by diagnostics that compare
-    fixed plans against the searched plan, and later by plan-level posteriors.
+    fixed plans against the searched plan, and later by plan-level
+    posteriors.
     """
     initial = np.asarray(initial_state, dtype=float).reshape(1, -1)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
@@ -306,7 +318,7 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
     step_stride = max(int(step_stride), 1)
     plan = np.asarray(plan, dtype=float).reshape(1, -1)
     states = initial.copy()
-    worst = 0.0
+    total = 0.0
     for step in range(horizon):
         history = history_features(
             plan, step + 1, pending_prefix, action_dim=action_dim
@@ -317,7 +329,7 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
             encoded = np.concatenate([states, pending], axis=1) / agent.scales
             if not np.isfinite(encoded).all():
                 return (float("inf"), float("inf"))
-            worst = max(worst, float(agent.pain_signal_batch(encoded)[0]))
+            total += float(agent.pain_signal_batch(encoded)[0])
     history = history_features(
         plan, horizon, pending_prefix, action_dim=action_dim
     )
@@ -329,7 +341,9 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
     terminal = max(
         float(pain[0]), float(agent.pain_signal_batch(encoded)[0])
     )
-    return (max(worst, terminal), -float(dopamine[0]))
+    value = float(agent.feature_value_batch(encoded)[0])
+    total += terminal - agent.feature_value_weight * value
+    return (total, -float(dopamine[0]))
 
 
 def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
@@ -360,7 +374,7 @@ def run_seed(task):
      epochs, lag, component_kinds, component_min_count, max_components,
      component_weight, component_gating, memory_weight,
      association_rate, induce_features, precursor_labels,
-     pain_horizon, voi_fraction, voi_target) = task
+     pain_horizon, voi_fraction, voi_target, feature_value_weight) = task
     world, agent = fit(
         seed, steps=steps, coverage=coverage,
         max_nodes=max_nodes, birth_threshold=birth_threshold,
@@ -377,6 +391,7 @@ def run_seed(task):
         pain_horizon=(pain_horizon or None),
         voi_fraction=voi_fraction,
         voi_target=voi_target,
+        feature_value_weight=feature_value_weight,
     )
     frames, actions = evaluate(
         seed, world, agent, cap=cap, horizon=horizon, lag=lag
@@ -425,6 +440,9 @@ def main():
                              "counterfactual budget (two-stage collect)")
     parser.add_argument("--voi-target", type=int, default=3,
                         help="minimum samples per (feature, action) cell")
+    parser.add_argument("--feature-value-weight", type=float, default=0.02,
+                        help="how much sequence-level value trades against "
+                             "accumulated hazard in the search objective")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset: 1500 steps, 3 epochs, "
                              "1000 nodes, 400-frame evaluation")
@@ -461,6 +479,8 @@ def main():
         raise ValueError("--voi-fraction must be in [0, 1)")
     if args.voi_target < 1:
         raise ValueError("--voi-target must be positive")
+    if args.feature_value_weight < 0.0:
+        raise ValueError("--feature-value-weight must be non-negative")
     if args.component_min_count < 1:
         raise ValueError("--component-min-count must be positive")
     if args.max_components < 0:
@@ -486,7 +506,8 @@ def main():
          args.component_gating, args.memory_weight,
          args.association_rate, not args.no_features,
          not args.instant_labels, args.pain_horizon,
-         args.voi_fraction, args.voi_target)
+         args.voi_fraction, args.voi_target,
+         args.feature_value_weight)
         for seed in seeds
     ]
     if args.jobs == 1:

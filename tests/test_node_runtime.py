@@ -153,7 +153,7 @@ class NodeRuntimeTests(unittest.TestCase):
     def test_smoke_run_on_flappy_signals(self):
         row = run_seed((100, 100, 0.1, 100, 200, 0.45, 6, 1, 3,
                         (), 8, 0, 0.5, False, 0.1, 0.0, True, True, 0,
-                        0.0, 3))
+                        0.0, 3, 0.02))
         self.assertGreater(row["frames"], 0)
         self.assertGreaterEqual(row["graph"]["nodes"], 1)
         self.assertGreaterEqual(row["graph"]["action_edges"], 1)
@@ -524,6 +524,59 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertEqual(overrides, 5)
         episodes = {row["episode"] for row in transitions}
         self.assertTrue(all(e >= 7 for e in episodes))
+
+    def test_feature_value_learns_the_discounted_return(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40, gamma=0.5
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        rows = [
+            dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
+                history=np.asarray([1.0, 0.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([1.0]), next_obs=np.asarray([2.0]),
+                history=np.asarray([0.0, 1.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([2.0]), next_obs=np.asarray([3.0]),
+                history=np.asarray([1.0, 0.0]),
+                signals=np.asarray([0.0, 1.0]), done=True, episode=0,
+            ),
+        ]
+        runtime.learn_episode(rows)
+        # The feature is active on the first two states.  Monte-Carlo
+        # dopamine returns, computed backward: the final transition earns 0
+        # (died), the middle one 1, the first one 1 + gamma.
+        cells = runtime.feature_value_stats[feature_id]
+        self.assertEqual(cells[0], [1, 1.5])   # row 0: 1 + 0.5 * 1
+        self.assertEqual(cells[1], [1, 1.0])   # row 1: acting = row0's action
+        self.assertGreater(runtime.value_baseline, 0.0)
+        # The readout separates the same state by the acting action; both
+        # reads shrink toward the running global baseline.
+        hold = np.asarray([0.0, 0.0])
+        flap = np.asarray([0.0, 1.0])
+        values = runtime.feature_value_batch(np.vstack([hold, flap]))
+        prior = runtime.feature_value_prior
+        baseline = runtime.value_baseline
+        self.assertAlmostEqual(
+            values[0], (1.5 + prior * baseline) / (1 + prior), places=9
+        )
+        self.assertAlmostEqual(
+            values[1], (1.0 + prior * baseline) / (1 + prior), places=9
+        )
+        self.assertGreater(values[0], values[1])
 
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()

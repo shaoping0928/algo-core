@@ -62,7 +62,8 @@ def _death_type(observation, died, reached_cap):
 def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
           epochs=10, max_nodes=5000, birth_threshold=0.45,
           components=(), component_min_count=8, max_components=128,
-          component_gating=False, pain_horizon=None, voi_fraction=0.0):
+          component_gating=False, pain_horizon=None, voi_fraction=0.0,
+          feature_value_weight=0.02):
     world, agent = fit(
         seed, steps=steps, coverage=coverage, max_nodes=max_nodes,
         birth_threshold=birth_threshold, epochs=epochs,
@@ -72,6 +73,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
         component_gating=component_gating,
         pain_horizon=pain_horizon,
         voi_fraction=voi_fraction,
+        feature_value_weight=feature_value_weight,
     )
     # The same deterministic transitions `fit` trained on; used only to
     # measure whether both actions exist near the planner states.
@@ -433,6 +435,8 @@ def main():
                         help="precursor label window; 0 uses the default")
     parser.add_argument("--voi-fraction", type=float, default=0.0,
                         help="counterfactual collection budget fraction")
+    parser.add_argument("--feature-value-weight", type=float, default=0.02,
+                        help="sequence-level value weight in the objective")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset matching substrate_nodes")
     args = parser.parse_args()
@@ -454,6 +458,7 @@ def main():
         component_gating=args.component_gating,
         pain_horizon=(args.pain_horizon or None),
         voi_fraction=args.voi_fraction,
+        feature_value_weight=args.feature_value_weight,
     )
 
 

@@ -115,6 +115,8 @@ class NodeRuntime:
         voi_target: int = 3,
         voi_cell_cap: int = 16,
         voi_min_prior: float = 0.5,
+        feature_value_prior: float = 4.0,
+        feature_value_weight: float = 0.02,
         action_temperature: float = 0.1,
         action_uncertainty: float = 0.5,
         seed: int = 0,
@@ -182,6 +184,10 @@ class NodeRuntime:
             raise ValueError("voi_cell_cap must be positive")
         if not 0.0 <= float(voi_min_prior) <= 1.0:
             raise ValueError("voi_min_prior must be in [0, 1]")
+        if float(feature_value_prior) < 0.0:
+            raise ValueError("feature_value_prior must be non-negative")
+        if float(feature_value_weight) < 0.0:
+            raise ValueError("feature_value_weight must be non-negative")
         if float(action_uncertainty) < 0.0:
             raise ValueError("action_uncertainty must be non-negative")
         actions = tuple(int(action) for action in action_space)
@@ -240,6 +246,16 @@ class NodeRuntime:
         self.voi_cell_cap = int(voi_cell_cap)
         self.voi_min_prior = float(voi_min_prior)
         self.voi_tests = {}
+        # Sequence-level value: per (feature, acting action) cells learning
+        # the discounted dopamine return of the paths that followed them,
+        # shrunk toward a running global baseline.  `feature_value_weight`
+        # is how much one unit of this value trades against one unit of
+        # accumulated hazard in the scalarized search objective.
+        self.feature_value_stats = {}
+        self.feature_value_prior = float(feature_value_prior)
+        self.feature_value_weight = float(feature_value_weight)
+        self.value_baseline = 0.0
+        self.value_baseline_rate = 0.02
         # Precursor label window: how many entered states ahead a pain event
         # still labels the current state.  Defaults to lag + 1, the first
         # state an action issued now can physically affect.
@@ -1247,9 +1263,13 @@ class NodeRuntime:
             )
             self._note_pain(next_node, float(signals[1]))
             self._component_step(next_node, signals)
+            value_roots = [
+                fid for fid in current_active if fid in self.feature_ids
+            ]
             steps.append((
                 current, action, next_node, float(signals[1]),
                 float(signals[0]), done, sources, signature,
+                acting, value_roots,
             ))
             if done:
                 self.reset()
@@ -1257,7 +1277,8 @@ class NodeRuntime:
         running_pain = 0.0
         running_dopamine = 0.0
         for (current, action, next_node, pain, dopamine,
-             terminal, sources, signature) in reversed(steps):
+             terminal, sources, signature, acting,
+             value_roots) in reversed(steps):
             return_pain = pain + (
                 0.0 if terminal else self.gamma * running_pain
             )
@@ -1281,6 +1302,14 @@ class NodeRuntime:
                 current, signature, action, next_node,
                 return_pain, return_dopamine,
             )
+            if acting is not None and value_roots:
+                # Sequence-level value: a (feature, acting action) cell
+                # learns the discounted dopamine return of the paths that
+                # actually followed it, so "aligned for a long survival"
+                # becomes readable where the pain hazard only says "local".
+                self._update_feature_value(
+                    value_roots, acting, return_dopamine
+                )
             if terminal:
                 entered = self.graph.nodes[next_node]
                 entered.value += self.alpha_mc * (
@@ -1515,6 +1544,64 @@ class NodeRuntime:
             self.voi_tests.get((node_id, action), 0) + 1
         )
         return action
+
+    def _update_feature_value(self, feature_ids, acting: int,
+                              return_dopamine: float) -> None:
+        """Accumulate E[discounted dopamine return | feature, acting]."""
+        value = float(return_dopamine)
+        for node_id in feature_ids:
+            cells = self.feature_value_stats.setdefault(node_id, {})
+            cell = cells.setdefault(int(acting), [0, 0.0])
+            cell[0] += 1
+            cell[1] += value
+        self.value_baseline += self.value_baseline_rate * (
+            value - self.value_baseline
+        )
+
+    def feature_value_batch(self, states: np.ndarray) -> np.ndarray:
+        """Expected discounted dopamine return at each state, in return units.
+
+        The read for a state is the support-shrunk mean over its active
+        feature roots of the ``(feature, pending[0])`` value cell; roots and
+        cells without data contribute the running global baseline, so the
+        readout degrades to a flat prior exactly where nothing was learned.
+        """
+        states = np.asarray(states, dtype=float)
+        baseline = float(self.value_baseline)
+        result = np.full(len(states), baseline)
+        if not self.feature_ids:
+            return result
+        obs = states[:, :self.obs_dim]
+        acting = None
+        if states.shape[1] > self.obs_dim:
+            acting = np.rint(states[:, self.obs_dim]).astype(int)
+        total = np.zeros(len(states), dtype=float)
+        weight = np.zeros(len(states), dtype=float)
+        for node_id in self.feature_ids:
+            feature = self._feature_objects.get(node_id)
+            if feature is None:
+                continue
+            mask = feature.mask(obs)
+            if not mask.any():
+                continue
+            values = np.full(len(states), baseline)
+            if acting is not None:
+                for action_key, (count, total_return) in (
+                    self.feature_value_stats.get(node_id, {}).items()
+                ):
+                    if count <= 0:
+                        continue
+                    selected = mask & (acting == int(action_key))
+                    if selected.any():
+                        prior = self.feature_value_prior
+                        values[selected] = (
+                            total_return + prior * baseline
+                        ) / (count + prior)
+            total += np.where(mask, values, 0.0)
+            weight += mask.astype(float)
+        averaged = np.where(weight > 0.0, total / np.maximum(weight, 1e-9),
+                            baseline)
+        return averaged
 
     def prediction_report(self) -> dict:
         """Calibration of the readout: prediction vs actual per cell."""
