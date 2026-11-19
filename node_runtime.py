@@ -118,6 +118,7 @@ class NodeRuntime:
         feature_value_prior: float = 4.0,
         feature_value_weight: float = 0.02,
         value_horizon: Optional[int] = None,
+        ood_trust_scale: float = 0.0,
         action_temperature: float = 0.1,
         action_uncertainty: float = 0.5,
         seed: int = 0,
@@ -191,6 +192,8 @@ class NodeRuntime:
             raise ValueError("feature_value_weight must be non-negative")
         if value_horizon is not None and int(value_horizon) < 1:
             raise ValueError("value_horizon must be positive")
+        if float(ood_trust_scale) < 0.0:
+            raise ValueError("ood_trust_scale must be non-negative")
         if float(action_uncertainty) < 0.0:
             raise ValueError("action_uncertainty must be non-negative")
         actions = tuple(int(action) for action in action_space)
@@ -260,6 +263,10 @@ class NodeRuntime:
         self.value_horizon = (
             None if value_horizon is None else int(value_horizon)
         )
+        # Prototype readouts shrink toward the population baseline as the
+        # query state leaves the supported region: statistics memorized on
+        # other worlds must not be reported with full confidence.
+        self.ood_trust_scale = float(ood_trust_scale)
         self.value_baseline = 0.0
         self.value_baseline_rate = 0.02
         # Precursor label window: how many entered states ahead a pain event
@@ -705,7 +712,7 @@ class NodeRuntime:
         if len(states) == 0:
             return np.zeros(0)
         result = np.zeros(len(states), dtype=float)
-        indices, weights = self._soft_weights_batch(states)
+        indices, weights, nearest_min = self._soft_weights_batch(states)
         if indices is not None:
             for row in range(len(states)):
                 total = 0.0
@@ -725,6 +732,10 @@ class NodeRuntime:
                         memory_id
                     )
                 result[row] = weighted / total if total > 0.0 else 0.0
+            result = self._shrink_to_baseline(
+                result, nearest_min,
+                baseline=self.prototype_pain_baseline(),
+            )
         if self.feature_ids:
             result = np.maximum(result, self._feature_risk_batch(states))
             result = np.maximum(
@@ -1762,12 +1773,58 @@ class NodeRuntime:
         return result
 
     # ---- analysis ----------------------------------------------------------
+    def prototype_pain_baseline(self) -> float:
+        """Population mean of the association-based pain readout."""
+        if not self._prototype_ids:
+            return 0.0
+        values = [
+            self._pain_association(node_id)
+            for node_id in self._prototype_ids
+        ]
+        return float(np.mean(values)) if values else 0.0
+
+    def prototype_valence_baselines(self):
+        """Population mean of (value + immediate) pain and dopamine."""
+        if not self._prototype_ids:
+            return 0.0, 0.0
+        pain = [
+            self.graph.nodes[node_id].value
+            + self.graph.nodes[node_id].immediate_pain
+            for node_id in self._prototype_ids
+        ]
+        dopamine = [
+            self.graph.nodes[node_id].dopamine
+            + self.graph.nodes[node_id].immediate_dopamine
+            for node_id in self._prototype_ids
+        ]
+        return float(np.mean(pain)), float(np.mean(dopamine))
+
+    def _shrink_to_baseline(self, values, nearest_min, baseline):
+        """Trust-shrink a prototype readout as the state leaves support.
+
+        ``ood_trust_scale`` is an absolute distance in standardized units;
+        the natural setting is the birth threshold, where trust is
+        exp(-0.5) ~ 0.61.  With the default 0.0 the readout is unchanged.
+        """
+        if self.ood_trust_scale <= 0.0:
+            return values
+        # `nearest_min` is the squared distance, matching the soft-weight
+        # convention, so trust = exp(-0.5 * d^2 / scale^2).
+        trust = np.exp(
+            -0.5
+            * np.asarray(nearest_min, dtype=float)
+            / (self.ood_trust_scale ** 2)
+        )
+        return trust * np.asarray(
+            values, dtype=float
+        ) + (1.0 - trust) * float(baseline)
+
     def _soft_weights_batch(self, states: np.ndarray):
         states = np.asarray(states, dtype=float)
         if states.ndim != 2 or states.shape[1] != len(self.scales):
             raise ValueError("states must be a matrix with the runtime width")
         if not self._prototype_ids:
-            return None, None
+            return None, None, None
         # Squared distances via matrix multiplication; this bounds memory to
         # (states x prototypes) instead of materialising states x prototypes x dim.
         prototypes = self._prototype_matrix
@@ -1780,12 +1837,13 @@ class NodeRuntime:
         count = min(self.soft_neighbors, distances.shape[1])
         indices = np.argpartition(distances, count - 1, axis=1)[:, :count]
         nearest = np.take_along_axis(distances, indices, axis=1)
+        nearest_min = nearest.min(axis=1)
         weights = np.exp(
             -0.5 * nearest / (self.soft_sigma * self.soft_sigma)
         )
         total = weights.sum(axis=1, keepdims=True)
         weights = weights / np.where(total > 0.0, total, 1.0)
-        return indices, weights
+        return indices, weights, nearest_min
 
     def _memory_values_batch(self, indices, weights, attribute: str):
         count = len(indices)
@@ -1812,7 +1870,7 @@ class NodeRuntime:
         states = np.asarray(states, dtype=float)
         if len(states) == 0:
             return np.zeros(0), np.zeros(0)
-        indices, weights = self._soft_weights_batch(states)
+        indices, weights, nearest_min = self._soft_weights_batch(states)
         if indices is None:
             length = len(np.asarray(states))
             return np.zeros(length), np.zeros(length)
@@ -1841,6 +1899,16 @@ class NodeRuntime:
                     + self.memory_weight
                     * memory_sums[present] / memory_mass[present]
                 )
+        if self.ood_trust_scale > 0.0:
+            baseline_pain, baseline_dopamine = (
+                self.prototype_valence_baselines()
+            )
+            pain = self._shrink_to_baseline(
+                pain, nearest_min, baseline=baseline_pain
+            )
+            dopamine = self._shrink_to_baseline(
+                dopamine, nearest_min, baseline=baseline_dopamine
+            )
         return pain, dopamine
 
     def _memory_value_from_weights(self, weights, attribute: str = "value"):
@@ -1865,14 +1933,23 @@ class NodeRuntime:
         states = np.asarray(states, dtype=float)
         if len(states) == 0:
             return np.zeros(0)
-        indices, weights = self._soft_weights_batch(states)
+        indices, weights, nearest_min = self._soft_weights_batch(states)
         if indices is None:
             return np.zeros(len(states))
         values = np.asarray([
             self.graph.nodes[self._prototype_ids[int(index)]].immediate_pain
             for index in indices.ravel()
         ]).reshape(indices.shape)
-        return (weights * values).sum(axis=1)
+        result = (weights * values).sum(axis=1)
+        if self.ood_trust_scale > 0.0:
+            baseline = float(np.mean([
+                self.graph.nodes[node_id].immediate_pain
+                for node_id in self._prototype_ids
+            ])) if self._prototype_ids else 0.0
+            result = self._shrink_to_baseline(
+                result, nearest_min, baseline=baseline
+            )
+        return result
 
     def value_state(self, state: np.ndarray) -> float:
         weights = self._neighbor_weights(np.asarray(state, dtype=float))

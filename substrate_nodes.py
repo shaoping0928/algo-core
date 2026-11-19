@@ -47,7 +47,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            component_weight, component_gating, memory_weight,
            association_rate, induce_features, precursor_labels,
            pain_horizon, voi_target, feature_value_weight,
-           value_horizon=None):
+           value_horizon=None, ood_trust_scale=0.0):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -80,6 +80,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         voi_target=voi_target,
         feature_value_weight=feature_value_weight,
         value_horizon=(value_horizon or None),
+        ood_trust_scale=ood_trust_scale,
     )
     episodes = {}
     for row in transitions:
@@ -185,7 +186,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         voi_fraction=0.0, voi_target=3, feature_value_weight=0.02,
         dagger_rounds=0, dagger_episodes=2, dagger_cap=1200,
         dagger_offset=50000, dagger_horizon=10, step_stride=2,
-        stride_includes_lag=False, value_horizon=0):
+        stride_includes_lag=False, value_horizon=0,
+        ood_trust_scale=0.0):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -235,6 +237,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("step_stride must be positive")
     if int(value_horizon) < 0:
         raise ValueError("value_horizon must be non-negative")
+    if float(ood_trust_scale) < 0.0:
+        raise ValueError("ood_trust_scale must be non-negative")
     lag = int(lag)
     voi_fraction = float(voi_fraction)
     if voi_fraction > 0.0:
@@ -289,6 +293,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         voi_target=voi_target,
         feature_value_weight=feature_value_weight,
         value_horizon=value_horizon,
+        ood_trust_scale=ood_trust_scale,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -589,6 +594,7 @@ def run_seed(task):
     step_stride = int(task.get("step_stride", 2))
     stride_includes_lag = bool(task.get("stride_includes_lag", False))
     decision = str(task.get("decision", "search"))
+    ood_trust_scale = float(task.get("ood_trust_scale", 0.0))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -624,6 +630,7 @@ def run_seed(task):
         step_stride=step_stride,
         stride_includes_lag=stride_includes_lag,
         value_horizon=value_horizon,
+        ood_trust_scale=ood_trust_scale,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -723,6 +730,10 @@ def main():
     parser.add_argument("--value-horizon", type=int, default=0,
                         help="k-step bootstrap target for the sequence-value "
                              "cells; 0 keeps the full-episode MC return")
+    parser.add_argument("--ood-trust-scale", type=float, default=0.0,
+                        help="shrink prototype readouts toward the population "
+                             "baseline beyond this distance (0 = off; the "
+                             "birth threshold is a natural setting)")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -803,6 +814,8 @@ def main():
         args.dagger_horizon = args.horizon
     if args.value_horizon < 0:
         raise ValueError("--value-horizon must be non-negative")
+    if args.ood_trust_scale < 0.0:
+        raise ValueError("--ood-trust-scale must be non-negative")
     component_kinds = tuple(
         kind.strip() for kind in args.components.split(",") if kind.strip()
     )
@@ -851,6 +864,7 @@ def main():
             stride_includes_lag=args.stride_includes_lag,
             decision=args.decision,
             value_horizon=args.value_horizon,
+            ood_trust_scale=args.ood_trust_scale,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -967,6 +981,7 @@ def main():
                 stride_includes_lag=args.stride_includes_lag,
                 decision=args.decision,
                 value_horizon=args.value_horizon,
+                ood_trust_scale=args.ood_trust_scale,
                 feature_value_weight=args.feature_value_weight,
                 features=not args.no_features,
                 precursor_labels=not args.instant_labels,

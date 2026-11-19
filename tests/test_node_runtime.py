@@ -233,6 +233,26 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertEqual(agent.value_horizon, 4)
         self.assertGreaterEqual(agent.snapshot()["nodes"], 1)
 
+    def test_ood_trust_shrinks_readouts_toward_the_baseline(self):
+        runtime = self.make_runtime(ood_trust_scale=0.5)
+        first = runtime._create_node(np.asarray([0.0]))
+        second = runtime._create_node(np.asarray([1.0]))
+        runtime.graph.nodes[first].value = 1.0
+        runtime.graph.nodes[second].value = 0.0
+        states = np.asarray([[4.0]])
+        indices, weights, nearest_min = runtime._soft_weights_batch(states)
+        self.assertIsNotNone(indices)
+        # Distances are squared, matching the soft-weight convention.
+        self.assertAlmostEqual(float(nearest_min[0]), 9.0, places=6)
+        # Without trust shrinkage the nearest prototype dominates.
+        runtime.ood_trust_scale = 0.0
+        pain_off, _ = runtime.valence_state_batch(states)
+        self.assertLess(float(pain_off[0]), 0.01)
+        # With shrinkage the unsupported query reports the population mean.
+        runtime.ood_trust_scale = 0.5
+        pain_on, _ = runtime.valence_state_batch(states)
+        self.assertAlmostEqual(float(pain_on[0]), 0.5, places=6)
+
     def test_fit_accepts_closed_loop_rounds(self):
         from substrate_nodes import fit
         world, agent = fit(
