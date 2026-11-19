@@ -251,6 +251,21 @@ end:     2337 concepts, 3410 action edges, assoc=2640, trans=2640, mem=128
 但决策路径仍未读取 association/transition 结构；memory 只以较小权重参与终点价值。存活与
 “只建立结构”基本持平，说明下一步需要更好的信用分配/校准，而不是继续增加结构数量。
 
+### 决策时实际参考什么
+
+`substrate_nodes.policy_result` 现在参考：
+
+1. `LinearObservationModel` 预测每条候选动作序列的 H=10 步观测；
+2. 每 2 步把预测状态映射到节点，查学到的 `immediate_pain`，按轨迹取 **max**；
+3. 终点查节点/ memory 的 pain 价值和 dopamine；
+4. 词典序：先最小化最坏预测 pain，再最大化终点 dopamine；
+5. 不使用 action edge 做搜索评分，也不读取管道/缺口/碰撞常量。
+
+实测：8 种子仍是 **108.6 帧**，和只查终点时完全相同；单 seed 耗时从约 36s 增加到 126s
+（8 种子并行）。原因是预测状态上的 `immediate_pain` 几乎都是 0：节点查表学到的终止/疼痛
+只覆盖真实行为轨迹，不能泛化到沙盒预测出来的反事实状态。因此“逐状态风险”目前没有真正
+起到避管作用，瓶颈是连续的 pain/terminal 读出，而不是搜索框架。
+
 ### 随机 memory 追踪
 
 `trace_memory_change.py` 随机抽 3 个种子、各抽 1 个 episode，对比学习前后的 memory：

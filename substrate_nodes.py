@@ -95,10 +95,12 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     return world, agent
 
 
-def policy_result(env, world, agent, prefix, horizon, lag=LAG):
+def policy_result(env, world, agent, prefix, horizon, lag=LAG,
+                  step_stride=2):
     initial = np.asarray(env.obs(), dtype=float)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
     action_dim = int(lag) + 1
+    step_stride = max(int(step_stride), 1)
 
     def predict_batch(states, sequences, step):
         history = history_features(
@@ -107,7 +109,21 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG):
         return world.predict(states, history)
 
     def evaluate_step(states, sequences, step):
-        return np.zeros((len(states), 2)), np.isfinite(states).all(axis=1)
+        if step % step_stride != 0:
+            return (
+                np.zeros((len(states), 2)),
+                np.isfinite(states).all(axis=1),
+            )
+        history = history_features(
+            sequences, step + 1, pending_prefix, action_dim=action_dim
+        )
+        pending = history[:, :agent.lag][:, ::-1]
+        encoded = np.concatenate([states, pending], axis=1) / agent.scales
+        risk = agent.immediate_risk_batch(encoded)
+        return (
+            np.column_stack([risk, np.zeros(len(states))]),
+            np.isfinite(encoded).all(axis=1),
+        )
 
     def evaluate_terminal(states, sequences):
         history = history_features(
@@ -130,27 +146,35 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG):
         evaluate_step=evaluate_step,
         evaluate_terminal=evaluate_terminal,
         batch_size=2 ** horizon,
-        score_combine="sum",
+        score_combine=("max", "sum"),
     )
     return result
 
 
-def policy_action(env, world, agent, prefix, horizon, lag=LAG):
-    return int(policy_result(env, world, agent, prefix, horizon, lag=lag).actions[0])
+def policy_action(env, world, agent, prefix, horizon, lag=LAG,
+                  step_stride=2):
+    return int(policy_result(
+        env, world, agent, prefix, horizon, lag=lag,
+        step_stride=step_stride,
+    ).actions[0])
 
 
-def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG):
+def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
+             step_stride=2):
     if cap < 1:
         raise ValueError("cap must be positive")
     if horizon < 1:
         raise ValueError("horizon must be positive")
+    if step_stride < 1:
+        raise ValueError("step_stride must be positive")
     lag = int(lag)
     env = latent[lag](seed)
     prefix = np.zeros(lag, dtype=float)
     actions = []
     while not env.dead and env.t < cap:
         action = policy_action(
-            env, world, agent, prefix, horizon, lag=lag
+            env, world, agent, prefix, horizon, lag=lag,
+            step_stride=step_stride,
         )
         actions.append(action)
         prefix = np.concatenate([[float(action)], prefix[:-1]])

@@ -112,6 +112,11 @@
 - [ ] memory 成员仍约 28 个，事件分段偏粗；需要更细的事件边界。
 - [x] transition edge node 用 MC/TD target 更新价值；memory value 以默认 0.1 权重进入终点评分；
   对称 association 价值平滑实测有害（232→141 帧），默认关闭，association 只参与 memory 检索。
+- [x] 决策改为沙盒轨迹搜索：线性模型预测 H=10 步，每 2 步查学到的 immediate pain 取 max，
+  终点用节点/memory pain + dopamine；不写管道/碰撞常量。8 种子仍 108.6 帧，耗时 126s；
+  预测状态 immediate pain 几乎为 0，逐状态风险没有真正避管。
+- [ ] 训练连续 pain/terminal 读出（从 world pain/dopamine 学习，不用 terminal 标签），
+  让它能泛化到沙盒预测的反事实状态；这是逐状态避管生效的前提。
 - [x] 组件出生改为按节点 valence 方差（相对节点总体 median+std）自适应；低效用组件按
   sign-pain 方差和访问次数剪枝。5000 步 seed 100 自动出生 76 个组件，存活仍 232。
 - [ ] 让 association/transition 结构进一步参与动作选择/信用分配；当前 memory 只以 0.1 权重

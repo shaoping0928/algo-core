@@ -1054,6 +1054,20 @@ class NodeRuntime:
             return None
         return weighted / total
 
+    def immediate_risk_batch(self, states: np.ndarray) -> np.ndarray:
+        """Weighted immediate pain of soft-neighbour states."""
+        states = np.asarray(states, dtype=float)
+        if len(states) == 0:
+            return np.zeros(0)
+        indices, weights = self._soft_weights_batch(states)
+        if indices is None:
+            return np.zeros(len(states))
+        values = np.asarray([
+            self.graph.nodes[self._prototype_ids[int(index)]].immediate_pain
+            for index in indices.ravel()
+        ]).reshape(indices.shape)
+        return (weights * values).sum(axis=1)
+
     def value_state(self, state: np.ndarray) -> float:
         weights = self._neighbor_weights(np.asarray(state, dtype=float))
         if not weights:
