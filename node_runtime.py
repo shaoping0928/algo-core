@@ -112,6 +112,9 @@ class NodeRuntime:
         feature_rate: float = 0.05,
         feature_action_prior: float = 2.0,
         pain_horizon: Optional[int] = None,
+        voi_target: int = 3,
+        voi_cell_cap: int = 16,
+        voi_min_prior: float = 0.5,
         action_temperature: float = 0.1,
         action_uncertainty: float = 0.5,
         seed: int = 0,
@@ -173,6 +176,12 @@ class NodeRuntime:
             raise ValueError("feature_action_prior must be non-negative")
         if pain_horizon is not None and int(pain_horizon) < 1:
             raise ValueError("pain_horizon must be positive")
+        if int(voi_target) < 1:
+            raise ValueError("voi_target must be positive")
+        if int(voi_cell_cap) < 1:
+            raise ValueError("voi_cell_cap must be positive")
+        if not 0.0 <= float(voi_min_prior) <= 1.0:
+            raise ValueError("voi_min_prior must be in [0, 1]")
         if float(action_uncertainty) < 0.0:
             raise ValueError("action_uncertainty must be non-negative")
         actions = tuple(int(action) for action in action_space)
@@ -223,6 +232,14 @@ class NodeRuntime:
         self.feature_calibration = {}
         self.surprise_buffer = []
         self.surprise_capacity = 64
+        # Counterfactual guidance: how many samples a (feature, action) cell
+        # should have before the guide stops testing it, how many guide
+        # tests one cell may receive, and the prior above which a root's
+        # consequence counts as large enough to test.
+        self.voi_target = int(voi_target)
+        self.voi_cell_cap = int(voi_cell_cap)
+        self.voi_min_prior = float(voi_min_prior)
+        self.voi_tests = {}
         # Precursor label window: how many entered states ahead a pain event
         # still labels the current state.  Defaults to lag + 1, the first
         # state an action issued now can physically affect.
@@ -1449,6 +1466,55 @@ class NodeRuntime:
             if len(self.surprise_buffer) > self.surprise_capacity:
                 self.surprise_buffer.sort(key=lambda item: -item["score"])
                 del self.surprise_buffer[self.surprise_capacity:]
+
+    def counterfactual_action(self, observation) -> Optional[int]:
+        """The action with the most deficient (feature, action) support here.
+
+        Counterfactual guidance for collection: among the feature roots
+        active at this state, prefer the one whose minority-action cell is
+        emptiest while the learned prior says the action matters.  Returns
+        None when every active root already has enough support for both
+        actions, when the prior is too low, or when the per-cell test
+        budget is spent.  Purely learned signals - no task geometry.
+        """
+        if not self.feature_ids:
+            return None
+        obs = np.asarray(observation, dtype=float).reshape(1, -1)
+        if obs.shape[1] < self.obs_dim:
+            return None
+        obs = obs[:, :self.obs_dim]
+        best = None
+        for node_id in self.feature_ids:
+            feature = self._feature_objects.get(node_id)
+            node = self.graph.nodes.get(node_id)
+            if feature is None or node is None:
+                continue
+            if not bool(feature.mask(obs)[0]):
+                continue
+            base = float(node.value)
+            if base < self.voi_min_prior:
+                continue
+            cells = self.feature_action_stats.get(node_id, {})
+            counts = [
+                int(cells.get(action, [0, 0.0])[0])
+                for action in self.action_space
+            ]
+            minority = int(np.argmin(counts))
+            if self.voi_tests.get((node_id, minority), 0) >= self.voi_cell_cap:
+                continue
+            deficit = self.voi_target - counts[minority]
+            if deficit <= 0:
+                continue
+            score = base * deficit
+            if best is None or score > best[0]:
+                best = (score, minority, node_id)
+        if best is None:
+            return None
+        score, action, node_id = best
+        self.voi_tests[(node_id, action)] = (
+            self.voi_tests.get((node_id, action), 0) + 1
+        )
+        return action
 
     def prediction_report(self) -> dict:
         """Calibration of the readout: prediction vs actual per cell."""

@@ -52,7 +52,7 @@ def _death_type(observation, died, reached_cap):
 def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
           epochs=10, max_nodes=5000, birth_threshold=0.45,
           components=(), component_min_count=8, max_components=128,
-          component_gating=False, pain_horizon=None):
+          component_gating=False, pain_horizon=None, voi_fraction=0.0):
     world, agent = fit(
         seed, steps=steps, coverage=coverage, max_nodes=max_nodes,
         birth_threshold=birth_threshold, epochs=epochs,
@@ -61,6 +61,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
         max_components=max_components,
         component_gating=component_gating,
         pain_horizon=pain_horizon,
+        voi_fraction=voi_fraction,
     )
     # The same deterministic transitions `fit` trained on; used only to
     # measure whether both actions exist near the planner states.
@@ -419,6 +420,8 @@ def main():
     parser.add_argument("--component-gating", action="store_true")
     parser.add_argument("--pain-horizon", type=int, default=0,
                         help="precursor label window; 0 uses the default")
+    parser.add_argument("--voi-fraction", type=float, default=0.0,
+                        help="counterfactual collection budget fraction")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset matching substrate_nodes")
     args = parser.parse_args()
@@ -439,6 +442,7 @@ def main():
         max_components=args.max_components,
         component_gating=args.component_gating,
         pain_horizon=(args.pain_horizon or None),
+        voi_fraction=args.voi_fraction,
     )
 
 

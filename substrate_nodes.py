@@ -32,31 +32,12 @@ DEFAULT_JOBS = min(8, os.cpu_count() or 1)
 FREE_THREADED = not getattr(sys, "_is_gil_enabled", lambda: True)()
 
 
-def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
-        birth_threshold=0.45, epochs=5, lag=LAG,
-        component_kinds=(), component_min_count=8,
-        max_components=128, component_weight=0.5,
-        component_gating=False, memory_weight=0.1,
-        association_rate=0.0, induce_features=True,
-        precursor_labels=True, pain_horizon=None):
-    if steps < 1:
-        raise ValueError("steps must be positive")
-    if not 0.0 <= coverage <= 1.0:
-        raise ValueError("coverage must be in [0, 1]")
-    if epochs < 1:
-        raise ValueError("epochs must be positive")
-    if int(lag) < 0:
-        raise ValueError("lag must be non-negative")
-    if int(component_min_count) < 1:
-        raise ValueError("component_min_count must be positive")
-    if int(max_components) < 0:
-        raise ValueError("max_components must be non-negative")
-    lag = int(lag)
-    transitions, _counts = collect(
-        seed, steps, coverage=coverage, lag=lag
-    )
-    if not transitions:
-        raise ValueError("collection produced no transitions")
+def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
+           component_kinds, component_min_count, max_components,
+           component_weight, component_gating, memory_weight,
+           association_rate, induce_features, precursor_labels,
+           pain_horizon, voi_target):
+    """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
     world = LinearObservationModel(obs_dim, action_dim).fit(
@@ -85,6 +66,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         memory_weight=memory_weight,
         association_rate=association_rate,
         pain_horizon=pain_horizon,
+        voi_target=voi_target,
     )
     episodes = {}
     for row in transitions:
@@ -153,6 +135,94 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
                 agent.rules_long = bank
                 agent.install_feature_rules(bank.rules, horizon=long_window)
     return world, agent
+
+
+def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
+        birth_threshold=0.45, epochs=5, lag=LAG,
+        component_kinds=(), component_min_count=8,
+        max_components=128, component_weight=0.5,
+        component_gating=False, memory_weight=0.1,
+        association_rate=0.0, induce_features=True,
+        precursor_labels=True, pain_horizon=None,
+        voi_fraction=0.0, voi_target=3):
+    """Collect transitions and train the node runtime on them.
+
+    With `voi_fraction > 0` collection runs in two stages: the first stage
+    bootstraps the runtime with the plain behavior policy, the second stage
+    asks that bootstrap agent where its (feature, action) support is
+    deficient and overrides at most `voi_fraction * steps` actions with the
+    less-supported one.  The override is additive - the behavior sampler
+    still runs the rest of the time - and everything is retrained on the
+    combined stream.
+    """
+    if steps < 1:
+        raise ValueError("steps must be positive")
+    if not 0.0 <= coverage <= 1.0:
+        raise ValueError("coverage must be in [0, 1]")
+    if epochs < 1:
+        raise ValueError("epochs must be positive")
+    if int(lag) < 0:
+        raise ValueError("lag must be non-negative")
+    if int(component_min_count) < 1:
+        raise ValueError("component_min_count must be positive")
+    if int(max_components) < 0:
+        raise ValueError("max_components must be non-negative")
+    if not 0.0 <= float(voi_fraction) < 1.0:
+        raise ValueError("voi_fraction must be in [0, 1)")
+    if int(voi_target) < 1:
+        raise ValueError("voi_target must be positive")
+    lag = int(lag)
+    voi_fraction = float(voi_fraction)
+    if voi_fraction > 0.0:
+        if steps < 2:
+            raise ValueError("two-stage collection needs at least 2 steps")
+        steps1 = max(1, int(round(steps * (1.0 - voi_fraction))))
+        stage1, _counts = collect(seed, steps1, coverage=coverage, lag=lag)
+        if not stage1:
+            raise ValueError("collection produced no transitions")
+        _bootstrap_world, guide_agent = _train(
+            stage1, seed=seed, epochs=epochs, lag=lag,
+            max_nodes=max_nodes, birth_threshold=birth_threshold,
+            component_kinds=component_kinds,
+            component_min_count=component_min_count,
+            max_components=max_components,
+            component_weight=component_weight,
+            component_gating=component_gating,
+            memory_weight=memory_weight,
+            association_rate=association_rate,
+            induce_features=induce_features,
+            precursor_labels=precursor_labels,
+            pain_horizon=pain_horizon,
+            voi_target=voi_target,
+        )
+        propensities = []
+        stage2, _counts2 = collect(
+            seed, steps - steps1, coverage=coverage, lag=lag,
+            guide=guide_agent.counterfactual_action,
+            budget=int(round(voi_fraction * steps)),
+            episode_start=max(int(row["episode"]) for row in stage1) + 1,
+            propensities=propensities,
+        )
+        transitions = list(stage1) + list(stage2)
+    else:
+        transitions, _counts = collect(seed, steps, coverage=coverage, lag=lag)
+    if not transitions:
+        raise ValueError("collection produced no transitions")
+    return _train(
+        transitions, seed=seed, epochs=epochs, lag=lag,
+        max_nodes=max_nodes, birth_threshold=birth_threshold,
+        component_kinds=component_kinds,
+        component_min_count=component_min_count,
+        max_components=max_components,
+        component_weight=component_weight,
+        component_gating=component_gating,
+        memory_weight=memory_weight,
+        association_rate=association_rate,
+        induce_features=induce_features,
+        precursor_labels=precursor_labels,
+        pain_horizon=pain_horizon,
+        voi_target=voi_target,
+    )
 
 
 def policy_result(env, world, agent, prefix, horizon, lag=LAG,
@@ -290,7 +360,7 @@ def run_seed(task):
      epochs, lag, component_kinds, component_min_count, max_components,
      component_weight, component_gating, memory_weight,
      association_rate, induce_features, precursor_labels,
-     pain_horizon) = task
+     pain_horizon, voi_fraction, voi_target) = task
     world, agent = fit(
         seed, steps=steps, coverage=coverage,
         max_nodes=max_nodes, birth_threshold=birth_threshold,
@@ -305,6 +375,8 @@ def run_seed(task):
         induce_features=induce_features,
         precursor_labels=precursor_labels,
         pain_horizon=(pain_horizon or None),
+        voi_fraction=voi_fraction,
+        voi_target=voi_target,
     )
     frames, actions = evaluate(
         seed, world, agent, cap=cap, horizon=horizon, lag=lag
@@ -348,6 +420,11 @@ def main():
     parser.add_argument("--pain-horizon", type=int, default=0,
                         help="precursor label window in entered states; "
                              "0 uses the default lag + 1")
+    parser.add_argument("--voi-fraction", type=float, default=0.0,
+                        help="fraction of collection steps guided by the "
+                             "counterfactual budget (two-stage collect)")
+    parser.add_argument("--voi-target", type=int, default=3,
+                        help="minimum samples per (feature, action) cell")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset: 1500 steps, 3 epochs, "
                              "1000 nodes, 400-frame evaluation")
@@ -380,6 +457,10 @@ def main():
         raise ValueError("--lag must be non-negative")
     if args.pain_horizon < 0:
         raise ValueError("--pain-horizon must be non-negative")
+    if not 0.0 <= args.voi_fraction < 1.0:
+        raise ValueError("--voi-fraction must be in [0, 1)")
+    if args.voi_target < 1:
+        raise ValueError("--voi-target must be positive")
     if args.component_min_count < 1:
         raise ValueError("--component-min-count must be positive")
     if args.max_components < 0:
@@ -404,7 +485,8 @@ def main():
          args.max_components, args.component_weight,
          args.component_gating, args.memory_weight,
          args.association_rate, not args.no_features,
-         not args.instant_labels, args.pain_horizon)
+         not args.instant_labels, args.pain_horizon,
+         args.voi_fraction, args.voi_target)
         for seed in seeds
     ]
     if args.jobs == 1:

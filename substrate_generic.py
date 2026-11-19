@@ -108,13 +108,24 @@ def history_features(sequences, steps, prefix, action_dim=ACTION_DIM):
     return result
 
 
-def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG):
-    """Collect real transitions using only observation/action/feedback."""
+def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
+            budget=0, episode_start=0, propensities=None):
+    """Collect real transitions using only observation/action/feedback.
+
+    `guide(obs) -> action or None` optionally overrides the behavior action
+    for counterfactual coverage; at most `budget` overrides happen, always
+    on top of (never instead of) the existing sampler.  `propensities`,
+    when given, receives the sampling probability of every emitted action
+    (1.0 marks a guide override).  `episode_start` offsets the episode ids
+    so two collection stages produce fresh episodes.
+    """
     lp = LayerPair(k_max=8)
     rng = np.random.RandomState(seed * 10000)
     transitions = []
     action_counts = {}
-    done = episode = 0
+    done = 0
+    episode = int(episode_start)
+    spent = 0
     while done < steps:
         env = latent[int(lag)](seed * 10000 + episode)
         lp.hist = [0.0] * 8
@@ -129,9 +140,11 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG):
                 center = 0.1
             explore = 0.03 + 0.10 * (1.0 - confidence)
             obs = np.asarray(env.obs(), dtype=float)
-            action = int(rng.rand() < np.clip(
+            behavior_p = float(np.clip(
                 center + rng.uniform(-explore, explore), 0.0, 1.0
             ))
+            action = int(rng.rand() < behavior_p)
+            propensity = behavior_p
             if coverage > 0.0 and rng.rand() < coverage:
                 # Generic action-coverage exploration: choose the less-used action
                 # in the current observation bucket. This uses no task geometry.
@@ -140,6 +153,15 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG):
                 action = int(counts[1] < counts[0] or (
                     counts[1] == counts[0] and rng.rand() < 0.5
                 ))
+                propensity = 0.5
+            if guide is not None and spent < int(budget):
+                tested = guide(obs)
+                if tested is not None:
+                    action = int(tested)
+                    propensity = 1.0
+                    spent += 1
+            if propensities is not None:
+                propensities.append(propensity)
             key = tuple(np.round(obs, 1))
             action_counts.setdefault(key, [0, 0])[action] += 1
             vy0 = env.vy

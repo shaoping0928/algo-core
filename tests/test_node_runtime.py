@@ -152,7 +152,8 @@ class NodeRuntimeTests(unittest.TestCase):
 
     def test_smoke_run_on_flappy_signals(self):
         row = run_seed((100, 100, 0.1, 100, 200, 0.45, 6, 1, 3,
-                        (), 8, 0, 0.5, False, 0.1, 0.0, True, True, 0))
+                        (), 8, 0, 0.5, False, 0.1, 0.0, True, True, 0,
+                        0.0, 3))
         self.assertGreater(row["frames"], 0)
         self.assertGreaterEqual(row["graph"]["nodes"], 1)
         self.assertGreaterEqual(row["graph"]["action_edges"], 1)
@@ -473,6 +474,56 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertEqual(len(flagged), 1)
         self.assertGreater(flagged[0]["pred"], 0.8)
         self.assertLess(flagged[0]["actual"], 0.3)
+
+    def test_counterfactual_action_targets_the_deficit_cell(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        observation = np.asarray([0.0])
+        # No cell data yet: both actions are deficient, action 0 first.
+        self.assertEqual(runtime.counterfactual_action(observation), 0)
+        # One cell rich, the other empty: the empty one is the target.
+        runtime.feature_action_stats[feature_id] = {0: [10, 10.0]}
+        self.assertEqual(runtime.counterfactual_action(observation), 1)
+        # Both cells rich -> no deficit.
+        runtime.feature_action_stats[feature_id] = {
+            0: [10, 10.0], 1: [10, 10.0],
+        }
+        self.assertIsNone(runtime.counterfactual_action(observation))
+        # A low prior makes the consequence too small to bother with.
+        runtime.feature_action_stats[feature_id] = {0: [10, 10.0]}
+        runtime.graph.nodes[feature_id].value = 0.3
+        self.assertIsNone(runtime.counterfactual_action(observation))
+        # The per-cell test budget stops repeated testing of one cell.
+        runtime.graph.nodes[feature_id].value = 5.0 / 7.0
+        runtime.voi_tests.clear()
+        for _ in range(16):
+            self.assertEqual(runtime.counterfactual_action(observation), 1)
+        self.assertIsNone(runtime.counterfactual_action(observation))
+
+    def test_collect_applies_the_counterfactual_budget(self):
+        from substrate_generic import collect
+
+        propensities = []
+        transitions, _ = collect(
+            100, 60, coverage=0.1, lag=3, guide=lambda obs: 1, budget=5,
+            episode_start=7, propensities=propensities,
+        )
+        self.assertTrue(transitions)
+        self.assertEqual(len(propensities), len(transitions))
+        overrides = sum(1 for p in propensities if p == 1.0)
+        self.assertEqual(overrides, 5)
+        episodes = {row["episode"] for row in transitions}
+        self.assertTrue(all(e >= 7 for e in episodes))
 
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()
