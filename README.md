@@ -198,6 +198,32 @@ held-out 没有出现“self-eval 大幅高估”，但分布明显更宽；两�
 不能直接当成同一个估计。该结果只覆盖短窗口臂，hybrid（`--pain-horizon 8`）
 和 full 5000 步协议仍需用同一 held-out 集复核。
 
+### 泛化瓶颈：self-eval 与 held-out 的差距（2026-11，full 协议初步）
+
+full 协议（5000 步、5 epoch、5000 节点、H=10、cap=6000）的 held-out
+复核正在进行（hybrid，dagger=0，6/8 模型完成）：
+
+```text
+per model mean: 88.0 / 90.0 / 104.0 / 106.2 / 120.6 / 125.0（6/8）
+partial mean ≈ 105.6   （全部完成后更新）
+对照 full self-eval（hybrid + w=0.02）：213.9 / 194.0
+```
+
+两个初步读数：
+
+1. **self-eval 与 held-out 差距约 108 帧**——full 协议最好臂的 self-eval
+   成绩里约一半是“在见过的世界上表现好”；
+2. **训练越多、held-out 越差**：fast held-out 134.9 > full held-out ~105.6
+   （数据 3.3 倍、节点上限 5 倍）。这是记忆化信号：图按“距离 > 阈值就出生”
+   无上限增长，把训练世界的状态空间铺满；评估状态 80–95% 距最近原型超过
+   `birth_threshold`，held-out 世界里这些原型的统计不再成立。
+
+今天的消融把其他嫌疑排除：价值归属时程（k 步目标中性偏负）、决策机制
+（cellq 崩到 68.2，MPC 壳必要）、动力学（误差 1e-9）。当前最大瓶颈是
+**泛化**：图在按世界记，不在按任务学。下一步实验：跨世界池化训练、
+`birth_threshold` 泛化 A/B、按 held-out 早停；同时给旧风险头路径
+（190.1，从未做过 held-out）补同一尺度的对照。
+
 ### 闭环采集（DAgger，2026-11）
 
 `substrate_nodes.evaluate(record=True)` 现在可以返回规划器**实际执行**的真实转移，
