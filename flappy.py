@@ -26,11 +26,15 @@ import time
 import numpy as np
 
 DEFAULT_GENS = 40
-GRAVITY = float(os.environ.get("FL_G", "0.0022"))
-FLAP = float(os.environ.get("FL_FLAP", "0.045"))
-SPEED = float(os.environ.get("FL_SPEED", "0.012"))
-GAP = float(os.environ.get("FL_GAP", "0.30"))
-SPACING = float(os.environ.get("FL_SPACING", "0.6"))
+# These defaults are the benchmark physics the whole repo measures on
+# (latent_world used to set them via os.environ before importing this
+# module, which silently failed whenever flappy was imported first).
+# FL_* environment variables still override them explicitly.
+GRAVITY = float(os.environ.get("FL_G", "0.0016"))
+FLAP = float(os.environ.get("FL_FLAP", "0.020"))
+SPEED = float(os.environ.get("FL_SPEED", "0.010"))
+GAP = float(os.environ.get("FL_GAP", "0.34"))
+SPACING = float(os.environ.get("FL_SPACING", "0.80"))
 DRAG = float(os.environ.get("FL_DRAG", "0.0"))    # quadratic drag: vy += -DRAG*vy*|vy|
 KY = float(os.environ.get("FL_KY", "0.0"))        # gravity grows off-centre: G*(1+KY*(y-0.5)^2)
 V0 = float(os.environ.get("FL_V0", "0.0"))        # flap weakens while falling: F*exp(vy/V0) if vy<0

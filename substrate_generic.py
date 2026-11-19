@@ -140,10 +140,12 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
                 center = 0.1
             explore = 0.03 + 0.10 * (1.0 - confidence)
             obs = np.asarray(env.obs(), dtype=float)
-            behavior_p = float(np.clip(
-                center + rng.uniform(-explore, explore), 0.0, 1.0
-            ))
-            action = int(rng.rand() < behavior_p)
+            # Draw order matters: the uniform offset is consumed after the
+            # uniform-variate rand, matching the original sampler's stream.
+            draw = rng.rand()
+            offset = rng.uniform(-explore, explore)
+            behavior_p = float(np.clip(center + offset, 0.0, 1.0))
+            action = int(draw < behavior_p)
             propensity = behavior_p
             if coverage > 0.0 and rng.rand() < coverage:
                 # Generic action-coverage exploration: choose the less-used action

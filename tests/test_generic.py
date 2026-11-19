@@ -18,6 +18,28 @@ class GenericWorldTests(unittest.TestCase):
         histories = history_features(sequences, 3, prefix=[0.0, 1.0, 0.0])
         np.testing.assert_allclose(histories[0], [1.0, 0.0, 1.0, 0.0])
 
+    def test_behavior_stream_is_pinned(self):
+        """The sampler's rng order is part of every downstream benchmark.
+
+        Reordering the draws (or adding one) shifts the whole behavior
+        stream and silently invalidates every paired comparison.  Changing
+        it must be a conscious decision that updates this hash.
+        """
+        import hashlib
+
+        from substrate_generic import collect
+
+        transitions, _ = collect(101, 200, coverage=0.1, lag=3)
+        items = [
+            (tuple(round(float(value), 6) for value in row["obs"]),
+             int(row["history"][0]),
+             tuple(round(float(value), 6) for value in row["next_obs"]),
+             float(row["signals"][1]))
+            for row in transitions
+        ]
+        digest = hashlib.md5(repr(items).encode("utf-8")).hexdigest()
+        self.assertEqual(digest, "223efe3797fedc251aa4bdbfab96395f")
+
     def test_history_features_fill_early_steps_from_prefix(self):
         sequences = np.asarray([[1.0, 0.0]])
         histories = history_features(sequences, 1, prefix=[0.0, 1.0, 0.0])
