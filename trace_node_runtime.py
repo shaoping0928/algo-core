@@ -14,7 +14,8 @@ All probes run against the states the planner actually visits:
      reacts to at the planner states
 
 The gap-direction check is a diagnostic only; it is never used to train the
-node runtime or the world model.
+node runtime or the world model.  The task constants below exist only so the
+reports are readable; the learner's task-freedom is enforced by a guard test.
 """
 import argparse
 
@@ -29,6 +30,14 @@ from substrate_value import binary_auc
 LAG = 3
 OBS_NAMES = ("y", "vy", "dx1", "gap1", "dx2", "gap2")
 
+# --- task constants, DIAGNOSTICS ONLY --------------------------------------
+# The measurement layer may name the world's geometry (collision band,
+# boundary limits, near-pipe window) so its reports are readable.  Nothing
+# here is imported by or fed into the learner.
+DIAG_COLLISION_WINDOW = 0.06   # world's |pipe_x - bird_x| collision band
+DIAG_BOUNDARY = (0.0, 1.0)     # world's y limits
+DIAG_NEAR_WINDOW = 0.2         # "near pipe" band for the support metrics
+
 
 def _node_state(agent, observation, pending):
     return np.concatenate(
@@ -41,10 +50,11 @@ def _death_type(observation, died, reached_cap):
     if not died or reached_cap:
         return "cap"
     y = float(observation[0]) + 0.5
-    if abs(float(observation[2])) < 0.06 \
+    if abs(float(observation[2])) < DIAG_COLLISION_WINDOW \
             and abs(float(observation[3])) > GAP / 2:
         return "pipe"
-    if y < 0.0 or y > 1.0:
+    low, high = DIAG_BOUNDARY
+    if y < low or y > high:
         return "boundary"
     return "other"
 
@@ -119,7 +129,8 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
                              counts[0] > 0 and counts[1] > 0))
         dx = float(observation[2])
         gap = float(observation[3])
-        is_near = abs(dx) < 0.2 and dx > -0.1
+        is_near = abs(dx) < DIAG_NEAR_WINDOW \
+            and dx > -0.5 * DIAG_NEAR_WINDOW
         if is_near:
             near_edge_support.append((chosen_count, other_count,
                                       counts[0] > 0 and counts[1] > 0))
@@ -208,8 +219,8 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
             if nearest_node is not None else 0.0
         )
         labels.append(bool(env.dead))
-        near.append(abs(float(next_observation[2])) < 0.2
-                    and float(next_observation[2]) > -0.1)
+        near.append(abs(float(next_observation[2])) < DIAG_NEAR_WINDOW
+                    and float(next_observation[2]) > -0.5 * DIAG_NEAR_WINDOW)
         prefix = np.concatenate([[float(action)], prefix[:-1]])
         t += 1
 

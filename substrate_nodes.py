@@ -384,7 +384,7 @@ def run_seed(task):
     return dict(
         seed=seed,
         frames=frames,
-        flap_rate=float(np.mean(actions)) if actions else 0.0,
+        action_rate=float(np.mean(actions)) if actions else 0.0,
         graph=agent.snapshot(),
         top_nodes=agent.top_nodes(5),
         top_edges=agent.top_edges(5),
@@ -502,11 +502,11 @@ def main():
         with ProcessPoolExecutor(max_workers=args.jobs) as pool:
             rows = list(pool.map(run_seed, tasks))
 
-    print(" seed  frames  flap_rate  concepts  graph_nodes  action_edges  components")
+    print(" seed  frames  action_rate  concepts  graph_nodes  action_edges  components")
     for row in rows:
         graph = row["graph"]
-        print(" %4d  %6d  %9.3f  %8d  %11d  %12d  %10d"
-              % (row["seed"], row["frames"], row["flap_rate"],
+        print(" %4d  %6d  %10.3f  %8d  %11d  %12d  %10d"
+              % (row["seed"], row["frames"], row["action_rate"],
                  graph["prototypes"], graph["nodes"],
                  graph["action_edges"], graph["components"]))
     print("frames mean %.1f median %.1f"

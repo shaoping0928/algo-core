@@ -591,6 +591,15 @@ class NodeRuntimeTests(unittest.TestCase):
             text = (root / name).read_text(encoding="utf-8")
             for token in forbidden:
                 self.assertNotIn(token, text, "%s in %s" % (token, name))
+        # The feature grammar must stay task-neutral too: its comments may
+        # not lean on the benchmark world's shapes.
+        feature_text = (root / "node_features.py").read_text(
+            encoding="utf-8"
+        )
+        for token in ("pipe", "flap", "gap", "boundary"):
+            self.assertNotIn(
+                token, feature_text, "%s in node_features.py" % token
+            )
         adapter = (root / "substrate_nodes.py").read_text(encoding="utf-8")
         for token in (
             "BIRD_X", "GAP", "pipes", "target_gap", "near_pipe",

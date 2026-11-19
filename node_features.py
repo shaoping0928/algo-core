@@ -267,8 +267,9 @@ class FeatureRuleBank:
                 feature = Composite("and", (predicate_a, predicate_b))
                 consider(feature, mask_a & mask_b)
 
-        # OR is restricted to the same coordinate: y outside a gap is
-        # (y < bottom) OR (y > top), and the two branches share a dimension.
+        # OR is restricted to a single coordinate: an "outside a band"
+        # pattern is (x < low) OR (x > high), and the two branches share
+        # one dimension.
         for first in range(len(candidates)):
             _, predicate_a, mask_a = candidates[first]
             if not isinstance(predicate_a, Primitive):
@@ -284,7 +285,7 @@ class FeatureRuleBank:
                 consider(feature, mask_a | mask_b)
 
         # AND(primitive, OR(primitive, primitive)) captures the general
-        # "x aligned AND y outside gap" shape.
+        # "aligned with one coordinate AND outside a band on another" shape.
         or_features = []
         for first in range(len(candidates)):
             _, predicate_a, mask_a = candidates[first]
@@ -306,10 +307,10 @@ class FeatureRuleBank:
                 combined = Composite("and", (predicate, feature))
                 consider(combined, mask & or_mask)
 
-        # Coverage-driven selection: each rule must explain pain events that
-        # no already-selected rule explains.  This keeps different causes
-        # (boundary, pipe, ...) instead of letting one high-precision family
-        # fill every slot.
+        # Coverage-driven selection: each rule must explain positive events
+        # that no already-selected rule explains.  This keeps distinct
+        # causes instead of letting one high-precision family fill every
+        # slot.
         positives = train_y > 0.5
         covered = np.zeros(len(train_y), dtype=bool)
         selected = []
@@ -340,9 +341,9 @@ class FeatureRuleBank:
             remaining.pop(best_index)
 
         # A precise feature can describe a cause that another broad feature
-        # already covers (for example a pipe collision that also happens near
-        # a boundary).  Fill the remaining slots with precise features that
-        # introduce a coordinate not already used by the selected rules.
+        # already covers when both fire on the same states.  Fill the
+        # remaining slots with precise features that introduce a coordinate
+        # not already used by the selected rules.
         selected_dims = set()
         selected_primitives = set()
         for rule in selected:
