@@ -1,4 +1,4 @@
-"""Task-agnostic compositional feature rules over input coordinates.
+﻿"""Task-agnostic compositional feature rules over input coordinates.
 
 A primitive is a test on one input coordinate (raw or magnitude).  A composite
 is an AND/OR of primitives or smaller composites.  Rules are composites that
@@ -324,7 +324,7 @@ class FeatureRuleBank:
             min_lift=self.min_lift,
             rules=[
                 dict(
-                    feature=_feature_state(rule.feature),
+                    feature=feature_state(rule.feature),
                     support=rule.support,
                     hits=rule.hits,
                     precision=rule.precision,
@@ -344,7 +344,7 @@ class FeatureRuleBank:
         self.min_lift = float(state.get("min_lift", self.min_lift))
         self.rules = [
             FeatureRule(
-                feature=_feature_from_state(data["feature"]),
+                feature=feature_from_state(data["feature"]),
                 support=int(data.get("support", 0)),
                 hits=float(data.get("hits", 0.0)),
                 precision=float(data.get("precision", 0.0)),
@@ -358,7 +358,7 @@ class FeatureRuleBank:
         return self
 
 
-def _feature_state(feature):
+def feature_state(feature):
     if isinstance(feature, Primitive):
         return dict(
             kind="primitive", dim=feature.dim,
@@ -367,11 +367,11 @@ def _feature_state(feature):
         )
     return dict(
         kind="composite", op=feature.op,
-        children=[_feature_state(child) for child in feature.children],
+        children=[feature_state(child) for child in feature.children],
     )
 
 
-def _feature_from_state(state):
+def feature_from_state(state):
     if state["kind"] == "primitive":
         return Primitive(
             int(state["dim"]), bool(state["magnitude"]),
@@ -379,5 +379,5 @@ def _feature_from_state(state):
         )
     return Composite(
         str(state["op"]),
-        tuple(_feature_from_state(child) for child in state["children"]),
+        tuple(feature_from_state(child) for child in state["children"]),
     )

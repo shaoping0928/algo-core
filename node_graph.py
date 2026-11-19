@@ -62,6 +62,7 @@ class Node:
     role: str = ""
     component_id: Optional[str] = None
     sign: int = 0
+    predicate: Optional[dict] = None
 
     def activate(self, value: float) -> float:
         self.activation = float(value)
@@ -415,6 +416,7 @@ class NodeGraph:
                     role=node.role,
                     component_id=node.component_id,
                     sign=node.sign,
+                    predicate=node.predicate,
                 )
                 for node in self.nodes.values()
             ],
@@ -485,6 +487,7 @@ class NodeGraph:
                 role=data.get("role", ""),
                 component_id=data.get("component_id"),
                 sign=int(data.get("sign", 0)),
+                predicate=data.get("predicate"),
             )
             graph.nodes[node.id] = node
             graph.outgoing[node.id] = []

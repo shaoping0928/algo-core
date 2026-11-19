@@ -36,7 +36,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         component_kinds=(), component_min_count=8,
         max_components=128, component_weight=0.5,
         component_gating=False, memory_weight=0.1,
-        association_rate=0.0):
+        association_rate=0.0, induce_features=True):
     if steps < 1:
         raise ValueError("steps must be positive")
     if not 0.0 <= coverage <= 1.0:
@@ -87,13 +87,11 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     for row in transitions:
         episodes.setdefault(row["episode"], []).append(row)
     ordered = [episodes[key] for key in sorted(episodes)]
-    for epoch in range(epochs):
-        for episode in ordered:
-            agent.learn_episode(episode)
 
-    # Induce compositional pain rules from the same batch.  Rules only use the
-    # observation part of the entered state and are verified on held-out
-    # episodes, so the sandbox can apply them to predicted future states.
+    # Rules are induced after the first pass, then materialized as feature
+    # nodes.  Later epochs train transitions, action edges and memories with
+    # those feature nodes active, so features take part in learning rather
+    # than only in the final readout.
     pain = np.asarray(
         [row["signals"][1] > 0.5 for row in transitions], dtype=float
     )
@@ -105,9 +103,15 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     split = max(int(len(order) * 0.7), 1)
     train = np.isin(groups, order[:split])
     test = ~train
-    agent.induce_rules(
-        states[train], pain[train], states[test], pain[test]
-    )
+
+    for epoch in range(epochs):
+        for episode in ordered:
+            agent.learn_episode(episode)
+        if induce_features and epoch == 0:
+            agent.induce_rules(
+                states[train], pain[train], states[test], pain[test]
+            )
+            agent.install_feature_rules()
     return world, agent
 
 

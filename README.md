@@ -264,7 +264,15 @@ end:     2337 concepts, 3410 action edges, assoc=2640, trans=2640, mem=128
 
 组合特征层（`node_features.py`）从输入坐标自动生成原语（raw 和 `|x|` 的阈值测试），
 用 AND/OR 组合，按“覆盖尚未解释的 pain 事件”选择规则，并在 held-out episode 上验证。
-规则命中时直接抬高沙盒预测状态的 pain 风险；它不读取管道/缺口/碰撞常量。
+规则在 epoch 0 后安装成图中的 `role="feature"` 节点：
+
+- 每个状态都会评估谓词并激活对应特征节点，节点上保存学到的 `P(pain | feature)`；
+- 特征节点作为 action edge 的 source 参与转移学习，决策时也会被加入候选 source；
+- 创建 memory 时把当时活跃的特征节点写成成员，之后可以按特征召回 memory；
+- 沙盒预测状态先算特征风险，再与节点/memory 的 pain 读出取 max。
+
+fast 8 种子：特征节点参与训练后 **116.4 帧**，关闭特征层 **94.6**；seed 100 为 232 vs 113。
+特征仍然不是手写的：谓词、阈值、AND/OR 结构和保留哪几条规则都由数据决定。
 
 ### 决策时实际参考什么
 
@@ -272,14 +280,16 @@ end:     2337 concepts, 3410 action edges, assoc=2640, trans=2640, mem=128
 
 1. `LinearObservationModel` 预测每条候选动作序列的 H=10 步观测；
 2. 每 2 步把预测状态映射到节点/memory，沿 association 读 `valence:pain` 的强度，按轨迹取 **max**；
-3. 预测状态同时经过组合特征规则层，规则命中时直接抬高 pain 风险；
-4. 终点用节点/memory pain 价值和学到的 pain 信号，再用 dopamine 排序；
-5. 词典序：先最小化最坏预测 pain，再最大化终点 dopamine；
-6. 不使用 action edge 做搜索评分，也不读取管道/缺口/碰撞常量。
+3. 预测状态同时计算组合特征节点的激活，特征上学的 `P(pain|feature)` 直接进入风险；
+4. 特征节点还能按 membership 召回相关 memory，memory 的 pain 值也进入风险；
+5. 终点用节点/memory pain 价值和学到的 pain 信号，再用 dopamine 排序；
+6. 词典序：先最小化最坏预测 pain，再最大化终点 dopamine；
+7. 不使用 action edge 做搜索评分，也不读取管道/缺口/碰撞常量。
 
-fast 规模下规则层把 seed 100 从 113 帧提高到 232 帧；8 种子均值 94.6 → 111.1。
-但当前 fast 规模选出的规则仍以边界为主、管道规则偏宽，精确的 `|f2|<0.07 & |f3|>0.18`
-还没有稳定进入规则集，下一步需要更细的尾部阈值和更稳的多规则覆盖。
+fast 规模下特征层把 seed 100 从 113 帧提高到 232 帧；8 种子均值 94.6 → 116.4。
+但当前 fast 规模选出的特征仍以边界为主、管道特征偏宽，精确的
+`|f2|<0.07 & |f3|>0.18` 还没有稳定进入特征集，下一步需要更细的尾部阈值、
+不变量分段和更稳的多特征覆盖。
 
 ### 随机 memory 追踪
 

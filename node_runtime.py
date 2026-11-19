@@ -21,12 +21,17 @@ The implementation deliberately keeps a small, explicit interface.  It is a
 prototype, not a replacement for the existing search baselines.
 """
 from collections import deque
+import json
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from node_components import ComponentBank
-from node_features import FeatureRuleBank
+from node_features import (
+    FeatureRuleBank,
+    feature_from_state,
+    feature_state,
+)
 from node_graph import (
     ASSOCIATION,
     CONCEPT,
@@ -71,6 +76,7 @@ class NodeRuntime:
         memory_weight: float = 0.1,
         association_rate: float = 0.0,
         valence_rate: float = 0.2,
+        feature_rate: float = 0.05,
         seed: int = 0,
         scales: Optional[Sequence[float]] = None,
     ):
@@ -122,6 +128,8 @@ class NodeRuntime:
             raise ValueError("association_rate must be in [0, 1]")
         if not 0.0 < float(valence_rate) <= 1.0:
             raise ValueError("valence_rate must be in (0, 1]")
+        if not 0.0 < float(feature_rate) <= 1.0:
+            raise ValueError("feature_rate must be in (0, 1]")
         actions = tuple(int(action) for action in action_space)
         if not actions:
             raise ValueError("action_space must not be empty")
@@ -155,6 +163,7 @@ class NodeRuntime:
         self.memory_weight = float(memory_weight)
         self.association_rate = float(association_rate)
         self.valence_rate = float(valence_rate)
+        self.feature_rate = float(feature_rate)
         self.gated_edges: Dict[
             Tuple[str, Tuple[int, ...], int], Dict[str, dict]
         ] = {}
@@ -186,6 +195,10 @@ class NodeRuntime:
             CONCEPT, "valence:dopamine", role="valence"
         )
         self.rules = FeatureRuleBank()
+        self.feature_ids: List[str] = []
+        self._feature_objects: Dict[str, object] = {}
+        self._feature_keys: Dict[str, str] = {}
+        self._feature_counter = 0
         self._prototype_ids: List[str] = []
         self._prototype_matrix = np.zeros((0, state_dim), dtype=float)
         self._traces: Dict[str, List[float]] = {}
@@ -343,10 +356,14 @@ class NodeRuntime:
         )
 
     def _interact(self, current: str, next_node: str, pain: float = 0.0,
-                  dopamine: float = 0.0) -> None:
+                  dopamine: float = 0.0,
+                  current_features: Iterable[str] = (),
+                  next_features: Iterable[str] = ()) -> None:
         """Create association, causal transition and signal-driven memory."""
         if current == next_node:
             return
+        current_features = list(dict.fromkeys(current_features))
+        next_features = list(dict.fromkeys(next_features))
         self.graph.activate([current, next_node], [1.0, 1.0])
         self.graph.observe_association(
             [current, next_node], rate=self.graph_rate
@@ -356,7 +373,9 @@ class NodeRuntime:
         )
         pain = float(pain)
         dopamine = float(dopamine)
-        memories = self.memories_for([current, next_node])
+        memories = self.memories_for(
+            [current, next_node] + current_features + next_features
+        )
         created_memory = None
         if pain > 0.0 and not memories:
             created_memory = self._new_memory()
@@ -370,7 +389,13 @@ class NodeRuntime:
                 self.graph.add_membership(
                     created_memory, edge.edge_node
                 )
-        self._reinforce_memories([current, next_node])
+            for feature_id in dict.fromkeys(
+                current_features + next_features
+            ):
+                self.graph.add_membership(created_memory, feature_id)
+        self._reinforce_memories(
+            [current, next_node] + current_features + next_features
+        )
         extra = [current, next_node]
         if created_memory is not None:
             extra.append(created_memory)
@@ -536,12 +561,17 @@ class NodeRuntime:
         learned = self.pain_signal_from_weights(
             self._neighbor_weights(state)
         )
-        if self.rules.rules:
+        row = state.reshape(1, -1)
+        if self.feature_ids:
             learned = max(
                 learned,
-                float(self.rules.activate(
-                    state.reshape(1, -1)[:, :self.obs_dim]
-                )[0]),
+                float(self._feature_risk_batch(row)[0]),
+                float(self._feature_memory_risk_batch(row)[0]),
+            )
+        elif self.rules.rules:
+            learned = max(
+                learned,
+                float(self.rules.activate(row[:, :self.obs_dim])[0]),
             )
         return learned
 
@@ -570,7 +600,12 @@ class NodeRuntime:
                         memory_id
                     )
                 result[row] = weighted / total if total > 0.0 else 0.0
-        if self.rules.rules:
+        if self.feature_ids:
+            result = np.maximum(result, self._feature_risk_batch(states))
+            result = np.maximum(
+                result, self._feature_memory_risk_batch(states)
+            )
+        elif self.rules.rules:
             rule_risk = self.rules.activate(states[:, :self.obs_dim])
             result = np.maximum(result, rule_risk)
         return result
@@ -720,6 +755,7 @@ class NodeRuntime:
         state = self.encode(observation)
         node_id = self._assign(state, create=False, count=False)
         sources = self.components.active_sign_nodes(node_id)
+        sources = sources + self._active_feature_ids(state)
         signature = self._signature(node_id)
         return node_id, self._score_actions(
             node_id, state, sources=sources, signature=signature
@@ -730,6 +766,7 @@ class NodeRuntime:
         node_id = self._assign(state, create=True, count=True)
         self._component_step(node_id)
         sources = self.components.active_sign_nodes(node_id)
+        sources = sources + self._active_feature_ids(state)
         signature = self._signature(node_id)
         scores = self._score_actions(
             node_id, state, sources=sources, signature=signature
@@ -845,10 +882,19 @@ class NodeRuntime:
 
         next_state = self.encode(observation)
         next_node = self._assign(next_state, create=True, count=True)
+        current_features = (
+            self._active_feature_ids(self.last_state)
+            if self.last_state is not None else []
+        )
+        next_features = self._active_feature_ids(next_state)
+        self._activate_features(next_features)
         self._interact(
             self.last_node, next_node,
             float(valence[1]), float(valence[0]),
+            current_features=current_features,
+            next_features=next_features,
         )
+        self._update_feature_pain(next_features, float(valence[1]))
         pain = float(valence[1])
         dopamine = float(valence[0])
         next_value = self.graph.nodes[next_node]
@@ -901,14 +947,25 @@ class NodeRuntime:
         state = self.encode(observation)
         current = self._assign(state, create=True, count=True)
         self._component_step(current)
-        sources = [current] + self.components.active_sign_nodes(current)
+        current_features = self._active_feature_ids(state)
+        self._activate_features(current_features)
+        sources = (
+            [current]
+            + self.components.active_sign_nodes(current)
+            + current_features
+        )
         signature = self._signature(current)
         self.pending.append(action)
         next_state = self.encode(next_observation)
         next_node = self._assign(next_state, create=True, count=True)
+        next_features = self._active_feature_ids(next_state)
+        self._activate_features(next_features)
         self._interact(
-            current, next_node, float(valence[1]), float(valence[0])
+            current, next_node, float(valence[1]), float(valence[0]),
+            current_features=current_features,
+            next_features=next_features,
         )
+        self._update_feature_pain(next_features, float(valence[1]))
         pain = float(valence[1])
         dopamine = float(valence[0])
         next_value = self.graph.nodes[next_node]
@@ -948,15 +1005,26 @@ class NodeRuntime:
             state = self.encode(row["obs"])
             current = self._assign(state, create=True, count=True)
             self._component_step(current)
-            sources = [current] + self.components.active_sign_nodes(current)
+            current_features = self._active_feature_ids(state)
+            self._activate_features(current_features)
+            sources = (
+                [current]
+                + self.components.active_sign_nodes(current)
+                + current_features
+            )
             signature = self._signature(current)
             self.pending.append(action)
             next_state = self.encode(row["next_obs"])
             next_node = self._assign(next_state, create=True, count=True)
+            next_features = self._active_feature_ids(next_state)
+            self._activate_features(next_features)
             self._interact(
                 current, next_node,
                 float(signals[1]), float(signals[0]),
+                current_features=current_features,
+                next_features=next_features,
             )
+            self._update_feature_pain(next_features, float(signals[1]))
             entered = self.graph.nodes[next_node]
             entered.immediate_pain += self.alpha_now * (
                 signals[1] - entered.immediate_pain
@@ -1037,6 +1105,105 @@ class NodeRuntime:
             train_states[:, :self.obs_dim], train_pain,
             test_obs, test_pain,
         )
+
+    def install_feature_rules(self, rules=None) -> List[str]:
+        """Materialize induced rules as graph nodes.
+
+        A feature node stores its predicate, its learned P(pain | feature) in
+        ``value`` and its observation count in ``count``.  It is activated by
+        evaluating the predicate on the current observation, so the same node
+        is shared by every state that satisfies it.
+        """
+        rules = self.rules.rules if rules is None else list(rules)
+        for rule in rules:
+            spec = feature_state(rule.feature)
+            key = json.dumps(spec, sort_keys=True)
+            if key in self._feature_keys:
+                node = self.graph.nodes[self._feature_keys[key]]
+                node.value = float(rule.confidence)
+                node.count = max(node.count, int(rule.support))
+                continue
+            self._feature_counter += 1
+            node_id = self.graph.add_node(
+                CONCEPT, "feature_%d" % self._feature_counter,
+                role="feature", predicate=spec,
+            )
+            node = self.graph.nodes[node_id]
+            node.value = float(rule.confidence)
+            node.count = int(rule.support)
+            node.beta = self.graph_rate
+            self.feature_ids.append(node_id)
+            self._feature_objects[node_id] = rule.feature
+            self._feature_keys[key] = node_id
+        return list(self.feature_ids)
+
+    def _active_feature_ids(self, state) -> List[str]:
+        if not self.feature_ids:
+            return []
+        obs = np.asarray(state, dtype=float).reshape(-1)[:self.obs_dim]
+        row = obs.reshape(1, -1)
+        return [
+            node_id for node_id in self.feature_ids
+            if node_id in self._feature_objects
+            and bool(self._feature_objects[node_id].mask(row)[0])
+        ]
+
+    def _update_feature_pain(self, feature_ids, pain: float) -> None:
+        pain = float(pain)
+        for node_id in feature_ids:
+            node = self.graph.nodes.get(node_id)
+            if node is None:
+                continue
+            node.value += self.feature_rate * (pain - node.value)
+            node.count += 1
+
+    def _activate_features(self, feature_ids) -> None:
+        active = set(feature_ids)
+        for node_id in self.feature_ids:
+            node = self.graph.nodes.get(node_id)
+            if node is not None:
+                node.activate(1.0 if node_id in active else 0.0)
+
+    def _feature_risk_batch(self, states: np.ndarray) -> np.ndarray:
+        states = np.asarray(states, dtype=float)
+        result = np.zeros(len(states), dtype=float)
+        if not self.feature_ids:
+            return result
+        obs = states[:, :self.obs_dim]
+        for node_id in self.feature_ids:
+            feature = self._feature_objects.get(node_id)
+            node = self.graph.nodes.get(node_id)
+            if feature is None or node is None:
+                continue
+            result = np.maximum(
+                result, float(node.value) * feature.mask(obs)
+            )
+        return result
+
+    def _feature_memory_risk_batch(self, states: np.ndarray) -> np.ndarray:
+        states = np.asarray(states, dtype=float)
+        result = np.zeros(len(states), dtype=float)
+        if not self.feature_ids:
+            return result
+        for row, state in enumerate(states):
+            feature_ids = self._active_feature_ids(state)
+            if not feature_ids:
+                continue
+            total = 0.0
+            weighted = 0.0
+            for memory_id, strength in self.memories_for(
+                feature_ids
+            ).items():
+                memory = self.graph.nodes.get(memory_id)
+                if memory is None or memory.kind != MEMORY:
+                    continue
+                total += float(strength)
+                weighted += float(strength) * (
+                    memory.value + memory.immediate_pain
+                )
+            if total > 0.0:
+                result[row] = weighted / total
+        return result
 
     # ---- analysis ----------------------------------------------------------
     def _soft_weights_batch(self, states: np.ndarray):
@@ -1255,6 +1422,7 @@ class NodeRuntime:
             ),
             prototypes=len(self._prototype_ids),
             rules=len(self.rules.rules),
+            features=len(self.feature_ids),
             components=len(self.components.specs),
             component_states=sum(
                 node.role == "component_state"

@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from node_features import Composite, FeatureRuleBank, Primitive
+from node_graph import CONCEPT, NodeGraph
 from node_runtime import NodeRuntime
 
 
@@ -51,6 +52,56 @@ class FeatureRuleTests(unittest.TestCase):
         states = np.asarray([[0.0, 0.5], [0.5, 0.0]])
         risk = runtime.pain_signal_batch(states)
         self.assertGreater(risk[0], risk[1])
+
+    def test_feature_node_predicate_survives_serialization(self):
+        graph = NodeGraph()
+        predicate = {
+            "kind": "composite", "op": "and",
+            "children": [
+                {"kind": "primitive", "dim": 0, "magnitude": True,
+                 "op": "<", "threshold": 0.1},
+                {"kind": "primitive", "dim": 1, "magnitude": False,
+                 "op": ">", "threshold": 0.2},
+            ],
+        }
+        node_id = graph.add_node(
+            CONCEPT, "feature_test", role="feature",
+            predicate=predicate,
+        )
+        restored = NodeGraph.from_state(graph.to_state())
+        self.assertEqual(restored.nodes[node_id].predicate, predicate)
+        self.assertEqual(restored.nodes[node_id].role, "feature")
+
+    def test_feature_nodes_join_memory_and_action_edges(self):
+        rng = np.random.RandomState(13)
+        x = rng.uniform(-1.0, 1.0, (1200, 2))
+        y = (
+            (np.abs(x[:, 0]) < 0.08) & (np.abs(x[:, 1]) > 0.30)
+        ).astype(float)
+        runtime = NodeRuntime(
+            obs_dim=2, lag=0, scales=np.ones(2),
+            birth_threshold=0.01, max_nodes=10, exploration=0.0,
+        )
+        runtime.induce_rules(x[:900], y[:900], x[900:], y[900:])
+        runtime.install_feature_rules()
+        self.assertTrue(runtime.feature_ids)
+        state = np.asarray([0.0, 0.5])
+        active = runtime._active_feature_ids(state)
+        self.assertTrue(active)
+        feature_id = active[0]
+
+        runtime.learn_transition(
+            state, 0, np.asarray([0.5, 0.0]), [0.0, 1.0]
+        )
+        edges = runtime.graph.action_edges_from(feature_id, 0)
+        self.assertTrue(edges)
+        memories = runtime.memories_for([feature_id])
+        self.assertTrue(memories)
+        memory_id = next(iter(memories))
+        self.assertIn(feature_id, runtime.graph.nodes[memory_id].members)
+        self.assertGreater(
+            runtime.pain_signal_batch(state.reshape(1, -1))[0], 0.0
+        )
 
 
 if __name__ == "__main__":
