@@ -52,7 +52,7 @@ def _death_type(observation, died, reached_cap):
 def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
           epochs=10, max_nodes=5000, birth_threshold=0.45,
           components=(), component_min_count=8, max_components=128,
-          component_gating=False):
+          component_gating=False, pain_horizon=None):
     world, agent = fit(
         seed, steps=steps, coverage=coverage, max_nodes=max_nodes,
         birth_threshold=birth_threshold, epochs=epochs,
@@ -60,6 +60,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
         component_min_count=component_min_count,
         max_components=max_components,
         component_gating=component_gating,
+        pain_horizon=pain_horizon,
     )
     # The same deterministic transitions `fit` trained on; used only to
     # measure whether both actions exist near the planner states.
@@ -398,6 +399,8 @@ def main():
     parser.add_argument("--component-min-count", type=int, default=8)
     parser.add_argument("--max-components", type=int, default=128)
     parser.add_argument("--component-gating", action="store_true")
+    parser.add_argument("--pain-horizon", type=int, default=0,
+                        help="precursor label window; 0 uses the default")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset matching substrate_nodes")
     args = parser.parse_args()
@@ -417,6 +420,7 @@ def main():
         component_min_count=args.component_min_count,
         max_components=args.max_components,
         component_gating=args.component_gating,
+        pain_horizon=(args.pain_horizon or None),
     )
 
 

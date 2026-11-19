@@ -3,6 +3,7 @@ from pathlib import Path
 
 import numpy as np
 
+from node_features import FeatureRuleBank
 from node_graph import MEMBERSHIP
 from node_runtime import NodeRuntime
 from substrate_nodes import run_seed
@@ -151,7 +152,7 @@ class NodeRuntimeTests(unittest.TestCase):
 
     def test_smoke_run_on_flappy_signals(self):
         row = run_seed((100, 100, 0.1, 100, 200, 0.45, 6, 1, 3,
-                        (), 8, 0, 0.5, False, 0.1, 0.0, True, True))
+                        (), 8, 0, 0.5, False, 0.1, 0.0, True, True, 0))
         self.assertGreater(row["frames"], 0)
         self.assertGreaterEqual(row["graph"]["nodes"], 1)
         self.assertGreaterEqual(row["graph"]["action_edges"], 1)
@@ -357,6 +358,60 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertLess(separated[0], prior_value)
         self.assertGreater(separated[1], prior_value)
         self.assertGreater(separated[1], separated[0])
+
+    def test_feature_windows_are_per_node(self):
+        from node_features import FeatureRule, Primitive
+        from node_graph import NodeGraph
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        short = FeatureRule(
+            Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+        )
+        long_rule = FeatureRule(
+            Primitive(0, False, "<", 2.5), 5, 4, 0.8, 2, 2, 1.0, 0.75
+        )
+        runtime.rules.rules = [short]
+        runtime.install_feature_rules()
+        short_id = runtime.feature_ids[0]
+        runtime.rules_long = FeatureRuleBank()
+        runtime.rules_long.rules = [long_rule]
+        runtime.install_feature_rules([long_rule], horizon=3)
+        long_id = runtime.feature_ids[1]
+        self.assertIsNone(runtime.graph.nodes[short_id].pain_horizon)
+        self.assertEqual(runtime.graph.nodes[long_id].pain_horizon, 3)
+        restored = NodeGraph.from_state(runtime.graph.to_state())
+        self.assertIsNone(restored.nodes[short_id].pain_horizon)
+        self.assertEqual(restored.nodes[long_id].pain_horizon, 3)
+
+        rows = [
+            dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
+                history=np.asarray([1.0, 0.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([1.0]), next_obs=np.asarray([2.0]),
+                history=np.asarray([0.0, 1.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([2.0]), next_obs=np.asarray([3.0]),
+                history=np.asarray([1.0, 0.0]),
+                signals=np.asarray([1.0, 1.0]), done=True, episode=0,
+            ),
+        ]
+        runtime.learn_episode(rows)
+        # The default (lag+1 = 2) window misses the death at the third
+        # entered state for row 0, so the short root moves down; the 3-step
+        # window sees it, so the long root moves up.
+        self.assertLess(
+            runtime.graph.nodes[short_id].value, 5.0 / 7.0
+        )
+        self.assertGreater(
+            runtime.graph.nodes[long_id].value, 5.0 / 7.0
+        )
 
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()

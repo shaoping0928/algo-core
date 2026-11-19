@@ -63,6 +63,7 @@ class Node:
     component_id: Optional[str] = None
     sign: int = 0
     predicate: Optional[dict] = None
+    pain_horizon: Optional[int] = None
 
     def activate(self, value: float) -> float:
         self.activation = float(value)
@@ -432,6 +433,7 @@ class NodeGraph:
                     component_id=node.component_id,
                     sign=node.sign,
                     predicate=node.predicate,
+                    pain_horizon=node.pain_horizon,
                 )
                 for node in self.nodes.values()
             ],
@@ -503,6 +505,10 @@ class NodeGraph:
                 component_id=data.get("component_id"),
                 sign=int(data.get("sign", 0)),
                 predicate=data.get("predicate"),
+                pain_horizon=(
+                    int(data["pain_horizon"])
+                    if data.get("pain_horizon") is not None else None
+                ),
             )
             graph.nodes[node.id] = node
             graph.outgoing[node.id] = []

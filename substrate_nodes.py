@@ -18,6 +18,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import numpy as np
 
 from latent_world import SEEDS, latent
+from node_features import FeatureRuleBank
 from node_runtime import NodeRuntime, future_pain_labels
 from substrate_generic import (
     LinearObservationModel,
@@ -37,7 +38,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         max_components=128, component_weight=0.5,
         component_gating=False, memory_weight=0.1,
         association_rate=0.0, induce_features=True,
-        precursor_labels=True):
+        precursor_labels=True, pain_horizon=None):
     if steps < 1:
         raise ValueError("steps must be positive")
     if not 0.0 <= coverage <= 1.0:
@@ -83,6 +84,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         component_gating=component_gating,
         memory_weight=memory_weight,
         association_rate=association_rate,
+        pain_horizon=pain_horizon,
     )
     episodes = {}
     for row in transitions:
@@ -91,20 +93,34 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
 
     # Rules are induced after the first pass, then materialized as feature
     # nodes.  Precursor labels let a rule describe the *current* state and
-    # predict pain within `lag + 1` steps, so it can fire while the action
-    # can still change the outcome.  Later epochs train transitions, action
-    # edges and memories with those feature nodes active, so features take
-    # part in learning rather than only in the final readout.
+    # predict pain within its own window, so it can fire while the action
+    # can still change the outcome.  A short window (default `lag + 1`)
+    # detects imminent death; a longer optional window gives the approach
+    # phase positive coverage.  Both banks are installed and every root
+    # trains with its own window's labels.  Later epochs train transitions,
+    # action edges and memories with those feature nodes active, so features
+    # take part in learning rather than only in the final readout.
+    long_window = None
     if precursor_labels:
+        window = int(pain_horizon) if pain_horizon else lag + 1
+        long_window = window if window != lag + 1 else None
         states = np.asarray(
             [row["obs"] for row in transitions], dtype=float
         ) / scales[:obs_dim]
         pain = np.asarray(
-            future_pain_labels(transitions, lag + 1), dtype=float
+            future_pain_labels(transitions, window), dtype=float
         )
+        if long_window is not None:
+            pain_short = np.asarray(
+                future_pain_labels(transitions, lag + 1), dtype=float
+            )
+        else:
+            pain_short = pain
     else:
         # Pre-precursor behavior: rules on the entered state with its own
         # pain label.
+        long_window = None
+        pain_short = None
         states = np.asarray(
             [row["next_obs"] for row in transitions], dtype=float
         ) / scales[:obs_dim]
@@ -124,10 +140,18 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         for episode in ordered:
             agent.learn_episode(episode)
         if induce_features and epoch == 0:
+            primary = pain_short if long_window is not None else pain
             agent.induce_rules(
-                states[train], pain[train], states[test], pain[test]
+                states[train], primary[train], states[test], primary[test]
             )
             agent.install_feature_rules()
+            if long_window is not None:
+                bank = FeatureRuleBank()
+                bank.induce(
+                    states[train], pain[train], states[test], pain[test]
+                )
+                agent.rules_long = bank
+                agent.install_feature_rules(bank.rules, horizon=long_window)
     return world, agent
 
 
@@ -265,7 +289,8 @@ def run_seed(task):
     (seed, steps, coverage, cap, max_nodes, birth_threshold, horizon,
      epochs, lag, component_kinds, component_min_count, max_components,
      component_weight, component_gating, memory_weight,
-     association_rate, induce_features, precursor_labels) = task
+     association_rate, induce_features, precursor_labels,
+     pain_horizon) = task
     world, agent = fit(
         seed, steps=steps, coverage=coverage,
         max_nodes=max_nodes, birth_threshold=birth_threshold,
@@ -279,6 +304,7 @@ def run_seed(task):
         association_rate=association_rate,
         induce_features=induce_features,
         precursor_labels=precursor_labels,
+        pain_horizon=(pain_horizon or None),
     )
     frames, actions = evaluate(
         seed, world, agent, cap=cap, horizon=horizon, lag=lag
@@ -319,6 +345,9 @@ def main():
     parser.add_argument("--instant-labels", action="store_true",
                         help="induce rules on the entered state with its own "
                              "pain label instead of precursor labels")
+    parser.add_argument("--pain-horizon", type=int, default=0,
+                        help="precursor label window in entered states; "
+                             "0 uses the default lag + 1")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset: 1500 steps, 3 epochs, "
                              "1000 nodes, 400-frame evaluation")
@@ -349,6 +378,8 @@ def main():
         raise ValueError("--epochs must be positive")
     if args.lag < 0:
         raise ValueError("--lag must be non-negative")
+    if args.pain_horizon < 0:
+        raise ValueError("--pain-horizon must be non-negative")
     if args.component_min_count < 1:
         raise ValueError("--component-min-count must be positive")
     if args.max_components < 0:
@@ -373,7 +404,7 @@ def main():
          args.max_components, args.component_weight,
          args.component_gating, args.memory_weight,
          args.association_rate, not args.no_features,
-         not args.instant_labels)
+         not args.instant_labels, args.pain_horizon)
         for seed in seeds
     ]
     if args.jobs == 1:

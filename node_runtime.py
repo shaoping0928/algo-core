@@ -111,6 +111,7 @@ class NodeRuntime:
         valence_rate: float = 0.2,
         feature_rate: float = 0.05,
         feature_action_prior: float = 2.0,
+        pain_horizon: Optional[int] = None,
         action_temperature: float = 0.1,
         action_uncertainty: float = 0.5,
         seed: int = 0,
@@ -170,6 +171,8 @@ class NodeRuntime:
             raise ValueError("action_temperature must be non-negative")
         if float(feature_action_prior) < 0.0:
             raise ValueError("feature_action_prior must be non-negative")
+        if pain_horizon is not None and int(pain_horizon) < 1:
+            raise ValueError("pain_horizon must be positive")
         if float(action_uncertainty) < 0.0:
             raise ValueError("action_uncertainty must be non-negative")
         actions = tuple(int(action) for action in action_space)
@@ -214,6 +217,12 @@ class NodeRuntime:
         # steps earlier (`history[lag]`), which is also the first pending
         # coordinate of the encoded state at decision time.
         self.feature_action_stats = {}
+        # Precursor label window: how many entered states ahead a pain event
+        # still labels the current state.  Defaults to lag + 1, the first
+        # state an action issued now can physically affect.
+        self.pain_horizon = (
+            int(pain_horizon) if pain_horizon is not None else int(self.lag) + 1
+        )
         self.gated_edges: Dict[
             Tuple[str, Tuple[int, ...], int], Dict[str, dict]
         ] = {}
@@ -252,6 +261,9 @@ class NodeRuntime:
         }
         self.last_action_probs = (1.0, 0.0)
         self.rules = FeatureRuleBank()
+        # Optional second bank induced on a longer precursor window; roots
+        # installed from it carry their own `pain_horizon` tag.
+        self.rules_long = None
         self.feature_ids: List[str] = []
         self._feature_all: List[str] = []
         self._feature_objects: Dict[str, object] = {}
@@ -1119,10 +1131,16 @@ class NodeRuntime:
             return
         self.reset()
         # Precursor labels: a feature on the *current* state is trained to
-        # predict pain within `lag + 1` entered states, so it can fire while
-        # the action can still change the outcome.  `lag + 1` is the first
-        # state an action issued now can physically affect.
-        labels = future_pain_labels(rows, self.lag + 1)
+        # predict pain within its own window (`pain_horizon`, default
+        # `lag + 1`), so it can fire while the action can still change the
+        # outcome.  Roots installed from a longer-window bank carry their
+        # own horizon and get that window's labels.
+        horizons = {self._node_horizon(fid) for fid in self.feature_ids}
+        horizons.add(self.pain_horizon)
+        labels_by_horizon = {
+            horizon: future_pain_labels(rows, horizon)
+            for horizon in sorted(horizons)
+        }
         steps = []
         for index, row in enumerate(rows):
             action = int(row["history"][0])
@@ -1162,18 +1180,27 @@ class NodeRuntime:
                 current_features=current_features,
                 next_features=next_features,
             )
-            self._update_feature_pain(current_active, labels[index])
+            active_by_horizon = {}
+            for fid in current_active:
+                active_by_horizon.setdefault(
+                    self._node_horizon(fid), []
+                ).append(fid)
+            for horizon, horizon_ids in active_by_horizon.items():
+                self._update_feature_pain(
+                    horizon_ids, labels_by_horizon[horizon][index]
+                )
             # Action-conditioned statistics: the action acting on the
             # transition s_m -> s_{m+1} was issued `lag` steps earlier
             # (`history[lag]`) and is what the search controls per plan.
             history_row = np.asarray(row["history"], dtype=float).reshape(-1)
             if history_row.size > self.lag:
                 acting = int(round(float(history_row[self.lag])))
-                self._update_feature_action(
-                    [fid for fid in current_active if fid in self.feature_ids],
-                    acting,
-                    labels[index],
-                )
+                for horizon, horizon_ids in active_by_horizon.items():
+                    self._update_feature_action(
+                        horizon_ids,
+                        acting,
+                        labels_by_horizon[horizon][index],
+                    )
             entered = self.graph.nodes[next_node]
             entered.immediate_pain += self.alpha_now * (
                 signals[1] - entered.immediate_pain
@@ -1287,12 +1314,15 @@ class NodeRuntime:
             self._feature_children[node_id] = child_ids
         return node_id
 
-    def install_feature_rules(self, rules=None) -> List[str]:
+    def install_feature_rules(self, rules=None,
+                              horizon: Optional[int] = None) -> List[str]:
         """Materialize induced rules as a shared feature graph.
 
         Primitive and composite nodes are shared by every rule that uses the
         same sub-feature; derivation edges point from a composite to its
-        children.  Root nodes keep the learned P(pain | feature) in ``value``.
+        children.  Root nodes keep the learned P(pain | feature) in ``value``
+        and, when `horizon` is given, the precursor window their value and
+        action cells are trained with.
         """
         rules = self.rules.rules if rules is None else list(rules)
         for rule in rules:
@@ -1303,9 +1333,18 @@ class NodeRuntime:
             prior = (float(rule.hits) + 1.0) / (float(rule.support) + 2.0)
             node.value = max(float(node.value), prior)
             node.count = max(node.count, int(rule.support))
+            node.pain_horizon = (
+                int(horizon) if horizon is not None else None
+            )
             if node_id not in self.feature_ids:
                 self.feature_ids.append(node_id)
         return list(self.feature_ids)
+
+    def _node_horizon(self, node_id: str) -> int:
+        node = self.graph.nodes.get(node_id)
+        if node is not None and node.pain_horizon is not None:
+            return int(node.pain_horizon)
+        return self.pain_horizon
 
     def _active_feature_ids(self, state) -> List[str]:
         if not self._feature_all:
