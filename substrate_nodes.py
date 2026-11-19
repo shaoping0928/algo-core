@@ -1,12 +1,12 @@
-"""Node-centric planning on Flappy using only signals, not task rules.
+﻿"""Node-centric planning on Flappy using only signals, not task rules.
 
 The runtime receives:
 
     observation, action, valence (dopamine/pain), episode boundary
 
-It never reads pipes, gap centres, BIRD_X, GAP, a collision window, or a
-`terminal` risk label.  A learned observation model predicts candidate
-trajectories; the node runtime supplies the learned valence of their endpoints.
+It never reads task geometry, a collision window, or a `terminal` risk label.
+A learned observation model predicts candidate trajectories; the node runtime
+supplies the learned valence of their endpoints.
 The node graph itself is trained from real transitions with TD(lambda) credit
 assignment and action-conditioned edges.
 """
@@ -20,7 +20,6 @@ import numpy as np
 from latent_world import SEEDS, latent
 from node_runtime import NodeRuntime
 from substrate_generic import (
-    ACTION_DIM,
     LinearObservationModel,
     collect,
     history_features,
@@ -28,34 +27,46 @@ from substrate_generic import (
 from trajectory_search import exhaustive_search
 
 LAG = 3
-OBS_DIM = 6
-SCALES = np.asarray([0.5, 0.5, 0.8, 0.5, 0.8, 0.5] + [1.0] * LAG)
 DEFAULT_JOBS = min(8, os.cpu_count() or 1)
 FREE_THREADED = not getattr(sys, "_is_gil_enabled", lambda: True)()
 
 
 def fit(seed, steps=5000, coverage=0.1, max_nodes=2000,
-        birth_threshold=0.45, epochs=5):
+        birth_threshold=0.45, epochs=5, lag=LAG):
     if steps < 1:
         raise ValueError("steps must be positive")
     if not 0.0 <= coverage <= 1.0:
         raise ValueError("coverage must be in [0, 1]")
     if epochs < 1:
         raise ValueError("epochs must be positive")
-    transitions, _counts = collect(seed, steps, coverage=coverage)
+    if int(lag) < 0:
+        raise ValueError("lag must be non-negative")
+    lag = int(lag)
+    transitions, _counts = collect(
+        seed, steps, coverage=coverage, lag=lag
+    )
     if not transitions:
         raise ValueError("collection produced no transitions")
-    world = LinearObservationModel(
-        len(transitions[0]["obs"]), ACTION_DIM
-    ).fit(
+    obs_dim = len(transitions[0]["obs"])
+    action_dim = lag + 1
+    world = LinearObservationModel(obs_dim, action_dim).fit(
         [row["obs"] for row in transitions],
         [row["history"] for row in transitions],
         [row["next_obs"] for row in transitions],
     )
+    observations = np.asarray(
+        [row["obs"] for row in transitions], dtype=float
+    )
+    # Scale only from observed state spread; no task-specific constants.
+    observation_scale = observations.std(axis=0)
+    observation_scale = np.where(
+        observation_scale > 1e-8, observation_scale, 1.0
+    )
+    scales = np.concatenate([observation_scale, np.ones(lag, dtype=float)])
     agent = NodeRuntime(
-        obs_dim=OBS_DIM, action_space=(0, 1), lag=LAG,
+        obs_dim=obs_dim, action_space=(0, 1), lag=lag,
         birth_threshold=birth_threshold, max_nodes=max_nodes,
-        exploration=0.0, seed=seed, scales=SCALES,
+        exploration=0.0, seed=seed, scales=scales,
     )
     episodes = {}
     for row in transitions:
@@ -67,19 +78,24 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=2000,
     return world, agent
 
 
-def policy_action(env, world, agent, prefix, horizon):
+def policy_action(env, world, agent, prefix, horizon, lag=LAG):
     initial = np.asarray(env.obs(), dtype=float)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
+    action_dim = int(lag) + 1
 
     def predict_batch(states, sequences, step):
-        history = history_features(sequences, step + 1, pending_prefix)
+        history = history_features(
+            sequences, step + 1, pending_prefix, action_dim=action_dim
+        )
         return world.predict(states, history)
 
     def evaluate_step(states, sequences, step):
         return np.zeros((len(states), 2)), np.isfinite(states).all(axis=1)
 
     def evaluate_terminal(states, sequences):
-        history = history_features(sequences, horizon, pending_prefix)
+        history = history_features(
+            sequences, horizon, pending_prefix, action_dim=action_dim
+        )
         # `history` is newest-first; the node state stores pending actions
         # oldest-first and only the last `lag` actions remain pending.
         pending = history[:, :agent.lag][:, ::-1]
@@ -102,16 +118,19 @@ def policy_action(env, world, agent, prefix, horizon):
     return int(result.actions[0])
 
 
-def evaluate(seed, world, agent, cap=6000, horizon=10):
+def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG):
     if cap < 1:
         raise ValueError("cap must be positive")
     if horizon < 1:
         raise ValueError("horizon must be positive")
-    env = latent[LAG](seed)
-    prefix = np.zeros(LAG, dtype=float)
+    lag = int(lag)
+    env = latent[lag](seed)
+    prefix = np.zeros(lag, dtype=float)
     actions = []
     while not env.dead and env.t < cap:
-        action = policy_action(env, world, agent, prefix, horizon)
+        action = policy_action(
+            env, world, agent, prefix, horizon, lag=lag
+        )
         actions.append(action)
         prefix = np.concatenate([[float(action)], prefix[:-1]])
         env.step(action)
@@ -120,14 +139,14 @@ def evaluate(seed, world, agent, cap=6000, horizon=10):
 
 def run_seed(task):
     (seed, steps, coverage, cap, max_nodes, birth_threshold, horizon,
-     epochs) = task
+     epochs, lag) = task
     world, agent = fit(
         seed, steps=steps, coverage=coverage,
         max_nodes=max_nodes, birth_threshold=birth_threshold,
-        epochs=epochs,
+        epochs=epochs, lag=lag,
     )
     frames, actions = evaluate(
-        seed, world, agent, cap=cap, horizon=horizon
+        seed, world, agent, cap=cap, horizon=horizon, lag=lag
     )
     return dict(
         seed=seed,
@@ -151,6 +170,7 @@ def main():
     parser.add_argument("--max-nodes", type=int, default=2000)
     parser.add_argument("--birth-threshold", type=float, default=0.45)
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--lag", type=int, default=LAG)
     args = parser.parse_args()
     if args.jobs < 1:
         raise ValueError("--jobs must be positive")
@@ -170,13 +190,16 @@ def main():
         raise ValueError("--birth-threshold must be positive")
     if args.epochs < 1:
         raise ValueError("--epochs must be positive")
+    if args.lag < 0:
+        raise ValueError("--lag must be non-negative")
 
     seeds = [seed for seed in SEEDS if seed >= args.seed][:args.seeds]
     if len(seeds) < args.seeds:
         seeds = list(range(args.seed, args.seed + args.seeds))
     tasks = [
         (seed, args.steps, args.coverage, args.cap,
-         args.max_nodes, args.birth_threshold, args.horizon, args.epochs)
+         args.max_nodes, args.birth_threshold, args.horizon, args.epochs,
+         args.lag)
         for seed in seeds
     ]
     if args.jobs == 1:

@@ -1,4 +1,5 @@
-import unittest
+﻿import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -64,19 +65,19 @@ class NodeRuntimeTests(unittest.TestCase):
             dict(
                 obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
                 history=np.asarray([0.0, 0.0, 0.0, 0.0]),
-                signals=np.asarray([1.0, 0.0]), terminal=False,
+                signals=np.asarray([1.0, 0.0]), done=False,
                 episode=0,
             ),
             dict(
                 obs=np.asarray([1.0]), next_obs=np.asarray([2.0]),
                 history=np.asarray([0.0, 0.0, 0.0, 0.0]),
-                signals=np.asarray([1.0, 0.0]), terminal=False,
+                signals=np.asarray([1.0, 0.0]), done=False,
                 episode=0,
             ),
             dict(
                 obs=np.asarray([2.0]), next_obs=np.asarray([3.0]),
                 history=np.asarray([0.0, 0.0, 0.0, 0.0]),
-                signals=np.asarray([0.0, 1.0]), terminal=True,
+                signals=np.asarray([0.0, 1.0]), done=True,
                 episode=0,
             ),
         ]
@@ -114,10 +115,27 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(runtime.node_value(np.asarray([0.0])), 0.0)
 
     def test_smoke_run_on_flappy_signals(self):
-        row = run_seed((100, 100, 0.1, 100, 200, 0.45, 6, 1))
+        row = run_seed((100, 100, 0.1, 100, 200, 0.45, 6, 1, 3))
         self.assertGreater(row["frames"], 0)
         self.assertGreaterEqual(row["graph"]["nodes"], 1)
         self.assertGreaterEqual(row["graph"]["action_edges"], 1)
+
+    def test_core_does_not_embed_task_geometry(self):
+        root = Path(__file__).resolve().parents[1]
+        forbidden = (
+            "BIRD_X", "GAP", "pipes", "target_gap", "near_pipe",
+            "crossing", "TerminalRiskHead", "latent_world", "flappy",
+        )
+        for name in ("node_runtime.py", "node_graph.py"):
+            text = (root / name).read_text(encoding="utf-8")
+            for token in forbidden:
+                self.assertNotIn(token, text, "%s in %s" % (token, name))
+        adapter = (root / "substrate_nodes.py").read_text(encoding="utf-8")
+        for token in (
+            "BIRD_X", "GAP", "pipes", "target_gap", "near_pipe",
+            "crossing", "TerminalRiskHead",
+        ):
+            self.assertNotIn(token, adapter, "%s in substrate_nodes.py" % token)
 
 
 if __name__ == "__main__":

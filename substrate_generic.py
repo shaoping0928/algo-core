@@ -94,12 +94,12 @@ class LinearObservationModel:
         return self._features(observations, histories) @ self.weights
 
 
-def history_features(sequences, steps, prefix):
+def history_features(sequences, steps, prefix, action_dim=ACTION_DIM):
     """Newest action first; fill the pre-plan prefix for early rollout steps."""
     sequences = np.asarray(sequences, dtype=float)
     prefix = np.asarray(prefix, dtype=float).reshape(-1)
-    result = np.zeros((len(sequences), ACTION_DIM), dtype=float)
-    for offset in range(ACTION_DIM):
+    result = np.zeros((len(sequences), int(action_dim)), dtype=float)
+    for offset in range(int(action_dim)):
         index = steps - 1 - offset
         if index >= 0:
             result[:, offset] = sequences[:, index]
@@ -108,7 +108,7 @@ def history_features(sequences, steps, prefix):
     return result
 
 
-def collect(seed, steps=PRACTICE, coverage=0.0):
+def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG):
     """Collect real transitions using only observation/action/feedback."""
     lp = LayerPair(k_max=8)
     rng = np.random.RandomState(seed * 10000)
@@ -116,7 +116,7 @@ def collect(seed, steps=PRACTICE, coverage=0.0):
     action_counts = {}
     done = episode = 0
     while done < steps:
-        env = latent[LAG](seed * 10000 + episode)
+        env = latent[int(lag)](seed * 10000 + episode)
         lp.hist = [0.0] * 8
         while not env.dead and done < steps:
             gains = np.abs(lp.h)
@@ -143,7 +143,7 @@ def collect(seed, steps=PRACTICE, coverage=0.0):
             key = tuple(np.round(obs, 1))
             action_counts.setdefault(key, [0, 0])[action] += 1
             vy0 = env.vy
-            history = np.asarray([action] + lp.hist[:LAG], dtype=float)
+            history = np.asarray([action] + lp.hist[:int(lag)], dtype=float)
             env.step(action)
             next_obs = np.asarray(env.obs(), dtype=float)
             feedback = env.feedback()
@@ -154,6 +154,7 @@ def collect(seed, steps=PRACTICE, coverage=0.0):
             transitions.append(dict(
                 obs=obs, next_obs=next_obs, history=history,
                 signals=signals, terminal=bool(env.dead),
+                done=bool(env.dead),
                 episode=episode,
             ))
             done += 1

@@ -408,8 +408,8 @@ class NodeRuntime:
         """Monte-Carlo node/edge values for one real episode.
 
         `rows` are transition dicts with ``obs``, ``next_obs``, ``history``,
-        ``signals`` and ``terminal``.  Values are accumulated backward from the
-        world's pain signal; no `terminal` risk label is used.
+        ``signals`` and ``done`` (an episode boundary, not a risk label).
+        Values are accumulated backward from the world's pain signal.
         """
         rows = list(rows)
         if not rows:
@@ -423,6 +423,7 @@ class NodeRuntime:
             signals = np.asarray(row["signals"], dtype=float).reshape(-1)
             if signals.shape != (2,) or not np.isfinite(signals).all():
                 raise ValueError("signals must contain finite valence")
+            done = bool(row["done"])
             state = self.encode(row["obs"])
             current = self._assign(state, create=True, count=True)
             self.pending.append(action)
@@ -439,9 +440,9 @@ class NodeRuntime:
             )
             steps.append((
                 current, action, next_node, float(signals[1]),
-                float(signals[0]), bool(row["terminal"]),
+                float(signals[0]), done,
             ))
-            if row["terminal"]:
+            if done:
                 self.reset()
 
         running_pain = 0.0
