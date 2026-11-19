@@ -121,8 +121,10 @@
   按覆盖尚未解释的 pain 事件选规则，held-out episode 验证。
 - [x] 规则在 epoch 0 后安装成 `role="feature"` 图节点：每步评估谓词并激活，节点保存
   `P(pain|feature)`；特征作为 action edge source 参与转移学习；memory 成员包含活跃特征，
-  可按特征召回；沙盒预测状态直接算特征风险。fast 8 种子 123.0 帧，关闭特征层 94.6；
-  seed 100 312 vs 113。
+  可按特征召回；沙盒预测状态直接算特征风险。fast 8 种子 131.6 帧，关闭特征层 94.6；
+  seed 100 312 vs 113，seed 107 152 vs 77。
+- [x] pain 事件会把活跃特征补写进已有 memory（不再只在 memory 创建时写）；fast 23 个
+  memory 中 16 个有 feature 成员，特征召回生效。
 - [x] 发现阶段补强：pain 样本少时自适应 minimum support；episode 交错 held-out；
   pain 阈值外扩 margin；覆盖选择后用未使用坐标/原语补充不同 cause。fast 规模已能选出
   撞管特征 `(|f2|<0.274 & |f3|>0.787)`（train 3/3，test 2/2）和边界特征。
@@ -132,7 +134,7 @@
   阈值原语 + AND/OR 搜索。
 - [ ] 特征生命周期：等价特征合并、低效用/冗余特征剪枝、特征节点预算。fast 规则集里
   仍有很多边界变体，需要压缩。
-- [x] 快速开发协议：1500 步、3 epoch、1000 节点、H=8、cap=400；单种子约 9s，8 种子约 30s。
+- [x] 快速开发协议：1500 步、3 epoch、1000 节点、H=8、cap=400；单种子约 11s，8 种子约 41s。
 - [x] 组件出生改为按节点 valence 方差（相对节点总体 median+std）自适应；低效用组件按
   sign-pain 方差和访问次数剪枝。5000 步 seed 100 自动出生 76 个组件，存活仍 232。
 - [ ] 让 association/transition 结构进一步参与动作选择/信用分配；当前 memory 只以 0.1 权重

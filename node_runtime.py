@@ -395,6 +395,15 @@ class NodeRuntime:
                 current_features + next_features
             ):
                 self.graph.add_membership(created_memory, feature_id)
+        if pain > 0.0:
+            # Features are installed after the first epoch.  Later pain
+            # events reuse the existing memories, so index those memories
+            # with the active features here instead of only at creation.
+            for memory_id in memories:
+                for feature_id in dict.fromkeys(
+                    current_features + next_features
+                ):
+                    self.graph.add_membership(memory_id, feature_id)
         self._reinforce_memories(
             [current, next_node] + current_features + next_features
         )

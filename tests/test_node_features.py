@@ -98,6 +98,26 @@ class FeatureRuleTests(unittest.TestCase):
         self.assertIn(runtime.feature_ids[0], child_ids)
         self.assertEqual(len(runtime._feature_all), len(set(runtime._feature_all)))
 
+    def test_existing_memory_is_indexed_by_features(self):
+        runtime = NodeRuntime(
+            obs_dim=2, lag=0, scales=np.ones(2),
+            birth_threshold=0.01, max_nodes=10, exploration=0.0,
+        )
+        state = np.asarray([0.0, 0.5])
+        next_state = np.asarray([0.5, 0.0])
+        runtime.learn_transition(state, 0, next_state, [0.0, 1.0])
+        rule = FeatureRule(
+            Primitive(0, True, "<", 0.2), 5, 4, 0.8, 2, 2, 1.0, 0.75
+        )
+        runtime.rules.rules = [rule]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        runtime.learn_transition(state, 0, next_state, [0.0, 1.0])
+        memories = runtime.memories_for([feature_id])
+        self.assertTrue(memories)
+        memory_id = next(iter(memories))
+        self.assertIn(feature_id, runtime.graph.nodes[memory_id].members)
+
     def test_feature_nodes_join_memory_and_action_edges(self):
         rng = np.random.RandomState(13)
         x = rng.uniform(-1.0, 1.0, (1200, 2))
