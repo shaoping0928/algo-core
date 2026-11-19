@@ -238,6 +238,25 @@ planner 每轮只记录约 110–800 步，说明小量 on-policy 真实轨迹�
 DAgger 没有把评估世界写进训练集（当前实现使用独立的 offset 世界，不用
 `--eval-seeds` 的世界）。
 
+### 决策消融：cell-Q-only（2026-11）
+
+`--decision cellq` 把决策从 MPC 搜索换成单步读格子：先把世界模型沿 pending
+动作确定性滚 `lag` 步到动作将生效的状态，再在该状态读
+`(feature, action)` 格子，`argmin_a [hazard(s,a) − w·V_f(s,a)]`。
+训练数据与 agent 与搜索臂完全相同，只换决策机制。
+
+fast held-out（hybrid + DAgger，同 8 模型 × 5 世界）：
+
+| 决策 | mean | median | 95% CI | paired vs 搜索 |
+|---|---:|---:|---|---:|
+| 搜索（MPC） | 179.8 | 152.0 | [144.9, 214.0] | — |
+| cellq（单步读格子） | **68.2** | 72.0 | [51.7, 87.0] | **−111.7**（SE 17.1，8/8 同向） |
+
+结论：**MPC 壳不是装饰**。学到的 cell 单独远不足以驱动决策——
+价值/风险读出依赖世界模型把整条 H 步轨迹铺开后逐点打分；
+`Q(s,a)` 格子是搜索的输入，不是策略本身。"决策不读 Q"的审计发现
+因此要修正为"决策读了 cell 的聚合读出，但必须经由轨迹展开"。
+
 脚本会检测 Python 是否启用 GIL：free-threaded 构建使用 `ThreadPoolExecutor`，普通构建使用
 `ProcessPoolExecutor`。当前 `.venv` 是 GIL 构建；本机的 `python3.15t` 存在，但 free-threaded
 numpy wheel 的 `_multiarray_umath` DLL 被应用控制策略阻止，暂时无法在该解释器加载 numpy。

@@ -155,7 +155,7 @@
     价值复利的场。
   - [ ] w 用留出 episodes 校准（`prediction_report` 基础设施已就绪），
     把 w 从拍的变成校准的。
-  - [ ] cell-Q-only 消融：不搜索，直接 `argmax_a V_f(s,a)` + hazard 惩罚，
+  - [x] cell-Q-only 消融：不搜索，直接 `argmax_a V_f(s,a)` + hazard 惩罚，
     测 MPC 壳的真实贡献。
 - [ ] 三套控制器收敛为一个 `ActionPolicy`（collect/eval/node 三模式），`act` 与
   `policy_result` 不再是平行宇宙。
@@ -245,9 +245,22 @@ trace（seed 100）：
     short-window：116.4 → **170.1**，paired +53.7（SE 24.6，2.18 SE），7/8 同向；
     hybrid：134.9 → **179.8**，paired +44.9（SE 23.6，1.90 SE），6/8 同向。
     planner 数据量约 110–800 步/模型/轮，图节点约 1808–2222。`cap=400` 会截断强种子。
+  - [x] cell-Q-only 消融（2026-11，fast held-out，hybrid+DAgger）：
+    同一批训练好的 cell，决策从 MPC 搜索换成单步 `argmin_a [hazard(s,a)
+    − w·V_f(s,a)]` → **68.2 / 72.0**（CI [51.7, 87.0]）vs 搜索 **179.8**；
+    paired **−111.7**（SE 17.1，**8/8 同向下降**）。结论：MPC 壳不是装饰——
+    学到的 cell 单独远不足以驱动决策；价值/风险读出依赖世界模型把整条
+    H 步轨迹铺开后再打分。Q 格子是搜索的输入，不是策略。
   - [ ] full 协议 held-out 复核（hybrid、cap=6000）与 dagger=1 vs 2 的
     轮数消融；同时检查 DAgger 是否把评估轨迹变成训练集导致自评泄漏
     （当前实现用 offset 世界，与 `--eval-seeds` 世界不相交）。
+  - [ ] **跨种子聚合**（2026-11 提出）：fast A/B 显示 DAgger 抬地板
+    （floor≤90 从 18/40→11/40，<100 均值模型 3→1），但弱种子的 planner
+    数据只有 70–80 帧/轮，闭环自举失败（seed 107 held-out 反而下降）。
+    根源是每种子独立训练。候选：一个全局模型吃全部训练种子的
+    行为+planner 数据（观测已按全局 std 标准化，无任务知识），或至少把
+    强种子的 planner 数据并入弱种子训练池做迁移 A/B。这是攻击
+    "种子抽签"的直接路径，排在 B2 之前。
 - **B2 价值通道无专属特征**："对齐接近"（|gap|<0.17 且 dx 适中）是反死亡
   状态，现有特征全部从死亡覆盖归纳，最接近的只有 |f3|<0.007 的细条——
   V_f 在最需要梯度的对齐带上回退 baseline。用高回报覆盖做一次
