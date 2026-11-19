@@ -289,6 +289,9 @@ trace（seed 100）：
 | hybrid (`--pain-horizon 8`), dagger=0 | fast | 40 | 134.9 | 152.0 | 80.8 | [109.4, 160.9] |
 | hybrid, dagger=2 | fast | 40 | **179.8** | 152.0 | 150.2 | [144.9, 214.0] |
 | hybrid, dagger=2, `--stride-includes-lag` | fast | 40 | 183.7 | 152.0 | 97.5 | [135.3, 239.8] |
+| hybrid, dagger=2, `--decision cellq` | fast | 40 | **68.2** | 72.0 | 39.2 | [51.7, 87.0] |
+| hybrid, dagger=2, `--value-horizon 4` | fast | 40 | 162.6 | 152.0 | 156.0 | [118.1, 211.5] |
+| hybrid, dagger=2, `--value-horizon 8` | fast | 40 | 167.1 | 152.0 | 153.8 | [123.4, 214.2] |
 | hybrid, dagger=0 | full | 待填 | | | | |
 | hybrid, dagger=2 | full | 待填 | | | | |
 
@@ -311,6 +314,20 @@ B5 的 `step_stride` 覆盖第一个受影响点：hybrid + DAgger 下
 179.8 / 152.0，paired `+82.0/-33.6/-99.8/-32.2/-112.8/+9.0/+184.6/+33.4`，
 mean **+3.8**、median **−11.6**、SE 34.5（0.11 SE）、4/8 正向。**中性**，
 维持默认关闭；开关保留，等 full 协议复核后再决定是否定案。
+
+cell-Q-only 消融（同 agent，只换决策）：68.2 vs 179.8，paired **−111.7**
+（SE 17.1，8/8 同向）——MPC 壳承重，cell 不是策略（见 B1 条目）。
+
+价值 cell 的 k 步 bootstrap 目标（`--value-horizon 4/8`，vs MC 全 episode）：
+
+```text
+k=4: 162.6 / 152.0  paired -17.3 (SE 27.1)  3正/1零/4负
+k=8: 167.1 / 152.0  paired -12.8 (SE 22.6)  4正/1零/4负
+```
+
+**中性偏负**：截短价值归属没有帮助，反而丢了长时程"对齐有回报"的信号
+（IQR 从 150.2 涨到 ~155，弱种子 104/107 仍弱）。结论：MC episode 归属
+不是价值 cell 的主要瓶颈；短时程 TD 假设在这个读出上不成立。
 
 fast 协议：1500 步、3 epoch、1000 节点、H=8、cap=400。full 协议：5000 步、
 5 epoch、5000 节点、H=10、cap=6000。short-window 指 `--pain-horizon 0`。

@@ -257,6 +257,24 @@ fast held-out（hybrid + DAgger，同 8 模型 × 5 世界）：
 `Q(s,a)` 格子是搜索的输入，不是策略本身。"决策不读 Q"的审计发现
 因此要修正为"决策读了 cell 的聚合读出，但必须经由轨迹展开"。
 
+### 价值 cell 的 k 步目标（2026-11）
+
+`--value-horizon k` 把序列级价值的归属从 MC 全 episode 回报换成
+k 步 bootstrap 目标 `Σ γ^i·dopamine + γ^k·V(s_{t+k})`（bootstrap 取自
+更新前快照，量纲与 MC 对齐）。动机是"短时程信用分配"假设：
+MC 把一个死亡摊派给沿途所有格子。fast held-out（hybrid + DAgger）：
+
+| 臂 | mean | median | IQR | 95% CI | paired vs MC |
+|---|---:|---:|---:|---|---:|
+| MC（默认） | 179.8 | 152.0 | 150.2 | [144.9, 214.0] | — |
+| k=4 | 162.6 | 152.0 | 156.0 | [118.1, 211.5] | −17.3（SE 27.1） |
+| k=8 | 167.1 | 152.0 | 153.8 | [123.4, 214.2] | −12.8（SE 22.6） |
+
+**中性偏负**：截短归属没有改善，反而丢了"对齐有长时程回报"的信号。
+结论：MC episode 归属不是价值 cell 的当前瓶颈；短时程 TD 假设
+在这个读出上不成立，瓶颈更可能在覆盖（对齐带没有正样本）而不是
+归属时程。
+
 脚本会检测 Python 是否启用 GIL：free-threaded 构建使用 `ThreadPoolExecutor`，普通构建使用
 `ProcessPoolExecutor`。当前 `.venv` 是 GIL 构建；本机的 `python3.15t` 存在，但 free-threaded
 numpy wheel 的 `_multiarray_umath` DLL 被应用控制策略阻止，暂时无法在该解释器加载 numpy。
