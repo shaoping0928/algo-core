@@ -86,6 +86,11 @@
 - [x] `NodeGraph.to_state/from_state` 持久化节点、边、动作边和组件状态；`ComponentBank.state_dict`
   持久化组件规格、当前三态、平滑值和节点 valence。
 - [x] `NodeRuntime.bind_component` 可把组件绑到运行时节点；三态节点已参与运行时关联/转移。
+- [x] 实际接入对照：8 种子、`difference+capacitor`、`min_count=8`、`max_components=128`，
+  baseline 107.9 帧 vs components 107.9 帧，逐种子相同；图从 2000 增至约 2512 节点。
+  **中性/负结果**：三态节点是基础节点激活的确定性函数，并行动作边没有带来新信息。
+- [ ] 让三态节点承担基础状态没有的角色：eligibility/信用分配、事件 memory、转移条件；
+  不要只增加同源动作边。
 - [ ] 把三态节点接入 NodeRuntime 的 MC/TD 信用分配（当前只做 EMA valence）。
 - [ ] 组件生命周期：哪些节点派生哪些组件、每节点组件数上限、按效用/冗余剪枝，避免图爆炸。
 - [ ] 旧 `add_derived` 数值派生节点仅保留为实验兼容；新路径不再用它承载概念。

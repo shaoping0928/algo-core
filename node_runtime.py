@@ -50,6 +50,12 @@ class NodeRuntime:
         unknown_penalty: float = 0.5,
         soft_neighbors: int = 5,
         soft_sigma: float = 0.75,
+        component_kinds: Sequence[str] = (),
+        component_min_count: int = 8,
+        max_components: int = 128,
+        component_threshold: float = 0.2,
+        component_smoothing: float = 0.5,
+        component_weight: float = 0.5,
         seed: int = 0,
         scales: Optional[Sequence[float]] = None,
     ):
@@ -81,6 +87,14 @@ class NodeRuntime:
             raise ValueError("soft_neighbors must be positive")
         if float(soft_sigma) <= 0.0:
             raise ValueError("soft_sigma must be positive")
+        if int(component_min_count) < 1:
+            raise ValueError("component_min_count must be positive")
+        if int(max_components) < 0:
+            raise ValueError("max_components must be non-negative")
+        if not 0.0 < float(component_smoothing) <= 1.0:
+            raise ValueError("component_smoothing must be in (0, 1]")
+        if float(component_weight) < 0.0:
+            raise ValueError("component_weight must be non-negative")
         actions = tuple(int(action) for action in action_space)
         if not actions:
             raise ValueError("action_space must not be empty")
@@ -101,6 +115,12 @@ class NodeRuntime:
         self.unknown_penalty = float(unknown_penalty)
         self.soft_neighbors = int(soft_neighbors)
         self.soft_sigma = float(soft_sigma)
+        self.component_kinds = tuple(str(kind) for kind in component_kinds)
+        self.component_min_count = int(component_min_count)
+        self.max_components = int(max_components)
+        self.component_threshold = float(component_threshold)
+        self.component_smoothing = float(component_smoothing)
+        self.component_weight = float(component_weight)
         self.rng = np.random.RandomState(seed)
 
         state_dim = self.obs_dim + self.lag
@@ -116,7 +136,11 @@ class NodeRuntime:
         self.scales = scales
 
         self.graph = NodeGraph()
-        self.components = ComponentBank(self.graph)
+        self.components = ComponentBank(
+            self.graph,
+            threshold=self.component_threshold,
+            smoothing=self.component_smoothing,
+        )
         self._prototype_ids: List[str] = []
         self._prototype_matrix = np.zeros((0, state_dim), dtype=float)
         self._traces: Dict[str, List[float]] = {}
@@ -125,6 +149,8 @@ class NodeRuntime:
         self.last_action: Optional[int] = None
         self.last_state: Optional[np.ndarray] = None
         self.last_scores: Dict[int, dict] = {}
+        self.last_sources: List[str] = []
+        self._component_bound = set()
 
     # ---- encoding ----------------------------------------------------------
     def _zero_pending(self):
@@ -178,7 +204,31 @@ class NodeRuntime:
             node_id = self._create_node(state)
         if count:
             self.graph.nodes[node_id].count += 1
+            self._maybe_bind_components(node_id)
         return node_id
+
+    def _maybe_bind_components(self, node_id: str) -> None:
+        if not self.component_kinds or self.max_components == 0:
+            return
+        if node_id in self._component_bound:
+            return
+        node = self.graph.nodes[node_id]
+        if node.count < self.component_min_count:
+            return
+        if len(self.components.specs) >= self.max_components:
+            return
+        for kind in self.component_kinds:
+            if len(self.components.specs) >= self.max_components:
+                break
+            component_id = "%s:%s" % (node_id, kind)
+            if component_id in self.components.specs:
+                continue
+            self.components.bind(
+                node_id, kind=kind, component_id=component_id,
+                threshold=self.component_threshold,
+                smoothing=self.component_smoothing,
+            )
+        self._component_bound.add(node_id)
 
     # ---- runtime components ------------------------------------------------
     def bind_component(self, base_node: str, kind: str = "difference",
@@ -229,7 +279,8 @@ class NodeRuntime:
         ]
 
     def _score_actions(self, node_id: str,
-                       state: Optional[np.ndarray] = None) -> Dict[int, dict]:
+                       state: Optional[np.ndarray] = None,
+                       sources: Optional[Iterable[str]] = None) -> Dict[int, dict]:
         node = self.graph.nodes[node_id]
         if state is None:
             state = (
@@ -237,6 +288,7 @@ class NodeRuntime:
                 else np.zeros(len(self.scales), dtype=float)
             )
         neighbors = self._neighbor_weights(state)
+        source_ids = list(dict.fromkeys(sources or ()))
         scores: Dict[int, dict] = {}
         for action in self.action_space:
             support = 0.0
@@ -247,6 +299,16 @@ class NodeRuntime:
             for neighbor_id, weight in neighbors:
                 for edge in self.graph.action_edges_from(neighbor_id, action):
                     mass = weight * edge.count
+                    support += mass
+                    pain_sum += mass * edge.q_pain
+                    dopamine_sum += mass * edge.q_dopamine
+                    uncertainty_sum += mass * (
+                        1.0 / np.sqrt(edge.count + 1.0)
+                    )
+                    visits += edge.count
+            for source in source_ids:
+                for edge in self.graph.action_edges_from(source, action):
+                    mass = self.component_weight * edge.count
                     support += mass
                     pain_sum += mass * edge.q_pain
                     dopamine_sum += mass * edge.q_dopamine
@@ -283,12 +345,15 @@ class NodeRuntime:
         """Score actions for an observation without changing the runtime state."""
         state = self.encode(observation)
         node_id = self._assign(state, create=False, count=False)
-        return node_id, self._score_actions(node_id, state)
+        sources = self.components.active_sign_nodes(node_id)
+        return node_id, self._score_actions(node_id, state, sources=sources)
 
     def act(self, observation, explore: bool = True) -> int:
         state = self.encode(observation)
         node_id = self._assign(state, create=True, count=True)
-        scores = self._score_actions(node_id, state)
+        self._component_step(node_id)
+        sources = self.components.active_sign_nodes(node_id)
+        scores = self._score_actions(node_id, state, sources=sources)
         if explore and self.rng.rand() < self.exploration:
             action = int(self.rng.choice(self.action_space))
         else:
@@ -304,20 +369,30 @@ class NodeRuntime:
         self.last_action = action
         self.last_state = state
         self.last_scores = scores
+        self.last_sources = [node_id] + sources
         self.pending.append(action)
-        self._component_step(node_id)
         return action
 
     # ---- learning ----------------------------------------------------------
+    def _update_action_edges(self, sources: Iterable[str], action: int,
+                             next_node: str, target_pain: float,
+                             target_dopamine: float) -> None:
+        for source in dict.fromkeys(sources):
+            edge = self.graph.add_action_edge(source, action, next_node)
+            edge.prediction_error = target_pain - edge.q_pain
+            edge.count += 1
+            edge.q_pain += self.alpha_q * (target_pain - edge.q_pain)
+            edge.q_dopamine += (
+                self.alpha_q * (target_dopamine - edge.q_dopamine)
+            )
+
     def _update(self, current: str, action: int, next_node: str,
                 target_pain: float, target_dopamine: float,
-                immediate_pain: float, immediate_dopamine: float) -> None:
-        edge = self.graph.add_action_edge(current, action, next_node)
-        edge.prediction_error = target_pain - edge.q_pain
-        edge.count += 1
-        edge.q_pain += self.alpha_q * (target_pain - edge.q_pain)
-        edge.q_dopamine += (
-            self.alpha_q * (target_dopamine - edge.q_dopamine)
+                immediate_pain: float, immediate_dopamine: float,
+                sources: Optional[Iterable[str]] = None) -> None:
+        self._update_action_edges(
+            sources or (current,), action, next_node,
+            target_pain, target_dopamine,
         )
 
         node = self.graph.nodes[current]
@@ -383,11 +458,13 @@ class NodeRuntime:
         self._update(
             self.last_node, int(action), next_node,
             target_pain, target_dopamine, pain, dopamine,
+            sources=self.last_sources,
         )
         self._component_step(next_node, valence)
         self.last_node = None
         self.last_action = None
         self.last_state = None
+        self.last_sources = []
         if done:
             self.reset()
 
@@ -398,6 +475,7 @@ class NodeRuntime:
         self.last_action = None
         self.last_state = None
         self.last_scores = {}
+        self.last_sources = []
         self._traces.clear()
 
     def learn_transition(self, observation, action, next_observation,
@@ -415,6 +493,8 @@ class NodeRuntime:
             raise ValueError("valence must contain finite dopamine and pain")
         state = self.encode(observation)
         current = self._assign(state, create=True, count=True)
+        self._component_step(current)
+        sources = [current] + self.components.active_sign_nodes(current)
         self.pending.append(action)
         next_state = self.encode(next_observation)
         next_node = self._assign(next_state, create=True, count=True)
@@ -428,6 +508,7 @@ class NodeRuntime:
         self._update(
             current, action, next_node,
             target_pain, target_dopamine, pain, dopamine,
+            sources=sources,
         )
         self._component_step(next_node, valence)
         if done:
@@ -455,11 +536,11 @@ class NodeRuntime:
             done = bool(row["done"])
             state = self.encode(row["obs"])
             current = self._assign(state, create=True, count=True)
+            self._component_step(current)
+            sources = [current] + self.components.active_sign_nodes(current)
             self.pending.append(action)
             next_state = self.encode(row["next_obs"])
             next_node = self._assign(next_state, create=True, count=True)
-            edge = self.graph.add_action_edge(current, action, next_node)
-            edge.count += 1
             entered = self.graph.nodes[next_node]
             entered.immediate_pain += self.alpha_now * (
                 signals[1] - entered.immediate_pain
@@ -470,16 +551,15 @@ class NodeRuntime:
             self._component_step(next_node, signals)
             steps.append((
                 current, action, next_node, float(signals[1]),
-                float(signals[0]), done,
+                float(signals[0]), done, sources,
             ))
             if done:
                 self.reset()
 
         running_pain = 0.0
         running_dopamine = 0.0
-        for current, action, next_node, pain, dopamine, terminal in reversed(
-            steps
-        ):
+        for (current, action, next_node, pain, dopamine,
+             terminal, sources) in reversed(steps):
             return_pain = pain + (
                 0.0 if terminal else self.gamma * running_pain
             )
@@ -493,14 +573,9 @@ class NodeRuntime:
             node.dopamine += self.alpha_mc * (
                 return_dopamine - node.immediate_dopamine - node.dopamine
             )
-            edge = self.graph.action_edges.get(
-                (current, next_node, action)
+            self._update_action_edges(
+                sources, action, next_node, return_pain, return_dopamine
             )
-            if edge is not None:
-                edge.q_pain += self.alpha_mc * (return_pain - edge.q_pain)
-                edge.q_dopamine += self.alpha_mc * (
-                    return_dopamine - edge.q_dopamine
-                )
             if terminal:
                 entered = self.graph.nodes[next_node]
                 entered.value += self.alpha_mc * (
@@ -642,4 +717,9 @@ class NodeRuntime:
             nodes=len(self.graph.nodes),
             action_edges=len(self.graph.action_edges),
             prototypes=len(self._prototype_ids),
+            components=len(self.components.specs),
+            component_states=sum(
+                node.role == "component_state"
+                for node in self.graph.nodes.values()
+            ),
         )

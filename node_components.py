@@ -209,8 +209,14 @@ class ComponentBank:
             ]
         return result
 
-    def active_sign_nodes(self) -> List[str]:
-        return list(self.last_active)
+    def active_sign_nodes(self, base_node: Optional[str] = None) -> List[str]:
+        if base_node is None:
+            return list(self.last_active)
+        return [
+            self.sign_nodes[component_id][self.previous_sign[component_id]]
+            for component_id, spec in self.specs.items()
+            if spec.base_node == base_node
+        ]
 
     def add_memory(self, component_ids: Optional[Iterable[str]] = None) -> str:
         ids = (

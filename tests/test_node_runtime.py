@@ -115,7 +115,8 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(runtime.node_value(np.asarray([0.0])), 0.0)
 
     def test_smoke_run_on_flappy_signals(self):
-        row = run_seed((100, 100, 0.1, 100, 200, 0.45, 6, 1, 3))
+        row = run_seed((100, 100, 0.1, 100, 200, 0.45, 6, 1, 3,
+                        (), 8, 0, 0.5))
         self.assertGreater(row["frames"], 0)
         self.assertGreaterEqual(row["graph"]["nodes"], 1)
         self.assertGreaterEqual(row["graph"]["action_edges"], 1)
@@ -134,6 +135,25 @@ class NodeRuntimeTests(unittest.TestCase):
         plus = runtime.components.sign_nodes[component_id][1]
         self.assertIn(plus, runtime.graph.nodes)
         self.assertGreater(runtime.graph.nodes[plus].dopamine, 0.0)
+
+    def test_runtime_auto_binds_components_and_uses_them(self):
+        runtime = self.make_runtime(
+            component_kinds=("difference",), component_min_count=1,
+            max_components=2,
+        )
+        runtime.reset()
+        action = runtime.act(np.asarray([0.0]), explore=False)
+        self.assertEqual(len(runtime.components.specs), 1)
+        runtime.observe(
+            np.asarray([1.0]), action, [1.0, 0.0], done=False,
+        )
+        component_id = next(iter(runtime.components.specs))
+        sign_nodes = runtime.components.sign_nodes[component_id].values()
+        self.assertTrue(any(
+            runtime.graph.action_edges_from(node_id, action)
+            for node_id in sign_nodes
+            for action in (0, 1)
+        ))
 
     def test_core_does_not_embed_task_geometry(self):
         root = Path(__file__).resolve().parents[1]
