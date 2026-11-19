@@ -467,6 +467,7 @@ class NodeRuntime:
             entered.immediate_dopamine += self.alpha_now * (
                 signals[0] - entered.immediate_dopamine
             )
+            self._component_step(next_node, signals)
             steps.append((
                 current, action, next_node, float(signals[1]),
                 float(signals[0]), done,
