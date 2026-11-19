@@ -93,6 +93,12 @@
   8 种子仍为 107.9 帧。**负结果**：signature 覆盖太稀疏，需要共享/回退或事件级记忆。
 - [x] 旧节点系统检查：`graph_memory` 初始价值改为由 world pain signal 估计，不再用
   `terminal`；`NodeGraph` round-trip 覆盖全部边类型；三个 trace 脚本正常退出。
+- [x] 实际追踪（`trace_node_runtime.py`，seed 100）：世界模型 y/vy 误差 ~1e-9；节点价值
+  offline holdout AUC 0.977，但 online terminal AUC 0.442；近管道 chosen/other 动作边
+  135/23.6，双动作支撑仅 0.52；方向准确率 0.696。瓶颈是终止状态/反事实动作的在线覆盖，
+  不是世界模型。
+- [ ] 用 on-policy/DAgger 采集 MPC 自己产生的终止状态与近管道反事实动作，再重训价值/Q。
+- [ ] 给终止状态更连续的价值读出不只依赖最近原型；检查 boundary 附近节点的分辨率。
 - [ ] 让三态节点承担基础状态没有的角色：eligibility/信用分配、事件 memory、转移条件；
   不要只增加同源动作边。
 - [ ] 把三态节点接入 NodeRuntime 的 MC/TD 信用分配（当前只做 EMA valence）。

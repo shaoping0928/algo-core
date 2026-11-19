@@ -194,6 +194,30 @@ gated 边时才使用它，否则回退到基础边。5000 步、128 个组件�
 memory、derivation、action edge 的 round-trip 测试。`trace_graph_memory.py`、
 `trace_mixed_nodes.py`、`trace_sensitivity.py` 均正常退出。
 
+### 实际追踪：哪个环节弱
+
+`trace_node_runtime.py` 把链路拆成四段（seed 100，5000 步，H=10）：
+
+```text
+[1] world model one-step error
+  y/vy  ~1e-9
+  dx/gap mean ~1e-2/1e-3, max 0.79/0.15（管道生成事件）
+[2] node value
+  offline holdout AUC 0.977, near 0.914
+  online terminal AUC 0.442, near 0.493
+  terminal states nearest immediate pain 0.000
+[3] action support
+  both actions 0.530; near-pipe 0.521
+  near-pipe chosen/other counts 135/23.6
+[4] decision direction near pipe 0.696 over 69 events
+```
+
+结论：世界模型不是瓶颈；瓶颈是**离线到在线的终止状态/价值覆盖**。节点价值在行为策略的
+留出集上 AUC `0.977`，但 MPC 评估时终止 AUC 只有 `0.442`，因为评估策略死亡的状态落在
+训练里“安全”的节点上，nearest immediate pain 为 0。另一个弱点是近管道反事实动作支撑：
+另一动作平均只有 `23.6` 条边，约一半近管道状态没有双动作支撑。方向准确率 `0.696` 说明
+决策不是完全盲目，但价值排序和反事实 Q 仍不可靠。
+
 ## 任务无关世界模型原型
 
 `substrate_generic.py` 是独立原型：规划器只通过

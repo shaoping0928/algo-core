@@ -90,7 +90,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=2000,
     return world, agent
 
 
-def policy_action(env, world, agent, prefix, horizon, lag=LAG):
+def policy_result(env, world, agent, prefix, horizon, lag=LAG):
     initial = np.asarray(env.obs(), dtype=float)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
     action_dim = int(lag) + 1
@@ -127,7 +127,11 @@ def policy_action(env, world, agent, prefix, horizon, lag=LAG):
         batch_size=2 ** horizon,
         score_combine="sum",
     )
-    return int(result.actions[0])
+    return result
+
+
+def policy_action(env, world, agent, prefix, horizon, lag=LAG):
+    return int(policy_result(env, world, agent, prefix, horizon, lag=lag).actions[0])
 
 
 def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG):
