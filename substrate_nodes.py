@@ -100,9 +100,12 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     ) / scales[:obs_dim]
     groups = np.asarray([row["episode"] for row in transitions])
     order = np.unique(groups)
-    split = max(int(len(order) * 0.7), 1)
-    train = np.isin(groups, order[:split])
-    test = ~train
+    # Interleaved episode split: every fifth episode is held out.  A contiguous
+    # tail split can leave rare causes entirely in train, so their rules can
+    # never be verified.
+    episode_index = np.searchsorted(order, groups)
+    test = (episode_index % 5 == 4)
+    train = ~test
 
     for epoch in range(epochs):
         for episode in ordered:

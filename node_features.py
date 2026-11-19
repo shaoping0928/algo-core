@@ -114,19 +114,36 @@ class FeatureRuleBank:
         self.rules: List[FeatureRule] = []
 
     # ---- candidates -------------------------------------------------------
-    def _primitives(self, x: np.ndarray, target: np.ndarray):
+    def _primitives(self, x: np.ndarray, target: np.ndarray,
+                    min_support: int = None):
         base = float(target.mean()) if len(target) else 0.0
+        min_support = (
+            self.min_support if min_support is None else int(min_support)
+        )
         positive = target > 0.5
         groups = {}
         for dim in range(x.shape[1]):
             for magnitude in (False, True):
                 values = np.abs(x[:, dim]) if magnitude else x[:, dim]
                 thresholds = [np.quantile(values, QUANTILES)]
+                forced_values = set()
                 if positive.any():
-                    thresholds.append(np.quantile(
+                    pain_thresholds = np.quantile(
                         values[positive],
                         np.linspace(0.0, 1.0, 11),
-                    ))
+                    )
+                    margins = np.maximum(
+                        np.abs(pain_thresholds) * 1e-3, 1e-6
+                    )
+                    expanded = np.concatenate([
+                        pain_thresholds,
+                        pain_thresholds + margins,
+                        pain_thresholds - margins,
+                    ])
+                    thresholds.append(expanded)
+                    forced_values.update(
+                        float(value) for value in expanded
+                    )
                 if (~positive).any():
                     thresholds.append(np.quantile(
                         values[~positive],
@@ -143,13 +160,15 @@ class FeatureRuleBank:
                         if mask.all() or not mask.any():
                             continue
                         stats = _stats(mask, target)
-                        if stats["support"] < self.min_support:
+                        if stats["support"] < min_support:
                             continue
                         if stats["precision"] <= base:
                             continue
                         items.append((stats["z"], predicate, mask))
-                    items.sort(key=lambda item: item[0], reverse=True)
-                    selected = list(items[:self.max_per_group])
+                    sorted_by_z = sorted(
+                        items, key=lambda item: item[0], reverse=True
+                    )
+                    selected = list(sorted_by_z[:self.max_per_group])
                     precise = sorted(
                         items,
                         key=lambda item: (
@@ -159,6 +178,10 @@ class FeatureRuleBank:
                         reverse=True,
                     )
                     selected.extend(precise[:self.max_per_group])
+                    selected.extend(
+                        item for item in items
+                        if float(item[1].threshold) in forced_values
+                    )
                     unique = {}
                     for item in selected:
                         unique.setdefault(item[2].tobytes(), item)
@@ -181,8 +204,14 @@ class FeatureRuleBank:
         ).reshape(-1)
         base_train = float(train_y.mean()) if len(train_y) else 0.0
         base_test = float(test_y.mean()) if len(test_y) else 0.0
+        positives = train_y > 0.5
+        min_support = max(
+            2, min(self.min_support, max(2, int(positives.sum()) // 8))
+        )
 
-        candidates = self._primitives(train_x, train_y)
+        candidates = self._primitives(
+            train_x, train_y, min_support=min_support
+        )
         considered = []
         seen = set()
 
@@ -192,7 +221,7 @@ class FeatureRuleBank:
                 return
             seen.add(key)
             stats = _stats(train_mask, train_y)
-            if stats["support"] < self.min_support:
+            if stats["support"] < min_support:
                 return
             if stats["z"] < self.min_z:
                 return
@@ -201,12 +230,20 @@ class FeatureRuleBank:
             test_mask = feature.mask(test_x)
             test_stats = _stats(test_mask, test_y)
             if test_stats["support"] <= 0:
-                return
-            if test_stats["precision"] <= base_test * self.min_lift:
-                return
-            confidence = (test_stats["hits"] + 1.0) / (
-                test_stats["support"] + 2.0
-            )
+                # Rare causes can be absent from the held-out split.  Keep
+                # them as low-confidence hypotheses instead of discarding
+                # every rule that cannot be verified yet.
+                test_precision = stats["precision"]
+                confidence = 0.5 * (stats["hits"] + 1.0) / (
+                    stats["support"] + 2.0
+                )
+            else:
+                if test_stats["precision"] <= base_test * self.min_lift:
+                    return
+                test_precision = test_stats["precision"]
+                confidence = (test_stats["hits"] + 1.0) / (
+                    test_stats["support"] + 2.0
+                )
             considered.append((FeatureRule(
                 feature=feature,
                 support=stats["support"],
@@ -214,7 +251,7 @@ class FeatureRuleBank:
                 precision=stats["precision"],
                 test_support=test_stats["support"],
                 test_hits=test_stats["hits"],
-                test_precision=test_stats["precision"],
+                test_precision=test_precision,
                 confidence=float(confidence),
             ), train_mask))
 
@@ -276,6 +313,7 @@ class FeatureRuleBank:
         positives = train_y > 0.5
         covered = np.zeros(len(train_y), dtype=bool)
         selected = []
+        selected_masks = []
         remaining = list(considered)
         while remaining and len(selected) < self.max_rules:
             best = None
@@ -297,8 +335,54 @@ class FeatureRuleBank:
             if best is None:
                 break
             selected.append(best[0])
+            selected_masks.append(best[1])
             covered |= best[1] & positives
             remaining.pop(best_index)
+
+        # A precise feature can describe a cause that another broad feature
+        # already covers (for example a pipe collision that also happens near
+        # a boundary).  Fill the remaining slots with precise features that
+        # introduce a coordinate not already used by the selected rules.
+        selected_dims = set()
+        selected_primitives = set()
+        for rule in selected:
+            selected_dims |= feature_dims(rule.feature)
+            selected_primitives |= feature_primitives(rule.feature)
+        remaining.sort(key=lambda item: (
+            feature_primitives(item[0].feature).isdisjoint(
+                selected_primitives
+            ),
+            bool(feature_dims(item[0].feature) - selected_dims),
+            item[0].test_precision,
+            item[0].confidence,
+            item[0].support,
+            -item[0].feature.complexity(),
+        ), reverse=True)
+        for rule, mask in remaining:
+            if len(selected) >= self.max_rules:
+                break
+            if (rule.precision < 0.7 or rule.test_precision < 0.7
+                    or rule.confidence < 0.5):
+                continue
+            primitives = feature_primitives(rule.feature)
+            # Refinements of an already selected rule are not a new cause.
+            if not primitives.isdisjoint(selected_primitives):
+                continue
+            redundant = False
+            for other in selected_masks:
+                union = int((mask | other).sum())
+                if union <= 0:
+                    continue
+                overlap = int((mask & other).sum()) / union
+                if overlap > 0.8:
+                    redundant = True
+                    break
+            if redundant:
+                continue
+            selected.append(rule)
+            selected_masks.append(mask)
+            selected_dims |= feature_dims(rule.feature)
+            selected_primitives |= primitives
         self.rules = selected
         return self.rules
 
@@ -356,6 +440,27 @@ class FeatureRuleBank:
             for data in state.get("rules", [])
         ]
         return self
+
+
+def feature_dims(feature) -> set:
+    if isinstance(feature, Primitive):
+        return {feature.dim}
+    result = set()
+    for child in feature.children:
+        result |= feature_dims(child)
+    return result
+
+
+def feature_primitives(feature) -> set:
+    if isinstance(feature, Primitive):
+        return {(
+            feature.dim, feature.magnitude, feature.op,
+            round(float(feature.threshold), 12),
+        )}
+    result = set()
+    for child in feature.children:
+        result |= feature_primitives(child)
+    return result
 
 
 def feature_state(feature):
