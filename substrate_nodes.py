@@ -90,6 +90,24 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     for epoch in range(epochs):
         for episode in ordered:
             agent.learn_episode(episode)
+
+    # Induce compositional pain rules from the same batch.  Rules only use the
+    # observation part of the entered state and are verified on held-out
+    # episodes, so the sandbox can apply them to predicted future states.
+    pain = np.asarray(
+        [row["signals"][1] > 0.5 for row in transitions], dtype=float
+    )
+    states = np.asarray(
+        [row["next_obs"] for row in transitions], dtype=float
+    ) / scales[:obs_dim]
+    groups = np.asarray([row["episode"] for row in transitions])
+    order = np.unique(groups)
+    split = max(int(len(order) * 0.7), 1)
+    train = np.isin(groups, order[:split])
+    test = ~train
+    agent.induce_rules(
+        states[train], pain[train], states[test], pain[test]
+    )
     return world, agent
 
 
@@ -232,7 +250,16 @@ def main():
     parser.add_argument("--component-gating", action="store_true")
     parser.add_argument("--memory-weight", type=float, default=0.1)
     parser.add_argument("--association-rate", type=float, default=0.0)
+    parser.add_argument("--fast", action="store_true",
+                        help="small development preset: 1500 steps, 3 epochs, "
+                             "1000 nodes, 400-frame evaluation")
     args = parser.parse_args()
+    if args.fast:
+        args.steps = 1500
+        args.epochs = 3
+        args.max_nodes = 1000
+        args.cap = 400
+        args.horizon = 8
     if args.jobs < 1:
         raise ValueError("--jobs must be positive")
     if args.seeds < 1:

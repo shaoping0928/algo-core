@@ -26,6 +26,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from node_components import ComponentBank
+from node_features import FeatureRuleBank
 from node_graph import (
     ASSOCIATION,
     CONCEPT,
@@ -184,6 +185,7 @@ class NodeRuntime:
         self.dopamine_node = self.graph.add_node(
             CONCEPT, "valence:dopamine", role="valence"
         )
+        self.rules = FeatureRuleBank()
         self._prototype_ids: List[str] = []
         self._prototype_matrix = np.zeros((0, state_dim), dtype=float)
         self._traces: Dict[str, List[float]] = {}
@@ -530,36 +532,47 @@ class NodeRuntime:
         return weighted / total
 
     def pain_signal_state(self, state: np.ndarray) -> float:
-        return self.pain_signal_from_weights(
-            self._neighbor_weights(np.asarray(state, dtype=float))
+        state = np.asarray(state, dtype=float)
+        learned = self.pain_signal_from_weights(
+            self._neighbor_weights(state)
         )
+        if self.rules.rules:
+            learned = max(
+                learned,
+                float(self.rules.activate(
+                    state.reshape(1, -1)[:, :self.obs_dim]
+                )[0]),
+            )
+        return learned
 
     def pain_signal_batch(self, states: np.ndarray) -> np.ndarray:
         states = np.asarray(states, dtype=float)
         if len(states) == 0:
             return np.zeros(0)
-        indices, weights = self._soft_weights_batch(states)
-        if indices is None:
-            return np.zeros(len(states))
         result = np.zeros(len(states), dtype=float)
-        for row in range(len(states)):
-            total = 0.0
-            weighted = 0.0
-            node_ids = []
-            for column, index in enumerate(indices[row]):
-                node_id = self._prototype_ids[int(index)]
-                node_weight = float(weights[row, column])
-                node_ids.append(node_id)
-                total += node_weight
-                weighted += node_weight * self._pain_association(node_id)
-            for memory_id, strength in self.memories_for(
-                node_ids
-            ).items():
-                total += float(strength)
-                weighted += float(strength) * self._pain_association(
-                    memory_id
-                )
-            result[row] = weighted / total if total > 0.0 else 0.0
+        indices, weights = self._soft_weights_batch(states)
+        if indices is not None:
+            for row in range(len(states)):
+                total = 0.0
+                weighted = 0.0
+                node_ids = []
+                for column, index in enumerate(indices[row]):
+                    node_id = self._prototype_ids[int(index)]
+                    node_weight = float(weights[row, column])
+                    node_ids.append(node_id)
+                    total += node_weight
+                    weighted += node_weight * self._pain_association(node_id)
+                for memory_id, strength in self.memories_for(
+                    node_ids
+                ).items():
+                    total += float(strength)
+                    weighted += float(strength) * self._pain_association(
+                        memory_id
+                    )
+                result[row] = weighted / total if total > 0.0 else 0.0
+        if self.rules.rules:
+            rule_risk = self.rules.activate(states[:, :self.obs_dim])
+            result = np.maximum(result, rule_risk)
         return result
 
     def _signature(self, node_id: str) -> Tuple[int, ...]:        return tuple(
@@ -999,6 +1012,32 @@ class NodeRuntime:
         self._prune_components()
         self.reset()
 
+    def induce_rules(self, train_states, train_pain,
+                     test_states=None, test_pain=None):
+        """Induce compositional pain rules over encoded observation states.
+
+        Only the observation part is used: the rule is a property of the
+        entered state, which is what the sandbox predicts.  Lag/action
+        coordinates remain available to the node graph.
+        """
+        train_states = np.asarray(train_states, dtype=float)
+        if train_states.ndim != 2 or train_states.shape[1] < self.obs_dim:
+            raise ValueError(
+                "states must have at least obs_dim columns"
+            )
+        test_obs = None
+        if test_states is not None:
+            test_states = np.asarray(test_states, dtype=float)
+            if test_states.ndim != 2 or test_states.shape[1] < self.obs_dim:
+                raise ValueError(
+                    "test states must have at least obs_dim columns"
+                )
+            test_obs = test_states[:, :self.obs_dim]
+        return self.rules.induce(
+            train_states[:, :self.obs_dim], train_pain,
+            test_obs, test_pain,
+        )
+
     # ---- analysis ----------------------------------------------------------
     def _soft_weights_batch(self, states: np.ndarray):
         states = np.asarray(states, dtype=float)
@@ -1215,6 +1254,7 @@ class NodeRuntime:
                 for node in self.graph.nodes.values()
             ),
             prototypes=len(self._prototype_ids),
+            rules=len(self.rules.rules),
             components=len(self.components.specs),
             component_states=sum(
                 node.role == "component_state"
