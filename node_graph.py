@@ -54,6 +54,9 @@ class Node:
     immediate_pain: float = 0.0
     immediate_dopamine: float = 0.0
     features: Optional[np.ndarray] = None
+    role: str = ""
+    component_id: Optional[str] = None
+    sign: int = 0
 
     def activate(self, value: float) -> float:
         self.activation = float(value)
@@ -370,3 +373,146 @@ class NodeGraph:
             edge_nodes=sum(n.kind == EDGE for n in self.nodes.values()),
             memories=sum(n.kind == MEMORY for n in self.nodes.values()),
         )
+
+    # ---- persistence -------------------------------------------------------
+    def to_state(self) -> dict:
+        return dict(
+            counter=int(self._counter),
+            nodes=[
+                dict(
+                    id=node.id,
+                    kind=node.kind,
+                    beta=node.beta,
+                    activation=node.activation,
+                    trace=node.trace,
+                    members=list(node.members),
+                    source=node.source,
+                    depth=node.depth,
+                    edge_key=(
+                        None if node.edge_key is None
+                        else list(node.edge_key)
+                    ),
+                    value=node.value,
+                    dopamine=node.dopamine,
+                    count=node.count,
+                    eligibility_pain=node.eligibility_pain,
+                    eligibility_dopamine=node.eligibility_dopamine,
+                    immediate_pain=node.immediate_pain,
+                    immediate_dopamine=node.immediate_dopamine,
+                    features=(
+                        None if node.features is None
+                        else np.asarray(node.features, dtype=float).tolist()
+                    ),
+                    role=node.role,
+                    component_id=node.component_id,
+                    sign=node.sign,
+                )
+                for node in self.nodes.values()
+            ],
+            edges=[
+                dict(
+                    source=edge.source,
+                    target=edge.target,
+                    kind=edge.kind,
+                    weight=edge.weight,
+                    eligibility=edge.eligibility,
+                    edge_node=edge.edge_node,
+                    order=edge.order,
+                )
+                for edge in self.edges.values()
+            ],
+            action_edges=[
+                dict(
+                    source=edge.source,
+                    target=edge.target,
+                    action=edge.action,
+                    count=edge.count,
+                    q_pain=edge.q_pain,
+                    q_dopamine=edge.q_dopamine,
+                    prediction_error=edge.prediction_error,
+                )
+                for edge in self.action_edges.values()
+            ],
+        )
+
+    @classmethod
+    def from_state(cls, state: dict) -> "NodeGraph":
+        graph = cls()
+        graph.nodes = {}
+        graph.edges = {}
+        graph.outgoing = {}
+        graph.incoming = {}
+        graph.action_edges = {}
+        graph.action_out = {}
+        graph._counter = int(state.get("counter", 0))
+        for data in state.get("nodes", []):
+            features = data.get("features")
+            edge_key = data.get("edge_key")
+            node = Node(
+                id=data["id"],
+                kind=data["kind"],
+                beta=float(data.get("beta", 0.2)),
+                activation=float(data.get("activation", 0.0)),
+                trace=float(data.get("trace", 0.0)),
+                members=list(data.get("members", [])),
+                source=data.get("source"),
+                depth=int(data.get("depth", 0)),
+                edge_key=None if edge_key is None else tuple(edge_key),
+                value=float(data.get("value", 0.0)),
+                dopamine=float(data.get("dopamine", 0.0)),
+                count=int(data.get("count", 0)),
+                eligibility_pain=float(data.get("eligibility_pain", 0.0)),
+                eligibility_dopamine=float(
+                    data.get("eligibility_dopamine", 0.0)
+                ),
+                immediate_pain=float(data.get("immediate_pain", 0.0)),
+                immediate_dopamine=float(
+                    data.get("immediate_dopamine", 0.0)
+                ),
+                features=(
+                    None if features is None
+                    else np.asarray(features, dtype=float)
+                ),
+                role=data.get("role", ""),
+                component_id=data.get("component_id"),
+                sign=int(data.get("sign", 0)),
+            )
+            graph.nodes[node.id] = node
+            graph.outgoing[node.id] = []
+            graph.incoming[node.id] = []
+        for data in state.get("edges", []):
+            edge = Edge(
+                source=data["source"],
+                target=data["target"],
+                kind=data["kind"],
+                weight=float(data.get("weight", 0.0)),
+                eligibility=float(data.get("eligibility", 0.0)),
+                edge_node=data.get("edge_node"),
+                order=int(data.get("order", 0)),
+            )
+            key = (edge.source, edge.target, edge.kind)
+            graph.edges[key] = edge
+            if edge.kind == ASSOCIATION:
+                graph.outgoing[edge.source].append(key)
+                graph.incoming[edge.target].append(key)
+                graph.outgoing[edge.target].append(key)
+                graph.incoming[edge.source].append(key)
+            else:
+                graph.outgoing[edge.source].append(key)
+                graph.incoming[edge.target].append(key)
+        for data in state.get("action_edges", []):
+            edge = ActionEdge(
+                source=data["source"],
+                target=data["target"],
+                action=int(data["action"]),
+                count=int(data.get("count", 0)),
+                q_pain=float(data.get("q_pain", 0.0)),
+                q_dopamine=float(data.get("q_dopamine", 0.0)),
+                prediction_error=float(data.get("prediction_error", 0.0)),
+            )
+            key = (edge.source, edge.target, edge.action)
+            graph.action_edges[key] = edge
+            graph.action_out.setdefault(
+                (edge.source, edge.action), []
+            ).append(key)
+        return graph

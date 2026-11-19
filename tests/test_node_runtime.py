@@ -120,6 +120,21 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(row["graph"]["nodes"], 1)
         self.assertGreaterEqual(row["graph"]["action_edges"], 1)
 
+    def test_components_attach_to_runtime_nodes(self):
+        runtime = self.make_runtime()
+        node = runtime._create_node(np.asarray([0.0]))
+        component_id = runtime.bind_component(
+            node, "difference", smoothing=1.0
+        )
+        runtime.reset()
+        runtime.act(np.asarray([0.0]), explore=False)
+        runtime.observe(
+            np.asarray([1.0]), 0, [1.0, 0.0], done=False,
+        )
+        plus = runtime.components.sign_nodes[component_id][1]
+        self.assertIn(plus, runtime.graph.nodes)
+        self.assertGreater(runtime.graph.nodes[plus].dopamine, 0.0)
+
     def test_core_does_not_embed_task_geometry(self):
         root = Path(__file__).resolve().parents[1]
         forbidden = (

@@ -154,6 +154,23 @@ python substrate_nodes.py --seed 100 --seeds 8 --jobs 8 \
 `ProcessPoolExecutor`。当前 `.venv` 是 GIL 构建；本机的 `python3.15t` 存在，但 free-threaded
 numpy wheel 的 `_multiarray_umath` DLL 被应用控制策略阻止，暂时无法在该解释器加载 numpy。
 
+## 运行时组件与三态概念节点
+
+数值派生量不再作为概念节点。`node_components.py` 把电容、电阻、差分器等算子留在运行时组件里：
+
+- 组件绑定到一个基础节点，只做数值计算，**不进入 `NodeGraph.nodes`**；
+- 组件输出先平滑（EMA），再饱和到 `[-1, 1]`，最后按触发阈值舍入成三态：
+  `[-1, -0.2] -> 抑制(-1)`，`(-0.2, 0.2) -> 保持(0)`，`[0.2, 1] -> 激活(+1)`；
+- 这三个状态是普通 `CONCEPT` 节点（`component:<id>:+ / 0 / -`），带 `role/component_id/sign`
+  元数据，参与关联、转移、memory、valence 学习和持久化；
+- 组件可以设置 `hysteresis`，让已经跨过触发的状态在回程时不被边界抖动反复翻转；
+- `NodeGraph.to_state/from_state` 持久化节点、边、动作边和组件三态节点；组件的瞬时数值不是概念，
+  只有组件规格、三态状态和学到的节点/边被持久化。
+
+`add_derived` 仍保留为旧实验的数值派生节点接口，但新的运行时路径不再用它承载概念。当前组件路径是
+原型：`NodeRuntime.bind_component` 可以把组件绑到运行时节点，三态节点会参与关联/转移和 EMA
+valence 更新；下一步是把它们接入 MC/TD 信用分配，并处理组件数量增长。
+
 ## 任务无关世界模型原型
 
 `substrate_generic.py` 是独立原型：规划器只通过

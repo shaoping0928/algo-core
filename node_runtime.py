@@ -25,6 +25,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from node_components import ComponentBank
 from node_graph import CONCEPT, NodeGraph
 
 
@@ -115,6 +116,7 @@ class NodeRuntime:
         self.scales = scales
 
         self.graph = NodeGraph()
+        self.components = ComponentBank(self.graph)
         self._prototype_ids: List[str] = []
         self._prototype_matrix = np.zeros((0, state_dim), dtype=float)
         self._traces: Dict[str, List[float]] = {}
@@ -177,6 +179,30 @@ class NodeRuntime:
         if count:
             self.graph.nodes[node_id].count += 1
         return node_id
+
+    # ---- runtime components ------------------------------------------------
+    def bind_component(self, base_node: str, kind: str = "difference",
+                       params: Sequence[float] = (),
+                       component_id: Optional[str] = None,
+                       threshold: Optional[float] = None,
+                       hysteresis: Optional[float] = None,
+                       smoothing: Optional[float] = None) -> str:
+        """Bind a numeric component; its +/0/- states become concept nodes."""
+        return self.components.bind(
+            base_node, kind=kind, params=params,
+            component_id=component_id, threshold=threshold,
+            hysteresis=hysteresis, smoothing=smoothing,
+        )
+
+    def _component_step(self, node_id: str,
+                        valence: Optional[np.ndarray] = None) -> None:
+        if not self.components.specs:
+            return
+        self.components.step({node_id: 1.0})
+        if valence is not None:
+            self.components.observe_valence(
+                float(valence[1]), float(valence[0])
+            )
 
     # ---- action values -----------------------------------------------------
     def _neighbor_weights(self, state: np.ndarray):
@@ -279,6 +305,7 @@ class NodeRuntime:
         self.last_state = state
         self.last_scores = scores
         self.pending.append(action)
+        self._component_step(node_id)
         return action
 
     # ---- learning ----------------------------------------------------------
@@ -357,6 +384,7 @@ class NodeRuntime:
             self.last_node, int(action), next_node,
             target_pain, target_dopamine, pain, dopamine,
         )
+        self._component_step(next_node, valence)
         self.last_node = None
         self.last_action = None
         self.last_state = None
@@ -401,6 +429,7 @@ class NodeRuntime:
             current, action, next_node,
             target_pain, target_dopamine, pain, dopamine,
         )
+        self._component_step(next_node, valence)
         if done:
             self.reset()
 

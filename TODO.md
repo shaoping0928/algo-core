@@ -75,6 +75,21 @@
 - [ ] 环境：free-threaded `python3.15t` 的 numpy DLL 被应用控制策略阻止；当前 GIL 构建
   自动用进程池，free-threaded 构建会自动切到线程池。
 
+## 运行时组件与三态概念节点
+
+- [x] `node_components.py`：`RuntimeComponent`（difference/capacitor/resistor）只做运行时数值计算，
+  不进入 `NodeGraph.nodes`；`ComponentBank` 把组件绑定到基础节点。
+- [x] 三态：先平滑（EMA），再饱和到 `[-1,1]`，按 `threshold` 舍入为 `+1/0/-1`；默认
+  `[-1,-0.2]` 抑制、`(-0.2,0.2)` 保持、`[0.2,1]` 激活；`hysteresis` 可选，防止边界抖动。
+- [x] 三态是普通 concept 节点（`role=component_state`、`component_id`、`sign`），参与关联、
+  transition、memory、valence EMA 和持久化。
+- [x] `NodeGraph.to_state/from_state` 持久化节点、边、动作边和组件状态；`ComponentBank.state_dict`
+  持久化组件规格、当前三态、平滑值和节点 valence。
+- [x] `NodeRuntime.bind_component` 可把组件绑到运行时节点；三态节点已参与运行时关联/转移。
+- [ ] 把三态节点接入 NodeRuntime 的 MC/TD 信用分配（当前只做 EMA valence）。
+- [ ] 组件生命周期：哪些节点派生哪些组件、每节点组件数上限、按效用/冗余剪枝，避免图爆炸。
+- [ ] 旧 `add_derived` 数值派生节点仅保留为实验兼容；新路径不再用它承载概念。
+
 任务无关原型（`substrate_generic.py`）已跑通：规划器只读 `obs/action/feedback/terminal`，
 `LinearObservationModel` 学习完整观测转移，价值/风险只吃观测和动作历史。3 个种子存活
 73/232/319 帧（均值 208）；单步留出误差约 `4e-3` 到 `1e-7`，seed 100 的最大训练误差 `0.79`
