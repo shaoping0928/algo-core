@@ -34,7 +34,8 @@ FREE_THREADED = not getattr(sys, "_is_gil_enabled", lambda: True)()
 def fit(seed, steps=5000, coverage=0.1, max_nodes=2000,
         birth_threshold=0.45, epochs=5, lag=LAG,
         component_kinds=(), component_min_count=8,
-        max_components=128, component_weight=0.5):
+        max_components=128, component_weight=0.5,
+        component_gating=False):
     if steps < 1:
         raise ValueError("steps must be positive")
     if not 0.0 <= coverage <= 1.0:
@@ -77,6 +78,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=2000,
         component_min_count=component_min_count,
         max_components=max_components,
         component_weight=component_weight,
+        component_gating=component_gating,
     )
     episodes = {}
     for row in transitions:
@@ -150,7 +152,7 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG):
 def run_seed(task):
     (seed, steps, coverage, cap, max_nodes, birth_threshold, horizon,
      epochs, lag, component_kinds, component_min_count, max_components,
-     component_weight) = task
+     component_weight, component_gating) = task
     world, agent = fit(
         seed, steps=steps, coverage=coverage,
         max_nodes=max_nodes, birth_threshold=birth_threshold,
@@ -159,6 +161,7 @@ def run_seed(task):
         component_min_count=component_min_count,
         max_components=max_components,
         component_weight=component_weight,
+        component_gating=component_gating,
     )
     frames, actions = evaluate(
         seed, world, agent, cap=cap, horizon=horizon, lag=lag
@@ -191,6 +194,7 @@ def main():
     parser.add_argument("--component-min-count", type=int, default=8)
     parser.add_argument("--max-components", type=int, default=128)
     parser.add_argument("--component-weight", type=float, default=0.5)
+    parser.add_argument("--component-gating", action="store_true")
     args = parser.parse_args()
     if args.jobs < 1:
         raise ValueError("--jobs must be positive")
@@ -229,7 +233,8 @@ def main():
         (seed, args.steps, args.coverage, args.cap,
          args.max_nodes, args.birth_threshold, args.horizon, args.epochs,
          args.lag, component_kinds, args.component_min_count,
-         args.max_components, args.component_weight)
+         args.max_components, args.component_weight,
+         args.component_gating)
         for seed in seeds
     ]
     if args.jobs == 1:

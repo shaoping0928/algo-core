@@ -89,6 +89,10 @@
 - [x] 实际接入对照：8 种子、`difference+capacitor`、`min_count=8`、`max_components=128`，
   baseline 107.9 帧 vs components 107.9 帧，逐种子相同；图从 2000 增至约 2512 节点。
   **中性/负结果**：三态节点是基础节点激活的确定性函数，并行动作边没有带来新信息。
+- [x] transition gating 尝试：5000 步/128 组件学到 156 个 gated key，评估 22 步命中 0 次，
+  8 种子仍为 107.9 帧。**负结果**：signature 覆盖太稀疏，需要共享/回退或事件级记忆。
+- [x] 旧节点系统检查：`graph_memory` 初始价值改为由 world pain signal 估计，不再用
+  `terminal`；`NodeGraph` round-trip 覆盖全部边类型；三个 trace 脚本正常退出。
 - [ ] 让三态节点承担基础状态没有的角色：eligibility/信用分配、事件 memory、转移条件；
   不要只增加同源动作边。
 - [ ] 把三态节点接入 NodeRuntime 的 MC/TD 信用分配（当前只做 EMA valence）。

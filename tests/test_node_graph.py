@@ -204,6 +204,29 @@ class NodeGraphTests(unittest.TestCase):
         self.assertEqual(len(graph.action_edges), 0)
         self.assertEqual(graph.action_out, {})
 
+    def test_graph_state_round_trip_preserves_all_edge_kinds(self):
+        graph = NodeGraph()
+        a = graph.add_node("concept", "a")
+        b = graph.add_node("concept", "b")
+        c = graph.add_node("concept", "c")
+        edge = graph.observe_transition(a, b, rate=0.5)
+        graph.add_association(a, c)
+        memory = graph.add_memory([a, b, edge.edge_node])
+        derived = graph.add_derived(a)
+        action = graph.add_action_edge(a, 1, b)
+        action.count = 4
+        action.q_pain = 0.25
+        action.q_dopamine = 0.75
+
+        restored = NodeGraph.from_state(graph.to_state())
+        self.assertEqual(restored.snapshot(), graph.snapshot())
+        self.assertIn((a, b, TRANSITION_EDGE), restored.edges)
+        self.assertIn((memory, a, "membership"), restored.edges)
+        self.assertIn(derived, restored.nodes)
+        self.assertEqual(restored.action_edges[(a, b, 1)].count, 4)
+        self.assertAlmostEqual(restored.action_edges[(a, b, 1)].q_pain, 0.25)
+        restored.recall([a], steps=1)
+
 
 if __name__ == "__main__":
     unittest.main()

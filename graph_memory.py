@@ -82,7 +82,11 @@ class PrototypeGraphMemory:
             [row.get("signals", [1.0 - p, p]) for row, p in zip(rows, pain)],
             dtype=float,
         )
-        self.base = float(pain.mean()) if len(pain) else 0.0
+        # The node value is initialised from the world's pain signal, not from
+        # the episode-boundary label.
+        self.base = (
+            float(signals[:, 1].mean()) if len(signals) else 0.0
+        )
         self.dopamine_base = (
             float(signals[:, 0].mean()) if len(signals) else 0.0
         )

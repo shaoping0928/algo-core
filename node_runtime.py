@@ -56,6 +56,7 @@ class NodeRuntime:
         component_threshold: float = 0.2,
         component_smoothing: float = 0.5,
         component_weight: float = 0.5,
+        component_gating: bool = False,
         seed: int = 0,
         scales: Optional[Sequence[float]] = None,
     ):
@@ -121,6 +122,11 @@ class NodeRuntime:
         self.component_threshold = float(component_threshold)
         self.component_smoothing = float(component_smoothing)
         self.component_weight = float(component_weight)
+        self.component_gating = bool(component_gating)
+        self.gated_edges: Dict[
+            Tuple[str, Tuple[int, ...], int], Dict[str, dict]
+        ] = {}
+        self.last_signature: Tuple[int, ...] = ()
         self.rng = np.random.RandomState(seed)
 
         state_dim = self.obs_dim + self.lag
@@ -254,6 +260,32 @@ class NodeRuntime:
                 float(valence[1]), float(valence[0])
             )
 
+    def _signature(self, node_id: str) -> Tuple[int, ...]:
+        return tuple(
+            self.components.previous_sign[component_id]
+            for component_id, spec in self.components.specs.items()
+            if spec.base_node == node_id
+        )
+
+    def _update_gated(self, node_id: str, signature: Tuple[int, ...],
+                      action: int, next_node: str, target_pain: float,
+                      target_dopamine: float) -> None:
+        if not self.component_gating or not signature:
+            return
+        targets = self.gated_edges.setdefault(
+            (node_id, signature, int(action)), {}
+        )
+        edge = targets.setdefault(
+            next_node, dict(count=0, q_pain=0.0, q_dopamine=0.0)
+        )
+        edge["count"] += 1
+        edge["q_pain"] += self.alpha_q * (
+            target_pain - edge["q_pain"]
+        )
+        edge["q_dopamine"] += self.alpha_q * (
+            target_dopamine - edge["q_dopamine"]
+        )
+
     # ---- action values -----------------------------------------------------
     def _neighbor_weights(self, state: np.ndarray):
         """Distance-weighted node mixture used for decisions.
@@ -280,7 +312,8 @@ class NodeRuntime:
 
     def _score_actions(self, node_id: str,
                        state: Optional[np.ndarray] = None,
-                       sources: Optional[Iterable[str]] = None) -> Dict[int, dict]:
+                       sources: Optional[Iterable[str]] = None,
+                       signature: Tuple[int, ...] = ()) -> Dict[int, dict]:
         node = self.graph.nodes[node_id]
         if state is None:
             state = (
@@ -291,6 +324,33 @@ class NodeRuntime:
         source_ids = list(dict.fromkeys(sources or ()))
         scores: Dict[int, dict] = {}
         for action in self.action_space:
+            gated = (
+                self.gated_edges.get((node_id, signature, action))
+                if self.component_gating and signature else None
+            )
+            if gated:
+                total = float(sum(item["count"] for item in gated.values()))
+                if total > 0.0:
+                    pain = sum(
+                        item["count"] * item["q_pain"]
+                        for item in gated.values()
+                    ) / total
+                    dopamine = sum(
+                        item["count"] * item["q_dopamine"]
+                        for item in gated.values()
+                    ) / total
+                    uncertainty = sum(
+                        item["count"] * (1.0 / np.sqrt(item["count"] + 1.0))
+                        for item in gated.values()
+                    ) / total
+                    scores[action] = dict(
+                        pain=pain,
+                        dopamine=dopamine,
+                        uncertainty=uncertainty,
+                        count=int(total),
+                        cost=pain + self.uncertainty_weight * uncertainty,
+                    )
+                    continue
             support = 0.0
             pain_sum = 0.0
             dopamine_sum = 0.0
@@ -346,14 +406,20 @@ class NodeRuntime:
         state = self.encode(observation)
         node_id = self._assign(state, create=False, count=False)
         sources = self.components.active_sign_nodes(node_id)
-        return node_id, self._score_actions(node_id, state, sources=sources)
+        signature = self._signature(node_id)
+        return node_id, self._score_actions(
+            node_id, state, sources=sources, signature=signature
+        )
 
     def act(self, observation, explore: bool = True) -> int:
         state = self.encode(observation)
         node_id = self._assign(state, create=True, count=True)
         self._component_step(node_id)
         sources = self.components.active_sign_nodes(node_id)
-        scores = self._score_actions(node_id, state, sources=sources)
+        signature = self._signature(node_id)
+        scores = self._score_actions(
+            node_id, state, sources=sources, signature=signature
+        )
         if explore and self.rng.rand() < self.exploration:
             action = int(self.rng.choice(self.action_space))
         else:
@@ -370,6 +436,7 @@ class NodeRuntime:
         self.last_state = state
         self.last_scores = scores
         self.last_sources = [node_id] + sources
+        self.last_signature = signature
         self.pending.append(action)
         return action
 
@@ -460,11 +527,16 @@ class NodeRuntime:
             target_pain, target_dopamine, pain, dopamine,
             sources=self.last_sources,
         )
+        self._update_gated(
+            self.last_node, self.last_signature, int(action), next_node,
+            target_pain, target_dopamine,
+        )
         self._component_step(next_node, valence)
         self.last_node = None
         self.last_action = None
         self.last_state = None
         self.last_sources = []
+        self.last_signature = ()
         if done:
             self.reset()
 
@@ -476,6 +548,7 @@ class NodeRuntime:
         self.last_state = None
         self.last_scores = {}
         self.last_sources = []
+        self.last_signature = ()
         self._traces.clear()
 
     def learn_transition(self, observation, action, next_observation,
@@ -495,6 +568,7 @@ class NodeRuntime:
         current = self._assign(state, create=True, count=True)
         self._component_step(current)
         sources = [current] + self.components.active_sign_nodes(current)
+        signature = self._signature(current)
         self.pending.append(action)
         next_state = self.encode(next_observation)
         next_node = self._assign(next_state, create=True, count=True)
@@ -538,6 +612,7 @@ class NodeRuntime:
             current = self._assign(state, create=True, count=True)
             self._component_step(current)
             sources = [current] + self.components.active_sign_nodes(current)
+            signature = self._signature(current)
             self.pending.append(action)
             next_state = self.encode(row["next_obs"])
             next_node = self._assign(next_state, create=True, count=True)
@@ -551,7 +626,7 @@ class NodeRuntime:
             self._component_step(next_node, signals)
             steps.append((
                 current, action, next_node, float(signals[1]),
-                float(signals[0]), done, sources,
+                float(signals[0]), done, sources, signature,
             ))
             if done:
                 self.reset()
@@ -559,7 +634,7 @@ class NodeRuntime:
         running_pain = 0.0
         running_dopamine = 0.0
         for (current, action, next_node, pain, dopamine,
-             terminal, sources) in reversed(steps):
+             terminal, sources, signature) in reversed(steps):
             return_pain = pain + (
                 0.0 if terminal else self.gamma * running_pain
             )
@@ -575,6 +650,10 @@ class NodeRuntime:
             )
             self._update_action_edges(
                 sources, action, next_node, return_pain, return_dopamine
+            )
+            self._update_gated(
+                current, signature, action, next_node,
+                return_pain, return_dopamine,
             )
             if terminal:
                 entered = self.graph.nodes[next_node]

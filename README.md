@@ -183,6 +183,17 @@ valence 更新；下一步是把它们接入 MC/TD 信用分配，并处理组�
 承担基础状态没有的角色，例如 eligibility/信用分配、事件记忆、或作为转移条件，而不是再加一套
 同源的动作边。
 
+进一步尝试把三态作为 **transition 条件**（gated action edge）：只有当当前 signature 有学到的
+gated 边时才使用它，否则回退到基础边。5000 步、128 个组件时学到 156 个 gated key，但评估时
+22 步中没有一步命中这些 key；8 种子存活仍为 107.9 帧，逐种子不变。原因是三态 signature 的
+覆盖太稀疏，评估状态大量落在未见的 `(node, signature, action)` 上。下一步需要 signature 共享/
+回退或事件级记忆，而不是继续增加条件分支。
+
+旧节点系统检查：`graph_memory` 的初始节点价值现在由 world `signals` 的 pain 估计，而不是由
+`terminal` 标签估计；`NodeGraph.to_state/from_state` 新增覆盖 association、transition、
+memory、derivation、action edge 的 round-trip 测试。`trace_graph_memory.py`、
+`trace_mixed_nodes.py`、`trace_sensitivity.py` 均正常退出。
+
 ## 任务无关世界模型原型
 
 `substrate_generic.py` 是独立原型：规划器只通过

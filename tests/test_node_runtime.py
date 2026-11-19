@@ -116,7 +116,7 @@ class NodeRuntimeTests(unittest.TestCase):
 
     def test_smoke_run_on_flappy_signals(self):
         row = run_seed((100, 100, 0.1, 100, 200, 0.45, 6, 1, 3,
-                        (), 8, 0, 0.5))
+                        (), 8, 0, 0.5, False))
         self.assertGreater(row["frames"], 0)
         self.assertGreaterEqual(row["graph"]["nodes"], 1)
         self.assertGreaterEqual(row["graph"]["action_edges"], 1)
@@ -154,6 +154,28 @@ class NodeRuntimeTests(unittest.TestCase):
             for node_id in sign_nodes
             for action in (0, 1)
         ))
+
+    def test_component_gating_uses_the_signature(self):
+        runtime = self.make_runtime(
+            component_kinds=("difference",), component_min_count=1,
+            max_components=1, component_gating=True,
+        )
+        runtime.reset()
+        runtime.act(np.asarray([0.0]), explore=False)
+        node = runtime.last_node
+        signature = runtime.last_signature
+        self.assertTrue(signature)
+        runtime.gated_edges[(node, signature, 0)] = {
+            "safe": dict(count=10, q_pain=0.1, q_dopamine=1.0)
+        }
+        runtime.gated_edges[(node, signature, 1)] = {
+            "danger": dict(count=10, q_pain=0.9, q_dopamine=1.0)
+        }
+        _node, scores = runtime.decision(np.asarray([0.0]))
+        self.assertLess(scores[0]["pain"], scores[1]["pain"])
+        self.assertEqual(
+            runtime.act(np.asarray([0.0]), explore=False), 0
+        )
 
     def test_core_does_not_embed_task_geometry(self):
         root = Path(__file__).resolve().parents[1]
