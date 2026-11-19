@@ -18,6 +18,10 @@
 `max` 的 152 帧接近；默认 `terminal` exhaustive 约 272 帧。没有证据表明长时域 beam 带来增益。
 搜索器本身仍没有任务专用 gap 规则。
 
+节点中心第一版（`substrate_nodes.py` / `node_runtime.py`）已经开始：不再用 `terminal` 标签训练
+风险头，风险由节点/边从 `dopamine/pain` 信号中用 MC/TD 信用分配学习；8 种子均值 122.8 帧，
+见下文。它还没有超过旧路径，但把“风险”从人工标签改成了节点自身的期望 valence。
+
 ## 本轮修复（代码）
 
 - `NodeGraph.prune` 现在会同时删除与被剪 edge node 相连的 association/membership 边，并从
@@ -38,6 +42,36 @@
 - 所有 CLI 增加范围校验；`kmeans`/图记忆/mixed memory 校验空数据；图记忆和 mixed memory 可重复 `fit`。
 - `WorldFeedbackValueHead` 按 seed 初始化；`trace_generic_training` 改为使用与生产一致的
   normalization、priority 采样和风险先验校正。
+
+## 节点中心改造（第一版）
+
+目标：风险不再由 `terminal` 标签和 `TerminalRiskHead` 定义，而是由节点/边从 world 的
+`dopamine/pain` 信号中自己学习。人类只提供 `obs/action/valence`，`done` 只用于 episode 边界。
+
+已完成：
+
+- `NodeGraph` 增加 `ActionEdge`：`(source, action) -> target`，含 count、`q_pain`、`q_dopamine`、
+  预测误差；删除节点时同步删除动作边。
+- `NodeRuntime`：在线概念节点出生（距离阈值）、Monte-Carlo 回报 + TD(λ) 信用分配、
+  soft-neighbour 运行时评分、未知动作的 optimism/uncertainty、episode 边界 reset。
+- `substrate_nodes.py`：learned observation model 做候选轨迹预测；节点 valence 只给终点打分；
+  没有终止风险头、`GAP/2`、`target_gap`、碰撞窗口或 near-pipe 采样。
+- 新增节点运行时/动作边回归测试；当前全量 62 个测试通过。
+
+测量（8 种子，5000 步，H=10，10 epochs）：312/152/72/72/34/232/25/83，均值 122.8，
+中位数 77.5。低于旧风险头路径 190.1 和任务基线 1026.9；这是第一版节点路径，不是最终性能结论。
+
+下一步：
+
+- [ ] 节点生命周期：按预测误差/valence surprise 出生，按效用/冗余剪枝；当前只有距离出生，
+  没有在线剪枝。
+- [ ] 事件记忆：memory 节点应按 valence 变化/事件分段，而不是整个 episode。
+- [ ] 节点级规划：当前 MPC 仍依赖 `LinearObservationModel` 预测轨迹；下一步让动作边直接参与
+  多步 rollout。
+- [ ] 弱种子（25/34/72 帧）诊断：检查未知动作 fallback、节点覆盖和动作边不确定性。
+- [ ] 评估：用“死亡前 k 帧 vs 匹配存活”的前兆指标替代 terminal 分类 AUC。
+- [ ] 环境：free-threaded `python3.15t` 的 numpy DLL 被应用控制策略阻止；当前 GIL 构建
+  自动用进程池，free-threaded 构建会自动切到线程池。
 
 任务无关原型（`substrate_generic.py`）已跑通：规划器只读 `obs/action/feedback/terminal`，
 `LinearObservationModel` 学习完整观测转移，价值/风险只吃观测和动作历史。3 个种子存活

@@ -129,6 +129,31 @@ python math_memory_search.py
 - 穿管时刻预测：seed 100 的选中计划/全不拍/全拍在缺口内的比例为 `0.843/0.753/0.663`；平均穿管前拍翅 `0.43` 次，平均 gap 误差约 `0.104`。也就是说，选中计划只有轻微、种子相关的调整，不是稳定的方向性动作规则。当前搜索仍主要靠宽缺口、初始高度和延迟拍翅延长存活。
 - 沙盒反事实 rollout 单独记录为搜索经验，不作为真实状态转移训练世界模型或价值头；只有实践中观察到的转移更新模型和价值。
 
+## 节点运行时：只给信号，不标注风险
+
+`substrate_nodes.py` / `node_runtime.py` 是新的节点中心原型，和上面的风险头路径并列：
+
+- 人类只规定 `obs`、`action`、`dopamine/pain`；`done` 只作为 episode 边界，用于 bootstrap 截断和 reset，不作为风险标签。
+- `NodeGraph` 新增动作条件转移边 `(source, action) -> target`，记录 count、`Q_pain`、`Q_dopamine` 和预测误差。
+- `NodeRuntime` 在线出生 concept 节点；用 Monte-Carlo 回报把 world pain 反向传播到此前被激活的节点和边；节点价值 = 未来回报 + 当前状态 immediate pain，避免“终止节点 V=0”把危险终点评成安全。
+- 运行时用 soft neighbours 聚合节点价值；`substrate_nodes.py` 用学到的 `LinearObservationModel` 预测候选轨迹，并用节点学到的 valence 给终点打分。
+- 这条路径不读取 `GAP/2`、`target_gap`、`BIRD_X`、碰撞窗口或 near-pipe 区域，也没有 `TerminalRiskHead`。
+
+```bash
+python substrate_nodes.py --seed 100 --seeds 8 --jobs 8 \
+    --steps 5000 --coverage 0.1 --horizon 10 --epochs 10
+```
+
+当前测量（8 种子，5000 步练习，H=10，10 epochs，max_nodes=2000）：存活
+**312/152/72/72/34/232/25/83** 帧，均值 **122.8**、中位数 **77.5**；图约 532–648 个概念节点、
+1592–1733 条动作边。它仍然低于世界反馈风险头路径（190.1）和任务基线（1026.9），但这是
+**第一个完全不使用终止风险标签、任务几何或近管道标注的节点路径**；下一步是改进节点生命周期、
+事件记忆和弱种子，而不是回到风险头调参。
+
+脚本会检测 Python 是否启用 GIL：free-threaded 构建使用 `ThreadPoolExecutor`，普通构建使用
+`ProcessPoolExecutor`。当前 `.venv` 是 GIL 构建；本机的 `python3.15t` 存在，但 free-threaded
+numpy wheel 的 `_multiarray_umath` DLL 被应用控制策略阻止，暂时无法在该解释器加载 numpy。
+
 ## 任务无关世界模型原型
 
 `substrate_generic.py` 是独立原型：规划器只通过

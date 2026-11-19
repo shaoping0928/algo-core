@@ -48,6 +48,12 @@ class Node:
     edge_key: Optional[Tuple[str, str]] = None
     value: float = 0.0
     dopamine: float = 0.0
+    count: int = 0
+    eligibility_pain: float = 0.0
+    eligibility_dopamine: float = 0.0
+    immediate_pain: float = 0.0
+    immediate_dopamine: float = 0.0
+    features: Optional[np.ndarray] = None
 
     def activate(self, value: float) -> float:
         self.activation = float(value)
@@ -73,12 +79,36 @@ class Edge:
         return (self.source, self.target, self.kind)
 
 
+@dataclass
+class ActionEdge:
+    """A transition conditioned on the action that caused it.
+
+    Unlike `Edge`, this records how often an action moved one concept node to
+    another and the learned expected valence of that transition.  It is the
+    substrate for node-level `Q(s, a)` values.
+    """
+
+    source: str
+    target: str
+    action: int
+    count: int = 0
+    q_pain: float = 0.0
+    q_dopamine: float = 0.0
+    prediction_error: float = 0.0
+
+    def key(self):
+        return (self.source, self.target, int(self.action))
+
+
 class NodeGraph:
     def __init__(self):
         self.nodes: Dict[str, Node] = {}
         self.edges: Dict[Tuple[str, str, str], Edge] = {}
         self.outgoing: Dict[str, List[str]] = {}
         self.incoming: Dict[str, List[str]] = {}
+        # Action-conditioned transition edges: (source, target, action) -> edge.
+        self.action_edges: Dict[Tuple[str, str, int], ActionEdge] = {}
+        self.action_out: Dict[Tuple[str, int], List[Tuple[str, str, int]]] = {}
         self._counter = 0
 
     # ---- creation -----------------------------------------------------------
@@ -130,6 +160,29 @@ class NodeGraph:
         self.outgoing[source].append(key)
         self.incoming[target].append(key)
         return edge
+
+    def add_action_edge(self, source: str, action: int,
+                        target: str) -> ActionEdge:
+        """Create or return the action-conditioned transition edge."""
+        for node in (source, target):
+            if node not in self.nodes:
+                raise KeyError(node)
+        key = (source, target, int(action))
+        if key in self.action_edges:
+            return self.action_edges[key]
+        edge = ActionEdge(source, target, int(action))
+        self.action_edges[key] = edge
+        self.action_out.setdefault((source, int(action)), []).append(key)
+        return edge
+
+    def action_edges_from(self, source: str, action: int) -> List[ActionEdge]:
+        return [
+            self.action_edges[key]
+            for key in self.action_out.get((source, int(action)), [])
+        ]
+
+    def action_targets(self, source: str, action: int) -> List[str]:
+        return [edge.target for edge in self.action_edges_from(source, action)]
 
     def add_memory(self, members: Iterable[str], node_id: Optional[str] = None) -> str:
         members = list(dict.fromkeys(members))
@@ -260,11 +313,22 @@ class NodeGraph:
             if key in bucket.get(node_id, []):
                 bucket[node_id].remove(key)
 
+    def _remove_action_edge(self, key: Tuple[str, str, int]) -> None:
+        edge = self.action_edges.pop(key)
+        bucket = self.action_out.get((edge.source, edge.action), [])
+        if key in bucket:
+            bucket.remove(key)
+        if not bucket:
+            self.action_out.pop((edge.source, edge.action), None)
+
     def _remove_node(self, node_id: str) -> None:
         """Remove a node and every edge that still refers to it."""
         for key, edge in list(self.edges.items()):
             if edge.source == node_id or edge.target == node_id:
                 self._remove_edge(key)
+        for key, edge in list(self.action_edges.items()):
+            if edge.source == node_id or edge.target == node_id:
+                self._remove_action_edge(key)
         for node in self.nodes.values():
             if node.members:
                 node.members = [member for member in node.members
@@ -302,6 +366,7 @@ class NodeGraph:
             edges=len(self.edges),
             associations=sum(e.kind == ASSOCIATION for e in self.edges.values()),
             transitions=sum(e.kind == TRANSITION_EDGE for e in self.edges.values()),
+            action_edges=len(self.action_edges),
             edge_nodes=sum(n.kind == EDGE for n in self.nodes.values()),
             memories=sum(n.kind == MEMORY for n in self.nodes.values()),
         )

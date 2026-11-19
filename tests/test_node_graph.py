@@ -177,6 +177,33 @@ class NodeGraphTests(unittest.TestCase):
         self.assertGreater(memory.graph.nodes[danger_node].value, 0.7)
         self.assertLess(memory.graph.nodes[safe_node].value, 0.3)
 
+    def test_action_edges_are_conditioned_on_the_action(self):
+        graph = NodeGraph()
+        source = graph.add_node("concept")
+        left = graph.add_node("concept")
+        right = graph.add_node("concept")
+        zero = graph.add_action_edge(source, 0, left)
+        one = graph.add_action_edge(source, 1, right)
+        zero.count = 3
+        one.count = 5
+
+        self.assertEqual(graph.action_targets(source, 0), [left])
+        self.assertEqual(graph.action_targets(source, 1), [right])
+        self.assertEqual(graph.action_edges_from(source, 0)[0].count, 3)
+        self.assertEqual(graph.snapshot()["action_edges"], 2)
+
+    def test_removing_a_node_removes_its_action_edges(self):
+        graph = NodeGraph()
+        source = graph.add_node("concept")
+        target = graph.add_node("concept")
+        graph.add_action_edge(source, 0, target)
+        graph.add_action_edge(target, 1, source)
+
+        graph._remove_node(target)
+        self.assertNotIn(target, graph.nodes)
+        self.assertEqual(len(graph.action_edges), 0)
+        self.assertEqual(graph.action_out, {})
+
 
 if __name__ == "__main__":
     unittest.main()
