@@ -26,7 +26,13 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from node_components import ComponentBank
-from node_graph import CONCEPT, NodeGraph
+from node_graph import (
+    ASSOCIATION,
+    CONCEPT,
+    MEMORY,
+    TRANSITION_EDGE,
+    NodeGraph,
+)
 
 
 class NodeRuntime:
@@ -57,6 +63,7 @@ class NodeRuntime:
         component_smoothing: float = 0.5,
         component_weight: float = 0.5,
         component_gating: bool = False,
+        graph_rate: float = 0.1,
         seed: int = 0,
         scales: Optional[Sequence[float]] = None,
     ):
@@ -96,6 +103,8 @@ class NodeRuntime:
             raise ValueError("component_smoothing must be in (0, 1]")
         if float(component_weight) < 0.0:
             raise ValueError("component_weight must be non-negative")
+        if not 0.0 < float(graph_rate) <= 1.0:
+            raise ValueError("graph_rate must be in (0, 1]")
         actions = tuple(int(action) for action in action_space)
         if not actions:
             raise ValueError("action_space must not be empty")
@@ -123,6 +132,7 @@ class NodeRuntime:
         self.component_smoothing = float(component_smoothing)
         self.component_weight = float(component_weight)
         self.component_gating = bool(component_gating)
+        self.graph_rate = float(graph_rate)
         self.gated_edges: Dict[
             Tuple[str, Tuple[int, ...], int], Dict[str, dict]
         ] = {}
@@ -157,6 +167,14 @@ class NodeRuntime:
         self.last_scores: Dict[int, dict] = {}
         self.last_sources: List[str] = []
         self._component_bound = set()
+        self.episode_memory: Optional[str] = None
+        self._memory_counter = 0
+        self.last_pain = 0.0
+        self.last_dopamine = 0.0
+        self._change_count = 0
+        self._change_mean = 0.0
+        self._change_m2 = 0.0
+        self._change_history = deque(maxlen=256)
 
     # ---- encoding ----------------------------------------------------------
     def _zero_pending(self):
@@ -260,8 +278,63 @@ class NodeRuntime:
                 float(valence[1]), float(valence[0])
             )
 
-    def _signature(self, node_id: str) -> Tuple[int, ...]:
-        return tuple(
+    def _new_memory(self) -> str:
+        self._memory_counter += 1
+        return self.graph.add_memory(
+            [], "memory_runtime_%d" % self._memory_counter
+        )
+
+    def _interact(self, current: str, next_node: str, pain: float = 0.0,
+                  dopamine: float = 0.0, build_memory: bool = True) -> None:
+        """Create association, causal transition and generic memory membership."""
+        if current == next_node:
+            return
+        self.graph.activate([current, next_node], [1.0, 1.0])
+        self.graph.observe_association(
+            [current, next_node], rate=self.graph_rate
+        )
+        edge = self.graph.observe_transition(
+            current, next_node, rate=self.graph_rate
+        )
+        pain = float(pain)
+        dopamine = float(dopamine)
+        change = abs(pain - self.last_pain) + abs(
+            dopamine - self.last_dopamine
+        )
+        self._change_count += 1
+        delta = change - self._change_mean
+        self._change_mean += delta / self._change_count
+        self._change_m2 += delta * (change - self._change_mean)
+        self._change_history.append(change)
+        if self._change_count > 1:
+            variance = self._change_m2 / (self._change_count - 1)
+            threshold = self._change_mean + 2.0 * np.sqrt(
+                max(variance, 1e-12)
+            )
+        else:
+            threshold = float("inf")
+        # Event boundaries are learned from the running valence-change
+        # distribution; there is no task-specific memory mode or threshold.
+        if build_memory:
+            start_memory = (
+                self.episode_memory is None
+                or (
+                    self._change_count >= 8
+                    and change > threshold
+                )
+            )
+            if start_memory:
+                self.episode_memory = self._new_memory()
+            self.graph.add_membership(self.episode_memory, current)
+            self.graph.add_membership(self.episode_memory, next_node)
+            if edge.edge_node is not None:
+                self.graph.add_membership(
+                    self.episode_memory, edge.edge_node
+                )
+        self.last_pain = pain
+        self.last_dopamine = dopamine
+
+    def _signature(self, node_id: str) -> Tuple[int, ...]:        return tuple(
             self.components.previous_sign[component_id]
             for component_id, spec in self.components.specs.items()
             if spec.base_node == node_id
@@ -515,6 +588,10 @@ class NodeRuntime:
 
         next_state = self.encode(observation)
         next_node = self._assign(next_state, create=True, count=True)
+        self._interact(
+            self.last_node, next_node,
+            float(valence[1]), float(valence[0]),
+        )
         pain = float(valence[1])
         dopamine = float(valence[0])
         next_value = self.graph.nodes[next_node]
@@ -549,6 +626,9 @@ class NodeRuntime:
         self.last_scores = {}
         self.last_sources = []
         self.last_signature = ()
+        self.episode_memory = None
+        self.last_pain = 0.0
+        self.last_dopamine = 0.0
         self._traces.clear()
 
     def learn_transition(self, observation, action, next_observation,
@@ -572,6 +652,9 @@ class NodeRuntime:
         self.pending.append(action)
         next_state = self.encode(next_observation)
         next_node = self._assign(next_state, create=True, count=True)
+        self._interact(
+            current, next_node, float(valence[1]), float(valence[0])
+        )
         pain = float(valence[1])
         dopamine = float(valence[0])
         next_value = self.graph.nodes[next_node]
@@ -588,7 +671,7 @@ class NodeRuntime:
         if done:
             self.reset()
 
-    def learn_episode(self, rows) -> None:
+    def learn_episode(self, rows, build_memory: bool = True) -> None:
         """Monte-Carlo node/edge values for one real episode.
 
         `rows` are transition dicts with ``obs``, ``next_obs``, ``history``,
@@ -616,6 +699,11 @@ class NodeRuntime:
             self.pending.append(action)
             next_state = self.encode(row["next_obs"])
             next_node = self._assign(next_state, create=True, count=True)
+            self._interact(
+                current, next_node,
+                float(signals[1]), float(signals[0]),
+                build_memory=build_memory,
+            )
             entered = self.graph.nodes[next_node]
             entered.immediate_pain += self.alpha_now * (
                 signals[1] - entered.immediate_pain
@@ -795,6 +883,18 @@ class NodeRuntime:
         return dict(
             nodes=len(self.graph.nodes),
             action_edges=len(self.graph.action_edges),
+            associations=sum(
+                edge.kind == ASSOCIATION
+                for edge in self.graph.edges.values()
+            ),
+            transitions=sum(
+                edge.kind == TRANSITION_EDGE
+                for edge in self.graph.edges.values()
+            ),
+            memories=sum(
+                node.kind == MEMORY
+                for node in self.graph.nodes.values()
+            ),
             prototypes=len(self._prototype_ids),
             components=len(self.components.specs),
             component_states=sum(

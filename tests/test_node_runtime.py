@@ -92,6 +92,10 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertLess(values[0], values[1])
         self.assertLess(values[1], values[2])
         self.assertGreater(values[3], 0.9)
+        snapshot = runtime.snapshot()
+        self.assertGreater(snapshot["associations"], 0)
+        self.assertGreater(snapshot["transitions"], 0)
+        self.assertGreater(snapshot["memories"], 0)
 
     def test_novel_observations_birth_nodes(self):
         runtime = self.make_runtime(birth_threshold=0.1)
@@ -120,6 +124,31 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertGreater(row["frames"], 0)
         self.assertGreaterEqual(row["graph"]["nodes"], 1)
         self.assertGreaterEqual(row["graph"]["action_edges"], 1)
+
+    def test_adaptive_event_memory_uses_valence_surprise(self):
+        def rows(count, final_pain):
+            result = []
+            for index in range(count):
+                terminal = index == count - 1 and final_pain
+                pain = 1.0 if terminal else 0.0
+                result.append(dict(
+                    obs=np.asarray([float(index)]),
+                    next_obs=np.asarray([float(index + 1)]),
+                    history=np.asarray([0.0, 0.0, 0.0, 0.0]),
+                    signals=np.asarray([1.0 - pain, pain]),
+                    done=terminal, episode=0,
+                ))
+            return result
+
+        steady = self.make_runtime(max_nodes=40)
+        steady.learn_episode(rows(12, False))
+        self.assertEqual(steady.snapshot()["memories"], 1)
+        steady.learn_episode(rows(12, False), build_memory=False)
+        self.assertEqual(steady.snapshot()["memories"], 1)
+
+        surprise = self.make_runtime(max_nodes=40)
+        surprise.learn_episode(rows(12, True))
+        self.assertGreaterEqual(surprise.snapshot()["memories"], 2)
 
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()

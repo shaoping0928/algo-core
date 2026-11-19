@@ -16,7 +16,7 @@ import argparse
 
 import numpy as np
 
-from node_graph import ASSOCIATION, MEMBERSHIP, TRANSITION_EDGE
+from node_graph import ASSOCIATION, CONCEPT, MEMORY, TRANSITION_EDGE
 from node_runtime import NodeRuntime
 from substrate_generic import collect
 
@@ -29,7 +29,7 @@ def _action_support(graph, near_only=False, scales=None):
     near_total = 0
     near_both = 0
     for node in graph.nodes.values():
-        if node.role == "component_state":
+        if node.kind != CONCEPT or node.role == "component_state":
             continue
         actions = set()
         for action in (0, 1):
@@ -97,7 +97,7 @@ def trace(seed, steps=5000, coverage=0.1, epochs=5, wave_episodes=10,
     wave = 0
     seen_episodes = 0
     credits = 0
-    for _epoch in range(epochs):
+    for epoch in range(epochs):
         for episode in ordered:
             before = {
                 node_id: (node.value, node.immediate_pain)
@@ -106,7 +106,7 @@ def trace(seed, steps=5000, coverage=0.1, epochs=5, wave_episodes=10,
             death = next(
                 (row for row in episode if row["terminal"]), None
             )
-            agent.learn_episode(episode)
+            agent.learn_episode(episode, build_memory=(epoch == 0))
             seen_episodes += 1
             if death is not None and credits < credit_samples:
                 changed = []
@@ -132,7 +132,12 @@ def trace(seed, steps=5000, coverage=0.1, epochs=5, wave_episodes=10,
             if seen_episodes % wave_episodes == 0:
                 wave += 1
                 current_nodes = set(agent.graph.nodes)
-                new_nodes = current_nodes - previous_nodes
+                new_nodes = {
+                    node_id for node_id in current_nodes - previous_nodes
+                    if agent.graph.nodes[node_id].kind == CONCEPT
+                    and agent.graph.nodes[node_id].role
+                    != "component_state"
+                }
                 previous_nodes = current_nodes
                 action_edges = len(agent.graph.action_edges)
                 associations = sum(
@@ -144,24 +149,27 @@ def trace(seed, steps=5000, coverage=0.1, epochs=5, wave_episodes=10,
                     for edge in agent.graph.edges.values()
                 )
                 memories = sum(
-                    edge.kind == MEMBERSHIP
-                    for edge in agent.graph.edges.values()
+                    node.kind == MEMORY
+                    for node in agent.graph.nodes.values()
                 )
                 both, total, near_both, near_total = _action_support(
                     agent.graph, near_only=True, scales=scales
                 )
                 values = np.asarray([
                     node.value for node in agent.graph.nodes.values()
-                    if node.role != "component_state"
+                    if node.kind == CONCEPT
+                    and node.role != "component_state"
                 ])
                 terminal_nodes = [
                     node for node in agent.graph.nodes.values()
-                    if node.role != "component_state"
+                    if node.kind == CONCEPT
+                    and node.role != "component_state"
                     and node.immediate_pain > 0.5
                 ]
                 concept_nodes = [
                     node for node in agent.graph.nodes.values()
-                    if node.role != "component_state"
+                    if node.kind == CONCEPT
+                    and node.role != "component_state"
                 ]
                 low_count = sum(
                     node.count <= 1 for node in concept_nodes

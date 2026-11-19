@@ -98,12 +98,17 @@
   135/23.6，双动作支撑仅 0.52；方向准确率 0.696。瓶颈是终止状态/反事实动作的在线覆盖，
   不是世界模型。
 - [x] 训练过程追踪（`trace_node_training.py`）：节点约 100 episode 达到 2000 上限后停止出生；
-  assoc/trans/mem 全程为 0；整体双动作支撑 0.22、近管道 0.11；终止节点 60 个。
-  **结构性发现**：当前 NodeRuntime 只训练概念原型 + 动作边，没有训练关联/转移/memory。
-- [ ] 在 NodeRuntime 训练中建立 association、transition 和 event/episode memory（当前为 0）。
+  整体双动作支撑 0.22、近管道 0.11；终止节点 60 个。
+- [x] 通用 interaction：每条真实转移建立 association/transition；event memory 的边界由
+  `|Δpain|+|Δdopamine|` 的 running mean/std（surprise）自适应决定，没有 memory_mode/阈值配置；
+  重复 epoch 不重复建 memory。5000 步后 assoc/trans/mem = 2435/2439/215。
+- [ ] 让 association/transition/memory 真正参与价值回传或动作选择；当前只建立、不读取，
+  所以存活仍是 107.9。
 - [ ] 节点生命周期：上限/剪枝/合并；避免新终止状态 alias 到安全节点。
 - [ ] 用 on-policy/DAgger 采集 MPC 自己产生的终止状态与近管道反事实动作，再重训价值/Q。
 - [ ] 给终止状态更连续的价值读出不只依赖最近原型；检查 boundary 附近节点的分辨率。
+- [ ] 组件绑定目前仍由 `component_min_count`/`max_components` 配置；下一步改成按训练中的
+  预测误差/valence 方差/效用自适应出生与剪枝，去掉配置层级决策。
 - [ ] 让三态节点承担基础状态没有的角色：eligibility/信用分配、事件 memory、转移条件；
   不要只增加同源动作边。
 - [ ] 把三态节点接入 NodeRuntime 的 MC/TD 信用分配（当前只做 EMA valence）。

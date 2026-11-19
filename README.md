@@ -221,22 +221,31 @@ memory、derivation、action edge 的 round-trip 测试。`trace_graph_memory.py
 训练过程本身（`trace_node_training.py`，seed 100，5000 步，5 epochs）：
 
 ```text
-wave 1:  363 nodes,  485 action edges, assoc=0, trans=0, mem=0, both=0.099, near=0.073
-wave 10: 2000 nodes, 2776 action edges, assoc=0, trans=0, mem=0, both=0.142, near=0.085
-wave 22: 2000 nodes, 3117 action edges, assoc=0, trans=0, mem=0, both=0.224, near=0.111
-end:     2000 nodes, 3117 action edges, 60 terminal nodes
+wave 1:  363 concepts,  485 action edges, assoc=356, trans=356, mem=19
+wave 10: 2000 concepts, 2776 action edges, assoc=2172, trans=2173, mem=177
+wave 22: 2000 concepts, 3117 action edges, assoc=2435, trans=2439, mem=215
+end:     2000 concepts, 3117 action edges, 60 terminal nodes
 ```
 
-关键发现：
+现在概念间 interaction 已经真正建立：
 
-- **连接/转移/记忆结构完全没有被训练使用**：assoc/trans/mem 全程为 0。节点运行时目前只是
-  “概念原型 + 动作边”，没有建立概念间关联、转移边或 memory。
+- 每条真实转移都建立 association 和 directed transition；
+- event memory 的边界由运行时统计决定：`|Δpain| + |Δdopamine|` 的 running mean/std
+  超过 `mean + 2*std`（至少 8 个样本）时开启新 memory；没有 `memory_mode` 或人手阈值配置；
+- 重复 epoch 不再重复创建 memory（只有第一个 epoch 建 memory，后续只更新值与边）；
+- `trace_node_training.py` 的 `assoc/trans/mem` 现在为 2435/2439/215。
+
+但决策路径仍未读取这些 interaction：存活仍是 107.9 帧，和没有 interaction 时相同。节点图的
+结构已经存在，下一步要把 association/transition/memory 用于价值回传或动作选择，而不是只建立。
+
+其余训练过程问题仍然成立：
+
 - 节点数在约 100 个 episode 时达到 2000 上限，之后不再出生；没有剪枝/合并，新的终止状态
   只能映射到旧节点，于是出现终止状态 alias 到安全节点。
 - 近管道双动作支撑只有 `0.11`，整体 `0.22`；另一动作的 Q 长期缺少数据。
 - 死亡信用会更新 16–22 个节点，但终止节点本身很少被重复访问；早期 `term>0.5` 的节点为 0，
   直到后期才累积到 60 个。
-- 因此训练出的图是**僵化的离散记忆**：能拟合行为策略的留出集，却不能覆盖 MPC 自己产生的
+- 因此训练出的图仍然偏“僵化的离散记忆”：能拟合行为策略的留出集，却不能覆盖 MPC 自己产生的
   终止状态和新轨迹。
 
 ## 任务无关世界模型原型

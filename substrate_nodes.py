@@ -84,9 +84,11 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=2000,
     for row in transitions:
         episodes.setdefault(row["episode"], []).append(row)
     ordered = [episodes[key] for key in sorted(episodes)]
-    for _epoch in range(epochs):
+    for epoch in range(epochs):
         for episode in ordered:
-            agent.learn_episode(episode)
+            agent.learn_episode(
+                episode, build_memory=(epoch == 0)
+            )
     return world, agent
 
 
@@ -254,12 +256,12 @@ def main():
         with ProcessPoolExecutor(max_workers=args.jobs) as pool:
             rows = list(pool.map(run_seed, tasks))
 
-    print(" seed  frames  flap_rate  nodes  components  action_edges")
+    print(" seed  frames  flap_rate  concepts  graph_nodes  action_edges")
     for row in rows:
         graph = row["graph"]
-        print(" %4d  %6d  %9.3f  %5d  %10d  %12d"
+        print(" %4d  %6d  %9.3f  %8d  %11d  %12d"
               % (row["seed"], row["frames"], row["flap_rate"],
-                 graph["nodes"], graph["components"],
+                 graph["prototypes"], graph["nodes"],
                  graph["action_edges"]))
     print("frames mean %.1f median %.1f"
           % (np.mean([row["frames"] for row in rows]),
