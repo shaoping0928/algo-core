@@ -55,8 +55,11 @@
   滞后槽位识别（Δ_j argmax + 分离度）、与 zero/one 计划同尺度的对照。
 - [x] `plan_score`：按 `policy_result` 同一目标给固定计划打分（含与 exhaustive_search
   一致性的单元测试）。
-- [ ] 评估协议：`--eval-seeds`/`--eval-episodes`、per-seed 中位数/IQR/bootstrap CI、
-  held-out 种子（如 120–139）。
+- [x] 评估协议（2026-11）：`--eval-seeds`/`--eval-episodes`、per-seed 中位数/IQR、
+  按训练模型聚类的 bootstrap 95% CI、`--report` JSON；`eval_protocol.py` 负责种子
+  解析与统计。首次 fast held-out（训练 100–107，评估 120–124，短窗口）：
+  n=40，均值 `116.4`、中位数 `152.0`、IQR `80.0`、区间 `42–232`，聚类 CI
+  `[99.9, 133.9]`。remaining：hybrid 与 full 5000 步协议用同一 held-out 集复核。
 - [ ] 删除或标注不可复现的 0.977 AUC 与 n=2 的"验证"；README 增加"实现/训练/被控制器读取"三栏。
 
 ### P1 正确性
@@ -233,6 +236,18 @@ trace（seed 100）：
   执行**的轨迹每步都有真实反馈，允许回流。DAgger + surprise 门控节点
   出生防图爆炸——把强种子的发现变成所有种子的先验，1.75 根 →
   系统性 4–5 根的直接路径。
+  - [x] 代码入口（2026-11）：`evaluate(record=True)` 记录实际执行的
+    `obs/next_obs/history/signals/done/episode`；`fit(dagger_rounds=N)` 每轮
+    在训练种子的独立世界（offset 50000）执行规划器、追加真实转移、从零重训；
+    每轮 episode id 递增，避免轨迹被错误合并。CLI：`--dagger-rounds/
+    --dagger-episodes/--dagger-cap/--dagger-offset/--dagger-horizon`。默认关闭。
+  - [x] fast held-out A/B（2026-11）：8 个训练模型 × 5 个 held-out 世界。
+    short-window：116.4 → **170.1**，paired +53.7（SE 24.6，2.18 SE），7/8 同向；
+    hybrid：134.9 → **179.8**，paired +44.9（SE 23.6，1.90 SE），6/8 同向。
+    planner 数据量约 110–800 步/模型/轮，图节点约 1808–2222。`cap=400` 会截断强种子。
+  - [ ] full 协议 held-out 复核（hybrid、cap=6000）与 dagger=1 vs 2 的
+    轮数消融；同时检查 DAgger 是否把评估轨迹变成训练集导致自评泄漏
+    （当前实现用 offset 世界，与 `--eval-seeds` 世界不相交）。
 - **B2 价值通道无专属特征**："对齐接近"（|gap|<0.17 且 dx 适中）是反死亡
   状态，现有特征全部从死亡覆盖归纳，最接近的只有 |f3|<0.007 的细条——
   V_f 在最需要梯度的对齐带上回退 baseline。用高回报覆盖做一次
@@ -242,10 +257,50 @@ trace（seed 100）：
   120–139、bootstrap CI。
 - **B4 世界模型管道事件失明**：dx 一步误差 max 0.79（生成/弹出不连续），
   穿越计划恰好在 dx 上做文章。事件感知动力学，中改。
-- **B5 残余人为成分**：w=0.02 未校准；step_stride=2 跳过第一个受影响
-  预测点；H 对 24 帧接近段偏紧。
+- **B5 残余人为成分**：w=0.02 未校准；`step_stride=2` 跳过第一个受影响
+  预测点；H 对 24 帧接近段偏紧。`--step-stride` 已暴露；`--stride-includes-lag`
+  的 fast A/B 已跑：paired +3.8（0.11 SE）、median −11.6、4/8 正向，**中性**，
+  默认保持关闭。剩余：full 复核、w 校准、H 消融。
 
 顺序：B3+B5（尺子可信）→ B1（闭环）→ B2（价值特征）→ B4（事件模型）。
+
+## Held-out 评估（2026-11）
+
+协议：训练种子 100–107，评估种子 120–124；每个训练模型在 5 个 held-out 世界上
+各跑 1 条确定性 episode；区间按训练模型聚类（8 个 cluster），不是按 episode。
+
+| 臂 | 协议 | n | mean | median | IQR | cluster 95% CI |
+|---|---|---:|---:|---:|---:|---|
+| short-window, dagger=0 | fast | 40 | 116.4 | 152.0 | 80.0 | [99.9, 133.9] |
+| short-window, dagger=2 | fast | 40 | **170.1** | 152.0 | 94.0 | [126.8, 212.9] |
+| hybrid (`--pain-horizon 8`), dagger=0 | fast | 40 | 134.9 | 152.0 | 80.8 | [109.4, 160.9] |
+| hybrid, dagger=2 | fast | 40 | **179.8** | 152.0 | 150.2 | [144.9, 214.0] |
+| hybrid, dagger=2, `--stride-includes-lag` | fast | 40 | 183.7 | 152.0 | 97.5 | [135.3, 239.8] |
+| hybrid, dagger=0 | full | 待填 | | | | |
+| hybrid, dagger=2 | full | 待填 | | | | |
+
+DAgger 的 paired 每模型差（同训练种子、同 held-out 世界）：
+
+```text
+short-window: +62.4/+14.4/+114.4/+44.8/+98.0/+156.4/+0.2/-60.8
+              mean +53.7  median +53.6  SE 24.6 (2.18 SE)  7/8 positive
+hybrid:       +96.4/+35.4/+115.8/+78.2/+80.6/-32.0/+61.8/-77.0
+              mean +44.9  median +70.0  SE 23.6 (1.90 SE)  6/8 positive
+```
+
+两个窗口臂方向一致：DAgger 把 fast held-out 均值提高约 35–55 帧，但 hybrid
+的种子间方差明显变大（IQR 80.8→150.2），有两个种子反向。注意 fast 协议
+`cap=400` 会截断强种子，真实收益可能被低估，也可能把“活得更久”混进
+cap 效应；full 协议仍需复核。
+
+B5 的 `step_stride` 覆盖第一个受影响点：hybrid + DAgger 下
+`--stride-includes-lag` 的 held-out A/B 已跑（2026-11）：183.7 / 152.0 vs
+179.8 / 152.0，paired `+82.0/-33.6/-99.8/-32.2/-112.8/+9.0/+184.6/+33.4`，
+mean **+3.8**、median **−11.6**、SE 34.5（0.11 SE）、4/8 正向。**中性**，
+维持默认关闭；开关保留，等 full 协议复核后再决定是否定案。
+
+fast 协议：1500 步、3 epoch、1000 节点、H=8、cap=400。full 协议：5000 步、
+5 epoch、5000 节点、H=10、cap=6000。short-window 指 `--pain-horizon 0`。
 
 ## 当前状态
 

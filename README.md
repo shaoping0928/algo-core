@@ -28,6 +28,9 @@ node_graph.py             统一 Node/Edge 图：概念、转移边节点、记�
 graph_memory.py           观测原型 -> 概念/转移边节点/事件记忆的原型图记忆
 trace_graph_memory.py     在真实 Flappy 转移上评估图记忆风险
 substrate_graph_search.py 用学习世界模型 + 图记忆风险做搜索的原型
+substrate_nodes.py        节点中心原型：在线节点价值 + 沙盒轨迹搜索
+node_runtime.py           节点运行时：动作条件边、MC 信用分配、事件记忆
+eval_protocol.py          held-out 种子解析、中位数/IQR、聚类 bootstrap 区间
 signal_bank.py            每节点信号源：差分、积分/泄漏、逆泄漏、均值
 substrate_*.py            各算子、记忆、噪声、延迟和搜索的验证脚本
 tests/                    unittest 回归测试
@@ -140,15 +143,100 @@ python math_memory_search.py
 - 这条路径不读取 `GAP/2`、`target_gap`、`BIRD_X`、碰撞窗口或 near-pipe 区域，也没有 `TerminalRiskHead`。
 
 ```bash
+# 训练 8 个种子，在 held-out 120–124 上评估（推荐协议）
 python substrate_nodes.py --seed 100 --seeds 8 --jobs 8 \
+    --eval-seeds 120-124 --eval-episodes 1 \
+    --report eval.json \
     --steps 5000 --coverage 0.1 --horizon 10 --epochs 10
+
+# 快速开发：held-out 评估 + 报告
+python substrate_nodes.py --fast --seed 100 --seeds 8 --jobs 8 \
+    --eval-seeds 120-124 --eval-episodes 1
+
+# DAgger 闭环：记录规划器实际执行的轨迹并重训（不记录反事实预测）
+python substrate_nodes.py --fast --seed 100 --seeds 8 --jobs 8 \
+    --eval-seeds 120-124 --dagger-rounds 2 --dagger-episodes 2 \
+    --dagger-cap 400
 ```
+
+`--eval-seeds` 为空时保留旧的 self-eval 并打印警告；`--report` 写出逐 episode
+行、按训练种子/评估种子的汇总，以及按训练模型聚类的 bootstrap 95% 区间。
+同一模型的多个 episode 不是独立证据，因此区间重采样的是训练模型，不是 episode。
 
 当前测量（8 种子，5000 步练习，H=10，10 epochs，max_nodes=2000）：存活
 **232/48/31/78/151/72/152/99** 帧，均值 **107.9**、中位数 **88.5**；每个种子都达到
 2000 节点上限、约 3100–3160 条动作边。状态尺度不是硬编码常量，而是从真实观测的标准差估计。
 它仍然低于世界反馈风险头路径（190.1）和任务基线（1026.9）；节点上限被顶满说明当前
 “距离出生、无剪枝”的生命周期需要下一步处理，而不是靠任务常数调参。
+
+### 评估协议（2026-11）
+
+之前所有数字都是“训练种子 = 评估种子”的单条确定性轨迹。现在协议支持：
+
+- `--eval-seeds`：held-out 种子（推荐 `120-139`），与训练种子分离；
+- `--eval-episodes`：每个评估种子的 episode 数；世界 id 走
+  `eval_seed * 10000 + episode`，与 `collect` 的命名一致；
+- 输出逐 episode 行、按训练种子和评估种子的汇总，以及 **按训练模型聚类** 的
+  bootstrap 95% 区间；同一模型的多个 episode 不当独立证据；
+- `--report` 把原始行和汇总写成 JSON，便于后续 paired 比较；
+- `--step-stride` 暴露出来；`--stride-includes-lag` 额外查询 `step == lag`
+  （计划动作第一次能影响预测状态的点）。fast held-out A/B（hybrid + DAgger）：
+  183.7 / 152.0 vs 179.8 / 152.0，paired +3.8（0.11 SE）、median −11.6、4/8
+  正向，**中性**；默认保持关闭，开关保留。
+
+首次 held-out 校准（fast 协议：1500 步、3 epoch、1000 节点、H=8、cap=400；
+训练种子 100–107，评估种子 120–124；默认短窗口，未开 `--pain-horizon 8`）：
+
+```text
+per model mean: 89.6 / 88.0 / 153.8 / 123.2 / 105.4 / 93.2 / 138.0 / 140.0
+overall: n=40  mean 116.4  median 152.0  IQR 80.0  range 42-232
+cluster bootstrap 95% CI over 8 models: [99.9, 133.9]
+```
+
+对照 fast self-eval 的短窗口臂（122.0 / 144.5，8 种子、每种子 1 条轨迹）：
+held-out 没有出现“self-eval 大幅高估”，但分布明显更宽；两者协议不同，
+不能直接当成同一个估计。该结果只覆盖短窗口臂，hybrid（`--pain-horizon 8`）
+和 full 5000 步协议仍需用同一 held-out 集复核。
+
+### 闭环采集（DAgger，2026-11）
+
+`substrate_nodes.evaluate(record=True)` 现在可以返回规划器**实际执行**的真实转移，
+schema 与 `collect` 完全一致：
+
+```text
+obs / next_obs / history / signals / done / episode
+```
+
+`--dagger-rounds N` 在每轮训练后，用当前规划器在训练种子的独立世界
+（episode offset 默认 `50000`）里执行若干 episode，把这些真实转移追加到行为数据，
+再从零重训；每轮 offset 递增，避免两轮轨迹被合并成同一个 episode。纪律不变：
+只记录实际执行的动作和观察到的反馈，不记录沙盒反事实预测。默认
+`--dagger-rounds 0`（关闭）。
+
+fast held-out 首次 A/B（训练 100–107，评估 120–124，短窗口，2 轮 × 2 episode，
+`cap=400`）：
+
+| 臂 | mean | median | IQR | cluster 95% CI |
+|---|---:|---:|---:|---:|
+| short-window, dagger=0 | 116.4 | 152.0 | 80.0 | [99.9, 133.9] |
+| short-window, dagger=2 | **170.1** | 152.0 | 94.0 | [126.8, 212.9] |
+| hybrid, dagger=0 | 134.9 | 152.0 | 80.8 | [109.4, 160.9] |
+| hybrid, dagger=2 | **179.8** | 152.0 | 150.2 | [144.9, 214.0] |
+
+paired 每模型差：
+
+```text
+short-window: +62.4/+14.4/+114.4/+44.8/+98.0/+156.4/+0.2/-60.8
+              mean +53.7  median +53.6  SE 24.6 (2.18 SE)  7/8 positive
+hybrid:       +96.4/+35.4/+115.8/+78.2/+80.6/-32.0/+61.8/-77.0
+              mean +44.9  median +70.0  SE 23.6 (1.90 SE)  6/8 positive
+```
+
+planner 每轮只记录约 110–800 步，说明小量 on-policy 真实轨迹已经能改变弱种子的先验。
+两个窗口臂方向一致，但 hybrid 的种子间方差变大（IQR 80.8→150.2），有两个种子反向。
+注意 fast `cap=400` 会截断强种子，full 5000 步协议仍需复核；另外必须确认
+DAgger 没有把评估世界写进训练集（当前实现使用独立的 offset 世界，不用
+`--eval-seeds` 的世界）。
 
 脚本会检测 Python 是否启用 GIL：free-threaded 构建使用 `ThreadPoolExecutor`，普通构建使用
 `ProcessPoolExecutor`。当前 `.venv` 是 GIL 构建；本机的 `python3.15t` 存在，但 free-threaded

@@ -11,12 +11,18 @@ The node graph itself is trained from real transitions with TD(lambda) credit
 assignment and action-conditioned edges.
 """
 import argparse
+import json
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import numpy as np
 
+from eval_protocol import (
+    cluster_summary,
+    group_summaries,
+    parse_seed_spec,
+)
 from latent_world import SEEDS, latent
 from node_features import FeatureRuleBank
 from node_runtime import NodeRuntime, future_pain_labels
@@ -138,6 +144,31 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
     return world, agent
 
 
+def collect_planner(seed, world, agent, episodes=2, cap=1200, horizon=10,
+                    lag=LAG, step_stride=2, stride_includes_lag=False,
+                    offset=50000):
+    """Record the trajectories the planner actually executes.
+
+    These are real transitions with real world feedback, in the same schema
+    as `collect`; no counterfactual prediction enters the stream.  The world
+    seeds are offset from the behavior stream so episode ids cannot collide.
+    """
+    transitions = []
+    frames = []
+    for episode in range(int(episodes)):
+        env_seed = int(seed) * 10000 + int(offset) + episode
+        length, _actions, rows = evaluate(
+            seed, world, agent, cap=cap, horizon=horizon, lag=lag,
+            step_stride=step_stride,
+            stride_includes_lag=stride_includes_lag,
+            env_seed=env_seed, record=True,
+            episode=int(offset) + episode,
+        )
+        transitions.extend(rows)
+        frames.append(int(length))
+    return transitions, frames
+
+
 def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         birth_threshold=0.45, epochs=5, lag=LAG,
         component_kinds=(), component_min_count=8,
@@ -145,7 +176,10 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         component_gating=False, memory_weight=0.1,
         association_rate=0.0, induce_features=True,
         precursor_labels=True, pain_horizon=None,
-        voi_fraction=0.0, voi_target=3, feature_value_weight=0.02):
+        voi_fraction=0.0, voi_target=3, feature_value_weight=0.02,
+        dagger_rounds=0, dagger_episodes=2, dagger_cap=1200,
+        dagger_offset=50000, dagger_horizon=10, step_stride=2,
+        stride_includes_lag=False):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -155,6 +189,11 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     less-supported one.  The override is additive - the behavior sampler
     still runs the rest of the time - and everything is retrained on the
     combined stream.
+
+    With `dagger_rounds > 0` the planner's own executed trajectories are
+    appended after each round and the runtime is retrained from scratch on
+    the combined real-transition stream.  Only executed actions and their
+    observed feedback are recorded.
     """
     if steps < 1:
         raise ValueError("steps must be positive")
@@ -174,6 +213,20 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("voi_target must be positive")
     if float(feature_value_weight) < 0.0:
         raise ValueError("feature_value_weight must be non-negative")
+    if int(dagger_rounds) < 0:
+        raise ValueError("dagger_rounds must be non-negative")
+    if int(dagger_episodes) < 0:
+        raise ValueError("dagger_episodes must be non-negative")
+    if dagger_rounds and int(dagger_episodes) < 1:
+        raise ValueError("dagger_episodes must be positive")
+    if int(dagger_cap) < 1:
+        raise ValueError("dagger_cap must be positive")
+    if int(dagger_offset) < 0:
+        raise ValueError("dagger_offset must be non-negative")
+    if int(dagger_horizon) < 1:
+        raise ValueError("dagger_horizon must be positive")
+    if int(step_stride) < 1:
+        raise ValueError("step_stride must be positive")
     lag = int(lag)
     voi_fraction = float(voi_fraction)
     if voi_fraction > 0.0:
@@ -212,8 +265,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         transitions, _counts = collect(seed, steps, coverage=coverage, lag=lag)
     if not transitions:
         raise ValueError("collection produced no transitions")
-    return _train(
-        transitions, seed=seed, epochs=epochs, lag=lag,
+    train_kwargs = dict(
+        seed=seed, epochs=epochs, lag=lag,
         max_nodes=max_nodes, birth_threshold=birth_threshold,
         component_kinds=component_kinds,
         component_min_count=component_min_count,
@@ -228,14 +281,40 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         voi_target=voi_target,
         feature_value_weight=feature_value_weight,
     )
+    world, agent = _train(transitions, **train_kwargs)
+    dagger_log = []
+    for _round in range(int(dagger_rounds)):
+        planner, _frames = collect_planner(
+            seed, world, agent, episodes=dagger_episodes,
+            cap=dagger_cap, horizon=dagger_horizon, lag=lag,
+            step_stride=step_stride,
+            stride_includes_lag=stride_includes_lag,
+            # Each round must get fresh episode ids: merging two rollouts
+            # under one id would make the backward pass treat the second as
+            # a continuation of the first.
+            offset=dagger_offset + _round * int(dagger_episodes),
+        )
+        if not planner:
+            break
+        transitions = list(transitions) + planner
+        dagger_log.append(dict(
+            round=_round + 1,
+            planner_steps=len(planner),
+            planner_frames=list(_frames),
+            total_steps=len(transitions),
+        ))
+        world, agent = _train(transitions, **train_kwargs)
+    agent.dagger_log = dagger_log
+    return world, agent
 
 
 def policy_result(env, world, agent, prefix, horizon, lag=LAG,
-                  step_stride=2):
+                  step_stride=2, stride_includes_lag=False):
     initial = np.asarray(env.obs(), dtype=float)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
     action_dim = int(lag) + 1
     step_stride = max(int(step_stride), 1)
+    lag = int(lag)
 
     def predict_batch(states, sequences, step):
         history = history_features(
@@ -244,7 +323,12 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         return world.predict(states, history)
 
     def evaluate_step(states, sequences, step):
-        if step % step_stride != 0:
+        # `lag` is the first predicted state whose acting action comes from
+        # the plan rather than the pending prefix, so a plain stride can step
+        # over the first point the plan can actually influence.
+        if step % step_stride != 0 and not (
+            stride_includes_lag and step == lag
+        ):
             return (
                 np.zeros((len(states), 2)),
                 np.isfinite(states).all(axis=1),
@@ -293,15 +377,16 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
 
 
 def policy_action(env, world, agent, prefix, horizon, lag=LAG,
-                  step_stride=2):
+                  step_stride=2, stride_includes_lag=False):
     return int(policy_result(
         env, world, agent, prefix, horizon, lag=lag,
         step_stride=step_stride,
+        stride_includes_lag=stride_includes_lag,
     ).actions[0])
 
 
 def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
-               step_stride=2):
+               step_stride=2, stride_includes_lag=False):
     """Score one fixed plan with the same objective as `policy_result`.
 
     Reproduces the `exhaustive_search` scoring under
@@ -316,6 +401,7 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
     action_dim = int(lag) + 1
     step_stride = max(int(step_stride), 1)
+    lag = int(lag)
     plan = np.asarray(plan, dtype=float).reshape(1, -1)
     states = initial.copy()
     total = 0.0
@@ -324,7 +410,9 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
             plan, step + 1, pending_prefix, action_dim=action_dim
         )
         states = np.asarray(world.predict(states, history), dtype=float)
-        if step % step_stride == 0:
+        if step % step_stride == 0 or (
+            stride_includes_lag and step == lag
+        ):
             pending = history[:, :agent.lag][:, ::-1]
             encoded = np.concatenate([states, pending], axis=1) / agent.scales
             if not np.isfinite(encoded).all():
@@ -347,7 +435,17 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
 
 
 def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
-             step_stride=2):
+             step_stride=2, stride_includes_lag=False, env_seed=None,
+             record=False, episode=0):
+    """Run one deterministic evaluation episode.
+
+    ``env_seed`` selects the world instance; when omitted the historical
+    ``seed`` world is used.  With ``record=True`` the real transitions the
+    planner actually executed are returned in the same schema as ``collect``
+    (``obs``/``next_obs``/``history``/``signals``/``done``/``episode``), which
+    is what the closed-loop (DAgger) path consumes.  No counterfactual
+    prediction is recorded.
+    """
     if cap < 1:
         raise ValueError("cap must be positive")
     if horizon < 1:
@@ -355,26 +453,80 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
     if step_stride < 1:
         raise ValueError("step_stride must be positive")
     lag = int(lag)
-    env = latent[lag](seed)
+    env = latent[lag](seed if env_seed is None else int(env_seed))
     prefix = np.zeros(lag, dtype=float)
+    recent = [0.0] * lag
     actions = []
+    transitions = []
     while not env.dead and env.t < cap:
+        obs = np.asarray(env.obs(), dtype=float)
         action = policy_action(
             env, world, agent, prefix, horizon, lag=lag,
             step_stride=step_stride,
+            stride_includes_lag=stride_includes_lag,
         )
+        history = np.asarray([float(action)] + recent[:lag], dtype=float)
         actions.append(action)
         prefix = np.concatenate([[float(action)], prefix[:-1]])
         env.step(action)
-    return env.t, actions
+        if record:
+            feedback = env.feedback()
+            transitions.append(dict(
+                obs=obs,
+                next_obs=np.asarray(env.obs(), dtype=float),
+                history=history,
+                signals=np.asarray(
+                    [feedback["dopamine"], feedback["pain"]], dtype=float
+                ),
+                terminal=bool(env.dead),
+                done=bool(env.dead),
+                episode=int(episode),
+            ))
+        recent = [float(action)] + recent[:-1]
+    return env.t, actions, transitions
 
 
 def run_seed(task):
-    (seed, steps, coverage, cap, max_nodes, birth_threshold, horizon,
-     epochs, lag, component_kinds, component_min_count, max_components,
-     component_weight, component_gating, memory_weight,
-     association_rate, induce_features, precursor_labels,
-     pain_horizon, voi_fraction, voi_target, feature_value_weight) = task
+    """Train one model and score it on the requested evaluation worlds.
+
+    ``task`` is a plain dict so the worker payload stays picklable and new
+    protocol fields do not require positional shuffling.  ``eval_seeds`` is
+    explicit: when it is empty the historical self-evaluation is kept, with a
+    warning printed by ``main``.  Each trained model is scored on every
+    evaluation seed and every requested episode of that seed.
+    """
+    seed = int(task["seed"])
+    steps = int(task.get("steps", 5000))
+    coverage = float(task.get("coverage", 0.1))
+    cap = int(task.get("cap", 6000))
+    max_nodes = int(task.get("max_nodes", 5000))
+    birth_threshold = float(task.get("birth_threshold", 0.45))
+    horizon = int(task.get("horizon", 10))
+    epochs = int(task.get("epochs", 5))
+    lag = int(task.get("lag", LAG))
+    component_kinds = tuple(task.get("component_kinds", ()))
+    component_min_count = int(task.get("component_min_count", 8))
+    max_components = int(task.get("max_components", 128))
+    component_weight = float(task.get("component_weight", 0.5))
+    component_gating = bool(task.get("component_gating", False))
+    memory_weight = float(task.get("memory_weight", 0.1))
+    association_rate = float(task.get("association_rate", 0.0))
+    induce_features = bool(task.get("induce_features", True))
+    precursor_labels = bool(task.get("precursor_labels", True))
+    pain_horizon = int(task.get("pain_horizon", 0))
+    voi_fraction = float(task.get("voi_fraction", 0.0))
+    voi_target = int(task.get("voi_target", 3))
+    feature_value_weight = float(task.get("feature_value_weight", 0.02))
+    step_stride = int(task.get("step_stride", 2))
+    stride_includes_lag = bool(task.get("stride_includes_lag", False))
+    eval_episodes = int(task.get("eval_episodes", 1))
+    eval_seeds = list(task.get("eval_seeds", ()))
+    dagger_rounds = int(task.get("dagger_rounds", 0))
+    dagger_episodes = int(task.get("dagger_episodes", 2))
+    dagger_cap = int(task.get("dagger_cap", 1200))
+    dagger_offset = int(task.get("dagger_offset", 50000))
+    dagger_horizon = int(task.get("dagger_horizon", horizon))
+
     world, agent = fit(
         seed, steps=steps, coverage=coverage,
         max_nodes=max_nodes, birth_threshold=birth_threshold,
@@ -392,15 +544,52 @@ def run_seed(task):
         voi_fraction=voi_fraction,
         voi_target=voi_target,
         feature_value_weight=feature_value_weight,
+        dagger_rounds=dagger_rounds,
+        dagger_episodes=dagger_episodes,
+        dagger_cap=dagger_cap,
+        dagger_offset=dagger_offset,
+        dagger_horizon=dagger_horizon,
+        step_stride=step_stride,
+        stride_includes_lag=stride_includes_lag,
     )
-    frames, actions = evaluate(
-        seed, world, agent, cap=cap, horizon=horizon, lag=lag
-    )
+    explicit_eval = bool(eval_seeds)
+    if not explicit_eval:
+        eval_seeds = [seed]
+    rows = []
+    for eval_seed in eval_seeds:
+        for episode in range(eval_episodes):
+            if explicit_eval:
+                # Match `collect`'s world-naming scheme so evaluation worlds
+                # are reproducible and disjoint from the training stream.
+                env_seed = int(eval_seed) * 10000 + episode
+            elif episode == 0:
+                # Historical self-evaluation world.
+                env_seed = int(eval_seed)
+            else:
+                env_seed = int(eval_seed) * 10000 + episode
+            frames, actions, _ = evaluate(
+                seed, world, agent, cap=cap, horizon=horizon, lag=lag,
+                step_stride=step_stride,
+                stride_includes_lag=stride_includes_lag,
+                env_seed=env_seed,
+            )
+            rows.append(dict(
+                train_seed=seed,
+                eval_seed=int(eval_seed),
+                episode=episode,
+                env_seed=int(env_seed),
+                frames=int(frames),
+                action_rate=(
+                    float(np.mean(actions)) if actions else 0.0
+                ),
+            ))
     return dict(
         seed=seed,
-        frames=frames,
-        action_rate=float(np.mean(actions)) if actions else 0.0,
+        frames=rows[0]["frames"],
+        action_rate=rows[0]["action_rate"],
+        evals=rows,
         graph=agent.snapshot(),
+        dagger=getattr(agent, "dagger_log", []),
         top_nodes=agent.top_nodes(5),
         top_edges=agent.top_edges(5),
     )
@@ -443,6 +632,30 @@ def main():
     parser.add_argument("--feature-value-weight", type=float, default=0.02,
                         help="how much sequence-level value trades against "
                              "accumulated hazard in the search objective")
+    parser.add_argument("--eval-seeds", default="",
+                        help="held-out seed spec, e.g. 120-139; empty keeps "
+                             "the legacy self-evaluation")
+    parser.add_argument("--eval-episodes", type=int, default=1,
+                        help="episodes per evaluation seed")
+    parser.add_argument("--step-stride", type=int, default=2,
+                        help="query every Nth predicted state in search")
+    parser.add_argument("--stride-includes-lag", action="store_true",
+                        help="also query step == lag, the first predicted "
+                             "state the plan action can affect")
+    parser.add_argument("--report", default="",
+                        help="write per-episode rows and summaries as JSON")
+    parser.add_argument("--dagger-rounds", type=int, default=0,
+                        help="closed-loop rounds: record the planner's own "
+                             "executed trajectories and retrain")
+    parser.add_argument("--dagger-episodes", type=int, default=2,
+                        help="planner episodes recorded per DAgger round")
+    parser.add_argument("--dagger-cap", type=int, default=1200,
+                        help="frame cap per recorded planner episode")
+    parser.add_argument("--dagger-offset", type=int, default=50000,
+                        help="episode-id offset for recorded planner data")
+    parser.add_argument("--dagger-horizon", type=int, default=0,
+                        help="search horizon while recording planner data; "
+                             "0 uses --horizon")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset: 1500 steps, 3 epochs, "
                              "1000 nodes, 400-frame evaluation")
@@ -491,23 +704,76 @@ def main():
         raise ValueError("--memory-weight must be in [0, 1]")
     if not 0.0 <= args.association_rate <= 1.0:
         raise ValueError("--association-rate must be in [0, 1]")
+    if args.eval_episodes < 1:
+        raise ValueError("--eval-episodes must be positive")
+    if args.step_stride < 1:
+        raise ValueError("--step-stride must be positive")
+    if args.dagger_rounds < 0:
+        raise ValueError("--dagger-rounds must be non-negative")
+    if args.dagger_rounds and args.dagger_episodes < 1:
+        raise ValueError("--dagger-episodes must be positive")
+    if args.dagger_cap < 1:
+        raise ValueError("--dagger-cap must be positive")
+    if args.dagger_offset < 0:
+        raise ValueError("--dagger-offset must be non-negative")
+    if args.dagger_horizon < 0:
+        raise ValueError("--dagger-horizon must be non-negative")
+    if args.dagger_horizon == 0:
+        args.dagger_horizon = args.horizon
     component_kinds = tuple(
         kind.strip() for kind in args.components.split(",") if kind.strip()
     )
+    eval_seeds = parse_seed_spec(args.eval_seeds)
 
     seeds = [seed for seed in SEEDS if seed >= args.seed][:args.seeds]
     if len(seeds) < args.seeds:
         seeds = list(range(args.seed, args.seed + args.seeds))
+    if eval_seeds:
+        overlap = sorted(set(seeds) & set(eval_seeds))
+        if overlap:
+            print(
+                "warning: evaluation seeds overlap training seeds: %s"
+                % ",".join(str(seed) for seed in overlap)
+            )
+    else:
+        print(
+            "warning: --eval-seeds is empty; using legacy self-evaluation "
+            "(training seed == evaluation seed)"
+        )
     tasks = [
-        (seed, args.steps, args.coverage, args.cap,
-         args.max_nodes, args.birth_threshold, args.horizon, args.epochs,
-         args.lag, component_kinds, args.component_min_count,
-         args.max_components, args.component_weight,
-         args.component_gating, args.memory_weight,
-         args.association_rate, not args.no_features,
-         not args.instant_labels, args.pain_horizon,
-         args.voi_fraction, args.voi_target,
-         args.feature_value_weight)
+        dict(
+            seed=seed,
+            steps=args.steps,
+            coverage=args.coverage,
+            cap=args.cap,
+            max_nodes=args.max_nodes,
+            birth_threshold=args.birth_threshold,
+            horizon=args.horizon,
+            epochs=args.epochs,
+            lag=args.lag,
+            component_kinds=component_kinds,
+            component_min_count=args.component_min_count,
+            max_components=args.max_components,
+            component_weight=args.component_weight,
+            component_gating=args.component_gating,
+            memory_weight=args.memory_weight,
+            association_rate=args.association_rate,
+            induce_features=not args.no_features,
+            precursor_labels=not args.instant_labels,
+            pain_horizon=args.pain_horizon,
+            voi_fraction=args.voi_fraction,
+            voi_target=args.voi_target,
+            feature_value_weight=args.feature_value_weight,
+            step_stride=args.step_stride,
+            stride_includes_lag=args.stride_includes_lag,
+            eval_seeds=eval_seeds,
+            eval_episodes=args.eval_episodes,
+            dagger_rounds=args.dagger_rounds,
+            dagger_episodes=args.dagger_episodes,
+            dagger_cap=args.dagger_cap,
+            dagger_offset=args.dagger_offset,
+            dagger_horizon=args.dagger_horizon,
+        )
         for seed in seeds
     ]
     if args.jobs == 1:
@@ -523,16 +789,91 @@ def main():
         with ProcessPoolExecutor(max_workers=args.jobs) as pool:
             rows = list(pool.map(run_seed, tasks))
 
-    print(" seed  frames  action_rate  concepts  graph_nodes  action_edges  components")
+    print("train  concepts  graph_nodes  action_edges  components")
     for row in rows:
         graph = row["graph"]
-        print(" %4d  %6d  %10.3f  %8d  %11d  %12d  %10d"
-              % (row["seed"], row["frames"], row["action_rate"],
-                 graph["prototypes"], graph["nodes"],
+        print(" %4d  %8d  %11d  %12d  %10d"
+              % (row["seed"], graph["prototypes"], graph["nodes"],
                  graph["action_edges"], graph["components"]))
-    print("frames mean %.1f median %.1f"
-          % (np.mean([row["frames"] for row in rows]),
-             np.median([row["frames"] for row in rows])))
+
+    for row in rows:
+        if row["dagger"]:
+            parts = [
+                "r%d +%d steps (%s frames)"
+                % (item["round"], item["planner_steps"],
+                   "/".join(str(value) for value in item["planner_frames"]))
+                for item in row["dagger"]
+            ]
+            print(" dagger seed %d: %s" % (row["seed"], ", ".join(parts)))
+
+    eval_rows = [row for result in rows for row in result["evals"]]
+    print("\ntrain  eval  ep  env_seed  frames  action_rate")
+    for row in eval_rows:
+        print(" %5d  %4d  %2d  %8d  %6d  %10.3f"
+              % (row["train_seed"], row["eval_seed"], row["episode"],
+                 row["env_seed"], row["frames"], row["action_rate"]))
+
+    per_train = group_summaries(eval_rows, group="train_seed")
+    per_eval = group_summaries(eval_rows, group="eval_seed")
+    overall = cluster_summary(eval_rows, cluster="train_seed")
+    print("\nframes per training seed (mean over evaluation worlds)")
+    for key, summary in per_train.items():
+        print(" train %4s  n=%2d  mean %6.1f  median %6.1f  range %d-%d"
+              % (key, summary["n"], summary["mean"], summary["median"],
+                 summary["min"], summary["max"]))
+    print("frames per evaluation seed (mean over training seeds)")
+    for key, summary in per_eval.items():
+        print(" eval  %4s  n=%2d  mean %6.1f  median %6.1f"
+              % (key, summary["n"], summary["mean"], summary["median"]))
+    print("\nframes overall: n=%d mean %.1f median %.1f IQR %.1f [%.1f, %.1f] "
+          "range %d-%d"
+          % (overall["n"], overall["mean"], overall["median"],
+             overall["iqr"], overall["q1"], overall["q3"],
+             overall["min"], overall["max"]))
+    print("bootstrap 95%% CI over %d training seeds: [%.1f, %.1f]"
+          % (overall["clusters"], overall["cluster_ci_low"],
+             overall["cluster_ci_high"]))
+    if overall["clusters"] < 5:
+        print("warning: fewer than 5 trained models; the interval is "
+              "descriptive, not a significance test")
+
+    if args.report:
+        report = dict(
+            config=dict(
+                training_seeds=seeds,
+                eval_seeds=eval_seeds,
+                eval_episodes=args.eval_episodes,
+                steps=args.steps,
+                coverage=args.coverage,
+                cap=args.cap,
+                horizon=args.horizon,
+                epochs=args.epochs,
+                max_nodes=args.max_nodes,
+                lag=args.lag,
+                step_stride=args.step_stride,
+                stride_includes_lag=args.stride_includes_lag,
+                feature_value_weight=args.feature_value_weight,
+                features=not args.no_features,
+                precursor_labels=not args.instant_labels,
+                self_evaluation=not bool(eval_seeds),
+                dagger_rounds=args.dagger_rounds,
+                dagger_episodes=args.dagger_episodes,
+                dagger_cap=args.dagger_cap,
+                dagger_offset=args.dagger_offset,
+                dagger_horizon=args.dagger_horizon,
+            ),
+            rows=eval_rows,
+            dagger=[
+                dict(seed=row["seed"], rounds=row["dagger"])
+                for row in rows
+            ],
+            per_train_seed=per_train,
+            per_eval_seed=per_eval,
+            overall=overall,
+        )
+        with open(args.report, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2, sort_keys=True)
+        print("wrote %s" % args.report)
 
     print("\nlearned high-pain nodes (seed %d):" % rows[0]["seed"])
     for node in rows[0]["top_nodes"]:

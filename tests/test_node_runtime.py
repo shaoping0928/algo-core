@@ -151,12 +151,52 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(runtime.node_value(np.asarray([0.0])), 0.0)
 
     def test_smoke_run_on_flappy_signals(self):
-        row = run_seed((100, 100, 0.1, 100, 200, 0.45, 6, 1, 3,
-                        (), 8, 0, 0.5, False, 0.1, 0.0, True, True, 0,
-                        0.0, 3, 0.02))
+        row = run_seed(dict(
+            seed=100, steps=100, coverage=0.1, cap=100, max_nodes=200,
+            birth_threshold=0.45, horizon=6, epochs=1, lag=3,
+            component_kinds=(), component_min_count=8, max_components=0,
+            component_weight=0.5, component_gating=False,
+            memory_weight=0.1, association_rate=0.0,
+            induce_features=True, precursor_labels=True, pain_horizon=0,
+            voi_fraction=0.0, voi_target=3, feature_value_weight=0.02,
+            eval_seeds=[120], eval_episodes=1,
+        ))
         self.assertGreater(row["frames"], 0)
         self.assertGreaterEqual(row["graph"]["nodes"], 1)
         self.assertGreaterEqual(row["graph"]["action_edges"], 1)
+        self.assertEqual(len(row["evals"]), 1)
+        self.assertEqual(row["evals"][0]["eval_seed"], 120)
+        self.assertEqual(row["evals"][0]["train_seed"], 100)
+
+    def test_planner_trajectories_are_recorded_as_real_transitions(self):
+        from substrate_nodes import collect_planner, fit
+        world, agent = fit(
+            100, steps=80, epochs=1, max_nodes=100, lag=3,
+            induce_features=False,
+        )
+        rows, frames = collect_planner(
+            100, world, agent, episodes=1, cap=20, horizon=2, lag=3,
+            step_stride=1,
+        )
+        self.assertGreater(len(rows), 0)
+        self.assertEqual(len(rows), frames[0])
+        for row in rows:
+            self.assertEqual(row["history"].shape, (4,))
+            self.assertEqual(row["signals"].shape, (2,))
+            self.assertEqual(row["done"], row["terminal"])
+            self.assertGreaterEqual(row["episode"], 50000)
+
+    def test_fit_accepts_closed_loop_rounds(self):
+        from substrate_nodes import fit
+        world, agent = fit(
+            100, steps=80, epochs=1, max_nodes=100, lag=3,
+            induce_features=False, dagger_rounds=1, dagger_episodes=1,
+            dagger_cap=20, dagger_offset=60000, dagger_horizon=2,
+        )
+        self.assertIsNotNone(world)
+        self.assertGreaterEqual(agent.snapshot()["nodes"], 1)
+        self.assertEqual(len(agent.dagger_log), 1)
+        self.assertGreater(agent.dagger_log[0]["planner_steps"], 0)
 
     def test_pain_signal_is_learned_by_association(self):
         runtime = self.make_runtime(max_nodes=40)
@@ -678,6 +718,33 @@ class PlanScoreTests(unittest.TestCase):
         ]
         best = min(range(2), key=lambda index: scores[index])
         self.assertEqual(int(result.actions[0]), best)
+        self.assertAlmostEqual(result.score[0], scores[best][0], places=6)
+        self.assertAlmostEqual(result.score[1], scores[best][1], places=6)
+
+    def test_plan_score_matches_search_at_the_lag_point(self):
+        """The lag point is the first state a plan action can affect."""
+        from latent_world import latent
+        from substrate_nodes import fit, plan_score, policy_result
+
+        world, agent = fit(100, steps=300, epochs=1, max_nodes=200, lag=3)
+        env = latent[3](100)
+        prefix = np.zeros(3, dtype=float)
+        result = policy_result(
+            env, world, agent, prefix, horizon=5, lag=3,
+            step_stride=2, stride_includes_lag=True,
+        )
+        plans = [
+            plan for plan in np.ndindex(*(2,) * 5)
+        ]
+        scores = [
+            plan_score(
+                env.obs(), world, agent, prefix, plan, 5, lag=3,
+                step_stride=2, stride_includes_lag=True,
+            )
+            for plan in plans
+        ]
+        best = min(range(len(plans)), key=lambda index: scores[index])
+        np.testing.assert_array_equal(result.actions, plans[best])
         self.assertAlmostEqual(result.score[0], scores[best][0], places=6)
         self.assertAlmostEqual(result.score[1], scores[best][1], places=6)
 
