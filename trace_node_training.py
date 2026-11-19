@@ -106,7 +106,7 @@ def trace(seed, steps=5000, coverage=0.1, epochs=5, wave_episodes=10,
             death = next(
                 (row for row in episode if row["terminal"]), None
             )
-            agent.learn_episode(episode, build_memory=(epoch == 0))
+            agent.learn_episode(episode)
             seen_episodes += 1
             if death is not None and credits < credit_samples:
                 changed = []

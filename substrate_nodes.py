@@ -89,9 +89,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     ordered = [episodes[key] for key in sorted(episodes)]
     for epoch in range(epochs):
         for episode in ordered:
-            agent.learn_episode(
-                episode, build_memory=(epoch == 0)
-            )
+            agent.learn_episode(episode)
     return world, agent
 
 
@@ -119,7 +117,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         )
         pending = history[:, :agent.lag][:, ::-1]
         encoded = np.concatenate([states, pending], axis=1) / agent.scales
-        risk = agent.immediate_risk_batch(encoded)
+        risk = agent.pain_signal_batch(encoded)
         return (
             np.column_stack([risk, np.zeros(len(states))]),
             np.isfinite(encoded).all(axis=1),
@@ -134,7 +132,8 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         pending = history[:, :agent.lag][:, ::-1]
         encoded = np.concatenate([states, pending], axis=1) / agent.scales
         pain, dopamine = agent.valence_state_batch(encoded)
-        return np.column_stack([pain, -dopamine]), np.isfinite(encoded).all(
+        risk = np.maximum(pain, agent.pain_signal_batch(encoded))
+        return np.column_stack([risk, -dopamine]), np.isfinite(encoded).all(
             axis=1
         )
 

@@ -97,24 +97,24 @@
   offline holdout AUC 0.977，但 online terminal AUC 0.442；近管道 chosen/other 动作边
   135/23.6，双动作支撑仅 0.52；方向准确率 0.696。瓶颈是终止状态/反事实动作的在线覆盖，
   不是世界模型。
-- [x] 训练过程追踪（`trace_node_training.py`，max_nodes=5000）：约 2337 概念节点、graph nodes
-  5105；整体双动作支撑 0.18、近管道 0.085；终止节点 75 个。
-- [x] 通用 interaction：每条真实转移建立 association/transition；event memory 的边界由
-  `|Δpain|+|Δdopamine|` 的 running mean/std（surprise）自适应决定，没有 memory_mode/阈值配置；
-  重复 epoch 不重复建 memory。5000 步后 assoc/trans/mem = 2640/2640/128。
+- [x] 训练过程追踪（`trace_node_training.py`，max_nodes=5000）：约 2339 概念节点、graph nodes
+  5068；整体双动作支撑 0.18、近管道 0.085；终止节点 75 个。
+- [x] 通用 interaction：每条真实转移建立 association/transition；**没有原生事件定义**，
+  memory 只由 world pain 信号创建；安全步只检索/加强已有 memory。5000 步后
+  assoc/trans/mem = 2915/2640/89。
 - [x] memory 通过 membership 关联；激活节点（含一跳 association）反查并加强 memory
-  trace/value/count 和 membership 边；episode 结束 decay，低支持 memory 遗忘。
-- [x] 随机 memory 追踪（`trace_memory_change.py`，3 种子）：修正 memory value 被后续存活步
-  洗掉/拉满、membership 权重饱和、高价值 memory 误删。修正后 learning 前后新增 1–2 个
-  memory，旧 memory value 稳定；terminal value≈1、安全 value≈0；首轮保留 206/208。
-- [ ] value-aware memory retrieval：高价值 terminal memory 的 trace/membership 可能衰减到 0，
+  trace/membership；episode 结束 decay，低支持 memory 遗忘，高 value memory 保护。
+- [x] 随机 memory 追踪（`trace_memory_change.py`，3 种子）：pain memory 约 8–89 个，
+  value 全为 1.0、members≈3；learning 前后新增 0–1 个；首轮 memory 保留率高，但很多
+  高 value memory 的 trace/membership 衰减到 0，保留但难以激活。
+- [ ] value-aware memory retrieval：高价值 pain memory 的 trace/membership 可能衰减到 0，
   需要按 value 而不只按 trace 找回。
 - [ ] memory 成员仍约 28 个，事件分段偏粗；需要更细的事件边界。
 - [x] transition edge node 用 MC/TD target 更新价值；memory value 以默认 0.1 权重进入终点评分；
   对称 association 价值平滑实测有害（232→141 帧），默认关闭，association 只参与 memory 检索。
-- [x] 决策改为沙盒轨迹搜索：线性模型预测 H=10 步，每 2 步查学到的 immediate pain 取 max，
-  终点用节点/memory pain + dopamine；不写管道/碰撞常量。8 种子仍 108.6 帧，耗时 126s；
-  预测状态 immediate pain 几乎为 0，逐状态风险没有真正避管。
+- [x] 决策改为沙盒轨迹搜索：线性模型预测 H=10 步，每 2 步沿 association 读
+  `valence:pain` 信号取 max，终点用节点/memory pain + dopamine；不写管道/碰撞常量。
+  8 种子仍 108.6 帧，耗时 126s；pain 信号在预测状态上仍很稀疏，逐状态避管没有明显生效。
 - [ ] 训练连续 pain/terminal 读出（从 world pain/dopamine 学习，不用 terminal 标签），
   让它能泛化到沙盒预测的反事实状态；这是逐状态避管生效的前提。
 - [x] 组件出生改为按节点 valence 方差（相对节点总体 median+std）自适应；低效用组件按

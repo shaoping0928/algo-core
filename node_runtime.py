@@ -69,6 +69,7 @@ class NodeRuntime:
         memory_min_strength: float = 0.02,
         memory_weight: float = 0.1,
         association_rate: float = 0.0,
+        valence_rate: float = 0.2,
         seed: int = 0,
         scales: Optional[Sequence[float]] = None,
     ):
@@ -118,6 +119,8 @@ class NodeRuntime:
             raise ValueError("memory_weight must be in [0, 1]")
         if not 0.0 <= float(association_rate) <= 1.0:
             raise ValueError("association_rate must be in [0, 1]")
+        if not 0.0 < float(valence_rate) <= 1.0:
+            raise ValueError("valence_rate must be in (0, 1]")
         actions = tuple(int(action) for action in action_space)
         if not actions:
             raise ValueError("action_space must not be empty")
@@ -150,6 +153,7 @@ class NodeRuntime:
         self.memory_min_strength = float(memory_min_strength)
         self.memory_weight = float(memory_weight)
         self.association_rate = float(association_rate)
+        self.valence_rate = float(valence_rate)
         self.gated_edges: Dict[
             Tuple[str, Tuple[int, ...], int], Dict[str, dict]
         ] = {}
@@ -174,6 +178,12 @@ class NodeRuntime:
             threshold=self.component_threshold,
             smoothing=self.component_smoothing,
         )
+        self.pain_node = self.graph.add_node(
+            CONCEPT, "valence:pain", role="valence"
+        )
+        self.dopamine_node = self.graph.add_node(
+            CONCEPT, "valence:dopamine", role="valence"
+        )
         self._prototype_ids: List[str] = []
         self._prototype_matrix = np.zeros((0, state_dim), dtype=float)
         self._traces: Dict[str, List[float]] = {}
@@ -187,14 +197,7 @@ class NodeRuntime:
         self._node_pain_count = {}
         self._node_pain_mean = {}
         self._node_pain_m2 = {}
-        self.episode_memory: Optional[str] = None
         self._memory_counter = 0
-        self.last_pain = 0.0
-        self.last_dopamine = 0.0
-        self._change_count = 0
-        self._change_mean = 0.0
-        self._change_m2 = 0.0
-        self._change_history = deque(maxlen=256)
 
     # ---- encoding ----------------------------------------------------------
     def _zero_pending(self):
@@ -338,8 +341,8 @@ class NodeRuntime:
         )
 
     def _interact(self, current: str, next_node: str, pain: float = 0.0,
-                  dopamine: float = 0.0, build_memory: bool = True) -> None:
-        """Create association, causal transition and generic memory membership."""
+                  dopamine: float = 0.0) -> None:
+        """Create association, causal transition and signal-driven memory."""
         if current == next_node:
             return
         self.graph.activate([current, next_node], [1.0, 1.0])
@@ -351,46 +354,25 @@ class NodeRuntime:
         )
         pain = float(pain)
         dopamine = float(dopamine)
-        change = abs(pain - self.last_pain) + abs(
-            dopamine - self.last_dopamine
-        )
-        self._change_count += 1
-        delta = change - self._change_mean
-        self._change_mean += delta / self._change_count
-        self._change_m2 += delta * (change - self._change_mean)
-        self._change_history.append(change)
-        if self._change_count > 1:
-            variance = self._change_m2 / (self._change_count - 1)
-            threshold = self._change_mean + 2.0 * np.sqrt(
-                max(variance, 1e-12)
-            )
-        else:
-            threshold = float("inf")
-        # Event boundaries are learned from the running valence-change
-        # distribution; there is no task-specific memory mode or threshold.
-        if build_memory:
-            start_memory = (
-                self.episode_memory is None
-                or (
-                    self._change_count >= 8
-                    and change > threshold
-                )
-            )
-            if start_memory:
-                self.episode_memory = self._new_memory()
-                memory = self.graph.nodes[self.episode_memory]
-                memory.value = pain
-                memory.dopamine = dopamine
-                memory.count = 1
-            self.graph.add_membership(self.episode_memory, current)
-            self.graph.add_membership(self.episode_memory, next_node)
+        memories = self.memories_for([current, next_node])
+        created_memory = None
+        if pain > 0.0 and not memories:
+            created_memory = self._new_memory()
+            memory = self.graph.nodes[created_memory]
+            memory.value = pain
+            memory.dopamine = dopamine
+            memory.count = 1
+            self.graph.add_membership(created_memory, current)
+            self.graph.add_membership(created_memory, next_node)
             if edge.edge_node is not None:
                 self.graph.add_membership(
-                    self.episode_memory, edge.edge_node
+                    created_memory, edge.edge_node
                 )
-        self.last_pain = pain
-        self.last_dopamine = dopamine
-        self._reinforce_memories([current, next_node], pain, dopamine)
+        self._reinforce_memories([current, next_node])
+        extra = [current, next_node]
+        if created_memory is not None:
+            extra.append(created_memory)
+        self._learn_pain_association(pain, extra)
 
     def memories_for(self, node_ids: Iterable[str]) -> Dict[str, float]:
         """Find memory nodes through membership edges of active nodes."""
@@ -423,19 +405,13 @@ class NodeRuntime:
                     )
         return result
 
-    def _reinforce_memories(self, node_ids: Iterable[str], pain: float,
-                            dopamine: float) -> None:
+    def _reinforce_memories(self, node_ids: Iterable[str]) -> None:
         active = set(node_ids)
         for memory_id in self.memories_for(node_ids):
             memory = self.graph.nodes.get(memory_id)
             if memory is None or memory.kind != MEMORY:
                 continue
             self.graph.activate([memory_id], [1.0])
-            # Only the current event owns its value. Retrieving an older
-            # memory must not overwrite its event valence with later steps.
-            if memory_id == self.episode_memory:
-                memory.value = max(memory.value, float(pain))
-                memory.dopamine = max(memory.dopamine, float(dopamine))
             for key in self.graph.outgoing.get(memory_id, []):
                 if key[2] != MEMBERSHIP:
                     continue
@@ -500,7 +476,8 @@ class NodeRuntime:
                     self.graph.edges[key].weight *= self.memory_decay
             if (memory.trace < self.memory_min_strength
                     and memory.count <= 1
-                    and memory.value <= median_value):
+                    and (memory.value < median_value
+                         or memory.value <= 0.0)):
                 self.graph._remove_node(memory.id)
 
     def _prune_components(self) -> None:
@@ -513,6 +490,77 @@ class NodeRuntime:
                 self._component_bound.discard(
                     component_id.rsplit(":", 1)[0]
                 )
+
+    def _learn_pain_association(self, pain: float,
+                                extra_nodes: Iterable[str] = ()) -> None:
+        pain = float(pain)
+        if pain <= 0.0:
+            return
+        self.graph.activate([self.pain_node], [pain])
+        nodes = list(dict.fromkeys(list(extra_nodes)))
+        for node_id in nodes:
+            if node_id == self.pain_node:
+                continue
+            self.graph.observe_association(
+                [node_id, self.pain_node], rate=self.valence_rate
+            )
+
+    def _pain_association(self, node_id: str) -> float:
+        key = (
+            min(node_id, self.pain_node),
+            max(node_id, self.pain_node),
+            ASSOCIATION,
+        )
+        edge = self.graph.edges.get(key)
+        return float(edge.weight) if edge is not None else 0.0
+
+    def pain_signal_from_weights(self, weights) -> float:
+        total = 0.0
+        weighted = 0.0
+        node_ids = []
+        for node_id, weight in weights:
+            node_ids.append(node_id)
+            total += float(weight)
+            weighted += float(weight) * self._pain_association(node_id)
+        for memory_id, strength in self.memories_for(node_ids).items():
+            total += float(strength)
+            weighted += float(strength) * self._pain_association(memory_id)
+        if total <= 0.0:
+            return 0.0
+        return weighted / total
+
+    def pain_signal_state(self, state: np.ndarray) -> float:
+        return self.pain_signal_from_weights(
+            self._neighbor_weights(np.asarray(state, dtype=float))
+        )
+
+    def pain_signal_batch(self, states: np.ndarray) -> np.ndarray:
+        states = np.asarray(states, dtype=float)
+        if len(states) == 0:
+            return np.zeros(0)
+        indices, weights = self._soft_weights_batch(states)
+        if indices is None:
+            return np.zeros(len(states))
+        result = np.zeros(len(states), dtype=float)
+        for row in range(len(states)):
+            total = 0.0
+            weighted = 0.0
+            node_ids = []
+            for column, index in enumerate(indices[row]):
+                node_id = self._prototype_ids[int(index)]
+                node_weight = float(weights[row, column])
+                node_ids.append(node_id)
+                total += node_weight
+                weighted += node_weight * self._pain_association(node_id)
+            for memory_id, strength in self.memories_for(
+                node_ids
+            ).items():
+                total += float(strength)
+                weighted += float(strength) * self._pain_association(
+                    memory_id
+                )
+            result[row] = weighted / total if total > 0.0 else 0.0
+        return result
 
     def _signature(self, node_id: str) -> Tuple[int, ...]:        return tuple(
             self.components.previous_sign[component_id]
@@ -822,9 +870,6 @@ class NodeRuntime:
         self.last_scores = {}
         self.last_sources = []
         self.last_signature = ()
-        self.episode_memory = None
-        self.last_pain = 0.0
-        self.last_dopamine = 0.0
         self._traces.clear()
 
     def learn_transition(self, observation, action, next_observation,
@@ -867,7 +912,7 @@ class NodeRuntime:
         if done:
             self.reset()
 
-    def learn_episode(self, rows, build_memory: bool = True) -> None:
+    def learn_episode(self, rows) -> None:
         """Monte-Carlo node/edge values for one real episode.
 
         `rows` are transition dicts with ``obs``, ``next_obs``, ``history``,
@@ -898,7 +943,6 @@ class NodeRuntime:
             self._interact(
                 current, next_node,
                 float(signals[1]), float(signals[0]),
-                build_memory=build_memory,
             )
             entered = self.graph.nodes[next_node]
             entered.immediate_pain += self.alpha_now * (

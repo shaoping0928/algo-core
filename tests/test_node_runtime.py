@@ -126,12 +126,23 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(row["graph"]["nodes"], 1)
         self.assertGreaterEqual(row["graph"]["action_edges"], 1)
 
+    def test_pain_signal_is_learned_by_association(self):
+        runtime = self.make_runtime(max_nodes=40)
+        first = runtime._create_node(np.asarray([0.0]))
+        second = runtime._create_node(np.asarray([1.0]))
+        runtime._interact(first, second, pain=1.0, dopamine=0.0)
+        self.assertIn(runtime.pain_node, runtime.graph.nodes)
+        self.assertGreater(runtime._pain_association(second), 0.0)
+        self.assertGreater(
+            runtime.pain_signal_state(np.asarray([1.0])), 0.0
+        )
+
     def test_memory_is_reinforced_and_retrievable_from_members(self):
         runtime = self.make_runtime(max_nodes=40)
         first = runtime._create_node(np.asarray([0.0]))
         second = runtime._create_node(np.asarray([1.0]))
         runtime._interact(first, second, pain=1.0, dopamine=0.0)
-        memory_id = runtime.episode_memory
+        memory_id = next(iter(runtime.memories_for([second])))
         self.assertIsNotNone(memory_id)
         memory = runtime.graph.nodes[memory_id]
         self.assertGreater(memory.trace, 0.0)
@@ -151,14 +162,14 @@ class NodeRuntimeTests(unittest.TestCase):
         first = runtime._create_node(np.asarray([0.0]))
         second = runtime._create_node(np.asarray([1.0]))
         runtime._interact(first, second, pain=1.0, dopamine=0.0)
-        memory_id = runtime.episode_memory
+        memory_id = next(iter(runtime.memories_for([second])))
         runtime.graph.nodes[memory_id].trace = 0.0
         runtime.graph.nodes[memory_id].count = 1
         runtime.graph.nodes[memory_id].value = 0.0
         runtime._forget_memories()
         self.assertNotIn(memory_id, runtime.graph.nodes)
 
-    def test_adaptive_event_memory_uses_valence_surprise(self):
+    def test_memory_is_created_by_pain_signal(self):
         def rows(count, final_pain):
             result = []
             for index in range(count):
@@ -175,13 +186,11 @@ class NodeRuntimeTests(unittest.TestCase):
 
         steady = self.make_runtime(max_nodes=40)
         steady.learn_episode(rows(12, False))
-        self.assertEqual(steady.snapshot()["memories"], 1)
-        steady.learn_episode(rows(12, False), build_memory=False)
-        self.assertEqual(steady.snapshot()["memories"], 1)
+        self.assertEqual(steady.snapshot()["memories"], 0)
 
         surprise = self.make_runtime(max_nodes=40)
         surprise.learn_episode(rows(12, True))
-        self.assertGreaterEqual(surprise.snapshot()["memories"], 2)
+        self.assertGreaterEqual(surprise.snapshot()["memories"], 1)
 
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()

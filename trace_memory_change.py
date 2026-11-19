@@ -114,14 +114,12 @@ def trace(seed, steps=5000, epochs=5, warmup=12):
         for index, episode in enumerate(ordered):
             if epoch == 0 and index == sample_index:
                 before_episode = _memory_snapshot(agent)
-                agent.learn_episode(episode, build_memory=True)
+                agent.learn_episode(episode)
                 after_episode = _memory_snapshot(agent)
                 if first_pass is None:
                     first_pass = dict(after_episode)
             else:
-                agent.learn_episode(
-                    episode, build_memory=(epoch == 0)
-                )
+                agent.learn_episode(episode)
 
     print("  before episode: %s" % _summary(before_episode))
     print("  after  episode: %s" % _summary(after_episode))

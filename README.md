@@ -228,24 +228,26 @@ end:     2337 concepts, 3410 action edges, assoc=2640, trans=2640, mem=128
          graph_nodes=5105, terminal_nodes=75
 ```
 
-节点上限扩大到 5000 后，5000 步数据实际只生成约 2337 个概念节点，没有触及上限。
+节点上限扩大到 5000 后，5000 步数据实际只生成约 2339 个概念节点，没有触及上限。
 现在概念间 interaction 已经真正建立：
 
 - 每条真实转移都建立 association 和 directed transition；
-- event memory 的边界由运行时统计决定：`|Δpain| + |Δdopamine|` 的 running mean/std
-  超过 `mean + 2*std`（至少 8 个样本）时开启新 memory；没有 `memory_mode` 或人手阈值配置；
-- 重复 epoch 不再重复创建 memory（只有第一个 epoch 建 memory，后续只更新值与边）；
-- memory 通过 membership 关联到 concept/transition 节点；训练时由激活节点（以及一跳 association）
-  反查 memory，强化 memory 的 trace/value/count 和 membership 边权重；
-- 每个 episode 结束对 memory 做 decay，低支持（trace 低、只被访问一次）的 memory 被遗忘；
-- transition edge node 的价值用 MC/TD target 更新；memory value 以默认 `0.1` 权重进入终点评分；
-  association 的对称价值平滑实测有害（232→141 帧），默认关闭，association 只参与 memory 检索。
+- **没有原生事件定义**：memory 只由 world 的 pain 信号触发；安全步只检索/加强已有 memory，
+  不按 episode 边界或 valence 变化阈值切事件；
+- 训练时 pain 信号把当前/下一状态和 memory 与 `valence:pain` 节点关联；预测状态通过
+  association 读出 pain 强度，而不是靠人工风险标签；
+- memory 通过 membership 关联 concept/transition；被激活时加强 trace 和 membership，
+  episode 结束 decay；高 value 的 pain memory 受保护，低支持/低 value 的遗忘；
+- transition edge node 的价值用 MC/TD target 更新；memory value 以 `0.1` 权重进入终点价值；
+  association 对称价值平滑实测有害（232→141 帧），默认关闭，association 只参与 memory/pain 检索。
 
 实测：
 
 - 8 种子（5000 步，H=10，epochs=10，max_nodes=5000，memory_weight=0.1）：
   均值 **108.6 帧**，中位数 **85.5**；memory_weight=0.5 时为 104.6。
-- 5000 步训练过程：assoc/trans/mem = 2640/2640/128，graph nodes 5105。
+- 5000 步训练过程：assoc/trans/mem = 2915/2640/89，graph nodes 5068。
+- 随机 memory 追踪（3 种子）：pain memory 约 8–89 个，value 几乎都是 1.0，members≈3；
+  很多 memory 的 trace/membership 会衰减到 0，虽然保留但很难再被激活。
 - 自适应组件（`difference+capacitor`）在 seed 100 自动出生 76 个组件，存活仍是 232 帧。
 
 但决策路径仍未读取 association/transition 结构；memory 只以较小权重参与终点价值。存活与
@@ -256,8 +258,8 @@ end:     2337 concepts, 3410 action edges, assoc=2640, trans=2640, mem=128
 `substrate_nodes.policy_result` 现在参考：
 
 1. `LinearObservationModel` 预测每条候选动作序列的 H=10 步观测；
-2. 每 2 步把预测状态映射到节点，查学到的 `immediate_pain`，按轨迹取 **max**；
-3. 终点查节点/ memory 的 pain 价值和 dopamine；
+2. 每 2 步把预测状态映射到节点/memory，沿 association 读 `valence:pain` 的强度，按轨迹取 **max**；
+3. 终点用节点/memory pain 价值和学到的 pain 信号，再用 dopamine 排序；
 4. 词典序：先最小化最坏预测 pain，再最大化终点 dopamine；
 5. 不使用 action edge 做搜索评分，也不读取管道/缺口/碰撞常量。
 
