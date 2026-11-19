@@ -217,6 +217,12 @@ class NodeRuntime:
         # steps earlier (`history[lag]`), which is also the first pending
         # coordinate of the encoded state at decision time.
         self.feature_action_stats = {}
+        # Decision-time readout predictions vs actual precursor outcomes,
+        # per (feature root, acting action), plus a bounded buffer of the
+        # most confident surprises (the counterfactual target list).
+        self.feature_calibration = {}
+        self.surprise_buffer = []
+        self.surprise_capacity = 64
         # Precursor label window: how many entered states ahead a pain event
         # still labels the current state.  Defaults to lag + 1, the first
         # state an action issued now can physically affect.
@@ -1185,6 +1191,22 @@ class NodeRuntime:
                 active_by_horizon.setdefault(
                     self._node_horizon(fid), []
                 ).append(fid)
+            # Prediction-error loop: record what the readout predicts for
+            # this state under the acting action *before* any update, then
+            # compare it with the actual precursor label.  Surprises with
+            # enough confidence land in the counterfactual target buffer.
+            history_row = np.asarray(row["history"], dtype=float).reshape(-1)
+            acting = None
+            if history_row.size > self.lag:
+                acting = int(round(float(history_row[self.lag])))
+            if acting is not None and self.feature_ids:
+                for horizon, horizon_ids in active_by_horizon.items():
+                    self._record_prediction(
+                        [fid for fid in horizon_ids
+                         if fid in self.feature_ids],
+                        acting, labels_by_horizon[horizon][index],
+                        state,
+                    )
             for horizon, horizon_ids in active_by_horizon.items():
                 self._update_feature_pain(
                     horizon_ids, labels_by_horizon[horizon][index]
@@ -1192,9 +1214,7 @@ class NodeRuntime:
             # Action-conditioned statistics: the action acting on the
             # transition s_m -> s_{m+1} was issued `lag` steps earlier
             # (`history[lag]`) and is what the search controls per plan.
-            history_row = np.asarray(row["history"], dtype=float).reshape(-1)
-            if history_row.size > self.lag:
-                acting = int(round(float(history_row[self.lag])))
+            if acting is not None:
                 for horizon, horizon_ids in active_by_horizon.items():
                     self._update_feature_action(
                         horizon_ids,
@@ -1381,6 +1401,94 @@ class NodeRuntime:
             cell = cells.setdefault(int(action), [0, 0.0])
             cell[0] += 1
             cell[1] += pain
+
+    def _feature_cell_read(self, node_id: str, acting: int):
+        """One root's readout value under one acting action, with support."""
+        node = self.graph.nodes.get(node_id)
+        if node is None:
+            return 0.0, 0
+        base = float(node.value)
+        cell = self.feature_action_stats.get(node_id, {}).get(int(acting))
+        if cell is not None and cell[0] > 0:
+            prior = self.feature_action_prior
+            count, hits = int(cell[0]), float(cell[1])
+            return (hits + prior * base) / (count + prior), count
+        return base, 0
+
+    def _record_prediction(self, root_ids, acting: int, actual: float,
+                           state) -> None:
+        """Record the pre-update readout against the actual outcome.
+
+        The prediction is what the search would see for this state under the
+        acting action.  Confidence comes from the (feature, action) cell
+        support; confident surprises enter the counterfactual target buffer.
+        """
+        actual = float(actual)
+        for node_id in root_ids:
+            prediction, count = self._feature_cell_read(node_id, acting)
+            confidence = count / (count + self.feature_action_prior)
+            entry = self.feature_calibration.setdefault(
+                (node_id, int(acting)), [0, 0.0, 0.0, 0.0]
+            )
+            entry[0] += 1
+            entry[1] += prediction
+            entry[2] += actual
+            entry[3] += (actual - prediction) ** 2
+            score = confidence * abs(actual - prediction)
+            if score <= 0.02:
+                continue
+            self.surprise_buffer.append(dict(
+                state=np.asarray(state, dtype=float).copy(),
+                node=node_id,
+                acting=int(acting),
+                prediction=float(prediction),
+                actual=actual,
+                confidence=float(confidence),
+                score=float(score),
+            ))
+            if len(self.surprise_buffer) > self.surprise_capacity:
+                self.surprise_buffer.sort(key=lambda item: -item["score"])
+                del self.surprise_buffer[self.surprise_capacity:]
+
+    def prediction_report(self) -> dict:
+        """Calibration of the readout: prediction vs actual per cell."""
+        cells = []
+        for (node_id, acting), (n, pred_sum, actual_sum, sq) in (
+            self.feature_calibration.items()
+        ):
+            if n <= 0:
+                continue
+            feature = self._feature_objects.get(node_id)
+            pred_mean = pred_sum / n
+            actual_mean = actual_sum / n
+            cells.append(dict(
+                node=node_id,
+                feature="" if feature is None else feature.label(),
+                action=int(acting),
+                n=n,
+                pred=pred_mean,
+                actual=actual_mean,
+                brier=sq / n,
+                gap=pred_mean - actual_mean,
+                miscalibrated=(abs(pred_mean - actual_mean) > 0.15
+                               and n >= 10),
+            ))
+        cells.sort(
+            key=lambda item: -abs(item["gap"]) * min(item["n"], 50)
+        )
+        return dict(
+            cells=cells,
+            miscalibrated=sum(1 for item in cells if item["miscalibrated"]),
+            buffer_size=len(self.surprise_buffer),
+            buffer=[
+                dict(score=item["score"], acting=item["acting"],
+                     prediction=item["prediction"], actual=item["actual"],
+                     confidence=item["confidence"])
+                for item in sorted(
+                    self.surprise_buffer, key=lambda item: -item["score"]
+                )[:8]
+            ],
+        )
 
     def _activate_features(self, feature_ids) -> None:
         active = set(feature_ids)

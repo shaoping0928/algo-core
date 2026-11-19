@@ -352,6 +352,22 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
               % (float(directions.mean()), len(directions)))
     else:
         print("  no near-pipe decisions")
+
+    print("\n[8] prediction calibration (readout vs actual)")
+    report = agent.prediction_report()
+    print("  cells %d  miscalibrated %d  surprise buffer %d"
+          % (len(report["cells"]), report["miscalibrated"],
+             report["buffer_size"]))
+    for entry in report["cells"]:
+        if entry["miscalibrated"]:
+            print("    a=%d n=%4d pred=%.3f actual=%.3f brier=%.3f  %s"
+                  % (entry["action"], entry["n"], entry["pred"],
+                     entry["actual"], entry["brier"],
+                     entry["feature"][:46]))
+    for item in report["buffer"][:5]:
+        print("    surprise score=%.2f a=%d pred=%.2f actual=%.0f conf=%.2f"
+              % (item["score"], item["acting"], item["prediction"],
+                 item["actual"], item["confidence"]))
     return dict(
         frames=env.t,
         death=death,
@@ -382,6 +398,8 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
             int(np.bincount(lag_slots, minlength=LAG + 1).argmax())
             if lag_slots else -1
         ),
+        prediction_miscalibrated=int(report["miscalibrated"]),
+        surprise_buffer=int(report["buffer_size"]),
     )
 
 

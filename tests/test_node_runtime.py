@@ -413,6 +413,67 @@ class NodeRuntimeTests(unittest.TestCase):
             runtime.graph.nodes[long_id].value, 5.0 / 7.0
         )
 
+    def test_prediction_calibration_uses_the_pre_update_readout(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        runtime.feature_action_stats[feature_id] = {1: [10, 10.0]}
+        rows = [
+            dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
+                history=np.asarray([1.0, 1.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+            ),
+        ]
+        runtime.learn_episode(rows)
+        entry = runtime.feature_calibration[(feature_id, 1)]
+        expected = (10.0 + 2.0 * (5.0 / 7.0)) / 12.0
+        self.assertEqual(entry[0], 1)
+        self.assertAlmostEqual(entry[1], expected, places=9)
+        self.assertAlmostEqual(entry[2], 0.0, places=9)
+        # The record happened before the update: the cell now includes the
+        # benign transition.
+        self.assertEqual(runtime.feature_action_stats[feature_id][1],
+                         [11, 10.0])
+        self.assertTrue(runtime.surprise_buffer)
+        report = runtime.prediction_report()
+        self.assertGreaterEqual(report["buffer_size"], 1)
+        self.assertEqual(len(report["buffer"]), min(
+            len(runtime.surprise_buffer), 8))
+
+    def test_prediction_report_flags_miscalibrated_cells(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        # The readout kept predicting disaster; reality kept being benign.
+        runtime.feature_calibration[(feature_id, 1)] = [20, 18.0, 4.0, 9.0]
+        report = runtime.prediction_report()
+        flagged = [
+            item for item in report["cells"]
+            if item["node"] == feature_id and item["miscalibrated"]
+        ]
+        self.assertEqual(len(flagged), 1)
+        self.assertGreater(flagged[0]["pred"], 0.8)
+        self.assertLess(flagged[0]["actual"], 0.3)
+
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()
         node = runtime._create_node(np.asarray([0.0]))
