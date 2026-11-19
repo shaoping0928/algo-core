@@ -42,6 +42,39 @@ from node_graph import (
 )
 
 
+def future_pain_labels(rows, window: int) -> List[float]:
+    """Precursor pain labels: ``P_k(t) = max pain over the next k states``.
+
+    `rows` are transition dicts ordered in time (``signals[1]`` is the pain of
+    the *entered* state, ``done`` marks an episode boundary).  With
+    ``window = k`` the label of row ``t`` is the largest pain observed at
+    states ``t+1 .. t+k``, truncated at the first terminal step or episode
+    end.  With ``window = 1`` this is the plain entered-state pain.
+    """
+    rows = list(rows)
+    pains = []
+    dones = []
+    episodes = []
+    for row in rows:
+        signals = np.asarray(row["signals"], dtype=float).reshape(-1)
+        pains.append(float(signals[1]))
+        dones.append(bool(row["done"]))
+        episodes.append(row.get("episode"))
+    span = max(int(window), 1)
+    labels = []
+    for index in range(len(rows)):
+        value = 0.0
+        for offset in range(span):
+            position = index + offset
+            if position >= len(rows) or episodes[position] != episodes[index]:
+                break
+            value = max(value, pains[position])
+            if dones[position]:
+                break
+        labels.append(value)
+    return labels
+
+
 class NodeRuntime:
     """Online concept graph with action-conditioned valence learning."""
 
@@ -1076,8 +1109,13 @@ class NodeRuntime:
         if not rows:
             return
         self.reset()
+        # Precursor labels: a feature on the *current* state is trained to
+        # predict pain within `lag + 1` entered states, so it can fire while
+        # the action can still change the outcome.  `lag + 1` is the first
+        # state an action issued now can physically affect.
+        labels = future_pain_labels(rows, self.lag + 1)
         steps = []
-        for row in rows:
+        for index, row in enumerate(rows):
             action = int(row["history"][0])
             if action not in self.action_space:
                 raise ValueError("action is outside the action space")
@@ -1115,7 +1153,7 @@ class NodeRuntime:
                 current_features=current_features,
                 next_features=next_features,
             )
-            self._update_feature_pain(next_active, float(signals[1]))
+            self._update_feature_pain(current_active, labels[index])
             entered = self.graph.nodes[next_node]
             entered.immediate_pain += self.alpha_now * (
                 signals[1] - entered.immediate_pain
@@ -1173,11 +1211,13 @@ class NodeRuntime:
 
     def induce_rules(self, train_states, train_pain,
                      test_states=None, test_pain=None):
-        """Induce compositional pain rules over encoded observation states.
+        """Induce compositional precursor rules over encoded states.
 
-        Only the observation part is used: the rule is a property of the
-        entered state, which is what the sandbox predicts.  Lag/action
-        coordinates remain available to the node graph.
+        Only the observation part is used.  With precursor labels the target
+        is ``pain within lag + 1 steps`` of the state itself, so a rule
+        describes a situation that *precedes* death while an action can
+        still change the outcome.  Lag/action coordinates remain available
+        to the node graph.
         """
         train_states = np.asarray(train_states, dtype=float)
         if train_states.ndim != 2 or train_states.shape[1] < self.obs_dim:
@@ -1238,7 +1278,10 @@ class NodeRuntime:
         for rule in rules:
             node_id = self._materialize_feature(rule.feature, "feature")
             node = self.graph.nodes[node_id]
-            node.value = max(float(node.value), float(rule.confidence))
+            # Initialize from train counts only: the held-out split that
+            # selected the rule must not also seed its predictor value.
+            prior = (float(rule.hits) + 1.0) / (float(rule.support) + 2.0)
+            node.value = max(float(node.value), prior)
             node.count = max(node.count, int(rule.support))
             if node_id not in self.feature_ids:
                 self.feature_ids.append(node_id)

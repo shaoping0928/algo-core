@@ -49,11 +49,12 @@
 
 ### P0 先修测量
 
-- [ ] `--no-features` / `--instant-labels` 开关贯通 `fit`/`run_seed`/CLI（消除"改代码才能消融"）。
-- [ ] `trace_node_runtime` 改为插桩部署路径：OOD 比例、决策状态风险激活率、死亡类型、
+- [x] `--no-features` / `--instant-labels` 开关贯通 `fit`/`run_seed`/CLI（消除"改代码才能消融"）。
+- [x] `trace_node_runtime` 改为插桩部署路径：OOD 比例、决策状态风险激活率、死亡类型、
   `P(death within k)` 前兆 AUC（k=1..lag+1）、kNN 双动作支撑（训练数据 k=8）、
   滞后槽位识别（Δ_j argmax + 分离度）、与 zero/one 计划同尺度的对照。
-- [ ] `plan_score`：按 `policy_result` 同一目标给固定计划打分（供诊断与后续计划级后验复用）。
+- [x] `plan_score`：按 `policy_result` 同一目标给固定计划打分（含与 exhaustive_search
+  一致性的单元测试）。
 - [ ] 评估协议：`--eval-seeds`/`--eval-episodes`、per-seed 中位数/IQR/bootstrap CI、
   held-out 种子（如 120–139）。
 - [ ] 删除或标注不可复现的 0.977 AUC 与 n=2 的"验证"；README 增加"实现/训练/被控制器读取"三栏。
@@ -61,8 +62,10 @@
 ### P1 正确性
 
 - [x] 特征值初始化改用 train 统计（Laplace 先验），不再用 held-out test confidence。
-- [ ] E1 前置标签：特征归纳与特征 pain 更新改在 `obs_t` 上，标签
+  单独验证：fast 8 种子 131.6/115.0 与基线逐种子完全相同（数值上无副作用）。
+- [x] E1 前置标签：特征归纳与特征 pain 更新改在 `obs_t` 上，标签
   `P_k(t) = max_{j≤lag} pain_{t+j}`（k=lag+1，截断于 done）；`--instant-labels` 回退。
+  结果见下节：检测修复，决策未受益，5000 步规模变差。
 - [ ] `memory.value` 改为 pain 事件局部 EMA + 真实遗忘判据（回归测试：pain memory
   复访安全步后 value 不再恒 1.0）。
 - [ ] 风险融合 max(association, feature, feature-memory) 统一量纲/校准后再融合。
@@ -88,6 +91,37 @@
 - paired frames ≥131.6 基线，单种子跌幅 <20%；Brier <0.10。
 - 判读：AUC 升而 frames 不动 → 瓶颈是终端价值/horizon（R4），标签时机不是约束；
   frames 也升 → 继续投入 VOI 采集（E2）。
+
+### E1 结果（已跑，2026-11）
+
+| 臂 | fast 8 种子 | 5000 步 8 种子 |
+|---|---|---|
+| 基线（instant，无泄漏修复） | 131.6 / 115.0 | — |
+| instant + 泄漏修复 | **131.6 / 115.0（逐种子相同）** | 119.6 / 112.5 |
+| 前置标签（默认） | 122.0 / 144.5（Δ -9.6，0.4 SE） | **87.1 / 72.0**（Δ -32.5，1.45 SE，6/8 更差） |
+
+trace（seed 100）：
+
+- 前兆 AUC 0.498 → **0.980–0.990**（fast 与 5000 步都成立）；特征激活 0 → 0.046；
+  终端 AUC 0.309 → 1.000（fast）。
+- 5000 步规则集被 `|f1|`（vy 幅值）类规则主导（n=239–427，p 0.63–0.95）。
+  全拍计划平均风险 **1.04** vs 全不拍 **0.67**：拍翅后的预测状态大量触发
+  vy 幅值规则 → 搜索把"拍翅"本身当成危险。
+- 未达验收：`risk_active_frac` 0.066/0.115 < 0.30；frames 未达 131.6；
+  Brier 未计算。
+
+结论与判读：
+
+1. **标签时机假设成立**：旧特征层确实只在死亡当帧出现；前置标签把风险读出
+   变成真正的前兆检测（AUC 0.50→0.98）。
+2. **但静态状态风险势无法选择动作**：幅值原语混淆 vy 方向，窗口 4 的标签把
+   "pending 动作已注定的死亡"也算进当前状态。这与三份审计的
+   "需要 `P(pain | s, a)`"结论一致，是当前最优先的结构缺口。
+3. 下一步（P2 最小版）：**按有效动作条件化的特征统计**。因果上干净：进入
+   `s_{t+1}` 的 pain 由 `history[lag]` 时刻发出的动作造成；沙盒预测状态的
+   `pending[0]` 恰好是该动作。特征节点按 `(feature, effective_action)` 维护
+   count/mean，`_feature_risk_batch` 用 `pending[0]` 查表；验收为
+   "全拍/全不拍计划风险不再系统性倒挂 + paired frames ≥ instant 臂"。
 
 ## 当前状态
 

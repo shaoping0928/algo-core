@@ -18,7 +18,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import numpy as np
 
 from latent_world import SEEDS, latent
-from node_runtime import NodeRuntime
+from node_runtime import NodeRuntime, future_pain_labels
 from substrate_generic import (
     LinearObservationModel,
     collect,
@@ -36,7 +36,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         component_kinds=(), component_min_count=8,
         max_components=128, component_weight=0.5,
         component_gating=False, memory_weight=0.1,
-        association_rate=0.0, induce_features=True):
+        association_rate=0.0, induce_features=True,
+        precursor_labels=True):
     if steps < 1:
         raise ValueError("steps must be positive")
     if not 0.0 <= coverage <= 1.0:
@@ -89,15 +90,27 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     ordered = [episodes[key] for key in sorted(episodes)]
 
     # Rules are induced after the first pass, then materialized as feature
-    # nodes.  Later epochs train transitions, action edges and memories with
-    # those feature nodes active, so features take part in learning rather
-    # than only in the final readout.
-    pain = np.asarray(
-        [row["signals"][1] > 0.5 for row in transitions], dtype=float
-    )
-    states = np.asarray(
-        [row["next_obs"] for row in transitions], dtype=float
-    ) / scales[:obs_dim]
+    # nodes.  Precursor labels let a rule describe the *current* state and
+    # predict pain within `lag + 1` steps, so it can fire while the action
+    # can still change the outcome.  Later epochs train transitions, action
+    # edges and memories with those feature nodes active, so features take
+    # part in learning rather than only in the final readout.
+    if precursor_labels:
+        states = np.asarray(
+            [row["obs"] for row in transitions], dtype=float
+        ) / scales[:obs_dim]
+        pain = np.asarray(
+            future_pain_labels(transitions, lag + 1), dtype=float
+        )
+    else:
+        # Pre-precursor behavior: rules on the entered state with its own
+        # pain label.
+        states = np.asarray(
+            [row["next_obs"] for row in transitions], dtype=float
+        ) / scales[:obs_dim]
+        pain = np.asarray(
+            [row["signals"][1] > 0.5 for row in transitions], dtype=float
+        )
     groups = np.asarray([row["episode"] for row in transitions])
     order = np.unique(groups)
     # Interleaved episode split: every fifth episode is held out.  A contiguous
@@ -252,7 +265,7 @@ def run_seed(task):
     (seed, steps, coverage, cap, max_nodes, birth_threshold, horizon,
      epochs, lag, component_kinds, component_min_count, max_components,
      component_weight, component_gating, memory_weight,
-     association_rate) = task
+     association_rate, induce_features, precursor_labels) = task
     world, agent = fit(
         seed, steps=steps, coverage=coverage,
         max_nodes=max_nodes, birth_threshold=birth_threshold,
@@ -264,6 +277,8 @@ def run_seed(task):
         component_gating=component_gating,
         memory_weight=memory_weight,
         association_rate=association_rate,
+        induce_features=induce_features,
+        precursor_labels=precursor_labels,
     )
     frames, actions = evaluate(
         seed, world, agent, cap=cap, horizon=horizon, lag=lag
@@ -299,6 +314,11 @@ def main():
     parser.add_argument("--component-gating", action="store_true")
     parser.add_argument("--memory-weight", type=float, default=0.1)
     parser.add_argument("--association-rate", type=float, default=0.0)
+    parser.add_argument("--no-features", action="store_true",
+                        help="disable the compositional feature layer")
+    parser.add_argument("--instant-labels", action="store_true",
+                        help="induce rules on the entered state with its own "
+                             "pain label instead of precursor labels")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset: 1500 steps, 3 epochs, "
                              "1000 nodes, 400-frame evaluation")
@@ -352,7 +372,8 @@ def main():
          args.lag, component_kinds, args.component_min_count,
          args.max_components, args.component_weight,
          args.component_gating, args.memory_weight,
-         args.association_rate)
+         args.association_rate, not args.no_features,
+         not args.instant_labels)
         for seed in seeds
     ]
     if args.jobs == 1:

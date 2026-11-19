@@ -151,7 +151,7 @@ class NodeRuntimeTests(unittest.TestCase):
 
     def test_smoke_run_on_flappy_signals(self):
         row = run_seed((100, 100, 0.1, 100, 200, 0.45, 6, 1, 3,
-                        (), 8, 0, 0.5, False, 0.1, 0.0))
+                        (), 8, 0, 0.5, False, 0.1, 0.0, True, True))
         self.assertGreater(row["frames"], 0)
         self.assertGreaterEqual(row["graph"]["nodes"], 1)
         self.assertGreaterEqual(row["graph"]["action_edges"], 1)
@@ -221,6 +221,69 @@ class NodeRuntimeTests(unittest.TestCase):
         surprise = self.make_runtime(max_nodes=40)
         surprise.learn_episode(rows(12, True))
         self.assertGreaterEqual(surprise.snapshot()["memories"], 1)
+
+    def test_future_pain_labels_window_and_truncation(self):
+        from node_runtime import future_pain_labels
+
+        rows = []
+        # Episode 0: the entered state after row 3 is painful and terminal.
+        for index, pain in enumerate([0.0, 0.0, 0.0, 1.0, 0.0, 0.0]):
+            rows.append(dict(
+                obs=np.asarray([float(index)]),
+                next_obs=np.asarray([float(index + 1)]),
+                history=np.asarray([0.0, 0.0]),
+                signals=np.asarray([1.0 - pain, pain]),
+                done=index == 3, episode=0,
+            ))
+        # A second episode whose first entered state is painful; it must not
+        # bleed into the last episode-0 label.
+        for index, pain in enumerate([1.0, 0.0, 0.0]):
+            rows.append(dict(
+                obs=np.asarray([float(index)]),
+                next_obs=np.asarray([float(index + 1)]),
+                history=np.asarray([0.0, 0.0]),
+                signals=np.asarray([1.0 - pain, pain]),
+                done=False, episode=1,
+            ))
+        labels = future_pain_labels(rows, 3)
+        self.assertEqual(labels[:6], [0.0, 1.0, 1.0, 1.0, 0.0, 0.0])
+        self.assertEqual(labels[5], 0.0)
+
+    def test_feature_pain_learns_the_precursor_label(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 0.2), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        # The initialization uses train counts, not the held-out confidence.
+        self.assertAlmostEqual(
+            runtime.graph.nodes[feature_id].value, 5.0 / 7.0, places=6
+        )
+        rows = [
+            dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
+                history=np.asarray([0.0, 0.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([1.0]), next_obs=np.asarray([2.0]),
+                history=np.asarray([0.0, 0.0]),
+                signals=np.asarray([1.0, 1.0]), done=True, episode=0,
+            ),
+        ]
+        runtime.learn_episode(rows)
+        # lag=1 → window 2: the label of row 0 is pain within 2 entered
+        # states (1.0), and the feature is active on the *current* state.
+        self.assertGreater(
+            runtime.graph.nodes[feature_id].value, 5.0 / 7.0
+        )
 
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()
