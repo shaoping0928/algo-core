@@ -2,8 +2,13 @@ import unittest
 
 import numpy as np
 
-from node_features import Composite, FeatureRuleBank, Primitive
-from node_graph import CONCEPT, NodeGraph
+from node_features import (
+    Composite,
+    FeatureRule,
+    FeatureRuleBank,
+    Primitive,
+)
+from node_graph import CONCEPT, DERIVATION, NodeGraph
 from node_runtime import NodeRuntime
 
 
@@ -72,6 +77,27 @@ class FeatureRuleTests(unittest.TestCase):
         self.assertEqual(restored.nodes[node_id].predicate, predicate)
         self.assertEqual(restored.nodes[node_id].role, "feature")
 
+    def test_shared_primitive_nodes_are_reused(self):
+        runtime = NodeRuntime(
+            obs_dim=2, lag=0, scales=np.ones(2),
+            birth_threshold=0.01, max_nodes=10, exploration=0.0,
+        )
+        shared = Primitive(0, True, "<", 0.2)
+        first = FeatureRule(shared, 5, 4, 0.8, 2, 2, 1.0, 0.75)
+        second = FeatureRule(
+            Composite("and", (shared, Primitive(1, False, ">", 0.3))),
+            5, 4, 0.8, 2, 2, 1.0, 0.75,
+        )
+        runtime.rules.rules = [first, second]
+        runtime.install_feature_rules()
+        self.assertEqual(len(runtime.feature_ids), 2)
+        composite = runtime.feature_ids[1]
+        child_ids = runtime._feature_children[composite]
+        # The primitive root is reused as the composite's child instead of
+        # being stored twice.
+        self.assertIn(runtime.feature_ids[0], child_ids)
+        self.assertEqual(len(runtime._feature_all), len(set(runtime._feature_all)))
+
     def test_feature_nodes_join_memory_and_action_edges(self):
         rng = np.random.RandomState(13)
         x = rng.uniform(-1.0, 1.0, (1200, 2))
@@ -85,6 +111,17 @@ class FeatureRuleTests(unittest.TestCase):
         runtime.induce_rules(x[:900], y[:900], x[900:], y[900:])
         runtime.install_feature_rules()
         self.assertTrue(runtime.feature_ids)
+        self.assertGreaterEqual(len(runtime._feature_all), len(runtime.feature_ids))
+        composite_roots = [
+            node_id for node_id in runtime.feature_ids
+            if runtime._feature_children.get(node_id)
+        ]
+        self.assertTrue(composite_roots)
+        root = composite_roots[0]
+        for child in runtime._feature_children[root]:
+            self.assertIn(
+                (root, child, DERIVATION), runtime.graph.edges
+            )
         state = np.asarray([0.0, 0.5])
         active = runtime._active_feature_ids(state)
         self.assertTrue(active)

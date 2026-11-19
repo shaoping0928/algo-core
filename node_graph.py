@@ -240,6 +240,21 @@ class NodeGraph:
         self.incoming[source].append(key)
         return derived
 
+    def add_derivation(self, derived: str, source: str,
+                       weight: float = 1.0) -> Edge:
+        """Add a directed derivation edge (composite -> child feature)."""
+        for node in (derived, source):
+            if node not in self.nodes:
+                raise KeyError(node)
+        key = (derived, source, DERIVATION)
+        if key in self.edges:
+            return self.edges[key]
+        edge = Edge(derived, source, DERIVATION, weight=float(weight))
+        self.edges[key] = edge
+        self.outgoing[derived].append(key)
+        self.incoming[source].append(key)
+        return edge
+
     # ---- observation -------------------------------------------------------
     def activate(self, ids: Iterable[str], values: Optional[Iterable[float]] = None) -> None:
         ids = list(ids)

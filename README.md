@@ -271,10 +271,11 @@ end:     2337 concepts, 3410 action edges, assoc=2640, trans=2640, mem=128
 - pain 组内阈值加外扩 margin，保证精确的“边界值”组合仍然覆盖所有 pain 样本；
 - 覆盖选择优先解释新的 pain 事件，再用“未使用过的坐标/原语”补充不同 cause。
 
-规则在 epoch 0 后安装成图中的 `role="feature"` 节点：
+规则在 epoch 0 后安装成图中的特征子图：
 
+- 原语、AND/OR 组合都是节点，组合节点用 derivation 边指向共享子节点；同一个原语不会重复存储；
 - 每个状态都会评估谓词并激活对应特征节点，节点上保存学到的 `P(pain | feature)`；
-- 特征节点作为 action edge 的 source 参与转移学习，决策时也会被加入候选 source；
+- 根特征节点作为 action edge 的 source 参与转移学习，决策时也会被加入候选 source；
 - 创建 memory 时把当时活跃的特征节点写成成员，之后可以按特征召回 memory；
 - 沙盒预测状态先算特征风险，再与节点/memory 的 pain 读出取 max。
 
