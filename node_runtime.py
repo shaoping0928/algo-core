@@ -65,7 +65,6 @@ class NodeRuntime:
         component_weight: float = 0.5,
         component_gating: bool = False,
         graph_rate: float = 0.1,
-        memory_rate: float = 0.2,
         memory_decay: float = 0.9,
         memory_min_strength: float = 0.02,
         memory_weight: float = 0.1,
@@ -111,8 +110,6 @@ class NodeRuntime:
             raise ValueError("component_weight must be non-negative")
         if not 0.0 < float(graph_rate) <= 1.0:
             raise ValueError("graph_rate must be in (0, 1]")
-        if not 0.0 < float(memory_rate) <= 1.0:
-            raise ValueError("memory_rate must be in (0, 1]")
         if not 0.0 < float(memory_decay) <= 1.0:
             raise ValueError("memory_decay must be in (0, 1]")
         if float(memory_min_strength) < 0.0:
@@ -149,7 +146,6 @@ class NodeRuntime:
         self.component_weight = float(component_weight)
         self.component_gating = bool(component_gating)
         self.graph_rate = float(graph_rate)
-        self.memory_rate = float(memory_rate)
         self.memory_decay = float(memory_decay)
         self.memory_min_strength = float(memory_min_strength)
         self.memory_weight = float(memory_weight)
@@ -382,6 +378,10 @@ class NodeRuntime:
             )
             if start_memory:
                 self.episode_memory = self._new_memory()
+                memory = self.graph.nodes[self.episode_memory]
+                memory.value = pain
+                memory.dopamine = dopamine
+                memory.count = 1
             self.graph.add_membership(self.episode_memory, current)
             self.graph.add_membership(self.episode_memory, next_node)
             if edge.edge_node is not None:
@@ -425,24 +425,28 @@ class NodeRuntime:
 
     def _reinforce_memories(self, node_ids: Iterable[str], pain: float,
                             dopamine: float) -> None:
+        active = set(node_ids)
         for memory_id in self.memories_for(node_ids):
             memory = self.graph.nodes.get(memory_id)
             if memory is None or memory.kind != MEMORY:
                 continue
             self.graph.activate([memory_id], [1.0])
-            memory.value += self.memory_rate * (pain - memory.value)
-            memory.dopamine += self.memory_rate * (
-                dopamine - memory.dopamine
-            )
-            memory.count += 1
+            # Only the current event owns its value. Retrieving an older
+            # memory must not overwrite its event valence with later steps.
+            if memory_id == self.episode_memory:
+                memory.value = max(memory.value, float(pain))
+                memory.dopamine = max(memory.dopamine, float(dopamine))
             for key in self.graph.outgoing.get(memory_id, []):
-                if key[2] == MEMBERSHIP:
-                    edge = self.graph.edges[key]
-                    edge.weight += self.graph_rate * (1.0 - edge.weight)
-                    edge.eligibility = (
-                        (1.0 - self.graph_rate) * edge.eligibility
-                        + self.graph_rate
-                    )
+                if key[2] != MEMBERSHIP:
+                    continue
+                edge = self.graph.edges[key]
+                if key[1] not in active:
+                    continue
+                edge.weight += self.graph_rate * (1.0 - edge.weight)
+                edge.eligibility = (
+                    (1.0 - self.graph_rate) * edge.eligibility
+                    + self.graph_rate
+                )
 
     def _propagate_association_values(self) -> None:
         """Blend concept values along learned association weights."""
@@ -479,12 +483,24 @@ class NodeRuntime:
             )
 
     def _forget_memories(self) -> None:
-        for memory in list(self.graph.nodes.values()):
-            if memory.kind != MEMORY:
-                continue
+        memories = [
+            memory for memory in self.graph.nodes.values()
+            if memory.kind == MEMORY
+        ]
+        if memories:
+            median_value = float(np.median([
+                memory.value for memory in memories
+            ]))
+        else:
+            median_value = 0.0
+        for memory in memories:
             memory.trace *= self.memory_decay
+            for key in self.graph.outgoing.get(memory.id, []):
+                if key[2] == MEMBERSHIP:
+                    self.graph.edges[key].weight *= self.memory_decay
             if (memory.trace < self.memory_min_strength
-                    and memory.count <= 1):
+                    and memory.count <= 1
+                    and memory.value <= median_value):
                 self.graph._remove_node(memory.id)
 
     def _prune_components(self) -> None:

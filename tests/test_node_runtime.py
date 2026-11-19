@@ -154,6 +154,7 @@ class NodeRuntimeTests(unittest.TestCase):
         memory_id = runtime.episode_memory
         runtime.graph.nodes[memory_id].trace = 0.0
         runtime.graph.nodes[memory_id].count = 1
+        runtime.graph.nodes[memory_id].value = 0.0
         runtime._forget_memories()
         self.assertNotIn(memory_id, runtime.graph.nodes)
 

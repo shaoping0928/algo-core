@@ -104,6 +104,12 @@
   重复 epoch 不重复建 memory。5000 步后 assoc/trans/mem = 2640/2640/128。
 - [x] memory 通过 membership 关联；激活节点（含一跳 association）反查并加强 memory
   trace/value/count 和 membership 边；episode 结束 decay，低支持 memory 遗忘。
+- [x] 随机 memory 追踪（`trace_memory_change.py`，3 种子）：修正 memory value 被后续存活步
+  洗掉/拉满、membership 权重饱和、高价值 memory 误删。修正后 learning 前后新增 1–2 个
+  memory，旧 memory value 稳定；terminal value≈1、安全 value≈0；首轮保留 206/208。
+- [ ] value-aware memory retrieval：高价值 terminal memory 的 trace/membership 可能衰减到 0，
+  需要按 value 而不只按 trace 找回。
+- [ ] memory 成员仍约 28 个，事件分段偏粗；需要更细的事件边界。
 - [x] transition edge node 用 MC/TD target 更新价值；memory value 以默认 0.1 权重进入终点评分；
   对称 association 价值平滑实测有害（232→141 帧），默认关闭，association 只参与 memory 检索。
 - [x] 组件出生改为按节点 valence 方差（相对节点总体 median+std）自适应；低效用组件按

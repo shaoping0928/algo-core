@@ -251,16 +251,51 @@ end:     2337 concepts, 3410 action edges, assoc=2640, trans=2640, mem=128
 但决策路径仍未读取 association/transition 结构；memory 只以较小权重参与终点价值。存活与
 “只建立结构”基本持平，说明下一步需要更好的信用分配/校准，而不是继续增加结构数量。
 
-但决策路径仍未读取这些 interaction：存活仍是 107.9 帧，和没有 interaction 时相同。节点图的
-结构已经存在，下一步要把 association/transition/memory 用于价值回传或动作选择，而不是只建立。
+### 随机 memory 追踪
+
+`trace_memory_change.py` 随机抽 3 个种子、各抽 1 个 episode，对比学习前后的 memory：
+
+```text
+学习前 n=130 value=0.146/1.000 trace=0.428/0.860 members=43.0
+学习后 n=131 value=0.145/1.000 trace=0.429/0.898 members=43.1
+created=2 updated=129 forgotten=1
+full training: n=111 value=0.000/0.000（修正前）
+```
+
+追踪暴露并修正了两个问题：
+
+- **memory value 被后续存活步洗掉/拉满**：原先每个 episode 的 memory 都会在后续 pain=0 的
+  转移上更新，最后要么趋近 0，要么被终止 pain 的 max 拉成 1。现在只有 **当前事件 memory**
+  更新 value，旧 memory 被检索时只更新 trace/membership，不改事件 valence。
+- **membership 权重饱和到 1**：原先任意成员被激活就强化该 memory 的所有 membership 边。
+  现在只强化当前/下一节点对应的边，并在结束时 decay；权重从全是 `1.00` 变为约 `0.00–0.20`。
+- **高价值 memory 被误删**：遗忘现在用 trace + 相对 value 中位数保护高 pain 的 terminal memory，
+  不再只看低 trace/count。
+
+修正后：
+
+```text
+学习前 n=206 value=0.461/1.000 trace=0.274/0.860 members=28.2
+学习后 n=208 value=0.462/1.000 trace=0.273/0.898 members=28.2
+created=2 updated=188 forgotten=0
+full training: n=207 value=0.464/1.000，首轮 memory 保留 206/208
+```
+
+也就是：每个 episode 约新增 1–2 个 memory；旧 memory 多数只更新 trace/权重，value 稳定；
+terminal event memory value≈1，安全 event memory value≈0；memory 成员数约 28，仍然偏
+episode/窗口级，而不是严格的事件级。
+
+剩余问题：
+
+- 部分高价值 terminal memory 的 trace 会衰减到 0，membership 权重也接近 0，虽然被保留下来
+  但很难再被激活；需要 value-aware retrieval，而不只靠 trace。
+- memory 成员仍较多（约 28），事件分段还不够细。
+- memory 以 0.1 权重进入终点价值时对存活没有可见影响（8 种子仍 108.6）。
 
 其余训练过程问题仍然成立：
 
-- 节点数在约 100 个 episode 时达到 2000 上限，之后不再出生；没有剪枝/合并，新的终止状态
-  只能映射到旧节点，于是出现终止状态 alias 到安全节点。
-- 近管道双动作支撑只有 `0.11`，整体 `0.22`；另一动作的 Q 长期缺少数据。
-- 死亡信用会更新 16–22 个节点，但终止节点本身很少被重复访问；早期 `term>0.5` 的节点为 0，
-  直到后期才累积到 60 个。
+- 概念节点约 2337 个，没有触及 5000 上限；但新的终止状态仍可能 alias 到旧安全节点。
+- 近管道双动作支撑只有约 `0.18` 整体、`0.085` 近管道；另一动作的 Q 长期缺少数据。
 - 因此训练出的图仍然偏“僵化的离散记忆”：能拟合行为策略的留出集，却不能覆盖 MPC 自己产生的
   终止状态和新轨迹。
 
