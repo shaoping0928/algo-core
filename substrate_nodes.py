@@ -183,6 +183,48 @@ def policy_action(env, world, agent, prefix, horizon, lag=LAG,
     ).actions[0])
 
 
+def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
+               step_stride=2):
+    """Score one fixed plan with the same objective as `policy_result`.
+
+    Reproduces the `exhaustive_search` scoring under
+    ``score_combine=("max", "sum")``: column 0 is the worst `pain_signal`
+    risk over the strided predicted states and the terminal state, column 1
+    is the negative terminal dopamine.  Used by diagnostics that compare
+    fixed plans against the searched plan, and later by plan-level posteriors.
+    """
+    initial = np.asarray(initial_state, dtype=float).reshape(1, -1)
+    pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
+    action_dim = int(lag) + 1
+    step_stride = max(int(step_stride), 1)
+    plan = np.asarray(plan, dtype=float).reshape(1, -1)
+    states = initial.copy()
+    worst = 0.0
+    for step in range(horizon):
+        history = history_features(
+            plan, step + 1, pending_prefix, action_dim=action_dim
+        )
+        states = np.asarray(world.predict(states, history), dtype=float)
+        if step % step_stride == 0:
+            pending = history[:, :agent.lag][:, ::-1]
+            encoded = np.concatenate([states, pending], axis=1) / agent.scales
+            if not np.isfinite(encoded).all():
+                return (float("inf"), float("inf"))
+            worst = max(worst, float(agent.pain_signal_batch(encoded)[0]))
+    history = history_features(
+        plan, horizon, pending_prefix, action_dim=action_dim
+    )
+    pending = history[:, :agent.lag][:, ::-1]
+    encoded = np.concatenate([states, pending], axis=1) / agent.scales
+    if not np.isfinite(encoded).all():
+        return (float("inf"), float("inf"))
+    pain, dopamine = agent.valence_state_batch(encoded)
+    terminal = max(
+        float(pain[0]), float(agent.pain_signal_batch(encoded)[0])
+    )
+    return (max(worst, terminal), -float(dopamine[0]))
+
+
 def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
              step_stride=2):
     if cap < 1:

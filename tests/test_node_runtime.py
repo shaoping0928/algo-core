@@ -296,5 +296,26 @@ class NodeRuntimeTests(unittest.TestCase):
             self.assertNotIn(token, adapter, "%s in substrate_nodes.py" % token)
 
 
+class PlanScoreTests(unittest.TestCase):
+    def test_plan_score_matches_search_selection(self):
+        from latent_world import latent
+        from substrate_nodes import fit, plan_score, policy_result
+
+        world, agent = fit(100, steps=300, epochs=1, max_nodes=200, lag=3)
+        env = latent[3](100)
+        prefix = np.zeros(3, dtype=float)
+        result = policy_result(env, world, agent, prefix, horizon=1, lag=3)
+        scores = [
+            plan_score(
+                env.obs(), world, agent, prefix, [float(action)], 1, lag=3
+            )
+            for action in (0, 1)
+        ]
+        best = min(range(2), key=lambda index: scores[index])
+        self.assertEqual(int(result.actions[0]), best)
+        self.assertAlmostEqual(result.score[0], scores[best][0], places=6)
+        self.assertAlmostEqual(result.score[1], scores[best][1], places=6)
+
+
 if __name__ == "__main__":
     unittest.main()
