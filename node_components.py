@@ -113,6 +113,9 @@ class ComponentBank:
         self.previous_sign: Dict[str, int] = {}
         self.previous_sign_node: Dict[str, Optional[str]] = {}
         self.smoothed: Dict[str, float] = {}
+        self.sign_counts: Dict[str, Dict[int, int]] = {}
+        self.sign_pain_sum: Dict[str, Dict[int, float]] = {}
+        self.sign_pain_count: Dict[str, Dict[int, int]] = {}
         self.last_active: List[str] = []
 
     def bind(self, base_node: str, kind: str = "difference",
@@ -164,6 +167,9 @@ class ComponentBank:
         self.previous_sign[component_id] = 0
         self.previous_sign_node[component_id] = None
         self.smoothed[component_id] = 0.0
+        self.sign_counts[component_id] = {1: 0, 0: 0, -1: 0}
+        self.sign_pain_sum[component_id] = {1: 0.0, 0: 0.0, -1: 0.0}
+        self.sign_pain_count[component_id] = {1: 0, 0: 0, -1: 0}
         return component_id
 
     def step(self, activations: Dict[str, float]) -> Dict[str, int]:
@@ -188,6 +194,7 @@ class ComponentBank:
             )
             self.previous_sign[component_id] = sign
             node_id = self.sign_nodes[component_id][sign]
+            self.sign_counts[component_id][sign] += 1
             self.graph.activate([node_id], [1.0])
             for other_sign, other in self.sign_nodes[component_id].items():
                 if other_sign != sign:
@@ -244,8 +251,83 @@ class ComponentBank:
             node.value += rate * (pain - node.value)
             node.dopamine += rate * (dopamine - node.dopamine)
             node.count += 1
+            component_id = node.component_id
+            if component_id in self.sign_pain_sum:
+                sign = int(node.sign)
+                self.sign_pain_sum[component_id][sign] += pain
+                self.sign_pain_count[component_id][sign] += 1
 
     # ---- persistence -------------------------------------------------------
+    def utility(self, component_id: str) -> float:
+        """How much the sign state explains pain (weighted variance of means)."""
+        means = []
+        weights = []
+        for sign in (1, 0, -1):
+            count = self.sign_pain_count.get(component_id, {}).get(sign, 0)
+            if count <= 0:
+                continue
+            means.append(
+                self.sign_pain_sum[component_id][sign] / count
+            )
+            weights.append(count)
+        if len(means) < 2:
+            return 0.0
+        total = float(sum(weights))
+        if total <= 0.0:
+            return 0.0
+        mean = sum(
+            weight * value for weight, value in zip(weights, means)
+        ) / total
+        return sum(
+            weight * (value - mean) ** 2
+            for weight, value in zip(weights, means)
+        ) / total
+
+    def observations(self, component_id: str) -> int:
+        return int(sum(self.sign_counts.get(component_id, {}).values()))
+
+    def remove(self, component_id: str) -> bool:
+        if component_id not in self.specs:
+            return False
+        nodes = list(self.sign_nodes.get(component_id, {}).values())
+        for node_id in nodes:
+            if node_id in self.graph.nodes:
+                self.graph._remove_node(node_id)
+        self.specs.pop(component_id, None)
+        self.components.pop(component_id, None)
+        self.sign_nodes.pop(component_id, None)
+        self.previous_sign.pop(component_id, None)
+        self.previous_sign_node.pop(component_id, None)
+        self.smoothed.pop(component_id, None)
+        self.sign_counts.pop(component_id, None)
+        self.sign_pain_sum.pop(component_id, None)
+        self.sign_pain_count.pop(component_id, None)
+        self.last_active = [
+            node_id for node_id in self.last_active
+            if node_id in self.graph.nodes
+        ]
+        return True
+
+    def prune(self, min_observations: int = 20,
+              quantile: float = 0.25) -> List[str]:
+        """Forget components whose sign states do not separate pain."""
+        candidates = [
+            component_id for component_id in self.specs
+            if self.observations(component_id) >= min_observations
+        ]
+        if len(candidates) < 2:
+            return []
+        utilities = np.asarray([
+            self.utility(component_id) for component_id in candidates
+        ])
+        threshold = float(np.quantile(utilities, quantile))
+        removed = []
+        for component_id in candidates:
+            if self.utility(component_id) <= threshold:
+                if self.remove(component_id):
+                    removed.append(component_id)
+        return removed
+
     def state_dict(self) -> dict:
         return dict(
             rate=self.rate,
@@ -265,6 +347,27 @@ class ComponentBank:
             ],
             signs=dict(self.previous_sign),
             smoothed=dict(self.smoothed),
+            sign_counts={
+                component_id: {
+                    str(sign): count
+                    for sign, count in counts.items()
+                }
+                for component_id, counts in self.sign_counts.items()
+            },
+            sign_pain_sum={
+                component_id: {
+                    str(sign): value
+                    for sign, value in values.items()
+                }
+                for component_id, values in self.sign_pain_sum.items()
+            },
+            sign_pain_count={
+                component_id: {
+                    str(sign): count
+                    for sign, count in counts.items()
+                }
+                for component_id, counts in self.sign_pain_count.items()
+            },
             sign_nodes={
                 component_id: {
                     str(sign): node_id for sign, node_id in nodes.items()
@@ -296,6 +399,9 @@ class ComponentBank:
         self.previous_sign = {}
         self.previous_sign_node = {}
         self.smoothed = {}
+        self.sign_counts = {}
+        self.sign_pain_sum = {}
+        self.sign_pain_count = {}
         sign_nodes = state.get("sign_nodes", {})
         signs = state.get("signs", {})
         smoothed = state.get("smoothed", {})
@@ -328,6 +434,24 @@ class ComponentBank:
             self.previous_sign_node[component_id] = self.sign_nodes[
                 component_id
             ].get(sign)
+            self.sign_counts[component_id] = {
+                int(key): int(value)
+                for key, value in state.get("sign_counts", {}).get(
+                    component_id, {}
+                ).items()
+            }
+            self.sign_pain_sum[component_id] = {
+                int(key): float(value)
+                for key, value in state.get("sign_pain_sum", {}).get(
+                    component_id, {}
+                ).items()
+            }
+            self.sign_pain_count[component_id] = {
+                int(key): int(value)
+                for key, value in state.get("sign_pain_count", {}).get(
+                    component_id, {}
+                ).items()
+            }
         for node_id, values in state.get("values", {}).items():
             node = self.graph.nodes.get(node_id)
             if node is None:

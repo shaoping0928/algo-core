@@ -1,4 +1,4 @@
-"""Trace what changes inside the node graph during training.
+﻿"""Trace what changes inside the node graph during training.
 
 This records the training process, not the post-training evaluation:
 
@@ -65,7 +65,7 @@ def _death_type(row):
 
 
 def trace(seed, steps=5000, coverage=0.1, epochs=5, wave_episodes=10,
-          max_nodes=2000, birth_threshold=0.45,
+          max_nodes=5000, birth_threshold=0.45,
           components=(), component_min_count=8, max_components=128,
           component_gating=False, credit_samples=5):
     rows, _counts = collect(seed, steps, coverage=coverage)
@@ -231,7 +231,7 @@ def main():
     parser.add_argument("--coverage", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--wave-episodes", type=int, default=10)
-    parser.add_argument("--max-nodes", type=int, default=2000)
+    parser.add_argument("--max-nodes", type=int, default=5000)
     parser.add_argument("--birth-threshold", type=float, default=0.45)
     parser.add_argument("--components", default="")
     parser.add_argument("--component-min-count", type=int, default=8)

@@ -204,6 +204,21 @@ class NodeGraphTests(unittest.TestCase):
         self.assertEqual(len(graph.action_edges), 0)
         self.assertEqual(graph.action_out, {})
 
+    def test_removing_a_node_removes_its_owned_edge_nodes(self):
+        graph = NodeGraph()
+        a = graph.add_node("concept", "a")
+        b = graph.add_node("concept", "b")
+        edge = graph.observe_transition(a, b)
+        edge_node = edge.edge_node
+        graph._remove_node(a)
+        self.assertNotIn(edge_node, graph.nodes)
+
+        # Re-creating the same transition must not collide with a stale edge
+        # node left behind by the removal.
+        a = graph.add_node("concept", "a")
+        graph.observe_transition(a, b)
+        self.assertIn((a, b, TRANSITION_EDGE), graph.edges)
+
     def test_graph_state_round_trip_preserves_all_edge_kinds(self):
         graph = NodeGraph()
         a = graph.add_node("concept", "a")

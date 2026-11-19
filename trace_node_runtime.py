@@ -29,7 +29,7 @@ def _node_state(agent, observation, pending):
 
 
 def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
-          epochs=10, max_nodes=2000, birth_threshold=0.45,
+          epochs=10, max_nodes=5000, birth_threshold=0.45,
           components=(), component_min_count=8, max_components=128,
           component_gating=False):
     world, agent = fit(
@@ -241,7 +241,7 @@ def main():
     parser.add_argument("--cap", type=int, default=1500)
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--max-nodes", type=int, default=2000)
+    parser.add_argument("--max-nodes", type=int, default=5000)
     parser.add_argument("--birth-threshold", type=float, default=0.45)
     parser.add_argument("--components", default="")
     parser.add_argument("--component-min-count", type=int, default=8)

@@ -1,4 +1,4 @@
-"""Runtime that learns from nodes instead of a hand-labeled risk target.
+﻿"""Runtime that learns from nodes instead of a hand-labeled risk target.
 
 The only human-supplied inputs are:
 
@@ -51,7 +51,7 @@ class NodeRuntime:
         alpha_now: float = 0.2,
         alpha_mc: float = 0.2,
         birth_threshold: float = 0.45,
-        max_nodes: int = 2000,
+        max_nodes: int = 5000,
         exploration: float = 0.1,
         uncertainty_weight: float = 0.05,
         unknown_penalty: float = 0.5,
@@ -68,6 +68,8 @@ class NodeRuntime:
         memory_rate: float = 0.2,
         memory_decay: float = 0.9,
         memory_min_strength: float = 0.02,
+        memory_weight: float = 0.1,
+        association_rate: float = 0.0,
         seed: int = 0,
         scales: Optional[Sequence[float]] = None,
     ):
@@ -115,6 +117,10 @@ class NodeRuntime:
             raise ValueError("memory_decay must be in (0, 1]")
         if float(memory_min_strength) < 0.0:
             raise ValueError("memory_min_strength must be non-negative")
+        if not 0.0 <= float(memory_weight) <= 1.0:
+            raise ValueError("memory_weight must be in [0, 1]")
+        if not 0.0 <= float(association_rate) <= 1.0:
+            raise ValueError("association_rate must be in [0, 1]")
         actions = tuple(int(action) for action in action_space)
         if not actions:
             raise ValueError("action_space must not be empty")
@@ -146,6 +152,8 @@ class NodeRuntime:
         self.memory_rate = float(memory_rate)
         self.memory_decay = float(memory_decay)
         self.memory_min_strength = float(memory_min_strength)
+        self.memory_weight = float(memory_weight)
+        self.association_rate = float(association_rate)
         self.gated_edges: Dict[
             Tuple[str, Tuple[int, ...], int], Dict[str, dict]
         ] = {}
@@ -180,6 +188,9 @@ class NodeRuntime:
         self.last_scores: Dict[int, dict] = {}
         self.last_sources: List[str] = []
         self._component_bound = set()
+        self._node_pain_count = {}
+        self._node_pain_mean = {}
+        self._node_pain_m2 = {}
         self.episode_memory: Optional[str] = None
         self._memory_counter = 0
         self.last_pain = 0.0
@@ -241,18 +252,51 @@ class NodeRuntime:
             node_id = self._create_node(state)
         if count:
             self.graph.nodes[node_id].count += 1
-            self._maybe_bind_components(node_id)
         return node_id
+
+    def _note_pain(self, node_id: str, pain: float) -> None:
+        pain = float(pain)
+        self._node_pain_count[node_id] = (
+            self._node_pain_count.get(node_id, 0) + 1
+        )
+        count = self._node_pain_count[node_id]
+        mean = self._node_pain_mean.get(node_id, 0.0)
+        delta = pain - mean
+        mean += delta / count
+        self._node_pain_mean[node_id] = mean
+        self._node_pain_m2[node_id] = (
+            self._node_pain_m2.get(node_id, 0.0)
+            + delta * (pain - mean)
+        )
+        self._maybe_bind_components(node_id)
 
     def _maybe_bind_components(self, node_id: str) -> None:
         if not self.component_kinds or self.max_components == 0:
             return
         if node_id in self._component_bound:
             return
-        node = self.graph.nodes[node_id]
-        if node.count < self.component_min_count:
+        count = self._node_pain_count.get(node_id, 0)
+        if count < self.component_min_count:
             return
         if len(self.components.specs) >= self.max_components:
+            return
+        variance = self._node_pain_m2.get(node_id, 0.0) / max(
+            count - 1, 1
+        )
+        variances = [
+            self._node_pain_m2[other] / max(
+                self._node_pain_count[other] - 1, 1
+            )
+            for other in self._node_pain_count
+            if self._node_pain_count[other] >= self.component_min_count
+        ]
+        if len(variances) > 1:
+            threshold = float(np.median(variances) + np.std(variances))
+        else:
+            threshold = float("inf")
+        # The decision to instantiate a component is learned from the
+        # node's valence variance relative to the population of visited nodes.
+        if variance <= threshold:
             return
         for kind in self.component_kinds:
             if len(self.components.specs) >= self.max_components:
@@ -359,6 +403,24 @@ class NodeRuntime:
                 result[key[0]] = max(
                     result.get(key[0], 0.0), float(edge.weight)
                 )
+            # Associations are one-hop retrieval paths to memories of
+            # related nodes; membership still carries the strength.
+            for key in self.graph.outgoing.get(node_id, []):
+                if key[2] != ASSOCIATION:
+                    continue
+                edge = self.graph.edges[key]
+                other = (
+                    edge.target if edge.source == node_id
+                    else edge.source
+                )
+                for member_key in self.graph.incoming.get(other, []):
+                    if member_key[2] != MEMBERSHIP:
+                        continue
+                    member_edge = self.graph.edges[member_key]
+                    result[member_key[0]] = max(
+                        result.get(member_key[0], 0.0),
+                        float(member_edge.weight),
+                    )
         return result
 
     def _reinforce_memories(self, node_ids: Iterable[str], pain: float,
@@ -382,6 +444,40 @@ class NodeRuntime:
                         + self.graph_rate
                     )
 
+    def _propagate_association_values(self) -> None:
+        """Blend concept values along learned association weights."""
+        if self.association_rate <= 0.0:
+            return
+        concept_ids = {
+            node_id for node_id, node in self.graph.nodes.items()
+            if node.kind == CONCEPT and node.role != "component_state"
+        }
+        if not concept_ids:
+            return
+        values = {
+            node_id: self.graph.nodes[node_id].value
+            for node_id in concept_ids
+        }
+        delta = {node_id: 0.0 for node_id in concept_ids}
+        for edge in self.graph.edges.values():
+            if edge.kind != ASSOCIATION:
+                continue
+            if edge.source not in values or edge.target not in values:
+                continue
+            weight = float(edge.weight)
+            if weight <= 0.0:
+                continue
+            delta[edge.source] += weight * (
+                values[edge.target] - values[edge.source]
+            )
+            delta[edge.target] += weight * (
+                values[edge.source] - values[edge.target]
+            )
+        for node_id, change in delta.items():
+            self.graph.nodes[node_id].value += (
+                self.association_rate * change
+            )
+
     def _forget_memories(self) -> None:
         for memory in list(self.graph.nodes.values()):
             if memory.kind != MEMORY:
@@ -390,6 +486,17 @@ class NodeRuntime:
             if (memory.trace < self.memory_min_strength
                     and memory.count <= 1):
                 self.graph._remove_node(memory.id)
+
+    def _prune_components(self) -> None:
+        if len(self.components.specs) < 2:
+            return
+        removed = self.components.prune()
+        if removed:
+            self.gated_edges.clear()
+            for component_id in removed:
+                self._component_bound.discard(
+                    component_id.rsplit(":", 1)[0]
+                )
 
     def _signature(self, node_id: str) -> Tuple[int, ...]:        return tuple(
             self.components.previous_sign[component_id]
@@ -571,6 +678,18 @@ class NodeRuntime:
         return action
 
     # ---- learning ----------------------------------------------------------
+    def _update_transition_value(self, current: str, next_node: str,
+                                 target_pain: float,
+                                 target_dopamine: float) -> None:
+        edge_node = self.graph.edge_node(current, next_node)
+        if edge_node is None:
+            return
+        node = self.graph.nodes[edge_node]
+        node.value += self.alpha_q * (target_pain - node.value)
+        node.dopamine += self.alpha_q * (
+            target_dopamine - node.dopamine
+        )
+
     def _update_action_edges(self, sources: Iterable[str], action: int,
                              next_node: str, target_pain: float,
                              target_dopamine: float) -> None:
@@ -591,6 +710,9 @@ class NodeRuntime:
             sources or (current,), action, next_node,
             target_pain, target_dopamine,
         )
+        self._update_transition_value(
+            current, next_node, target_pain, target_dopamine
+        )
 
         node = self.graph.nodes[current]
         delta_pain = target_pain - node.value
@@ -605,6 +727,7 @@ class NodeRuntime:
         entered.immediate_dopamine += self.alpha_now * (
             immediate_dopamine - entered.immediate_dopamine
         )
+        self._note_pain(next_node, immediate_pain)
 
         decay = self.gamma * self.lam
         for node_id, trace in list(self._traces.items()):
@@ -768,6 +891,7 @@ class NodeRuntime:
             entered.immediate_dopamine += self.alpha_now * (
                 signals[0] - entered.immediate_dopamine
             )
+            self._note_pain(next_node, float(signals[1]))
             self._component_step(next_node, signals)
             steps.append((
                 current, action, next_node, float(signals[1]),
@@ -796,6 +920,9 @@ class NodeRuntime:
             self._update_action_edges(
                 sources, action, next_node, return_pain, return_dopamine
             )
+            self._update_transition_value(
+                current, next_node, return_pain, return_dopamine
+            )
             self._update_gated(
                 current, signature, action, next_node,
                 return_pain, return_dopamine,
@@ -807,7 +934,9 @@ class NodeRuntime:
                 )
             running_pain = return_pain
             running_dopamine = return_dopamine
+        self._propagate_association_values()
         self._forget_memories()
+        self._prune_components()
         self.reset()
 
     # ---- analysis ----------------------------------------------------------
@@ -836,6 +965,26 @@ class NodeRuntime:
         weights = weights / np.where(total > 0.0, total, 1.0)
         return indices, weights
 
+    def _memory_values_batch(self, indices, weights, attribute: str):
+        count = len(indices)
+        sums = np.zeros(count, dtype=float)
+        mass = np.zeros(count, dtype=float)
+        for row in range(count):
+            for column, index in enumerate(indices[row]):
+                node_id = self._prototype_ids[int(index)]
+                for memory_id, strength in self.memories_for(
+                    [node_id]
+                ).items():
+                    memory = self.graph.nodes.get(memory_id)
+                    if memory is None or memory.kind != MEMORY:
+                        continue
+                    weight = float(weights[row, column]) * float(strength)
+                    if weight <= 0.0:
+                        continue
+                    sums[row] += weight * getattr(memory, attribute)
+                    mass[row] += weight
+        return sums, mass
+
     def valence_state_batch(self, states: np.ndarray):
         """Soft-neighbour pain/dopamine values for encoded states."""
         states = np.asarray(states, dtype=float)
@@ -855,20 +1004,58 @@ class NodeRuntime:
         dopamine_values = np.asarray([
             node.dopamine + node.immediate_dopamine for node in nodes
         ]).reshape(indices.shape)
-        return (
-            (weights * pain_values).sum(axis=1),
-            (weights * dopamine_values).sum(axis=1),
-        )
+        pain = (weights * pain_values).sum(axis=1)
+        dopamine = (weights * dopamine_values).sum(axis=1)
+        for attribute, values in (
+            ("value", pain), ("dopamine", dopamine)
+        ):
+            memory_sums, memory_mass = self._memory_values_batch(
+                indices, weights, attribute
+            )
+            present = memory_mass > 0.0
+            if present.any():
+                values[present] = (
+                    (1.0 - self.memory_weight) * values[present]
+                    + self.memory_weight
+                    * memory_sums[present] / memory_mass[present]
+                )
+        return pain, dopamine
+
+    def _memory_value_from_weights(self, weights, attribute: str = "value"):
+        total = 0.0
+        weighted = 0.0
+        for node_id, weight in weights:
+            for memory_id, strength in self.memories_for([node_id]).items():
+                mass = float(weight) * float(strength)
+                if mass <= 0.0:
+                    continue
+                memory = self.graph.nodes.get(memory_id)
+                if memory is None or memory.kind != MEMORY:
+                    continue
+                total += mass
+                weighted += mass * getattr(memory, attribute)
+        if total <= 0.0:
+            return None
+        return weighted / total
 
     def value_state(self, state: np.ndarray) -> float:
         weights = self._neighbor_weights(np.asarray(state, dtype=float))
-        return float(sum(
+        if not weights:
+            return 0.0
+        value = float(sum(
             weight * (
                 self.graph.nodes[node_id].value
                 + self.graph.nodes[node_id].immediate_pain
             )
             for node_id, weight in weights
-        )) if weights else 0.0
+        ))
+        memory_value = self._memory_value_from_weights(weights, "value")
+        if memory_value is not None:
+            value = (
+                (1.0 - self.memory_weight) * value
+                + self.memory_weight * memory_value
+            )
+        return value
 
     def dopamine_state(self, state: np.ndarray) -> float:
         weights = self._neighbor_weights(np.asarray(state, dtype=float))

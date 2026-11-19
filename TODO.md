@@ -58,9 +58,9 @@
   没有终止风险头、`GAP/2`、`target_gap`、碰撞窗口或 near-pipe 采样。
 - 新增节点运行时/动作边回归测试；当前全量 62 个测试通过。
 
-测量（8 种子，5000 步，H=10，10 epochs）：232/48/31/78/151/72/152/99，均值 107.9，
-中位数 88.5；状态尺度由观测标准差估计，不写任务常量。每个种子都达到 2000 节点上限，
-说明“距离出生、无剪枝”的生命周期需要下一步处理。低于旧风险头路径 190.1 和任务基线
+测量（8 种子，5000 步，H=10，10 epochs，max_nodes=5000，memory_weight=0.1）：
+均值 108.6，中位数 85.5；状态尺度由观测标准差估计，不写任务常量。概念节点约 2220–2337，
+没有触及 5000 上限；graph nodes 约 4900–5105。仍低于旧风险头路径 190.1 和任务基线
 1026.9；这是第一版节点路径，不是最终性能结论。
 
 下一步：
@@ -97,20 +97,24 @@
   offline holdout AUC 0.977，但 online terminal AUC 0.442；近管道 chosen/other 动作边
   135/23.6，双动作支撑仅 0.52；方向准确率 0.696。瓶颈是终止状态/反事实动作的在线覆盖，
   不是世界模型。
-- [x] 训练过程追踪（`trace_node_training.py`）：节点约 100 episode 达到 2000 上限后停止出生；
-  整体双动作支撑 0.22、近管道 0.11；终止节点 60 个。
+- [x] 训练过程追踪（`trace_node_training.py`，max_nodes=5000）：约 2337 概念节点、graph nodes
+  5105；整体双动作支撑 0.18、近管道 0.085；终止节点 75 个。
 - [x] 通用 interaction：每条真实转移建立 association/transition；event memory 的边界由
   `|Δpain|+|Δdopamine|` 的 running mean/std（surprise）自适应决定，没有 memory_mode/阈值配置；
-  重复 epoch 不重复建 memory。5000 步后 assoc/trans/mem = 2435/2439/133。
-- [x] memory 通过 membership 关联；激活节点反查并加强 memory trace/value/count 和 membership
-  边；episode 结束 decay，低支持 memory 遗忘（mem 215 -> 133）。
-- [ ] 让 association/transition/memory 参与价值回传或动作选择；当前只建立/加强，不读取，
-  所以存活仍是 107.9。
+  重复 epoch 不重复建 memory。5000 步后 assoc/trans/mem = 2640/2640/128。
+- [x] memory 通过 membership 关联；激活节点（含一跳 association）反查并加强 memory
+  trace/value/count 和 membership 边；episode 结束 decay，低支持 memory 遗忘。
+- [x] transition edge node 用 MC/TD target 更新价值；memory value 以默认 0.1 权重进入终点评分；
+  对称 association 价值平滑实测有害（232→141 帧），默认关闭，association 只参与 memory 检索。
+- [x] 组件出生改为按节点 valence 方差（相对节点总体 median+std）自适应；低效用组件按
+  sign-pain 方差和访问次数剪枝。5000 步 seed 100 自动出生 76 个组件，存活仍 232。
+- [ ] 让 association/transition 结构进一步参与动作选择/信用分配；当前 memory 只以 0.1 权重
+  进入终点价值，存活与不读取时基本持平。
 - [ ] 节点生命周期：上限/剪枝/合并；避免新终止状态 alias 到安全节点。
 - [ ] 用 on-policy/DAgger 采集 MPC 自己产生的终止状态与近管道反事实动作，再重训价值/Q。
 - [ ] 给终止状态更连续的价值读出不只依赖最近原型；检查 boundary 附近节点的分辨率。
-- [ ] 组件绑定目前仍由 `component_min_count`/`max_components` 配置；下一步改成按训练中的
-  预测误差/valence 方差/效用自适应出生与剪枝，去掉配置层级决策。
+- [ ] 组件仍保留 `component_min_count`/`max_components` 作为样本/资源保护；下一步去掉，
+  让组件算子选择和预算也由训练统计决定。
 - [ ] 让三态节点承担基础状态没有的角色：eligibility/信用分配、事件 memory、转移条件；
   不要只增加同源动作边。
 - [ ] 把三态节点接入 NodeRuntime 的 MC/TD 信用分配（当前只做 EMA valence）。

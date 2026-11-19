@@ -218,26 +218,38 @@ memory、derivation、action edge 的 round-trip 测试。`trace_graph_memory.py
 另一动作平均只有 `23.6` 条边，约一半近管道状态没有双动作支撑。方向准确率 `0.696` 说明
 决策不是完全盲目，但价值排序和反事实 Q 仍不可靠。
 
-训练过程本身（`trace_node_training.py`，seed 100，5000 步，5 epochs）：
+训练过程本身（`trace_node_training.py`，seed 100，5000 步，5 epochs，max_nodes=5000）：
 
 ```text
-wave 1:  363 concepts,  485 action edges, assoc=356, trans=356, mem=19
-wave 10: 2000 concepts, 2776 action edges, assoc=2172, trans=2173, mem=177
-wave 22: 2000 concepts, 3117 action edges, assoc=2435, trans=2439, mem=215
-end:     2000 concepts, 3117 action edges, assoc=2435, trans=2439, mem=133
+wave 1:  363 concepts,  485 action edges, assoc=356,  trans=356,  mem=19
+wave 10: 2057 concepts, 2819 action edges, assoc=2203, trans=2203, mem=122
+wave 22: 2337 concepts, 3389 action edges, assoc=2632, trans=2632, mem=128
+end:     2337 concepts, 3410 action edges, assoc=2640, trans=2640, mem=128
+         graph_nodes=5105, terminal_nodes=75
 ```
 
+节点上限扩大到 5000 后，5000 步数据实际只生成约 2337 个概念节点，没有触及上限。
 现在概念间 interaction 已经真正建立：
 
 - 每条真实转移都建立 association 和 directed transition；
 - event memory 的边界由运行时统计决定：`|Δpain| + |Δdopamine|` 的 running mean/std
   超过 `mean + 2*std`（至少 8 个样本）时开启新 memory；没有 `memory_mode` 或人手阈值配置；
 - 重复 epoch 不再重复创建 memory（只有第一个 epoch 建 memory，后续只更新值与边）；
-- memory 通过 membership 关联到 concept/transition 节点；训练时由激活节点反查 memory，
-  强化 memory 的 trace/value/count 和 membership 边权重；
+- memory 通过 membership 关联到 concept/transition 节点；训练时由激活节点（以及一跳 association）
+  反查 memory，强化 memory 的 trace/value/count 和 membership 边权重；
 - 每个 episode 结束对 memory 做 decay，低支持（trace 低、只被访问一次）的 memory 被遗忘；
-  所以 mem 从峰值 215 降到 133。
-- `trace_node_training.py` 的 `assoc/trans/mem` 现在为 2435/2439/133。
+- transition edge node 的价值用 MC/TD target 更新；memory value 以默认 `0.1` 权重进入终点评分；
+  association 的对称价值平滑实测有害（232→141 帧），默认关闭，association 只参与 memory 检索。
+
+实测：
+
+- 8 种子（5000 步，H=10，epochs=10，max_nodes=5000，memory_weight=0.1）：
+  均值 **108.6 帧**，中位数 **85.5**；memory_weight=0.5 时为 104.6。
+- 5000 步训练过程：assoc/trans/mem = 2640/2640/128，graph nodes 5105。
+- 自适应组件（`difference+capacitor`）在 seed 100 自动出生 76 个组件，存活仍是 232 帧。
+
+但决策路径仍未读取 association/transition 结构；memory 只以较小权重参与终点价值。存活与
+“只建立结构”基本持平，说明下一步需要更好的信用分配/校准，而不是继续增加结构数量。
 
 但决策路径仍未读取这些 interaction：存活仍是 107.9 帧，和没有 interaction 时相同。节点图的
 结构已经存在，下一步要把 association/transition/memory 用于价值回传或动作选择，而不是只建立。

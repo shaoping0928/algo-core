@@ -31,11 +31,12 @@ DEFAULT_JOBS = min(8, os.cpu_count() or 1)
 FREE_THREADED = not getattr(sys, "_is_gil_enabled", lambda: True)()
 
 
-def fit(seed, steps=5000, coverage=0.1, max_nodes=2000,
+def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         birth_threshold=0.45, epochs=5, lag=LAG,
         component_kinds=(), component_min_count=8,
         max_components=128, component_weight=0.5,
-        component_gating=False):
+        component_gating=False, memory_weight=0.1,
+        association_rate=0.0):
     if steps < 1:
         raise ValueError("steps must be positive")
     if not 0.0 <= coverage <= 1.0:
@@ -79,6 +80,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=2000,
         max_components=max_components,
         component_weight=component_weight,
         component_gating=component_gating,
+        memory_weight=memory_weight,
+        association_rate=association_rate,
     )
     episodes = {}
     for row in transitions:
@@ -158,7 +161,8 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG):
 def run_seed(task):
     (seed, steps, coverage, cap, max_nodes, birth_threshold, horizon,
      epochs, lag, component_kinds, component_min_count, max_components,
-     component_weight, component_gating) = task
+     component_weight, component_gating, memory_weight,
+     association_rate) = task
     world, agent = fit(
         seed, steps=steps, coverage=coverage,
         max_nodes=max_nodes, birth_threshold=birth_threshold,
@@ -168,6 +172,8 @@ def run_seed(task):
         max_components=max_components,
         component_weight=component_weight,
         component_gating=component_gating,
+        memory_weight=memory_weight,
+        association_rate=association_rate,
     )
     frames, actions = evaluate(
         seed, world, agent, cap=cap, horizon=horizon, lag=lag
@@ -191,7 +197,7 @@ def main():
     parser.add_argument("--coverage", type=float, default=0.1)
     parser.add_argument("--cap", type=int, default=6000)
     parser.add_argument("--horizon", type=int, default=10)
-    parser.add_argument("--max-nodes", type=int, default=2000)
+    parser.add_argument("--max-nodes", type=int, default=5000)
     parser.add_argument("--birth-threshold", type=float, default=0.45)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lag", type=int, default=LAG)
@@ -201,6 +207,8 @@ def main():
     parser.add_argument("--max-components", type=int, default=128)
     parser.add_argument("--component-weight", type=float, default=0.5)
     parser.add_argument("--component-gating", action="store_true")
+    parser.add_argument("--memory-weight", type=float, default=0.1)
+    parser.add_argument("--association-rate", type=float, default=0.0)
     args = parser.parse_args()
     if args.jobs < 1:
         raise ValueError("--jobs must be positive")
@@ -228,6 +236,10 @@ def main():
         raise ValueError("--max-components must be non-negative")
     if args.component_weight < 0.0:
         raise ValueError("--component-weight must be non-negative")
+    if not 0.0 <= args.memory_weight <= 1.0:
+        raise ValueError("--memory-weight must be in [0, 1]")
+    if not 0.0 <= args.association_rate <= 1.0:
+        raise ValueError("--association-rate must be in [0, 1]")
     component_kinds = tuple(
         kind.strip() for kind in args.components.split(",") if kind.strip()
     )
@@ -240,7 +252,8 @@ def main():
          args.max_nodes, args.birth_threshold, args.horizon, args.epochs,
          args.lag, component_kinds, args.component_min_count,
          args.max_components, args.component_weight,
-         args.component_gating)
+         args.component_gating, args.memory_weight,
+         args.association_rate)
         for seed in seeds
     ]
     if args.jobs == 1:
@@ -256,13 +269,13 @@ def main():
         with ProcessPoolExecutor(max_workers=args.jobs) as pool:
             rows = list(pool.map(run_seed, tasks))
 
-    print(" seed  frames  flap_rate  concepts  graph_nodes  action_edges")
+    print(" seed  frames  flap_rate  concepts  graph_nodes  action_edges  components")
     for row in rows:
         graph = row["graph"]
-        print(" %4d  %6d  %9.3f  %8d  %11d  %12d"
+        print(" %4d  %6d  %9.3f  %8d  %11d  %12d  %10d"
               % (row["seed"], row["frames"], row["flap_rate"],
                  graph["prototypes"], graph["nodes"],
-                 graph["action_edges"]))
+                 graph["action_edges"], graph["components"]))
     print("frames mean %.1f median %.1f"
           % (np.mean([row["frames"] for row in rows]),
              np.median([row["frames"] for row in rows])))

@@ -333,7 +333,11 @@ class NodeGraph:
         """Remove a node and every edge that still refers to it."""
         for key, edge in list(self.edges.items()):
             if edge.source == node_id or edge.target == node_id:
+                edge_node = edge.edge_node
                 self._remove_edge(key)
+                if (edge_node is not None and edge_node != node_id
+                        and edge_node in self.nodes):
+                    self._remove_node(edge_node)
         for key, edge in list(self.action_edges.items()):
             if edge.source == node_id or edge.target == node_id:
                 self._remove_action_edge(key)
