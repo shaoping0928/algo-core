@@ -17,7 +17,7 @@ from trace_generic_training import OBS_NAMES, split_episodes
 
 def metrics(name, risk, held):
     pain = np.asarray([row["terminal"] for row in held], dtype=bool)
-    obs = np.asarray([row["obs"] for row in held], dtype=float)
+    obs = np.asarray([row["next_obs"] for row in held], dtype=float)
     near = (np.abs(obs[:, 2]) < 0.20) & (obs[:, 2] > -0.10)
     inside = np.abs(obs[:, 3]) <= GAP / 2.0
     print(
@@ -33,16 +33,14 @@ def metrics(name, risk, held):
 
 
 def sensitivity(name, score, held, rng):
-    obs = np.asarray([row["obs"] for row in held], dtype=float)
+    obs = np.asarray([row["next_obs"] for row in held], dtype=float)
     pain = np.asarray([row["terminal"] for row in held], dtype=bool)
-    base = binary_auc(score(obs, held), pain)
+    base = binary_auc(score(obs), pain)
     deltas = []
     for channel in range(obs.shape[1]):
         shuffled = obs.copy()
         shuffled[:, channel] = shuffled[rng.permutation(len(shuffled)), channel]
-        rows = [dict(row, obs=shuffled[index])
-                for index, row in enumerate(held)]
-        deltas.append(base - binary_auc(score(shuffled, rows), pain))
+        deltas.append(base - binary_auc(score(shuffled), pain))
     print("\n%s sensitivity:" % name)
     for index in np.argsort(deltas)[::-1]:
         print("  %-4s %+.4f" % (OBS_NAMES[index], deltas[index]))
@@ -52,27 +50,29 @@ def run(seed, steps, coverage, clusters):
     rows, _counts = collect(seed, steps, coverage=coverage)
     train, held = split_episodes(rows)
     memory = PrototypeGraphMemory(clusters=clusters, seed=seed).fit(train)
-    graph_risk = memory.risk(held)
+    held_states = np.asarray([row["next_obs"] for row in held], dtype=float)
+    held_previous = memory.prototype(
+        np.asarray([row["obs"] for row in held], dtype=float)
+    )
+    graph_risk = memory.risk_states(held_states, held_previous)
     print("seed=%d train=%d held=%d graph=%s"
           % (seed, len(train), len(held), memory.snapshot()))
 
     obs_dim = len(rows[0]["obs"])
     global_head = TerminalRiskHead(feature_dim=obs_dim)
-    replay = TransitionReplay(capacity=len(train) + 1, seed=seed)
+    replay = TransitionReplay.for_stream(len(train), seed=seed)
     for row in train:
-        obs = np.asarray(row["obs"], dtype=float)
+        state = np.asarray(row["next_obs"], dtype=float)
         pain = float(row["terminal"])
-        replay.add(obs, [1.0 - pain, pain], obs, bool(pain))
+        replay.add(state, [1.0 - pain, pain], state, bool(pain))
     fit_terminal_risk(global_head, replay, 4000, batch_size=128,
                       terminal_fraction=0.15)
-    global_risk = global_head.probability(
-        np.asarray([row["obs"] for row in held], dtype=float)
-    )
+    global_risk = global_head.probability(held_states)
     metrics("global", global_risk, held)
     metrics("graph", graph_risk, held)
 
     sensitivity(
-        "graph", lambda _obs, rows_: memory.risk(rows_), held,
+        "graph", memory.risk_states, held,
         np.random.RandomState(seed + 1000),
     )
 
@@ -84,6 +84,12 @@ def main():
     parser.add_argument("--coverage", type=float, default=0.1)
     parser.add_argument("--clusters", type=int, default=48)
     args = parser.parse_args()
+    if args.steps < 1:
+        raise ValueError("--steps must be positive")
+    if not 0.0 <= args.coverage <= 1.0:
+        raise ValueError("--coverage must be in [0, 1]")
+    if args.clusters < 1:
+        raise ValueError("--clusters must be positive")
     run(args.seed, args.steps, args.coverage, args.clusters)
 
 

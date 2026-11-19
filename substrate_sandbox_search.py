@@ -115,18 +115,35 @@ def practice(seed, steps=PRACTICE, value_updates=VALUE_UPDATES,
              near_pipe_fraction=NEAR_PIPE_FRACTION,
              risk_interaction_dim=RISK_INTERACTION_DIM,
              risk_action_dim=RISK_ACTION_DIM):
+    risk_action_dim = int(risk_action_dim)
+    if not 0 <= risk_action_dim <= ACTION_DIM:
+        raise ValueError(
+            "risk_action_dim must be between 0 and %d" % ACTION_DIM
+        )
+    if steps < 1:
+        raise ValueError("steps must be positive")
+    if not 0.0 <= terminal_fraction <= 1.0:
+        raise ValueError("terminal_fraction must be in [0, 1]")
+    if not 0.0 <= near_pipe_fraction <= 1.0:
+        raise ValueError("near_pipe_fraction must be in [0, 1]")
     lp = LayerPair(k_max=8)
     novelty = InputNovelty(feature_dim=len(lp.hist))
     sample_env = latent[LAG](seed * 10000)
-    feature_dim = len(substrate_features(lp)) + len(sample_env.obs())
+    substrate_dim = len(substrate_features(lp))
+    observation_dim = len(sample_env.obs())
+    feature_dim = substrate_dim + observation_dim
     risk_feature_dim = feature_dim + risk_action_dim
-    feedback_head = WorldFeedbackValueHead(feature_dim=feature_dim, discount=0.99)
+    feedback_head = WorldFeedbackValueHead(
+        feature_dim=feature_dim, discount=0.99, seed=seed
+    )
     risk_head = TerminalRiskHead(
-        feature_dim=risk_feature_dim, interaction_dim=risk_interaction_dim
+        feature_dim=risk_feature_dim,
+        interaction_dim=min(risk_interaction_dim, observation_dim),
+        interaction_start=substrate_dim,
     )
     done = ep = 0
     probe = []
-    replay = TransitionReplay(capacity=max(steps * 2, 1000), seed=seed)
+    replay = TransitionReplay.for_stream(max(steps, 1), seed=seed)
     return_replay = ReturnReplay(capacity=max(steps * 2, 1000), seed=seed + 1)
     coverage = dict(
         episodes=0, frames=0, pipe_deaths=0, boundary_deaths=0,
@@ -159,8 +176,8 @@ def practice(seed, steps=PRACTICE, value_updates=VALUE_UPDATES,
             ))
             action = int(rng.rand() < action_rate)
             vy0 = env.vy
-            y0, t0 = env.y, env.t
-            pipe_dx, gap_dy = nearest_pipe(env)
+            y0 = env.y
+            pipe_dx, _ = nearest_pipe(env)
             if abs(pipe_dx) < 0.1:
                 coverage["pipe_window_steps"] += 1
             if y0 > 0.9:
@@ -171,6 +188,7 @@ def practice(seed, steps=PRACTICE, value_updates=VALUE_UPDATES,
             env.step(action)
             next_observation = env.obs()
             world_feedback = env.feedback()
+            next_pipe_dx, next_gap_dy = nearest_pipe(env)
             history_vector = None
             if risk_action_dim:
                 history_vector = np.concatenate(
@@ -182,24 +200,24 @@ def practice(seed, steps=PRACTICE, value_updates=VALUE_UPDATES,
                 learn_value=False, learn_novelty=not holdout,
                 action_history_vector=history_vector,
             )
-            risk_features = (
-                transition["risk_features"] if risk_action_dim
-                else transition["features"]
-            )
+            # The terminal label belongs to the next state, so risk features and
+            # their diagnostic metadata both describe that same state.
+            risk_features = transition["risk_features"]
             if holdout:
                 probe.append(dict(
                     features=transition["features"],
                     risk_features=risk_features,
                     terminal=transition["terminal"],
                     action=int(action),
-                    y=y0, vy=vy0, t=t0, pipe_dx=pipe_dx, gap_dy=gap_dy,
-                    episode=ep,
+                    y=float(env.y), vy=float(env.vy), t=env.t,
+                    pipe_dx=next_pipe_dx, gap_dy=next_gap_dy, episode=ep,
                 ))
             else:
                 replay.add(
                     risk_features, transition["signals"],
                     risk_features, transition["terminal"],
-                    metadata=dict(pipe_dx=pipe_dx, gap_dy=gap_dy, y=y0, t=t0),
+                    metadata=dict(pipe_dx=next_pipe_dx, gap_dy=next_gap_dy,
+                                  y=float(env.y), t=env.t),
                 )
                 episode_transitions.append(transition)
             done += 1
@@ -234,9 +252,9 @@ def practice(seed, steps=PRACTICE, value_updates=VALUE_UPDATES,
             replay, coverage)
 
 
-def target_gap(env):
-    # Select the pipe closest to reaching the bird during this short horizon.
-    px_target = BIRD_X + H * SPEED
+def target_gap(env, horizon=H):
+    # Select the pipe closest to reaching the bird during this horizon.
+    px_target = BIRD_X + horizon * SPEED
     _, gc = min(env.pipes, key=lambda p: abs(p[0] - px_target))
     return gc
 
@@ -257,7 +275,7 @@ def rollout_candidates(
     if len(pending) < lag:
         pending = np.pad(pending, (0, lag - len(pending)))
     initial_state = np.asarray([env.y, env.vy], dtype=float)
-    gc = target_gap(env) if value_mode == "task" else None
+    gc = target_gap(env, horizon) if value_mode == "task" else None
 
     def predict_batch(states, sequences, step):
         y, vy = states[:, 0], states[:, 1]
@@ -309,7 +327,7 @@ def rollout_candidates(
                 )
             else:
                 crossing = True
-            if engine == "beam" or risk_aggregate in ("sum", "max", "crossing"):
+            if risk_aggregate in ("sum", "max", "crossing"):
                 if crossing:
                     # Query the learned pain/risk head at the predicted pipe-crossing
                     # moment, not at every harmless step or only at the endpoint.
@@ -380,6 +398,14 @@ def run(seed, value_mode="feedback", engine="exhaustive", horizon=H,
         risk_aggregate="terminal", show=False):
     if value_mode == "task" and engine != "exhaustive":
         raise ValueError("the task baseline uses exhaustive search")
+    if not 0.0 <= terminal_fraction <= 1.0:
+        raise ValueError("terminal_fraction must be in [0, 1]")
+    if not 0.0 <= near_pipe_fraction <= 1.0:
+        raise ValueError("near_pipe_fraction must be in [0, 1]")
+    if horizon < 1 or beam_width < 1:
+        raise ValueError("horizon and beam_width must be positive")
+    if practice_steps < 1 or value_updates < 0 or risk_updates < 0:
+        raise ValueError("practice/update counts are invalid")
     lp, lag, f, feedback_head, risk_head, novelty, probe, replay, coverage = practice(
         seed, steps=practice_steps, value_updates=value_updates,
         risk_updates=risk_updates, terminal_fraction=terminal_fraction,
@@ -599,6 +625,26 @@ def main(argv=None):
         raise ValueError("--jobs must be positive")
     if args.seeds < 1:
         raise ValueError("--seeds must be positive")
+    if args.seeds > len(SEEDS):
+        raise ValueError("--seeds cannot exceed %d" % len(SEEDS))
+    if args.practice_steps < 1:
+        raise ValueError("--practice-steps must be positive")
+    if args.value_updates < 0 or args.risk_updates < 0:
+        raise ValueError("update counts must be non-negative")
+    if not 0.0 <= args.terminal_fraction <= 1.0:
+        raise ValueError("--terminal-fraction must be in [0, 1]")
+    if not 0.0 <= args.near_pipe_fraction <= 1.0:
+        raise ValueError("--near-pipe-fraction must be in [0, 1]")
+    if not 0 <= args.risk_action_dim <= ACTION_DIM:
+        raise ValueError(
+            "--risk-action-dim must be between 0 and %d" % ACTION_DIM
+        )
+    if args.risk_interaction_dim < 0:
+        raise ValueError("--risk-interaction-dim must be non-negative")
+    if args.horizon is not None and args.horizon < 1:
+        raise ValueError("--horizon must be positive")
+    if args.beam_width < 1:
+        raise ValueError("--beam-width must be positive")
 
     print("sandbox value mode: %s" % value_mode)
     print("sandbox engine: %s; horizon=%d; beam_width=%d; jobs=%d"

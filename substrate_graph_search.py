@@ -31,7 +31,15 @@ DEFAULT_JOBS = min(4, os.cpu_count() or 1)
 
 
 def fit(seed, steps, coverage, clusters):
+    if steps < 1:
+        raise ValueError("steps must be positive")
+    if not 0.0 <= coverage <= 1.0:
+        raise ValueError("coverage must be in [0, 1]")
+    if clusters < 1:
+        raise ValueError("clusters must be positive")
     transitions, _counts = collect(seed, steps, coverage=coverage)
+    if not transitions:
+        raise ValueError("collection produced no transitions")
     world = LinearObservationModel(
         len(transitions[0]["obs"]), ACTION_DIM
     ).fit(
@@ -41,11 +49,11 @@ def fit(seed, steps, coverage, clusters):
     )
     graph = PrototypeGraphMemory(clusters=clusters, seed=seed).fit(transitions)
     risk = TerminalRiskHead(feature_dim=len(transitions[0]["obs"]))
-    replay = TransitionReplay(capacity=len(transitions) + 1, seed=seed)
+    replay = TransitionReplay.for_stream(len(transitions), seed=seed)
     for row in transitions:
-        obs = np.asarray(row["obs"], dtype=float)
+        state = np.asarray(row["next_obs"], dtype=float)
         pain = float(row["terminal"])
-        replay.add(obs, [1.0 - pain, pain], obs, bool(pain))
+        replay.add(state, [1.0 - pain, pain], state, bool(pain))
     fit_terminal_risk(
         risk, replay, 4000, batch_size=128, terminal_fraction=0.15
     )
@@ -55,11 +63,22 @@ def fit(seed, steps, coverage, clusters):
 def policy_action(env, world, graph, risk_head, prefix):
     initial = np.asarray(env.obs(), dtype=float)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
-    last_labels = None
+    label_cache = {}
 
     def predict_batch(states, sequences, step):
         history = history_features(sequences, step + 1, pending_prefix)
         return world.predict(states, history)
+
+    def previous_labels(sequences, step):
+        if step == 0:
+            return None
+        return np.asarray([
+            label_cache.get(seq[:step].tobytes(), -1) for seq in sequences
+        ], dtype=int)
+
+    def remember(sequences, labels, step):
+        for seq, label in zip(sequences, labels):
+            label_cache[seq[:step + 1].tobytes()] = int(label)
 
     def combined_risk(states, labels, previous):
         graph_risk = graph.risk_labels(labels, previous)
@@ -67,19 +86,19 @@ def policy_action(env, world, graph, risk_head, prefix):
         return 0.5 * (graph_risk + global_risk)
 
     def evaluate_step(states, sequences, step):
-        nonlocal last_labels
         labels = graph.prototype(states)
-        previous = None if step == 0 else last_labels
+        previous = previous_labels(sequences, step)
         risk = combined_risk(states, labels, previous)
-        last_labels = labels
+        remember(sequences, labels, step)
         return np.column_stack([risk, np.zeros(len(states))]), np.ones(
             len(states), dtype=bool
         )
 
     def evaluate_terminal(states, sequences):
         labels = graph.prototype(states)
-        risk = combined_risk(states, labels, last_labels)
-        value = graph.value_labels(labels, last_labels)
+        previous = previous_labels(sequences, sequences.shape[1] - 1)
+        risk = combined_risk(states, labels, previous)
+        value = graph.value_labels(labels, previous)
         return np.column_stack([risk, -value]), np.ones(
             len(states), dtype=bool
         )
@@ -98,6 +117,8 @@ def policy_action(env, world, graph, risk_head, prefix):
 
 
 def evaluate(seed, world, graph, risk_head, cap=6000):
+    if cap < 1:
+        raise ValueError("cap must be positive")
     env = latent[LAG](seed)
     prefix = np.zeros(LAG, dtype=float)
     actions = []
@@ -110,9 +131,9 @@ def evaluate(seed, world, graph, risk_head, cap=6000):
 
 
 def run_seed(task):
-    seed, steps, coverage, clusters = task
+    seed, steps, coverage, clusters, cap = task
     world, graph, risk_head = fit(seed, steps, coverage, clusters)
-    frames, actions = evaluate(seed, world, graph, risk_head)
+    frames, actions = evaluate(seed, world, graph, risk_head, cap=cap)
     return dict(
         seed=seed, frames=frames,
         flap_rate=float(np.mean(actions)) if actions else 0.0,
@@ -128,17 +149,29 @@ def main():
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--coverage", type=float, default=0.1)
     parser.add_argument("--clusters", type=int, default=48)
+    parser.add_argument("--cap", type=int, default=6000)
     args = parser.parse_args()
     if args.jobs < 1:
         raise ValueError("--jobs must be positive")
     if args.seeds < 1:
         raise ValueError("--seeds must be positive")
+    if args.steps < 1:
+        raise ValueError("--steps must be positive")
+    if not 0.0 <= args.coverage <= 1.0:
+        raise ValueError("--coverage must be in [0, 1]")
+    if args.clusters < 1:
+        raise ValueError("--clusters must be positive")
+    if args.cap < 1:
+        raise ValueError("--cap must be positive")
     seeds = [
         seed for seed in SEEDS if seed >= args.seed
     ][:args.seeds]
     if len(seeds) < args.seeds:
         seeds = list(range(args.seed, args.seed + args.seeds))
-    tasks = [(seed, args.steps, args.coverage, args.clusters) for seed in seeds]
+    tasks = [
+        (seed, args.steps, args.coverage, args.clusters, args.cap)
+        for seed in seeds
+    ]
     if args.jobs == 1:
         rows = [run_seed(task) for task in tasks]
     else:

@@ -363,15 +363,36 @@ def value_probe_metrics(records, head, risk_head=None, gap=None):
 
 
 class TransitionReplay:
-    """Store real transitions by outcome class and sample without discarding terminal cases."""
+    """Store real transitions by outcome class with class-balanced sampling.
 
-    def __init__(self, capacity=20000, seed=0):
-        if capacity < 2:
+    `capacity` is split evenly between alive and terminal deques. Use
+    `TransitionReplay.for_stream(n)` when a finite stream of `n` transitions should
+    be retained without dropping either class.
+    """
+
+    def __init__(self, capacity=20000, seed=0, alive_capacity=None,
+                 terminal_capacity=None):
+        if capacity < 2 and (alive_capacity is None or terminal_capacity is None):
             raise ValueError("capacity must allow at least two transitions")
-        half = int(capacity) // 2
-        self.alive = deque(maxlen=half)
-        self.terminal = deque(maxlen=int(capacity) - half)
         self.rng = np.random.RandomState(seed)
+        if alive_capacity is None or terminal_capacity is None:
+            half = int(capacity) // 2
+            alive_capacity = half
+            terminal_capacity = int(capacity) - half
+        if int(alive_capacity) < 1 or int(terminal_capacity) < 1:
+            raise ValueError("each outcome class needs a positive capacity")
+        self.alive = deque(maxlen=int(alive_capacity))
+        self.terminal = deque(maxlen=int(terminal_capacity))
+
+    @classmethod
+    def for_stream(cls, transitions, seed=0):
+        """Capacity that keeps every transition from one finite data stream."""
+        transitions = int(transitions)
+        if transitions < 1:
+            raise ValueError("transitions must be positive")
+        return cls(capacity=2 * transitions + 2, seed=seed,
+                   alive_capacity=transitions + 1,
+                   terminal_capacity=transitions + 1)
 
     def __len__(self):
         return len(self.alive) + len(self.terminal)
@@ -512,10 +533,10 @@ def fit_value_head(head, replay, updates, batch_size=128, terminal_fraction=0.5,
 
 
 class TerminalRiskHead:
-    """Logistic readout of the world's pain label, giving a calibrated terminal risk."""
+    """Logistic readout of the world's pain label, giving a terminal risk score."""
 
     def __init__(self, feature_dim, learning_rate=0.05, l2=1e-4,
-                 interaction_dim=0):
+                 interaction_dim=0, interaction_start=None):
         if feature_dim < 1:
             raise ValueError("feature_dim must be positive")
         if learning_rate <= 0.0:
@@ -524,11 +545,18 @@ class TerminalRiskHead:
         self.learning_rate = float(learning_rate)
         self.l2 = float(l2)
         self.interaction_dim = min(max(int(interaction_dim), 0), self.feature_dim)
-        start = self.feature_dim - self.interaction_dim
+        if interaction_start is None:
+            self.interaction_start = self.feature_dim - self.interaction_dim
+        else:
+            self.interaction_start = int(interaction_start)
+        if (self.interaction_start < 0
+                or self.interaction_start + self.interaction_dim > self.feature_dim):
+            raise ValueError("interaction block must fit inside the feature vector")
+        start = self.interaction_start
         self.interaction_pairs = [
             (i - start, j - start)
-            for i in range(start, self.feature_dim)
-            for j in range(i + 1, self.feature_dim)
+            for i in range(start, start + self.interaction_dim)
+            for j in range(i + 1, start + self.interaction_dim)
         ]
         self.mean = np.zeros(self.feature_dim, dtype=float)
         self.scale = np.ones(self.feature_dim, dtype=float)
@@ -538,6 +566,8 @@ class TerminalRiskHead:
             2 * self.feature_dim + len(self.interaction_pairs), dtype=float
         )
         self.b = 0.0
+        # Rebalanced training changes the intercept; this restores the natural prior.
+        self.prior_shift = 0.0
 
     def set_normalization(self, features):
         features = np.asarray(features, dtype=float)
@@ -547,6 +577,18 @@ class TerminalRiskHead:
         scale = features.std(axis=0)
         self.scale = np.where(scale > 1e-8, scale, 1.0)
 
+    def calibrate(self, base_rate, sample_rate):
+        """Shift the intercept from the sampled class prior to the natural prior."""
+        base_rate, sample_rate = float(base_rate), float(sample_rate)
+        if not (0.0 < base_rate < 1.0 and 0.0 < sample_rate < 1.0):
+            self.prior_shift = 0.0
+            return self.prior_shift
+        self.prior_shift = (
+            np.log(base_rate / (1.0 - base_rate))
+            - np.log(sample_rate / (1.0 - sample_rate))
+        )
+        return self.prior_shift
+
     def _expand(self, features):
         features = np.asarray(features, dtype=float)
         if features.ndim < 1 or features.shape[-1] != self.feature_dim:
@@ -554,7 +596,8 @@ class TerminalRiskHead:
         x = (features - self.mean) / self.scale
         parts = [x, x * x]
         if self.interaction_pairs:
-            block = x[..., -self.interaction_dim:]
+            block = x[..., self.interaction_start:
+                        self.interaction_start + self.interaction_dim]
             parts.append(np.stack(
                 [block[..., i] * block[..., j]
                  for i, j in self.interaction_pairs],
@@ -563,7 +606,7 @@ class TerminalRiskHead:
         return np.concatenate(parts, axis=-1)
 
     def logits(self, features):
-        return self._expand(features) @ self.w + self.b
+        return self._expand(features) @ self.w + self.b + self.prior_shift
 
     def probability(self, features):
         z = np.clip(self.logits(features), -60.0, 60.0)
@@ -577,7 +620,10 @@ class TerminalRiskHead:
         if not len(features):
             return 0
         x = self._expand(features)
-        probability = self.probability(features)
+        # The prior shift is an inference-time calibration; it must not absorb
+        # subsequent gradient updates.
+        z = np.clip(x @ self.w + self.b, -60.0, 60.0)
+        probability = 1.0 / (1.0 + np.exp(-z))
         error = (probability - labels) / len(labels)
         rate = self.learning_rate if learning_rate is None else float(learning_rate)
         self.w -= rate * (x.T @ error + self.l2 * self.w)
@@ -594,6 +640,8 @@ def fit_terminal_risk(head, replay, updates, batch_size=128,
         return 0
     head.set_normalization(data[0])
     completed = 0
+    positive = 0.0
+    seen = 0.0
     for _ in range(int(updates)):
         batch = replay.sample(
             batch_size, terminal_fraction, near_pipe_fraction,
@@ -602,7 +650,13 @@ def fit_terminal_risk(head, replay, updates, batch_size=128,
         if batch is None:
             break
         head.update_batch(batch[0], batch[3])
+        positive += float(np.asarray(batch[3], dtype=float).sum())
+        seen += float(len(batch[3]))
         completed += 1
+    if seen:
+        # Balanced batches change the class prior; correct the intercept so the
+        # reported probabilities refer to the natural outcome rate.
+        head.calibrate(float(data[3].mean()), positive / seen)
     return completed
 
 

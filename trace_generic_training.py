@@ -16,6 +16,8 @@ import numpy as np
 from latent_world import GAP
 from substrate_generic import (
     ACTION_DIM,
+    PRIORITY_ALPHA,
+    TERMINAL_FRACTION,
     LinearObservationModel,
     collect,
     history_features,
@@ -76,7 +78,7 @@ def report_world(world, rows):
 def build_training_replays(train, priorities=None):
     obs_dim = len(train[0]["obs"])
     value_replay = ReturnReplay(capacity=len(train) + 1, seed=11)
-    risk_replay = TransitionReplay(capacity=len(train) + 1, seed=12)
+    risk_replay = TransitionReplay.for_stream(len(train), seed=12)
     by_episode = {}
     for index, row in enumerate(train):
         priority = 1.0 if priorities is None else float(priorities[index])
@@ -144,29 +146,55 @@ def trace(seed, steps, coverage, checkpoints, batch_size=128):
     )
     report_world(world, held)
 
-    value_replay, risk_replay, obs_dim = build_training_replays(train)
+    train_obs = np.asarray([row["obs"] for row in train], dtype=float)
+    train_hist = np.asarray([row["history"] for row in train], dtype=float)
+    train_next = np.asarray([row["next_obs"] for row in train], dtype=float)
+    errors = np.abs(
+        world.predict(train_obs, train_hist) - train_next
+    ).mean(axis=1)
+    scale = float(np.median(errors))
+    priorities = 1.0 + np.minimum(errors / max(scale, 1e-12), 10.0)
+    value_replay, risk_replay, obs_dim = build_training_replays(
+        train, priorities
+    )
     value_head = WorldFeedbackValueHead(
-        feature_dim=obs_dim + ACTION_DIM, discount=0.99
+        feature_dim=obs_dim + ACTION_DIM, discount=0.99, seed=seed
     )
     risk_head = TerminalRiskHead(feature_dim=obs_dim + ACTION_DIM)
+    risk_data = risk_replay.arrays()
+    risk_head.set_normalization(risk_data[0])
+    natural_rate = float(risk_data[3].mean())
     records, targets = held_records(held)
 
     print("\nTraining checkpoints:")
     print("  update  value_mse  pain_auc  risk_auc  near_auc  brier  separation")
     report_checkpoint(0, 0, value_head, risk_head, records, targets)
     step = 0
+    sampled_positive = 0.0
+    sampled_total = 0.0
     per_checkpoint = max(1, checkpoints // 12)
     for wave in range(1, 13):
         for _ in range(per_checkpoint):
-            value_batch = value_replay.sample(batch_size)
+            value_batch = value_replay.sample(
+                batch_size, priority_alpha=PRIORITY_ALPHA
+            )
             if value_batch is not None:
                 features, returns = value_batch
                 for index in range(len(features)):
                     value_head.update_return(features[index], returns[index])
-            risk_batch = risk_replay.sample(batch_size, terminal_fraction=0.15)
+            risk_batch = risk_replay.sample(
+                batch_size, terminal_fraction=TERMINAL_FRACTION,
+                priority_alpha=PRIORITY_ALPHA,
+            )
             if risk_batch is not None:
                 risk_head.update_batch(risk_batch[0], risk_batch[3])
+                sampled_positive += float(
+                    np.asarray(risk_batch[3], dtype=float).sum()
+                )
+                sampled_total += float(len(risk_batch[3]))
             step += 1
+        if sampled_total:
+            risk_head.calibrate(natural_rate, sampled_positive / sampled_total)
         report_checkpoint(wave, step * batch_size, value_head, risk_head,
                           records, targets)
 
@@ -178,6 +206,12 @@ def main():
     parser.add_argument("--coverage", type=float, default=0.1)
     parser.add_argument("--checkpoints", type=int, default=6000)
     args = parser.parse_args()
+    if args.steps < 1:
+        raise ValueError("--steps must be positive")
+    if not 0.0 <= args.coverage <= 1.0:
+        raise ValueError("--coverage must be in [0, 1]")
+    if args.checkpoints < 1:
+        raise ValueError("--checkpoints must be positive")
     trace(args.seed, args.steps, args.coverage, args.checkpoints)
 
 

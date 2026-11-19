@@ -162,6 +162,8 @@ def collect(seed, steps=PRACTICE, coverage=0.0):
 
 
 def fit(transitions, seed):
+    if not transitions:
+        raise ValueError("need at least one transition to fit")
     obs_dim = len(transitions[0]["obs"])
     world = LinearObservationModel(obs_dim, ACTION_DIM).fit(
         [row["obs"] for row in transitions],
@@ -182,9 +184,9 @@ def fit(transitions, seed):
     priorities = 1.0 + np.minimum(errors / scale, 10.0)
 
     value_replay = ReturnReplay(capacity=len(transitions) + 1, seed=seed)
-    risk_replay = TransitionReplay(capacity=len(transitions) + 1, seed=seed)
+    risk_replay = TransitionReplay.for_stream(len(transitions), seed=seed)
     value_head = WorldFeedbackValueHead(
-        feature_dim=obs_dim + ACTION_DIM, discount=0.99
+        feature_dim=obs_dim + ACTION_DIM, discount=0.99, seed=seed
     )
     risk_head = TerminalRiskHead(feature_dim=obs_dim + ACTION_DIM)
     by_episode = {}
@@ -271,6 +273,10 @@ def main():
     parser.add_argument("--steps", type=int, default=PRACTICE)
     parser.add_argument("--coverage", type=float, default=0.0)
     args = parser.parse_args()
+    if args.steps < 1:
+        raise ValueError("--steps must be positive")
+    if not 0.0 <= args.coverage <= 1.0:
+        raise ValueError("--coverage must be in [0, 1]")
     transitions, action_counts = collect(
         args.seed, args.steps, coverage=args.coverage
     )

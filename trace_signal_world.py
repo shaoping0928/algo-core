@@ -5,7 +5,9 @@ It does not change the controller. For each signal mode we fit the same linear t
 
     signal_features(window) + action history -> next raw observation
 
-and report one-step and recursive multi-step errors on held-out episodes.
+and report one-step errors and multi-step errors on held-out episodes. The multi-step
+probe recurses on predicted observations but keeps the recorded action history
+(teacher-forced actions); it is not a closed-loop action rollout.
 """
 import argparse
 
@@ -127,6 +129,10 @@ def main():
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--coverage", type=float, default=0.1)
     args = parser.parse_args()
+    if args.steps < 1:
+        raise ValueError("--steps must be positive")
+    if not 0.0 <= args.coverage <= 1.0:
+        raise ValueError("--coverage must be in [0, 1]")
     run(args.seed, args.steps, args.coverage)
 
 

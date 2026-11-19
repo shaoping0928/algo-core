@@ -249,10 +249,36 @@ class NodeGraph:
         for node in self.nodes.values():
             node.decay(trace_factor)
 
+    def _remove_edge(self, key: Tuple[str, str, str]) -> None:
+        edge = self.edges.pop(key)
+        for bucket, node_id in (
+            (self.outgoing, edge.source),
+            (self.incoming, edge.target),
+            (self.outgoing, edge.target),
+            (self.incoming, edge.source),
+        ):
+            if key in bucket.get(node_id, []):
+                bucket[node_id].remove(key)
+
+    def _remove_node(self, node_id: str) -> None:
+        """Remove a node and every edge that still refers to it."""
+        for key, edge in list(self.edges.items()):
+            if edge.source == node_id or edge.target == node_id:
+                self._remove_edge(key)
+        for node in self.nodes.values():
+            if node.members:
+                node.members = [member for member in node.members
+                                if member != node_id]
+        self.nodes.pop(node_id, None)
+        self.outgoing.pop(node_id, None)
+        self.incoming.pop(node_id, None)
+
     def prune(self, min_association: float = 1e-3,
               min_edge_trace: float = 1e-4) -> List[Tuple[str, str, str]]:
         removed = []
         for key, edge in list(self.edges.items()):
+            if key not in self.edges:
+                continue
             drop = False
             if edge.kind == ASSOCIATION and abs(edge.weight) < min_association:
                 drop = True
@@ -260,20 +286,10 @@ class NodeGraph:
                 if self.nodes[edge.edge_node].trace < min_edge_trace:
                     drop = True
             if drop:
-                self.edges.pop(key)
+                self._remove_edge(key)
                 removed.append(key)
-                for bucket, node_id in (
-                    (self.outgoing, edge.source),
-                    (self.incoming, edge.target),
-                    (self.outgoing, edge.target),
-                    (self.incoming, edge.source),
-                ):
-                    if key in bucket.get(node_id, []):
-                        bucket[node_id].remove(key)
                 if edge.edge_node is not None:
-                    self.nodes.pop(edge.edge_node, None)
-                    self.outgoing.pop(edge.edge_node, None)
-                    self.incoming.pop(edge.edge_node, None)
+                    self._remove_node(edge.edge_node)
         return removed
 
     def edge_node(self, source: str, target: str) -> Optional[str]:

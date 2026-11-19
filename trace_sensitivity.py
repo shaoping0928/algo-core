@@ -72,7 +72,7 @@ def run(seed, steps, coverage, value_updates=3000, risk_updates=6000):
         train, priorities
     )
     value_head = WorldFeedbackValueHead(
-        feature_dim=obs_dim + ACTION_DIM, discount=0.99
+        feature_dim=obs_dim + ACTION_DIM, discount=0.99, seed=seed
     )
     risk_head = TerminalRiskHead(feature_dim=obs_dim + ACTION_DIM)
     fit_value_head_returns(
@@ -144,6 +144,10 @@ def main():
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--coverage", type=float, default=0.1)
     args = parser.parse_args()
+    if args.steps < 1:
+        raise ValueError("--steps must be positive")
+    if not 0.0 <= args.coverage <= 1.0:
+        raise ValueError("--coverage must be in [0, 1]")
     run(args.seed, args.steps, args.coverage)
 
 

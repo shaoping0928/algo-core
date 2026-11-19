@@ -18,6 +18,7 @@ import numpy as np
 
 from latent_world import BIRD_X, GAP, SPEED, latent
 from substrate_sandbox_search import (
+    ACTION_DIM,
     BEAM_WIDTH,
     H,
     LAG,
@@ -260,6 +261,14 @@ def main():
     parser.add_argument("--show-events", type=int, default=12)
     parser.add_argument("--risk-action-dim", type=int, default=0)
     args = parser.parse_args()
+    if args.distance < 0.0:
+        raise ValueError("--distance must be non-negative")
+    if args.show_events < 0:
+        raise ValueError("--show-events must be non-negative")
+    if not 0 <= args.risk_action_dim <= ACTION_DIM:
+        raise ValueError(
+            "--risk-action-dim must be between 0 and %d" % ACTION_DIM
+        )
     trace(args.seed, args.risk_aggregate, args.distance, args.show_events,
           args.risk_action_dim)
 

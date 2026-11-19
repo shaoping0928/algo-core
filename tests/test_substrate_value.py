@@ -97,6 +97,36 @@ class SubstrateValueTests(unittest.TestCase):
         self.assertEqual(next_features.shape, features.shape)
         self.assertEqual(int(terminal.sum()), 4)
 
+    def test_stream_replay_keeps_every_transition(self):
+        replay = TransitionReplay.for_stream(600, seed=0)
+        for index in range(600):
+            replay.add([float(index)], [1.0, 0.0], [float(index)], False)
+        for index in range(600):
+            replay.add([float(index)], [0.0, 1.0], [float(index)], True)
+        self.assertEqual(len(replay), 1200)
+        self.assertEqual(len(replay.alive), 600)
+        self.assertEqual(len(replay.terminal), 600)
+
+    def test_terminal_risk_prior_correction_moves_towards_base_rate(self):
+        head = TerminalRiskHead(feature_dim=1)
+        head.calibrate(base_rate=0.05, sample_rate=0.5)
+        probability = head.probability(np.zeros((1, 1)))[0]
+        self.assertAlmostEqual(probability, 0.05, places=6)
+        head.calibrate(base_rate=0.5, sample_rate=0.5)
+        self.assertEqual(head.prior_shift, 0.0)
+
+    def test_terminal_risk_interaction_block_is_selectable(self):
+        head = TerminalRiskHead(
+            feature_dim=4, interaction_dim=2, interaction_start=1
+        )
+        expanded = head._expand(np.asarray([[0.0, 1.0, 1.0, 0.0]]))
+        self.assertAlmostEqual(float(expanded[0, -1]), 1.0)
+        head = TerminalRiskHead(
+            feature_dim=4, interaction_dim=2, interaction_start=2
+        )
+        expanded = head._expand(np.asarray([[0.0, 1.0, 1.0, 0.0]]))
+        self.assertAlmostEqual(float(expanded[0, -1]), 0.0)
+
     def test_fit_value_head_uses_replay_batch(self):
         head = WorldFeedbackValueHead(
             feature_dim=2, hidden_dim=8, learning_rate=0.05, discount=0.0

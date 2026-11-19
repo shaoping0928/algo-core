@@ -2,7 +2,12 @@ import unittest
 
 import numpy as np
 
-from mixed_nodes import ContinuousMixedMemory, LayeredMixedMemory
+from graph_memory import kmeans
+from mixed_nodes import (
+    ContinuousMixedMemory,
+    LayeredMixedMemory,
+    MixedNodeRiskMemory,
+)
 from substrate_generic import LinearObservationModel, history_features
 from trace_signal_world import signal_features
 
@@ -74,6 +79,28 @@ class GenericWorldTests(unittest.TestCase):
         risk = memory.risk(observations)
         self.assertEqual(risk.shape, (300,))
         self.assertTrue(np.isfinite(risk).all())
+
+    def test_kmeans_rejects_empty_data_and_zero_clusters(self):
+        with self.assertRaises(ValueError):
+            kmeans(np.empty((0, 2)), 2)
+        with self.assertRaises(ValueError):
+            kmeans(np.ones((3, 2)), 0)
+
+    def test_mixed_memories_can_be_refitted_without_accumulating_state(self):
+        rng = np.random.RandomState(9)
+        observations = rng.normal(size=(200, 2))
+        pain = ((observations[:, 0] > 1.0)
+                & (observations[:, 1] > 1.0)).astype(float)
+        for memory in (
+            ContinuousMixedMemory(capacity=8),
+            LayeredMixedMemory(common_capacity=4, rare_capacity=3,
+                               min_support=4.0),
+            MixedNodeRiskMemory(max_nodes=8, min_support=4.0),
+        ):
+            memory.fit(observations, pain)
+            first = (len(memory.gates), len(memory.nodes))
+            memory.fit(observations, pain)
+            self.assertEqual((len(memory.gates), len(memory.nodes)), first)
 
 
 if __name__ == "__main__":

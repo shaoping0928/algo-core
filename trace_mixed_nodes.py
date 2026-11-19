@@ -25,7 +25,7 @@ from trace_generic_training import OBS_NAMES, split_episodes
 
 
 def near_masks(rows):
-    observations = np.asarray([row["obs"] for row in rows], dtype=float)
+    observations = np.asarray([row["next_obs"] for row in rows], dtype=float)
     near = (np.abs(observations[:, 2]) < 0.20) & (observations[:, 2] > -0.10)
     inside = np.abs(observations[:, 3]) <= GAP / 2.0
     return observations, near, inside
@@ -76,10 +76,10 @@ def run(seed, steps, coverage):
     layered_risk = layered.risk(held_obs)
 
     global_head = TerminalRiskHead(feature_dim=train_obs.shape[1])
-    replay = TransitionReplay(capacity=len(train) + 1, seed=seed)
+    replay = TransitionReplay.for_stream(len(train), seed=seed)
     for row, pain in zip(train, train_pain):
-        obs = np.asarray(row["obs"], dtype=float)
-        replay.add(obs, [1.0 - pain, pain], obs, bool(pain))
+        state = np.asarray(row["next_obs"], dtype=float)
+        replay.add(state, [1.0 - pain, pain], state, bool(pain))
     fit_terminal_risk(
         global_head, replay, 4000, batch_size=128,
         terminal_fraction=0.15,
@@ -157,6 +157,10 @@ def main():
     parser.add_argument("--steps", type=int, default=5000)
     parser.add_argument("--coverage", type=float, default=0.1)
     args = parser.parse_args()
+    if args.steps < 1:
+        raise ValueError("--steps must be positive")
+    if not 0.0 <= args.coverage <= 1.0:
+        raise ValueError("--coverage must be in [0, 1]")
     run(args.seed, args.steps, args.coverage)
 
 

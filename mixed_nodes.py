@@ -92,6 +92,13 @@ class ContinuousMixedMemory:
         pain = np.asarray(pain, dtype=float).reshape(-1)
         if observations.ndim != 2 or len(observations) != len(pain):
             raise ValueError("observations and pain must have matching rows")
+        if not len(observations):
+            raise ValueError("need at least one observation")
+        self.gates = []
+        self.nodes = []
+        self.base_rate = 0.0
+        self.created = 0
+        self.forgotten = 0
         self._build_gates(observations)
         activations = self._gate_matrix(observations)
         self.base_rate = float(pain.mean()) if len(pain) else 0.0
@@ -212,6 +219,14 @@ class LayeredMixedMemory(ContinuousMixedMemory):
         pain = np.asarray(pain, dtype=float).reshape(-1)
         if observations.ndim != 2 or len(observations) != len(pain):
             raise ValueError("observations and pain must have matching rows")
+        if not len(observations):
+            raise ValueError("need at least one observation")
+        self.gates = []
+        self.nodes = []
+        self.base_rate = 0.0
+        self.created = 0
+        self.forgotten = 0
+        self.rare_nodes = 0
         self._build_gates(observations)
         activations = self._gate_matrix(observations)
         self.base_rate = float(pain.mean()) if len(pain) else 0.0
@@ -342,6 +357,11 @@ class MixedNodeRiskMemory:
         pain = np.asarray(pain, dtype=float).reshape(-1)
         if observations.ndim != 2 or len(observations) != len(pain):
             raise ValueError("observations and pain must have matching rows")
+        if not len(observations):
+            raise ValueError("need at least one observation")
+        self.gates = []
+        self.nodes = []
+        self.base_rate = 0.0
         self._build_gates(observations)
         activations = self._gate_matrix(observations)
         self.base_rate = float(pain.mean()) if len(pain) else 0.0
