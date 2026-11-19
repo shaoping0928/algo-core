@@ -47,7 +47,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            component_weight, component_gating, memory_weight,
            association_rate, induce_features, precursor_labels,
            pain_horizon, voi_target, feature_value_weight,
-           value_horizon=None, ood_trust_scale=0.0):
+           value_horizon=None, ood_trust_scale=0.0, obs_trust=1.0,
+           feature_action_prior=2.0, feature_value_prior=4.0):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -81,6 +82,9 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         feature_value_weight=feature_value_weight,
         value_horizon=(value_horizon or None),
         ood_trust_scale=ood_trust_scale,
+        obs_trust=obs_trust,
+        feature_action_prior=feature_action_prior,
+        feature_value_prior=feature_value_prior,
     )
     episodes = {}
     for row in transitions:
@@ -187,7 +191,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         dagger_rounds=0, dagger_episodes=2, dagger_cap=1200,
         dagger_offset=50000, dagger_horizon=10, step_stride=2,
         stride_includes_lag=False, value_horizon=0,
-        ood_trust_scale=0.0):
+        ood_trust_scale=0.0, obs_trust=1.0,
+        feature_action_prior=2.0, feature_value_prior=4.0):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -239,6 +244,12 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("value_horizon must be non-negative")
     if float(ood_trust_scale) < 0.0:
         raise ValueError("ood_trust_scale must be non-negative")
+    if not 0.0 <= float(obs_trust) <= 1.0:
+        raise ValueError("obs_trust must be in [0, 1]")
+    if float(feature_action_prior) < 0.0:
+        raise ValueError("feature_action_prior must be non-negative")
+    if float(feature_value_prior) < 0.0:
+        raise ValueError("feature_value_prior must be non-negative")
     lag = int(lag)
     voi_fraction = float(voi_fraction)
     if voi_fraction > 0.0:
@@ -294,6 +305,9 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         feature_value_weight=feature_value_weight,
         value_horizon=value_horizon,
         ood_trust_scale=ood_trust_scale,
+        obs_trust=obs_trust,
+        feature_action_prior=feature_action_prior,
+        feature_value_prior=feature_value_prior,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -595,6 +609,9 @@ def run_seed(task):
     stride_includes_lag = bool(task.get("stride_includes_lag", False))
     decision = str(task.get("decision", "search"))
     ood_trust_scale = float(task.get("ood_trust_scale", 0.0))
+    obs_trust = float(task.get("obs_trust", 1.0))
+    feature_action_prior = float(task.get("feature_action_prior", 2.0))
+    feature_value_prior = float(task.get("feature_value_prior", 4.0))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -631,6 +648,9 @@ def run_seed(task):
         stride_includes_lag=stride_includes_lag,
         value_horizon=value_horizon,
         ood_trust_scale=ood_trust_scale,
+        obs_trust=obs_trust,
+        feature_action_prior=feature_action_prior,
+        feature_value_prior=feature_value_prior,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -734,6 +754,17 @@ def main():
                         help="shrink prototype readouts toward the population "
                              "baseline beyond this distance (0 = off; the "
                              "birth threshold is a natural setting)")
+    parser.add_argument("--obs-trust", type=float, default=1.0,
+                        help="weight of the observation-anchored prototype/"
+                             "memory channel against induced feature channels")
+    parser.add_argument("--feature-action-prior", type=float, default=2.0,
+                        help="pseudo-counts shrinking pain cells toward the "
+                             "feature scalar; lower = more trust in verified "
+                             "action-conditioned cells")
+    parser.add_argument("--feature-value-prior", type=float, default=4.0,
+                        help="pseudo-counts shrinking value cells toward the "
+                             "baseline; lower = more trust in verified "
+                             "success cells")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -816,6 +847,12 @@ def main():
         raise ValueError("--value-horizon must be non-negative")
     if args.ood_trust_scale < 0.0:
         raise ValueError("--ood-trust-scale must be non-negative")
+    if not 0.0 <= args.obs_trust <= 1.0:
+        raise ValueError("--obs-trust must be in [0, 1]")
+    if args.feature_action_prior < 0.0:
+        raise ValueError("--feature-action-prior must be non-negative")
+    if args.feature_value_prior < 0.0:
+        raise ValueError("--feature-value-prior must be non-negative")
     component_kinds = tuple(
         kind.strip() for kind in args.components.split(",") if kind.strip()
     )
@@ -865,6 +902,9 @@ def main():
             decision=args.decision,
             value_horizon=args.value_horizon,
             ood_trust_scale=args.ood_trust_scale,
+            obs_trust=args.obs_trust,
+            feature_action_prior=args.feature_action_prior,
+            feature_value_prior=args.feature_value_prior,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -982,6 +1022,9 @@ def main():
                 decision=args.decision,
                 value_horizon=args.value_horizon,
                 ood_trust_scale=args.ood_trust_scale,
+                obs_trust=args.obs_trust,
+                feature_action_prior=args.feature_action_prior,
+                feature_value_prior=args.feature_value_prior,
                 feature_value_weight=args.feature_value_weight,
                 features=not args.no_features,
                 precursor_labels=not args.instant_labels,

@@ -119,6 +119,7 @@ class NodeRuntime:
         feature_value_weight: float = 0.02,
         value_horizon: Optional[int] = None,
         ood_trust_scale: float = 0.0,
+        obs_trust: float = 1.0,
         action_temperature: float = 0.1,
         action_uncertainty: float = 0.5,
         seed: int = 0,
@@ -194,6 +195,8 @@ class NodeRuntime:
             raise ValueError("value_horizon must be positive")
         if float(ood_trust_scale) < 0.0:
             raise ValueError("ood_trust_scale must be non-negative")
+        if not 0.0 <= float(obs_trust) <= 1.0:
+            raise ValueError("obs_trust must be in [0, 1]")
         if float(action_uncertainty) < 0.0:
             raise ValueError("action_uncertainty must be non-negative")
         actions = tuple(int(action) for action in action_space)
@@ -267,6 +270,10 @@ class NodeRuntime:
         # query state leaves the supported region: statistics memorized on
         # other worlds must not be reported with full confidence.
         self.ood_trust_scale = float(ood_trust_scale)
+        # Observation-anchored statistics (prototypes and their memories) are
+        # down-weighted relative to induced, verified feature channels; 1.0
+        # keeps the historical max-combination behaviour.
+        self.obs_trust = float(obs_trust)
         self.value_baseline = 0.0
         self.value_baseline_rate = 0.02
         # Precursor label window: how many entered states ahead a pain event
@@ -736,6 +743,7 @@ class NodeRuntime:
                 result, nearest_min,
                 baseline=self.prototype_pain_baseline(),
             )
+            result = result * self.obs_trust
         if self.feature_ids:
             result = np.maximum(result, self._feature_risk_batch(states))
             result = np.maximum(
@@ -1909,6 +1917,9 @@ class NodeRuntime:
             dopamine = self._shrink_to_baseline(
                 dopamine, nearest_min, baseline=baseline_dopamine
             )
+        # Terminal pain shares the observation channel's trust; dopamine is
+        # only a tie-break in the search objective and is left at full trust.
+        pain = pain * self.obs_trust
         return pain, dopamine
 
     def _memory_value_from_weights(self, weights, attribute: str = "value"):

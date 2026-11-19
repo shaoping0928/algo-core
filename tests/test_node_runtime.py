@@ -253,6 +253,20 @@ class NodeRuntimeTests(unittest.TestCase):
         pain_on, _ = runtime.valence_state_batch(states)
         self.assertAlmostEqual(float(pain_on[0]), 0.5, places=6)
 
+    def test_obs_trust_downweights_the_observation_channel(self):
+        runtime = self.make_runtime()
+        first = runtime._create_node(np.asarray([0.0]))
+        second = runtime._create_node(np.asarray([1.0]))
+        runtime.graph.nodes[first].value = 1.0
+        runtime.graph.nodes[second].value = 0.0
+        states = np.asarray([[0.0]])
+        pain_full, _ = runtime.valence_state_batch(states)
+        runtime.obs_trust = 0.5
+        pain_half, _ = runtime.valence_state_batch(states)
+        self.assertAlmostEqual(
+            float(pain_half[0]), 0.5 * float(pain_full[0]), places=6
+        )
+
     def test_fit_accepts_closed_loop_rounds(self):
         from substrate_nodes import fit
         world, agent = fit(
