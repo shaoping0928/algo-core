@@ -1,4 +1,5 @@
-﻿import unittest
+﻿import types
+import unittest
 from pathlib import Path
 
 import numpy as np
@@ -185,6 +186,52 @@ class NodeRuntimeTests(unittest.TestCase):
             self.assertEqual(row["signals"].shape, (2,))
             self.assertEqual(row["done"], row["terminal"])
             self.assertGreaterEqual(row["episode"], 50000)
+
+    def test_cell_q_action_decides_without_search(self):
+        from latent_world import latent
+        from substrate_nodes import cell_q_action, fit
+        world, agent = fit(
+            100, steps=80, epochs=1, max_nodes=100, lag=3,
+            induce_features=False,
+        )
+        env = latent[3](100)
+        prefix = np.zeros(3, dtype=float)
+        action = cell_q_action(env, world, agent, prefix, lag=3)
+        self.assertIn(action, (0, 1))
+        # The pending prefix is untouched by a no-search decision.
+        self.assertEqual(list(env.pending()), [0, 0, 0])
+
+    def test_k_step_value_target_matches_the_truncated_return(self):
+        from node_runtime import NodeRuntime
+        stub = types.SimpleNamespace(gamma=0.5, value_horizon=2)
+        steps = [
+            (None, 0, "n0", 0.0, 1.0, False, (), (), 0, ()),
+            (None, 0, "n1", 0.0, 2.0, False, (), (), 0, ()),
+            (None, 0, "n2", 0.0, 4.0, True, (), (), 0, ()),
+        ]
+        snapshot = {"n1": 8.0}
+        # position 0: 1 + 0.5*2 + 0.25*V(n1) = 4.0; the state two steps
+        # ahead of step 0 is the next node of step 1.
+        self.assertAlmostEqual(
+            NodeRuntime._k_step_value_target(stub, steps, 0, snapshot), 4.0
+        )
+        # position 1: 2 + 0.5*4, no bootstrap (episode ends inside horizon)
+        self.assertAlmostEqual(
+            NodeRuntime._k_step_value_target(stub, steps, 1, snapshot), 4.0
+        )
+        # position 2: terminal step, reward only
+        self.assertAlmostEqual(
+            NodeRuntime._k_step_value_target(stub, steps, 2, snapshot), 4.0
+        )
+
+    def test_fit_accepts_a_value_horizon(self):
+        from substrate_nodes import fit
+        world, agent = fit(
+            100, steps=80, epochs=1, max_nodes=100, lag=3,
+            induce_features=False, value_horizon=4,
+        )
+        self.assertEqual(agent.value_horizon, 4)
+        self.assertGreaterEqual(agent.snapshot()["nodes"], 1)
 
     def test_fit_accepts_closed_loop_rounds(self):
         from substrate_nodes import fit

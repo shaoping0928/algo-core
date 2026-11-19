@@ -14,7 +14,11 @@ import argparse
 import json
 import os
 import sys
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+)
 
 import numpy as np
 
@@ -42,7 +46,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            component_kinds, component_min_count, max_components,
            component_weight, component_gating, memory_weight,
            association_rate, induce_features, precursor_labels,
-           pain_horizon, voi_target, feature_value_weight):
+           pain_horizon, voi_target, feature_value_weight,
+           value_horizon=None):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -74,6 +79,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         pain_horizon=pain_horizon,
         voi_target=voi_target,
         feature_value_weight=feature_value_weight,
+        value_horizon=(value_horizon or None),
     )
     episodes = {}
     for row in transitions:
@@ -179,7 +185,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         voi_fraction=0.0, voi_target=3, feature_value_weight=0.02,
         dagger_rounds=0, dagger_episodes=2, dagger_cap=1200,
         dagger_offset=50000, dagger_horizon=10, step_stride=2,
-        stride_includes_lag=False):
+        stride_includes_lag=False, value_horizon=0):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -227,6 +233,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("dagger_horizon must be positive")
     if int(step_stride) < 1:
         raise ValueError("step_stride must be positive")
+    if int(value_horizon) < 0:
+        raise ValueError("value_horizon must be non-negative")
     lag = int(lag)
     voi_fraction = float(voi_fraction)
     if voi_fraction > 0.0:
@@ -280,6 +288,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         pain_horizon=pain_horizon,
         voi_target=voi_target,
         feature_value_weight=feature_value_weight,
+        value_horizon=value_horizon,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -385,6 +394,65 @@ def policy_action(env, world, agent, prefix, horizon, lag=LAG,
     ).actions[0])
 
 
+def cell_q_action(env, world, agent, prefix, lag=LAG):
+    """Decide without search, from the learned (feature, action) cells.
+
+    The pending actions are already issued and fixed, so the world model is
+    rolled forward `lag` steps on them alone.  The candidate action issued
+    now acts `lag` steps from now, on the rolled state; both candidates are
+    scored there with the same cells the search reads:
+
+        score(a) = feature hazard(s, a) - w * sequence value(s, a)
+
+    and the lower score wins.  This is the cell-Q-only ablation: it measures
+    what the MPC shell adds beyond reading the learned values directly.
+    """
+    if int(lag) < 0:
+        raise ValueError("lag must be non-negative")
+    lag = int(lag)
+    state = np.asarray(env.obs(), dtype=float).reshape(1, -1)
+    pending = list(env.pending()[:lag])
+    if len(pending) < lag:
+        pending = [0.0] * (lag - len(pending)) + pending
+    prefix = np.asarray(prefix, dtype=float).reshape(-1)
+    for step in range(lag):
+        applied = float(pending[step])
+        columns = [applied]
+        for offset in range(1, lag + 1):
+            index = step - offset
+            columns.append(
+                float(pending[index]) if index >= 0
+                else float(prefix[-index - 1])
+            )
+        history = np.asarray([columns], dtype=float)
+        state = np.asarray(world.predict(state, history), dtype=float)
+    scores = {}
+    for action in (0, 1):
+        columns = [float(action)] + [float(item) for item in pending[1:]]
+        encoded = np.concatenate(
+            [state, np.asarray([columns], dtype=float)], axis=1
+        ) / agent.scales
+        risk = float(agent.feature_risk_batch(encoded)[0])
+        value = float(agent.feature_value_batch(encoded)[0])
+        scores[action] = risk - agent.feature_value_weight * value
+    return int(min(scores, key=lambda key: (scores[key], key)))
+
+
+def decision_action(env, world, agent, prefix, horizon, lag=LAG,
+                    step_stride=2, stride_includes_lag=False,
+                    decision="search"):
+    """Dispatch one decision to the searched or the cell-Q-only policy."""
+    if decision == "search":
+        return policy_action(
+            env, world, agent, prefix, horizon, lag=lag,
+            step_stride=step_stride,
+            stride_includes_lag=stride_includes_lag,
+        )
+    if decision == "cellq":
+        return cell_q_action(env, world, agent, prefix, lag=lag)
+    raise ValueError("unknown decision mode %r" % decision)
+
+
 def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
                step_stride=2, stride_includes_lag=False):
     """Score one fixed plan with the same objective as `policy_result`.
@@ -436,7 +504,7 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
 
 def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
              step_stride=2, stride_includes_lag=False, env_seed=None,
-             record=False, episode=0):
+             record=False, episode=0, decision="search"):
     """Run one deterministic evaluation episode.
 
     ``env_seed`` selects the world instance; when omitted the historical
@@ -460,10 +528,11 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
     transitions = []
     while not env.dead and env.t < cap:
         obs = np.asarray(env.obs(), dtype=float)
-        action = policy_action(
+        action = decision_action(
             env, world, agent, prefix, horizon, lag=lag,
             step_stride=step_stride,
             stride_includes_lag=stride_includes_lag,
+            decision=decision,
         )
         history = np.asarray([float(action)] + recent[:lag], dtype=float)
         actions.append(action)
@@ -519,6 +588,7 @@ def run_seed(task):
     feature_value_weight = float(task.get("feature_value_weight", 0.02))
     step_stride = int(task.get("step_stride", 2))
     stride_includes_lag = bool(task.get("stride_includes_lag", False))
+    decision = str(task.get("decision", "search"))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -526,6 +596,8 @@ def run_seed(task):
     dagger_cap = int(task.get("dagger_cap", 1200))
     dagger_offset = int(task.get("dagger_offset", 50000))
     dagger_horizon = int(task.get("dagger_horizon", horizon))
+
+    value_horizon = int(task.get("value_horizon", 0))
 
     world, agent = fit(
         seed, steps=steps, coverage=coverage,
@@ -551,6 +623,7 @@ def run_seed(task):
         dagger_horizon=dagger_horizon,
         step_stride=step_stride,
         stride_includes_lag=stride_includes_lag,
+        value_horizon=value_horizon,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -572,6 +645,7 @@ def run_seed(task):
                 step_stride=step_stride,
                 stride_includes_lag=stride_includes_lag,
                 env_seed=env_seed,
+                decision=decision,
             )
             rows.append(dict(
                 train_seed=seed,
@@ -642,6 +716,13 @@ def main():
     parser.add_argument("--stride-includes-lag", action="store_true",
                         help="also query step == lag, the first predicted "
                              "state the plan action can affect")
+    parser.add_argument("--decision", choices=("search", "cellq"),
+                        default="search",
+                        help="search = full MPC planning; cellq = read the "
+                             "learned (feature, action) cells directly")
+    parser.add_argument("--value-horizon", type=int, default=0,
+                        help="k-step bootstrap target for the sequence-value "
+                             "cells; 0 keeps the full-episode MC return")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -720,6 +801,8 @@ def main():
         raise ValueError("--dagger-horizon must be non-negative")
     if args.dagger_horizon == 0:
         args.dagger_horizon = args.horizon
+    if args.value_horizon < 0:
+        raise ValueError("--value-horizon must be non-negative")
     component_kinds = tuple(
         kind.strip() for kind in args.components.split(",") if kind.strip()
     )
@@ -766,6 +849,8 @@ def main():
             feature_value_weight=args.feature_value_weight,
             step_stride=args.step_stride,
             stride_includes_lag=args.stride_includes_lag,
+            decision=args.decision,
+            value_horizon=args.value_horizon,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -776,18 +861,46 @@ def main():
         )
         for seed in seeds
     ]
+    def _drain(futures):
+        """Collect worker results, streaming one line per finished model."""
+        rows = []
+        for future in as_completed(futures):
+            row = future.result()
+            rows.append(row)
+            frames = [item["frames"] for item in row["evals"]]
+            print(
+                " model %3d done: held-out mean %.1f over %d worlds"
+                % (row["seed"], float(np.mean(frames)), len(frames)),
+                flush=True,
+            )
+        return rows
+
     if args.jobs == 1:
-        rows = [run_seed(task) for task in tasks]
+        rows = []
+        for task in tasks:
+            row = run_seed(task)
+            frames = [item["frames"] for item in row["evals"]]
+            print(
+                " model %3d done: held-out mean %.1f over %d worlds"
+                % (row["seed"], float(np.mean(frames)), len(frames)),
+                flush=True,
+            )
+            rows.append(row)
     elif FREE_THREADED:
         # The free-threaded build runs seed-level Python and numpy work in
         # parallel without pickling graphs between workers.
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            rows = list(pool.map(run_seed, tasks))
+            rows = _drain([
+                pool.submit(run_seed, task) for task in tasks
+            ])
     else:
         # A GIL build still gets true parallelism from independent seeds; the
         # payload per seed is small (plain dicts and lists).
         with ProcessPoolExecutor(max_workers=args.jobs) as pool:
-            rows = list(pool.map(run_seed, tasks))
+            rows = _drain([
+                pool.submit(run_seed, task) for task in tasks
+            ])
+    rows.sort(key=lambda row: row["seed"])
 
     print("train  concepts  graph_nodes  action_edges  components")
     for row in rows:
@@ -852,6 +965,8 @@ def main():
                 lag=args.lag,
                 step_stride=args.step_stride,
                 stride_includes_lag=args.stride_includes_lag,
+                decision=args.decision,
+                value_horizon=args.value_horizon,
                 feature_value_weight=args.feature_value_weight,
                 features=not args.no_features,
                 precursor_labels=not args.instant_labels,

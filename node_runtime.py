@@ -117,6 +117,7 @@ class NodeRuntime:
         voi_min_prior: float = 0.5,
         feature_value_prior: float = 4.0,
         feature_value_weight: float = 0.02,
+        value_horizon: Optional[int] = None,
         action_temperature: float = 0.1,
         action_uncertainty: float = 0.5,
         seed: int = 0,
@@ -188,6 +189,8 @@ class NodeRuntime:
             raise ValueError("feature_value_prior must be non-negative")
         if float(feature_value_weight) < 0.0:
             raise ValueError("feature_value_weight must be non-negative")
+        if value_horizon is not None and int(value_horizon) < 1:
+            raise ValueError("value_horizon must be positive")
         if float(action_uncertainty) < 0.0:
             raise ValueError("action_uncertainty must be non-negative")
         actions = tuple(int(action) for action in action_space)
@@ -254,6 +257,9 @@ class NodeRuntime:
         self.feature_value_stats = {}
         self.feature_value_prior = float(feature_value_prior)
         self.feature_value_weight = float(feature_value_weight)
+        self.value_horizon = (
+            None if value_horizon is None else int(value_horizon)
+        )
         self.value_baseline = 0.0
         self.value_baseline_rate = 0.02
         # Precursor label window: how many entered states ahead a pain event
@@ -1276,9 +1282,18 @@ class NodeRuntime:
 
         running_pain = 0.0
         running_dopamine = 0.0
-        for (current, action, next_node, pain, dopamine,
+        # Short-horizon value attribution bootstraps from the pre-update node
+        # value of the state `value_horizon` steps ahead, so the k-step target
+        # keeps the return scale of the MC path while crediting only the
+        # actions inside the horizon.
+        value_snapshot = (
+            {key: node.value for key, node in self.graph.nodes.items()}
+            if self.value_horizon else None
+        )
+        for position in range(len(steps) - 1, -1, -1):
+            (current, action, next_node, pain, dopamine,
              terminal, sources, signature, acting,
-             value_roots) in reversed(steps):
+             value_roots) = steps[position]
             return_pain = pain + (
                 0.0 if terminal else self.gamma * running_pain
             )
@@ -1307,9 +1322,13 @@ class NodeRuntime:
                 # learns the discounted dopamine return of the paths that
                 # actually followed it, so "aligned for a long survival"
                 # becomes readable where the pain hazard only says "local".
-                self._update_feature_value(
-                    value_roots, acting, return_dopamine
+                target = (
+                    self._k_step_value_target(
+                        steps, position, value_snapshot
+                    )
+                    if value_snapshot is not None else return_dopamine
                 )
+                self._update_feature_value(value_roots, acting, target)
             if terminal:
                 entered = self.graph.nodes[next_node]
                 entered.value += self.alpha_mc * (
@@ -1545,6 +1564,26 @@ class NodeRuntime:
         )
         return action
 
+    def _k_step_value_target(self, steps, position, snapshot):
+        """k-step dopamine return with a bootstrap from the pre-update node
+        value of the state `value_horizon` steps ahead.
+
+        Truncation at the episode end simply sums the rewards that actually
+        happened (the same convention as the MC path at a terminal step).
+        """
+        total = 0.0
+        discount = 1.0
+        for offset in range(int(self.value_horizon)):
+            index = position + offset
+            if index >= len(steps):
+                return total
+            total += discount * float(steps[index][4])
+            discount *= self.gamma
+        index = position + int(self.value_horizon) - 1
+        if index < len(steps):
+            total += discount * float(snapshot.get(steps[index][2], 0.0))
+        return total
+
     def _update_feature_value(self, feature_ids, acting: int,
                               return_dopamine: float) -> None:
         """Accumulate E[discounted dopamine return | feature, acting]."""
@@ -1649,6 +1688,10 @@ class NodeRuntime:
             node = self.graph.nodes.get(node_id)
             if node is not None:
                 node.activate(1.0 if node_id in active else 0.0)
+
+    def feature_risk_batch(self, states: np.ndarray) -> np.ndarray:
+        """Public read of the action-conditioned feature risk cells."""
+        return self._feature_risk_batch(states)
 
     def _feature_risk_batch(self, states: np.ndarray) -> np.ndarray:
         """Action-conditioned feature risk.
