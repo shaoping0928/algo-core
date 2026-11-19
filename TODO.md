@@ -133,6 +133,20 @@
 - [ ] 标量 EMA 是近因估计器（有效窗口 ~20 次激活，随 replay 顺序在
   0.73–0.96 摆动，全数据率 0.81）：读出已以计数格子为主，标量只作收缩先验；
   后续把标量也改成计数式或显著加大窗口，消除 per-seed 顺序噪声。
+- [x] **序列级价值 + 标量化目标**（2026-11；纪律裁定：任务无关的通用形式
+  可以人为设计，守卫测试保证其中无任务知识，但每个形式改动必须 A/B 验收）：
+  `(feature, acting)` 格子学 MC 折扣 dopamine 回报（learn_episode 反向 pass
+  更新，收缩先验 = 运行中的全局 baseline）；搜索目标从词典序 max-risk 改为
+  标量化 `Σ hazard − feature_value_weight × V_f(terminal)`。
+  fast 8 种子：max→sum 本身 110.9→144.9（seed 104 到 cap、seed 107 到 232），
+  加 w=0.02 → 121.1/104.5（中位数回升、方差收窄）。
+  trace：前兆 AUC 0.92+（旧盲区死法消失——它是轨迹性质）、kNN 双动作支撑
+  0.806 / 近管道 0.923、chosen 计划累计风险 0.69 最低。
+  - [ ] 全量 w=0.02（后台）与 w=0 对照，隔离 max→sum 与价值项各自贡献。
+  - [ ] w 用留出 episodes 校准（`prediction_report` 基础设施已就绪），
+    把 w 从拍的变成校准的。
+  - [ ] cell-Q-only 消融：不搜索，直接 `argmax_a V_f(s,a)` + hazard 惩罚，
+    测 MPC 壳的真实贡献。
 - [ ] 三套控制器收敛为一个 `ActionPolicy`（collect/eval/node 三模式），`act` 与
   `policy_result` 不再是平行宇宙。
 - [ ] 计划级后验 `p1 = Φ(Δ/se)`（se 来自世界模型残差 + 支撑度）替代固定温度；
