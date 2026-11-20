@@ -27,6 +27,32 @@ class FeatureRuleTests(unittest.TestCase):
             collision.mask(x), [True, True, False, False]
         )
 
+    def test_coverage_gates_drop_rare_extreme_rules(self):
+        x = np.linspace(0.0, 1.0, 1000).reshape(-1, 1)
+        # A high-precision rule that only fires on 2% of the states.
+        rare = (x[:, 0] > 0.98).astype(float)
+        train = np.arange(0, 1000, 2)
+        test = np.arange(1, 1000, 2)
+        off = FeatureRuleBank(min_z=1.0, min_lift=1.5)
+        self.assertTrue(off.induce(x[train], rare[train], x[test], rare[test]))
+        rule_gate = FeatureRuleBank(
+            min_z=1.0, min_lift=1.5, min_coverage=0.1
+        )
+        self.assertFalse(rule_gate.induce(
+            x[train], rare[train], x[test], rare[test]
+        ))
+        primitive_gate = FeatureRuleBank(
+            min_z=1.0, min_lift=1.5, min_primitive_coverage=0.1
+        )
+        self.assertFalse(primitive_gate.induce(
+            x[train], rare[train], x[test], rare[test]
+        ))
+        # A rule that covers a large share of states still passes.
+        common = (x[:, 0] > 0.5).astype(float)
+        self.assertTrue(rule_gate.induce(
+            x[train], common[train], x[test], common[test]
+        ))
+
     def test_bank_recovers_and_composition(self):
         rng = np.random.RandomState(7)
         x = rng.uniform(-1.0, 1.0, (2400, 4))

@@ -121,7 +121,9 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         value_dispersion=False, iterative_induction=False,
         compose_readout: bool = True, importance_weighting=False,
         voi_threat_min: float = 0.25, curiosity_weight: float = 0.0,
-        dagger_frames: int = 0, memory_credit: bool = False):
+        dagger_frames: int = 0, memory_credit: bool = False,
+        rule_min_coverage: float = 0.0,
+        rule_min_primitive_coverage: float = 0.0):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -170,6 +172,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         curiosity_weight=curiosity_weight,
         point_labels=(not precursor_labels),
         memory_credit=memory_credit,
+        rule_min_coverage=rule_min_coverage,
+        rule_min_primitive_coverage=rule_min_primitive_coverage,
     )
     episodes = {}
     for row in transitions:
@@ -242,7 +246,10 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
             # longer window would also push it out of the graded readout.
             agent.install_feature_rules(horizon=lag + 1)
             if long_window is not None:
-                bank = FeatureRuleBank()
+                bank = FeatureRuleBank(
+                    min_coverage=rule_min_coverage,
+                    min_primitive_coverage=rule_min_primitive_coverage,
+                )
                 bank.induce(
                     states[train], pain[train], states[test], pain[test]
                 )
@@ -273,7 +280,10 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                         ) / scales[:obs_dim]
                     else:
                         value_states = states
-                    value_bank = FeatureRuleBank()
+                    value_bank = FeatureRuleBank(
+                    min_coverage=rule_min_coverage,
+                    min_primitive_coverage=rule_min_primitive_coverage,
+                )
                     value_bank.induce(
                         value_states[train], high[train],
                         value_states[test], high[test],
@@ -339,7 +349,10 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
             ) else 0.5
             missed_short = (pain_short > 0.5) & (threat_read <= cut)
             if missed_short.sum() >= 5:
-                gap_bank = FeatureRuleBank()
+                gap_bank = FeatureRuleBank(
+                    min_coverage=rule_min_coverage,
+                    min_primitive_coverage=rule_min_primitive_coverage,
+                )
                 gap_bank.induce(
                     states[train], (pain_short * missed_short)[train],
                     states[test], (pain_short * missed_short)[test],
@@ -354,7 +367,10 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                     ]
             missed_long = (pain > 0.5) & (threat_read <= cut)
             if missed_long.sum() >= 5 and long_window is not None:
-                gap_long = FeatureRuleBank()
+                gap_long = FeatureRuleBank(
+                        min_coverage=rule_min_coverage,
+                        min_primitive_coverage=rule_min_primitive_coverage,
+                    )
                 gap_long.induce(
                     states[train], (pain * missed_long)[train],
                     states[test], (pain * missed_long)[test],
@@ -600,7 +616,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         control_risk_weight=0.0, value_bank_only=False,
         iterative_induction=False, compose_readout=True,
         importance_weighting=False, learn_objective=True,
-        curiosity_weight=0.5, memory_credit=False):
+        curiosity_weight=0.5, memory_credit=False,
+        rule_min_coverage=0.0, rule_min_primitive_coverage=0.0):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -670,6 +687,10 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("control_risk_weight must be non-negative")
     if float(curiosity_weight) < 0.0:
         raise ValueError("curiosity_weight must be non-negative")
+    if not 0.0 <= float(rule_min_coverage) <= 1.0:
+        raise ValueError("rule_min_coverage must be in [0, 1]")
+    if not 0.0 <= float(rule_min_primitive_coverage) <= 1.0:
+        raise ValueError("rule_min_primitive_coverage must be in [0, 1]")
     lag = int(lag)
     voi_fraction = float(voi_fraction)
     if voi_fraction > 0.0:
@@ -753,6 +774,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         curiosity_weight=curiosity_weight,
         dagger_frames=dagger_frames,
         memory_credit=memory_credit,
+        rule_min_coverage=rule_min_coverage,
+        rule_min_primitive_coverage=rule_min_primitive_coverage,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -1359,6 +1382,10 @@ def run_seed(task):
     learn_objective = bool(task.get("learn_objective", True))
     curiosity_weight = float(task.get("curiosity_weight", 0.5))
     memory_credit = bool(task.get("memory_credit", False))
+    rule_min_coverage = float(task.get("rule_min_coverage", 0.0))
+    rule_min_primitive_coverage = float(
+        task.get("rule_min_primitive_coverage", 0.0)
+    )
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
@@ -1418,6 +1445,8 @@ def run_seed(task):
         voi_threat_min=voi_threat_min,
         curiosity_weight=curiosity_weight,
         memory_credit=memory_credit,
+        rule_min_coverage=rule_min_coverage,
+        rule_min_primitive_coverage=rule_min_primitive_coverage,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1600,6 +1629,16 @@ def main():
                              "risk rates by an eligibility trace and link "
                              "the event memory back to the preceding "
                              "context; the pain itself stays a point event")
+    parser.add_argument("--rule-min-coverage", type=float, default=0.0,
+                        help="induction gate: minimum fraction of the "
+                             "validation states a candidate rule must "
+                             "activate on (0 = off)")
+    parser.add_argument("--rule-min-primitive-coverage", type=float,
+                        default=0.0,
+                        help="induction gate: every conjunct/branch "
+                             "primitive must activate on at least this "
+                             "fraction of the validation states "
+                             "(0 = off)")
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
@@ -1701,6 +1740,10 @@ def main():
         raise ValueError("--feature-value-weight must be non-negative")
     if args.curiosity_weight < 0.0:
         raise ValueError("--curiosity-weight must be non-negative")
+    if not 0.0 <= args.rule_min_coverage <= 1.0:
+        raise ValueError("--rule-min-coverage must be in [0, 1]")
+    if not 0.0 <= args.rule_min_primitive_coverage <= 1.0:
+        raise ValueError("--rule-min-primitive-coverage must be in [0, 1]")
     if not 0.0 < args.value_quantile < 1.0:
         raise ValueError("--value-quantile must be in (0, 1)")
     if args.component_min_count < 1:
@@ -1812,6 +1855,8 @@ def main():
             learn_objective=args.learn_objective,
             curiosity_weight=args.curiosity_weight,
             memory_credit=args.memory_credit,
+            rule_min_coverage=args.rule_min_coverage,
+            rule_min_primitive_coverage=args.rule_min_primitive_coverage,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,

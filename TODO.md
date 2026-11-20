@@ -349,6 +349,19 @@
   held-out 上全不触发（只有子特征激活）。**首轮 null 的直接原因是
   特征归纳 OOD/表征抽签，不是修正逻辑**。`feature_generalization_probe.py`
   正在量化根激活率与阈值脆弱性。
+- **特征根泛化诊断（2026-11-20，`feature_generalization_probe.py`）**：
+  对照臂 8 根中 **7 根 held-out 零激活**、7 根有“稀有合取”；平均
+  held-out 激活 3.15%（全部来自唯一一条宽规则，而它的 test precision
+  只有 0.333）。memory-credit 臂 **8/8 零激活**、平均 0%。典型死根：
+  `f0>2.357`（support 12，行为流/held-out 均 0%）、
+  `|f1|>0.959`（support 27，均 0%）、
+  `(f2<0.324 & (f3<-0.686 | f3>0.885))` 的瓶颈原语 held-out 0%。
+  **根因**：归纳只按 precision/z 选规则，无覆盖率门槛；极端阈值只在
+  planner 远端状态上高精度；验证集是同流 episode 切分，不覆盖 held-out
+  分布；合取中一个原语为 0 就整根死。
+  **修法（默认关）**：`--rule-min-coverage`（整条规则激活率）+
+  `--rule-min-primitive-coverage`（每个原语激活率）。A/B
+  `0.01/0.02`（3 种子）与门控后根激活探针运行中。
 - **死亡归因探针（2026-11-20，临时脚本 death_abstraction_probe.py，seed 101/3000 步）**：
   判别"抽象不足 vs 决策不足"：死亡前 5 决策的账本危险份额 **3.09** vs
   平稳段 1.08；死亡行分级威胁读出 **0.77** vs 平稳段中位 0.00——

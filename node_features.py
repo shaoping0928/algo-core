@@ -105,12 +105,20 @@ class FeatureRuleBank:
 
     def __init__(self, max_rules: int = 8, min_support: int = 5,
                  max_per_group: int = 8, min_z: float = 2.0,
-                 min_lift: float = 2.0):
+                 min_lift: float = 2.0, min_coverage: float = 0.0,
+                 min_primitive_coverage: float = 0.0):
         self.max_rules = int(max_rules)
         self.min_support = int(min_support)
         self.max_per_group = int(max_per_group)
         self.min_z = float(min_z)
         self.min_lift = float(min_lift)
+        # Coverage gates (fractions of the validation states): a rule must
+        # fire on enough states to be testable, and every conjunct/branch
+        # primitive must fire on enough of them that the composite is not
+        # dead on arrival.  Precision alone keeps extreme thresholds that
+        # only ever see rare planner states.
+        self.min_coverage = float(min_coverage)
+        self.min_primitive_coverage = float(min_primitive_coverage)
         self.rules: List[FeatureRule] = []
 
     # ---- candidates -------------------------------------------------------
@@ -214,6 +222,34 @@ class FeatureRuleBank:
         )
         considered = []
         seen = set()
+        primitive_rates = {}
+
+        def primitive_rate(predicate):
+            if predicate not in primitive_rates:
+                primitive_rates[predicate] = (
+                    float(predicate.mask(test_x).mean())
+                    if len(test_x) else 0.0
+                )
+            return primitive_rates[predicate]
+
+        def primitives_of(feature):
+            if isinstance(feature, Primitive):
+                return [feature]
+            result = []
+            for child in getattr(feature, "children", ()):
+                result.extend(primitives_of(child))
+            return result
+
+        def coverage_ok(feature, test_stats):
+            if self.min_coverage > 0.0 and len(test_x):
+                coverage = test_stats["support"] / float(len(test_x))
+                if coverage < self.min_coverage:
+                    return False
+            if self.min_primitive_coverage > 0.0:
+                for primitive in primitives_of(feature):
+                    if primitive_rate(primitive) < self.min_primitive_coverage:
+                        return False
+            return True
 
         def consider(feature, train_mask):
             key = train_mask.tobytes()
@@ -229,6 +265,8 @@ class FeatureRuleBank:
                 return
             test_mask = feature.mask(test_x)
             test_stats = _stats(test_mask, test_y)
+            if not coverage_ok(feature, test_stats):
+                return
             if test_stats["support"] <= 0:
                 # Rare causes can be absent from the held-out split.  Keep
                 # them as low-confidence hypotheses instead of discarding

@@ -281,6 +281,8 @@ class NodeRuntime:
         pain_horizon: Optional[int] = None,
         point_labels: bool = False,
         memory_credit: bool = False,
+        rule_min_coverage: float = 0.0,
+        rule_min_primitive_coverage: float = 0.0,
         voi_target: int = 3,
         voi_cell_cap: int = 16,
         voi_min_prior: float = 0.5,
@@ -580,7 +582,10 @@ class NodeRuntime:
             for action in self.action_space
         }
         self.last_action_probs = (1.0, 0.0)
-        self.rules = FeatureRuleBank()
+        self.rules = FeatureRuleBank(
+            min_coverage=rule_min_coverage,
+            min_primitive_coverage=rule_min_primitive_coverage,
+        )
         # Optional second bank induced on a longer precursor window; roots
         # installed from it carry their own `pain_horizon` tag.
         self.rules_long = None

@@ -36,7 +36,8 @@ def _rate(mask):
     return float(mask.mean()) if mask.size else 0.0
 
 
-def run(seed, eval_seeds, memory_credit):
+def run(seed, eval_seeds, memory_credit,
+        rule_min_coverage=0.0, rule_min_primitive_coverage=0.0):
     world, agent = fit(
         seed,
         steps=1500, epochs=3, max_nodes=1000,
@@ -46,6 +47,8 @@ def run(seed, eval_seeds, memory_credit):
         dagger_frames=3000, dagger_horizon=8,
         step_stride=2,
         memory_credit=memory_credit,
+        rule_min_coverage=rule_min_coverage,
+        rule_min_primitive_coverage=rule_min_primitive_coverage,
     )
     behavior, _counts = collect(seed, 1500, coverage=0.1, lag=3)
     behavior_obs = np.asarray(
@@ -121,10 +124,16 @@ def main():
     parser.add_argument("--seed", type=int, default=100)
     parser.add_argument("--eval-seeds", default="120-124")
     parser.add_argument("--memory-credit", action="store_true")
+    parser.add_argument("--rule-min-coverage", type=float, default=0.0)
+    parser.add_argument(
+        "--rule-min-primitive-coverage", type=float, default=0.0
+    )
     parser.add_argument("--report", default="")
     args = parser.parse_args()
     report = run(
-        args.seed, parse_seed_spec(args.eval_seeds), args.memory_credit
+        args.seed, parse_seed_spec(args.eval_seeds), args.memory_credit,
+        rule_min_coverage=args.rule_min_coverage,
+        rule_min_primitive_coverage=args.rule_min_primitive_coverage,
     )
     print(json.dumps(report, indent=2, default=str))
     if args.report:
