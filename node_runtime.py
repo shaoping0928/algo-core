@@ -1851,14 +1851,27 @@ class NodeRuntime:
                 end += 1
             pooled.extend([total / count] * (end - start))
             start = end
-        self.readout_calibration = (edges.tolist(), pooled)
+        # Interpolation nodes: each bin's midpoint, with the unbounded
+        # edge bins pinned just outside the finite range so np.interp
+        # clamps the tails to the end rates.
+        finite = edges[1:-1]
+        mids = []
+        for index in range(len(rates)):
+            low, high = edges[index], edges[index + 1]
+            if not np.isfinite(low):
+                low = finite[0] - 1.0
+            if not np.isfinite(high):
+                high = finite[-1] + 1.0
+            mids.append((low + high) / 2.0)
+        self.readout_calibration = (np.asarray(mids, dtype=float),
+                                    np.asarray(pooled, dtype=float))
 
     def _calibrate_threat(self, threat: np.ndarray) -> np.ndarray:
         calibration = getattr(self, "readout_calibration", None)
         if calibration is None:
             return threat
-        edges, rates = calibration
-        return np.interp(threat, edges[1:-1], rates)
+        mids, rates = calibration
+        return np.interp(threat, mids, rates)
 
     def pain_graded_batch(self, states: np.ndarray,
                           mask_table: Optional[List] = None):
@@ -1923,10 +1936,10 @@ class NodeRuntime:
                     reads[action_key] = base
             calibration = getattr(self, "readout_calibration", None)
             if calibration is not None:
-                edges, rates = calibration
+                mids, rates = calibration
                 for action_key in reads:
                     reads[action_key] = float(np.interp(
-                        reads[action_key], edges[1:-1], rates
+                        reads[action_key], mids, rates
                     ))
             threat_root = min(reads[action_key]
                               for action_key in self.action_space)
