@@ -90,7 +90,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            value_trust_samples: float = 150.0, control_risk_weight: float = 0.0,
         value_bank_only: bool = False,
         value_dispersion=False, iterative_induction=False,
-        compose_readout: bool = True):
+        compose_readout: bool = True, importance_weighting=False):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -134,6 +134,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         value_trust_samples=value_trust_samples,
         control_risk_weight=control_risk_weight,
         value_bank_only=value_bank_only,
+        importance_weighting=importance_weighting,
     )
     episodes = {}
     for row in transitions:
@@ -352,7 +353,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         event_memory_risk=True, contrast_objective=False,
         value_trust_samples=150.0, value_dispersion=False,
         control_risk_weight=0.0, value_bank_only=False,
-        iterative_induction=False, compose_readout=True):
+        iterative_induction=False, compose_readout=True,
+        importance_weighting=False):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -486,6 +488,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         value_dispersion=value_dispersion,
         iterative_induction=iterative_induction,
         compose_readout=compose_readout,
+        importance_weighting=importance_weighting,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -837,6 +840,9 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
                 terminal=bool(env.dead),
                 done=bool(env.dead),
                 episode=int(episode),
+                # The planner's choice is deterministic: its rows are
+                # already on the target policy, so their IS weight is one.
+                propensity=1.0,
             ))
         recent = [float(action)] + recent[:-1]
     return env.t, actions, transitions
@@ -892,6 +898,7 @@ def run_seed(task):
     value_bank_only = bool(task.get("value_bank_only", False))
     iterative_induction = bool(task.get("iterative_induction", False))
     compose_readout = bool(task.get("compose_readout", True))
+    importance_weighting = bool(task.get("importance_weighting", False))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -943,6 +950,7 @@ def run_seed(task):
         value_bank_only=value_bank_only,
         iterative_induction=iterative_induction,
         compose_readout=compose_readout,
+        importance_weighting=importance_weighting,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1107,6 +1115,13 @@ def main():
                              "pain_signal_batch instead of the stacked "
                              "non-negative composition fitted to the "
                              "precursor labels")
+    parser.add_argument("--importance-weighting", action="store_true",
+                        help="weight each window label by the clipped "
+                             "product of uniform-target propensity "
+                             "ratios over the window's governing "
+                             "actions, rebalancing the cells' "
+                             "state-action mix away from the behavior "
+                             "policy's occupancy")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -1261,6 +1276,7 @@ def main():
             value_bank_only=args.value_bank_only,
             iterative_induction=args.iterative_induction,
             compose_readout=args.compose_readout,
+            importance_weighting=args.importance_weighting,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,

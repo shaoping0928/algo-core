@@ -147,6 +147,7 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
             behavior_p = float(np.clip(center + offset, 0.0, 1.0))
             action = int(draw < behavior_p)
             propensity = behavior_p
+            overridden = False
             if coverage > 0.0 and rng.rand() < coverage:
                 # Generic action-coverage exploration: choose the less-used action
                 # in the current observation bucket. This uses no task geometry.
@@ -156,11 +157,13 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
                     counts[1] == counts[0] and rng.rand() < 0.5
                 ))
                 propensity = 0.5
+                overridden = True
             if guide is not None and spent < int(budget):
                 tested = guide(obs)
                 if tested is not None:
                     action = int(tested)
                     propensity = 1.0
+                    overridden = True
                     spent += 1
             if propensities is not None:
                 propensities.append(propensity)
@@ -180,6 +183,16 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
                 signals=signals, terminal=bool(env.dead),
                 done=bool(env.dead),
                 episode=episode,
+                # The sampling probability of the emitted action under the
+                # behavior policy: P(a=1) is `behavior_p`, so the taken
+                # action's propensity is 1 - behavior_p when a=0.  The
+                # coverage and guide overrides carry their own probability.
+                # Nothing here consumes an rng draw, so the pinned behavior
+                # stream is untouched.
+                propensity=(
+                    float(propensity) if overridden
+                    else (behavior_p if action == 1 else 1.0 - behavior_p)
+                ),
             ))
             done += 1
         episode += 1

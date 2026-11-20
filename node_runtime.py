@@ -275,6 +275,7 @@ class NodeRuntime:
         feature_rate: float = 0.05,
         feature_action_prior: float = 2.0,
         association_prior: float = 2.0,
+        importance_weighting: bool = False,
         pain_horizon: Optional[int] = None,
         voi_target: int = 3,
         voi_cell_cap: int = 16,
@@ -422,6 +423,16 @@ class NodeRuntime:
         # instead of a base rate.
         self._association_stats = {}
         self._association_global = [0, 0.0]
+        # Per-decision clipped importance weighting (P1): when on, each
+        # transition's window label is weighted by the clipped product of
+        # uniform-target propensity ratios over the window's governing
+        # actions, so cells estimate their conditional rates on a
+        # state-action mix closer to uniform instead of the behavior
+        # policy's occupancy.  The clip min(1, target/b) bounds the
+        # variance (Retrace-style); rows without a propensity read one
+        # and stay unweighted.
+        self.importance_weighting = bool(importance_weighting)
+        self.importance_target = 1.0 / len(self.action_space)
         self.action_temperature = float(action_temperature)
         self.action_uncertainty = float(action_uncertainty)
         # Per (feature root, acting action) pain statistics.  The acting
@@ -1576,6 +1587,11 @@ class NodeRuntime:
         }
         value_roots_all = self._all_value_roots()
         steps = []
+        # Per-row propensities within the episode: the window's clipped
+        # importance weight needs the propensities of the governing
+        # actions, which are the current row's action and the ones issued
+        # up to `lag` rows earlier.  Cleared at episode boundaries.
+        recent_propensities: List[float] = []
         for index, row in enumerate(rows):
             action = int(row["history"][0])
             if action not in self.action_space:
@@ -1584,6 +1600,22 @@ class NodeRuntime:
             if signals.shape != (2,) or not np.isfinite(signals).all():
                 raise ValueError("signals must contain finite valence")
             done = bool(row["done"])
+            # Per-decision clipped importance weight toward the uniform
+            # target over the window's governing actions (the current
+            # row's propensity plus up to `lag` earlier ones).  Rows
+            # without a stored propensity read one - unweighted.
+            row_propensity = float(row.get("propensity", 1.0))
+            row_weight = 1.0
+            if self.importance_weighting:
+                row_weight = 1.0
+                for propensity in (
+                    recent_propensities[-self.lag:] + [row_propensity]
+                ):
+                    behavior = max(propensity, 1e-9)
+                    row_weight *= min(
+                        1.0, self.importance_target / behavior
+                    )
+            recent_propensities.append(row_propensity)
             state = self.encode(row["obs"])
             current = self._assign(state, create=True, count=True)
             self._component_step(current)
@@ -1667,7 +1699,8 @@ class NodeRuntime:
                     )
             for horizon, horizon_ids in active_by_horizon.items():
                 self._update_feature_pain(
-                    horizon_ids, labels_by_horizon[horizon][index]
+                    horizon_ids, labels_by_horizon[horizon][index],
+                    weight=row_weight,
                 )
             # Action-conditioned statistics: the action acting on the
             # transition s_m -> s_{m+1} was issued `lag` steps earlier
@@ -1678,6 +1711,7 @@ class NodeRuntime:
                         horizon_ids,
                         acting,
                         labels_by_horizon[horizon][index],
+                        weight=row_weight,
                     )
             entered = self.graph.nodes[next_node]
             entered.immediate_pain += self.alpha_now * (
@@ -1704,25 +1738,29 @@ class NodeRuntime:
             steps.append((
                 current, action, next_node, float(signals[1]),
                 float(signals[0]), done, sources, signature,
-                acting, value_roots,
+                acting, value_roots, row_weight,
             ))
             if done:
                 self.reset()
+                recent_propensities.clear()
 
         running_pain = 0.0
         running_dopamine = 0.0
-        # Short-horizon value attribution bootstraps from the pre-update node
-        # value of the state `value_horizon` steps ahead, so the k-step target
-        # keeps the return scale of the MC path while crediting only the
-        # actions inside the horizon.
-        value_snapshot = (
-            {key: node.value for key, node in self.graph.nodes.items()}
+        # Short-horizon value attribution bootstraps from the pre-update
+        # dopamine value of the state `value_horizon` steps ahead, so the
+        # k-step target keeps the return scale of the MC path while
+        # crediting only the actions inside the horizon.  The snapshot
+        # reads the dopamine channel - the same quantity the cells
+        # estimate - not the pain channel.
+        dopamine_snapshot = (
+            {key: node.dopamine + node.immediate_dopamine
+             for key, node in self.graph.nodes.items()}
             if self.value_horizon else None
         )
         for position in range(len(steps) - 1, -1, -1):
             (current, action, next_node, pain, dopamine,
              terminal, sources, signature, acting,
-             value_roots) = steps[position]
+             value_roots, row_weight) = steps[position]
             return_pain = pain + (
                 0.0 if terminal else self.gamma * running_pain
             )
@@ -1760,12 +1798,13 @@ class NodeRuntime:
                 # becomes readable where the pain hazard only says "local".
                 target = (
                     self._k_step_value_target(
-                        steps, position, value_snapshot
+                        steps, position, dopamine_snapshot
                     )
-                    if value_snapshot is not None else return_dopamine
+                    if dopamine_snapshot is not None else return_dopamine
                 )
                 self._update_feature_value(
-                    value_roots, acting, target, rows[0].get("episode")
+                    value_roots, acting, target, rows[0].get("episode"),
+                    weight=row_weight,
                 )
             if terminal:
                 entered = self.graph.nodes[next_node]
@@ -1944,8 +1983,10 @@ class NodeRuntime:
             stack.extend(self._feature_children.get(node_id, ()))
         return descendants
 
-    def _update_feature_pain(self, feature_ids, pain: float) -> None:
+    def _update_feature_pain(self, feature_ids, pain: float,
+                             weight: float = 1.0) -> None:
         pain = float(pain)
+        weight = float(weight)
         for node_id in feature_ids:
             node = self.graph.nodes.get(node_id)
             if node is None:
@@ -1954,18 +1995,26 @@ class NodeRuntime:
             # marginal pain rate.  A constant-rate EMA would leave a
             # residual noise floor that never decays with more data, and
             # every thin cell inherits that noise through this anchor.
-            node.count += 1
-            node.value += (pain - node.value) / node.count
+            # `weight` scales the effective sample size - the clipped
+            # importance weight when importance weighting is on.
+            node.count += weight
+            node.value += weight * (pain - node.value) / node.count
 
     def _update_feature_action(self, feature_ids, action: int,
-                               pain: float) -> None:
-        """Accumulate P(pain | feature active, acting action) cells."""
+                               pain: float, weight: float = 1.0) -> None:
+        """Accumulate P(pain | feature active, acting action) cells.
+
+        `weight` scales the cell's effective sample size - the clipped
+        per-decision importance weight when importance weighting is on,
+        plain one otherwise.
+        """
         pain = float(pain)
+        weight = float(weight)
         for node_id in feature_ids:
             cells = self.feature_action_stats.setdefault(node_id, {})
             cell = cells.setdefault(int(action), [0, 0.0])
-            cell[0] += 1
-            cell[1] += pain
+            cell[0] += weight
+            cell[1] += weight * pain
 
     def _feature_cell_read(self, node_id: str, acting: int):
         """One root's readout value under one acting action, with support."""
@@ -2358,11 +2407,14 @@ class NodeRuntime:
         return action
 
     def _k_step_value_target(self, steps, position, snapshot):
-        """k-step dopamine return with a bootstrap from the pre-update node
-        value of the state `value_horizon` steps ahead.
+        """k-step dopamine return with a bootstrap from the pre-update
+        dopamine value of the state `value_horizon` steps ahead.
 
-        Truncation at the episode end simply sums the rewards that actually
-        happened (the same convention as the MC path at a terminal step).
+        The bootstrap reads the graph's dopamine value (the same channel
+        the cells estimate) - snapshotting the pain channel here would
+        inject a hazard level into a return target.  Truncation at the
+        episode end simply sums the rewards that actually happened (the
+        same convention as the MC path at a terminal step).
         """
         total = 0.0
         discount = 1.0
@@ -2379,29 +2431,34 @@ class NodeRuntime:
 
     def _update_feature_value(self, feature_ids, acting: int,
                               value: float,
-                              episode_id=None) -> None:
+                              episode_id=None, weight: float = 1.0) -> None:
         """Accumulate E[discounted dopamine return | feature, acting].
 
         Each cell also tracks how many distinct episodes (world instances)
         contributed to it - repetition inside one episode is not the same
         evidence as coverage across episodes, and the trust readout uses
-        the distinct count.
+        the distinct count.  `weight` scales the cell's effective sample
+        size (the clipped importance weight when importance weighting is
+        on); the diversity tally stays unweighted - it counts distinct
+        episodes, not evidence mass.
         """
         value = float(value)
+        weight = float(weight)
         for node_id in feature_ids:
             cells = self.feature_value_stats.setdefault(node_id, {})
             cell = cells.setdefault(int(acting), [0, 0.0, {}])
-            cell[0] += 1
-            cell[1] += value
+            cell[0] += weight
+            cell[1] += weight * value
             if episode_id is not None:
                 cell[2][episode_id] = cell[2].get(episode_id, 0) + 1
         # 1/n cumulative mean of the value targets: the anchor converges
         # to the stream's marginal mean return instead of tracking a
         # 50-event recency window whose wander is the same order as the
         # per-action differences it is meant to stabilize.
-        self._value_baseline_count += 1
+        self._value_baseline_count += weight
         self.value_baseline += (
-            (value - self.value_baseline) / self._value_baseline_count
+            weight * (value - self.value_baseline)
+            / self._value_baseline_count
         )
 
     def feature_value_batch(self, states: np.ndarray,

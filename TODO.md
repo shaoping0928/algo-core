@@ -98,6 +98,36 @@
     组合层。142 测试全过（新增 _nnls/组合拟合/回退 3 条——其中
     _nnls 测试纠正了一个经典误设：裁剪无约束解 ≠ NNLS 最优，
     边界面上的 [0.5, 0] 才是）。
+- **P1 剩余已实施（2026-11-20，本轮）**：
+  - **propensity 入行**：`collect` 行携带所发动作的行为采样概率
+    （P(a=1)=behavior_p → a=0 时 1−behavior_p；coverage/guide 覆盖
+    携带自身概率；显式 overridden 旗标避免 behavior_p 恰好等于
+    覆盖值时的边界错误）；`evaluate`（规划器行）= 1.0（确定性选择
+    已在目标策略上）。**不消耗 rng 抽取**——pinned hash 不变（测试
+    仍在过）。
+  - **逐决策截断 IS（默认关，`--importance-weighting`）**：行权 =
+    Π min(1, target/b) over 窗口掌管动作（当前行 + 至多 lag 行，
+    episode 内）；**target = 1/|action_space|**（任务无关——从动作
+    空间维度导出，非硬编码）。截断限方差（Retrace 式）；无 propensity
+    的行读 1（不加权）。
+  - **加权传播**：`_update_feature_action`/`_update_feature_value`/
+    `_update_feature_pain` 都收 `weight`（有效样本量缩放；count 变
+    有效样本量，diversity 字典不加权——它数的是不同 episode 数）；
+    价值基线 1/n 均值同样加权。
+  - **k 步 bootstrap 通道修复**：snapshot 从 pain 通道
+    （node.value）改为 **dopamine 通道（node.dopamine +
+    immediate_dopamine）**——旧路径把危险水平注入回报目标（B 审计
+    的缺陷）；value_horizon 默认 0，路径修复后启用时才生效。
+    **DR 的模型 rollout 版（反事实世界模型预测接进 learn_episode）
+    记录在案，属 P4 执行计划数据流领地**。
+  - **fast A/B（graded+dispersion ± IS）**：56.2 vs 46.1——2/3 升
+    （+4、+45）、1/3 降（−19）：方向混合、效应温和，与机制分析一致
+    （条件格子无偏可纠，IS 只是状态-动作混合再平衡）。**默认关，
+    与 P3 组合再验**。
+  - 测试 142 → 146（IS 加权、k 步 dopamine 算术、两遍 episode
+    bootstrap 通道判别、collect propensity 范围；其中两个期望修正
+    暴露了真实机制：安装播种计数进锚点、前向 immediate 更新先于
+    快照）。
 - 所有后台实验已停止，代码与文档已提交；工作树应为干净。
 - **资源裁定（2026-11-20，用户）**：验证运行**每轮共 3 个种子**
   （`--jobs 3` 一波跑完），臂与臂串行；**默认验证任务 5–10 分钟内出

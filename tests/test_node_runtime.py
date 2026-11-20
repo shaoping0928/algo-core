@@ -1492,6 +1492,150 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(float(read[0]), 11.0 / 12.0, places=9)
         self.assertAlmostEqual(float(read[1]), 0.5, places=9)
 
+    def test_importance_weighting_scales_the_cell_evidence(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40,
+            importance_weighting=True,
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        rows = [
+            dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
+                history=np.asarray([1.0, 0.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+                propensity=0.9,
+            ),
+            dict(
+                obs=np.asarray([1.0]), next_obs=np.asarray([2.0]),
+                history=np.asarray([0.0, 1.0]),
+                signals=np.asarray([1.0, 1.0]), done=True, episode=0,
+                propensity=0.1,
+            ),
+        ]
+        runtime.learn_episode(rows)
+        cells = runtime.feature_action_stats[feature_id]
+        # Each row's window weight is the clipped product of
+        # uniform-target ratios over the governing actions.  Row 0:
+        # window = [0.9] -> min(1, 0.5/0.9).  Row 1: window = [0.9, 0.1]
+        # -> the product clips the rare action's ratio at one.
+        row0 = min(1.0, 0.5 / 0.9)
+        self.assertAlmostEqual(cells[0][0], row0, places=9)
+        self.assertAlmostEqual(cells[1][0], row0, places=9)
+        # The anchor's effective sample size scales the same way, on top
+        # of the install seeding (count = rule support = 5).
+        node = runtime.graph.nodes[feature_id]
+        self.assertAlmostEqual(node.count, 5.0 + 2.0 * row0, places=9)
+        # Off: the same rows leave plain integer counts.
+        plain = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40,
+        )
+        plain.rules.rules = runtime.rules.rules
+        plain.install_feature_rules()
+        plain.learn_episode(rows)
+        plain_cells = plain.feature_action_stats[plain.feature_ids[0]]
+        self.assertEqual(plain_cells[0][0], 1)
+        self.assertEqual(plain_cells[1][0], 1)
+
+    def test_value_cells_bootstrap_from_the_dopamine_channel(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=0, scales=np.asarray([1.0]), max_nodes=40, gamma=0.5
+        )
+        runtime.value_horizon = 1
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 0.5), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules(channel="value")
+        feature_id = runtime.value_feature_ids[0]
+        episode_one = [
+            dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
+                history=np.asarray([0.0]),
+                signals=np.asarray([2.0, 0.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([1.0]), next_obs=np.asarray([2.0]),
+                history=np.asarray([0.0]),
+                signals=np.asarray([4.0, 1.0]), done=True, episode=0,
+            ),
+        ]
+        runtime.learn_episode(episode_one)
+        # The bootstrap snapshot is taken before the backward pass but
+        # after the forward pass, so the entered node's immediate
+        # dopamine (0.2 * 2.0) is already visible: the first pass's
+        # target is 2.0 + 0.5 * 0.4 = 2.2.
+        cell = runtime.feature_value_stats[feature_id][0]
+        self.assertAlmostEqual(cell[1], 2.2, places=9)
+        # Second pass: the middle node now carries a dopamine value.  The
+        # bootstrap must read the dopamine channel (dopamine + immediate),
+        # not the pain value planted next to it.  The forward pass of the
+        # second episode moves the immediate again (0.2 * 2.0).
+        middle = None
+        for node_id, node in runtime.graph.nodes.items():
+            features = getattr(node, "features", None)
+            if node.kind == "concept" and features is not None and (
+                np.allclose(features, [1.0])
+            ):
+                middle = node_id
+                break
+        self.assertIsNotNone(middle)
+        runtime.graph.nodes[middle].value = 7.0
+        runtime.graph.nodes[middle].dopamine = 6.0
+        runtime.graph.nodes[middle].immediate_dopamine = 0.0
+        episode_two = [
+            dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
+                history=np.asarray([0.0]),
+                signals=np.asarray([2.0, 0.0]), done=False, episode=1,
+            ),
+            dict(
+                obs=np.asarray([1.0]), next_obs=np.asarray([2.0]),
+                history=np.asarray([0.0]),
+                signals=np.asarray([4.0, 1.0]), done=True, episode=1,
+            ),
+        ]
+        runtime.learn_episode(episode_two)
+        # Target = 2.0 + 0.5 * (6.0 + 0.4) = 5.2; the pain value 7.0
+        # would have produced 5.5.
+        self.assertAlmostEqual(cell[1], 2.2 + 5.2, places=9)
+
+    def test_k_step_target_arithmetic(self):
+        runtime = self.make_runtime(gamma=0.5)
+        runtime.value_horizon = 2
+        ahead = runtime._create_node(np.asarray([0.0]))
+        steps = [
+            (None, 0, "n0", 0.0, 1.0, False, (), (), 0, (), 1.0),
+            (None, 0, ahead, 0.0, 1.0, False, (), (), 0, (), 1.0),
+            (None, 0, "n2", 0.0, 1.0, True, (), (), 0, (), 1.0),
+        ]
+        snapshot = {ahead: 8.0}
+        # 1 + 0.5*1 + 0.25*8 = 3.5, truncated at the episode end.
+        self.assertAlmostEqual(
+            runtime._k_step_value_target(steps, 0, snapshot), 3.5
+        )
+        # Position 2 (terminal): reward only.
+        self.assertAlmostEqual(
+            runtime._k_step_value_target(steps, 2, snapshot), 1.0
+        )
+
+    def test_collect_rows_carry_the_action_propensity(self):
+        from substrate_generic import collect
+
+        transitions, _ = collect(101, 30, coverage=0.1, lag=3)
+        for row in transitions:
+            self.assertTrue(0.0 <= float(row["propensity"]) <= 1.0)
+
 
 class PlanScoreTests(unittest.TestCase):
     def test_plan_score_matches_search_selection(self):
