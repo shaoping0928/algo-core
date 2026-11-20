@@ -58,6 +58,33 @@ def value_dispersion_labels(returns, quantile: float) -> np.ndarray:
     return ((returns > high_cut) | (returns < low_cut)).astype(float)
 
 
+def _graded_holdout_loss(agent, enc: np.ndarray, labels: np.ndarray,
+                         mask: np.ndarray, exclude=()) -> Optional[float]:
+    """Mean absolute error of the graded threat read on held-out rows.
+
+    The loss the structure generations must not worsen: the calibrated
+    threat read against the realized window labels, over the held-out
+    rows where some root fires.  `exclude` temporarily withdraws roots
+    from the readout (a reversible attribute swap, so the same rows and
+    calibration are read with and without a candidate generation's
+    roots) - that is what makes the backfit test exact.
+    """
+    saved = list(getattr(agent, "feature_ids", ()))
+    if not saved:
+        return None
+    if exclude:
+        dropped = set(exclude)
+        agent.feature_ids = [fid for fid in saved if fid not in dropped]
+    try:
+        threat, _excess = agent.pain_graded_batch(enc)
+    finally:
+        agent.feature_ids = saved
+    scope = (threat > 0.0) & mask
+    if not scope.any():
+        return None
+    return float(np.mean(np.abs(threat[scope] - labels[scope])))
+
+
 def _encoded_pending(rows, lag: int) -> np.ndarray:
     """The pending-action window the runtime's own encoder pairs with each row.
 
@@ -186,6 +213,12 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
     episode_index = np.searchsorted(order, groups)
     test = (episode_index % 5 == 4)
     train = ~test
+    # Structure generations pending their held-out backfit (P3): the roots
+    # a gap generation installed, tested against the exact counterfactual
+    # at the next generation and rolled back if they made the held-out
+    # readout worse.
+    pending_roots: List[str] = []
+    agent.generation_log = []
 
     for epoch in range(epochs):
         for episode in ordered:
@@ -267,6 +300,31 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                 agent.fit_readout_calibration(
                     states, pending_all, pain_short
                 )
+            if pending_roots:
+                # LS_Boost backfitting: the previous generation stays
+                # only if the held-out loss is better with its roots
+                # than without them - the counterfactual is exact, the
+                # same rows and calibration read with and without.
+                loss_with = _graded_holdout_loss(
+                    agent, enc_all, pain_short, test
+                )
+                loss_without = _graded_holdout_loss(
+                    agent, enc_all, pain_short, test, exclude=pending_roots
+                )
+                rolled_back = (
+                    loss_with is None or loss_without is None
+                    or loss_with > loss_without
+                )
+                if rolled_back:
+                    agent.uninstall_feature_rules(pending_roots)
+                agent.generation_log.append(dict(
+                    epoch=epoch,
+                    tested=len(pending_roots),
+                    loss_with=loss_with,
+                    loss_without=loss_without,
+                    rolled_back=bool(rolled_back),
+                ))
+                pending_roots = []
             threat_read, _excess_read = agent.pain_graded_batch(enc_all)
             negative_levels = threat_read[pain_short <= 0.5]
             cut = float(np.median(negative_levels)) if len(
@@ -280,9 +338,13 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                     states[test], (pain_short * missed_short)[test],
                 )
                 if gap_bank.rules:
+                    before = set(agent.feature_ids)
                     agent.install_feature_rules(
                         gap_bank.rules, horizon=lag + 1
                     )
+                    pending_roots = [
+                        fid for fid in agent.feature_ids if fid not in before
+                    ]
             missed_long = (pain > 0.5) & (threat_read <= cut)
             if missed_long.sum() >= 5 and long_window is not None:
                 gap_long = FeatureRuleBank()
@@ -291,8 +353,12 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                     states[test], (pain * missed_long)[test],
                 )
                 if gap_long.rules:
+                    before = set(agent.feature_ids)
                     agent.install_feature_rules(
                         gap_long.rules, horizon=long_window
+                    )
+                    pending_roots.extend(
+                        fid for fid in agent.feature_ids if fid not in before
                     )
     if (
         compose_readout and precursor_labels and len(states)
@@ -319,6 +385,28 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         # accounting and the planner's comparisons recover their meaning.
         pending_final = _encoded_pending(transitions, lag)
         agent.fit_readout_calibration(states, pending_final, pain_short)
+    if pending_roots and contrast_objective:
+        # The last generation never met a backfit test inside the loop;
+        # run it once against the final calibration.
+        pending_final = _encoded_pending(transitions, lag)
+        enc_all = np.concatenate([states, pending_final], axis=1)
+        loss_with = _graded_holdout_loss(agent, enc_all, pain_short, test)
+        loss_without = _graded_holdout_loss(
+            agent, enc_all, pain_short, test, exclude=pending_roots
+        )
+        rolled_back = (
+            loss_with is None or loss_without is None
+            or loss_with > loss_without
+        )
+        if rolled_back:
+            agent.uninstall_feature_rules(pending_roots)
+        agent.generation_log.append(dict(
+            epoch=epochs - 1,
+            tested=len(pending_roots),
+            loss_with=loss_with,
+            loss_without=loss_without,
+            rolled_back=bool(rolled_back),
+        ))
     return world, agent
 
 

@@ -1681,6 +1681,96 @@ class NodeRuntimeTests(unittest.TestCase):
             self.assertGreaterEqual(hazard, 0.0)
             self.assertLessEqual(value_share, 0.0)
 
+    def test_uninstall_withdraws_root_registrations_only(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        rule = FeatureRule(
+            Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+        )
+        runtime.rules.rules = [rule]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        runtime.uninstall_feature_rules([feature_id])
+        self.assertEqual(runtime.feature_ids, [])
+        self.assertNotIn(feature_id, runtime._feature_all)
+        self.assertNotIn(feature_id, runtime._feature_objects)
+        # The materialization key is kept: re-installing the same rule
+        # returns the existing node instead of duplicating it.
+        runtime.install_feature_rules()
+        self.assertEqual(runtime.feature_ids, [feature_id])
+
+    def test_graded_holdout_loss_computes_the_backfit_counterfactual(self):
+        from node_features import FeatureRule, Primitive
+        from substrate_nodes import _graded_holdout_loss
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        good_rule = FeatureRule(
+            Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+        )
+        bad_rule = FeatureRule(
+            Primitive(0, True, ">", 3.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+        )
+        runtime.rules.rules = [good_rule, bad_rule]
+        runtime.install_feature_rules([good_rule], horizon=2)
+        runtime.install_feature_rules([bad_rule], horizon=2)
+        good_id, bad_id = runtime.feature_ids
+        # The good root reads its clean action slightly above zero (so
+        # the fired-scope proxy keeps it); the bad root flags clean
+        # states as dangerous.
+        runtime.graph.nodes[good_id].value = 0.1
+        runtime.graph.nodes[bad_id].value = 0.9
+        runtime._update_feature_action([good_id], 0, 0.0)
+        runtime._update_feature_action([good_id], 0, 0.0)
+        runtime._update_feature_action([good_id], 1, 1.0)
+        runtime._update_feature_action([bad_id], 0, 1.0)
+        runtime._update_feature_action([bad_id], 0, 1.0)
+        runtime._update_feature_action([bad_id], 1, 1.0)
+        enc = np.asarray([
+            [0.5, 0.0], [0.5, 0.0], [4.0, 0.0], [4.0, 0.0],
+        ])
+        labels = np.zeros(4)
+        mask = np.ones(4, dtype=bool)
+        # Good root: threat = min(read0, read1) = (0 + 2*0.1)/4 = 0.05.
+        # Bad root: min((2+1.8)/4, (1+1.8)/3) = 0.9333...
+        loss_all = _graded_holdout_loss(runtime, enc, labels, mask)
+        self.assertAlmostEqual(loss_all, (0.05 + 0.9333333333) / 2, places=6)
+        # The exact counterfactual: the same rows read without the
+        # generation's roots - the bad root's false alarm is gone.
+        loss_without = _graded_holdout_loss(
+            runtime, enc, labels, mask, exclude=[bad_id]
+        )
+        self.assertAlmostEqual(loss_without, 0.05, places=9)
+        self.assertLess(loss_without, loss_all)
+        # The swap is reversible: the full readout is intact.
+        self.assertEqual(runtime.feature_ids, [good_id, bad_id])
+
+    def test_iterative_generations_record_their_backfit(self):
+        from substrate_generic import collect
+        from substrate_nodes import _train
+
+        transitions, _ = collect(101, 240, coverage=0.1, lag=3)
+        world, agent = _train(
+            transitions, seed=101, epochs=3, lag=3, max_nodes=200,
+            birth_threshold=0.45, component_kinds=(), component_min_count=8,
+            max_components=0, component_weight=0.5, component_gating=False,
+            memory_weight=0.1, association_rate=0.0, induce_features=True,
+            precursor_labels=True, pain_horizon=None, voi_target=3,
+            feature_value_weight=0.02, contrast_objective=True,
+            iterative_induction=True,
+        )
+        # Every generation's install meets a held-out backfit test; the
+        # log records the two losses and the keep-or-rollback verdict.
+        self.assertIsInstance(agent.generation_log, list)
+        for entry in agent.generation_log:
+            self.assertIn("loss_with", entry)
+            self.assertIn("loss_without", entry)
+            self.assertIn("rolled_back", entry)
+
     def test_variance_birth_splits_a_mixed_cell(self):
         runtime = self.make_runtime(
             lag=0, scales=np.asarray([1.0]), max_nodes=40,
@@ -1724,6 +1814,9 @@ class NodeRuntimeTests(unittest.TestCase):
         runtime.graph.nodes[first_id].value = 1.0
         runtime.graph.nodes[runtime._prototype_ids[2]].value = 5.0
         runtime._association_stats[first_id] = [3, 1.0]
+        # An episode boundary: the nodes assigned so far belong to past
+        # episodes and become prune candidates again.
+        runtime.reset()
         # A fourth distinct state is blocked by the budget: the least
         # useful prototype merges into its nearest neighbour and the
         # birth proceeds, so the cover keeps refining at the cap.

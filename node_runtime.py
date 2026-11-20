@@ -447,6 +447,10 @@ class NodeRuntime:
         # Population variance bar for refinement births, recomputed once
         # per episode (an O(nodes) pass per row would dominate training).
         self._variance_bar = None
+        # Prototype ids the running episode already assigned: a prune
+        # must never remove a node the episode's backward pass still
+        # references, so victims come from the rest of the cover.
+        self._episode_nodes: set = set()
         self.action_temperature = float(action_temperature)
         self.action_uncertainty = float(action_uncertainty)
         # Per (feature root, acting action) pain statistics.  The acting
@@ -676,9 +680,11 @@ class NodeRuntime:
                 # The budget blocks the birth: consolidate the least
                 # useful prototype into its neighbour first (GNG-U), so
                 # the cover keeps refining instead of absorbing far
-                # states into stale cells forever.
-                self._prune_prototypes()
-                node_id = self._create_node(state)
+                # states into stale cells forever.  Nodes the running
+                # episode still references are not candidates.
+                self._prune_prototypes(exclude=self._episode_nodes)
+                if len(self._prototype_ids) < self.max_nodes:
+                    node_id = self._create_node(state)
         elif create and self.variance_births and self._variance_split(
             node_id, distance
         ):
@@ -688,10 +694,12 @@ class NodeRuntime:
             if len(self._prototype_ids) < self.max_nodes:
                 node_id = self._create_node(state)
             elif self.utility_pruning and len(self._prototype_ids) > 1:
-                self._prune_prototypes()
-                node_id = self._create_node(state)
+                self._prune_prototypes(exclude=self._episode_nodes)
+                if len(self._prototype_ids) < self.max_nodes:
+                    node_id = self._create_node(state)
         if count:
             self.graph.nodes[node_id].count += 1
+        self._episode_nodes.add(node_id)
         return node_id
 
     def _refresh_variance_bar(self) -> None:
@@ -729,7 +737,7 @@ class NodeRuntime:
             return False
         return distance > 0.5 * self.birth_threshold
 
-    def _prune_prototypes(self) -> Optional[str]:
+    def _prune_prototypes(self, exclude=()) -> Optional[str]:
         """Remove the least useful prototype, merging it into its neighbour.
 
         Utility follows the growing-neural-gas principle - the error a
@@ -739,7 +747,9 @@ class NodeRuntime:
         a distinct outcome is expensive to delete and survives; a
         near-duplicate of its neighbour is cheap and merges first, its
         statistics carried over as count-weighted means so no evidence is
-        lost, only consolidated.
+        lost, only consolidated.  `exclude` names nodes that must not be
+        removed - the running episode's own assignments, whose backward
+        pass still references them.
         """
         count_all = len(self._prototype_ids)
         if count_all <= 1:
@@ -751,8 +761,11 @@ class NodeRuntime:
         np.fill_diagonal(distances, np.inf)
         nearest_index = np.argmin(distances, axis=1)
         nearest_distance = distances[np.arange(count_all), nearest_index]
-        utilities = np.empty(count_all, dtype=float)
+        excluded = set(exclude)
+        utilities = np.full(count_all, np.inf)
         for index, node_id in enumerate(self._prototype_ids):
+            if node_id in excluded:
+                continue
             node = self.graph.nodes[node_id]
             other = self.graph.nodes[self._prototype_ids[nearest_index[index]]]
             gap = node.value - other.value
@@ -760,6 +773,10 @@ class NodeRuntime:
                 nearest_distance[index] ** 2 + gap * gap
             )
         victim_index = int(np.argmin(utilities))
+        if not np.isfinite(utilities[victim_index]):
+            # Every candidate is protected (a single-node episode at the
+            # cap): the birth is absorbed into the nearest cell.
+            return None
         victim_id = self._prototype_ids[victim_index]
         host_id = self._prototype_ids[int(nearest_index[victim_index])]
         victim = self.graph.nodes[victim_id]
@@ -1633,6 +1650,7 @@ class NodeRuntime:
         self.last_sources = []
         self.last_signature = ()
         self._traces.clear()
+        self._episode_nodes = set()
 
     def learn_transition(self, observation, action, next_observation,
                          valence, done: bool = False) -> None:
@@ -2068,6 +2086,24 @@ class NodeRuntime:
         if channel == "value":
             return list(self.value_feature_ids)
         return list(self.feature_ids)
+
+    def uninstall_feature_rules(self, node_ids) -> None:
+        """Remove root registrations added by a rejected structure stage.
+
+        The materialized predicate nodes and any shared sub-features stay
+        in place (another live root may use them); only the root's
+        participation in the readouts and training groups is withdrawn.
+        The materialization key is kept, so re-installing the same rule
+        later returns the existing node instead of duplicating it.
+        """
+        for node_id in list(node_ids):
+            if node_id in self.feature_ids:
+                self.feature_ids.remove(node_id)
+            if node_id in self._feature_all:
+                self._feature_all.remove(node_id)
+            self._feature_descendants.pop(node_id, None)
+            self._feature_objects.pop(node_id, None)
+            self._feature_children.pop(node_id, None)
 
     def _node_horizon(self, node_id: str) -> int:
         node = self.graph.nodes.get(node_id)
