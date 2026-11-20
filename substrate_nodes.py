@@ -118,7 +118,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            value_trust_samples: float = 150.0, control_risk_weight: float = 0.0,
         value_bank_only: bool = False,
         value_dispersion=False, iterative_induction=False,
-        compose_readout: bool = True, importance_weighting=False):
+        compose_readout: bool = True, importance_weighting=False,
+        voi_threat_min: float = 0.25):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -163,6 +164,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         control_risk_weight=control_risk_weight,
         value_bank_only=value_bank_only,
         importance_weighting=importance_weighting,
+        voi_threat_min=voi_threat_min,
     )
     episodes = {}
     for row in transitions:
@@ -572,6 +574,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         association_rate=0.0, induce_features=True,
         precursor_labels=True, pain_horizon=None,
         voi_fraction=0.0, voi_target=3, feature_value_weight=0.02,
+        voi_threat_min=0.25,
         dagger_rounds=0, dagger_episodes=2, dagger_cap=1200,
         dagger_offset=50000, dagger_horizon=10, step_stride=2,
         stride_includes_lag=False, value_horizon=0,
@@ -671,16 +674,25 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             pain_horizon=pain_horizon,
             voi_target=voi_target,
             feature_value_weight=feature_value_weight,
+            # The guide's threat gate reads the calibrated graded threat;
+            # the monotone calibration only exists when this flag is on,
+            # and the bootstrap agent never plans, so the flag costs
+            # nothing beyond the calibration fit.
+            contrast_objective=True,
         )
         propensities = []
-        stage2, _counts2 = collect(
-            seed, steps - steps1, coverage=coverage, lag=lag,
+        # Re-collect the whole stream with the guide instead of splicing
+        # a guided tail onto the bootstrap stream: the two-stage split
+        # fragments the episodes enough to cost a third of survival at
+        # full scale even when the guide never fires, and a fresh single
+        # pass lets the guide's knowledge shape every decision point.
+        transitions, _counts2 = collect(
+            seed, steps, coverage=coverage, lag=lag,
             guide=guide_agent.counterfactual_action,
             budget=int(round(voi_fraction * steps)),
-            episode_start=max(int(row["episode"]) for row in stage1) + 1,
             propensities=propensities,
         )
-        transitions = list(stage1) + list(stage2)
+        transitions = list(transitions)
     else:
         transitions, _counts = collect(seed, steps, coverage=coverage, lag=lag)
     if not transitions:
@@ -1180,6 +1192,7 @@ def run_seed(task):
     compose_readout = bool(task.get("compose_readout", True))
     importance_weighting = bool(task.get("importance_weighting", False))
     learn_objective = bool(task.get("learn_objective", True))
+    voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -1233,6 +1246,7 @@ def run_seed(task):
         compose_readout=compose_readout,
         importance_weighting=importance_weighting,
         learn_objective=learn_objective,
+        voi_threat_min=voi_threat_min,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1311,7 +1325,12 @@ def main():
                         help="fraction of collection steps guided by the "
                              "counterfactual budget (two-stage collect)")
     parser.add_argument("--voi-target", type=int, default=3,
-                        help="minimum samples per (feature, action) cell")
+                        help="how many samples a (feature, action) cell "
+                             "should have before the guide stops testing it")
+    parser.add_argument("--voi-threat-min", type=float, default=0.25,
+                        help="minimum calibrated threat rate a state must "
+                             "read before the counterfactual guide tests "
+                             "an action there (decision-critical targeting)")
     parser.add_argument("--feature-value-weight", type=float, default=0.02,
                         help="how much sequence-level value trades against "
                              "accumulated hazard in the search objective")
@@ -1543,6 +1562,7 @@ def main():
             pain_horizon=args.pain_horizon,
             voi_fraction=args.voi_fraction,
             voi_target=args.voi_target,
+            voi_threat_min=args.voi_threat_min,
             feature_value_weight=args.feature_value_weight,
             step_stride=args.step_stride,
             stride_includes_lag=args.stride_includes_lag,

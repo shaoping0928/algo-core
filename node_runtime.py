@@ -282,6 +282,7 @@ class NodeRuntime:
         voi_target: int = 3,
         voi_cell_cap: int = 16,
         voi_min_prior: float = 0.5,
+        voi_threat_min: float = 0.25,
         feature_value_prior: float = 4.0,
         feature_value_weight: float = 0.02,
         subgraph_cells: bool = False,
@@ -365,6 +366,8 @@ class NodeRuntime:
             raise ValueError("voi_cell_cap must be positive")
         if not 0.0 <= float(voi_min_prior) <= 1.0:
             raise ValueError("voi_min_prior must be in [0, 1]")
+        if not 0.0 <= float(voi_threat_min) <= 1.0:
+            raise ValueError("voi_threat_min must be in [0, 1]")
         if float(feature_value_prior) < 0.0:
             raise ValueError("feature_value_prior must be non-negative")
         if float(feature_value_weight) < 0.0:
@@ -471,6 +474,11 @@ class NodeRuntime:
         self.voi_target = int(voi_target)
         self.voi_cell_cap = int(voi_cell_cap)
         self.voi_min_prior = float(voi_min_prior)
+        # Counterfactual tests fire only where the calibrated threat read
+        # says the danger rate is at least this high: decision-critical
+        # states are where a rarely-taken action's real outcome changes
+        # what the planner can see.
+        self.voi_threat_min = float(voi_threat_min)
         self.voi_tests = {}
         # Sequence-level value: per (feature, acting action) cells learning
         # the discounted dopamine return of the paths that followed them,
@@ -2546,14 +2554,23 @@ class NodeRuntime:
                 del self.surprise_buffer[self.surprise_capacity:]
 
     def counterfactual_action(self, observation) -> Optional[int]:
-        """The action with the most deficient (feature, action) support here.
+        """The action to force where the decision matters and is unknown.
 
-        Counterfactual guidance for collection: among the feature roots
-        active at this state, prefer the one whose minority-action cell is
-        emptiest while the learned prior says the action matters.  Returns
-        None when every active root already has enough support for both
-        actions, when the prior is too low, or when the per-cell test
-        budget is spent.  Purely learned signals - no task geometry.
+        Counterfactual guidance for collection, v2: a state qualifies
+        only when the calibrated graded threat read puts the danger rate
+        above `voi_threat_min` - a test spent on a state the readout
+        considers safe buys no decision information, and the death
+        attribution probe showed the planner's failures concentrate
+        exactly at high-threat states whose rarely-taken action's cell
+        is starved.  Among the feature roots active at such a state,
+        prefer the one whose minority-action cell is emptiest while the
+        learned prior says the action matters; the forced action is the
+        minority one, so that cell gains a real outcome exactly where
+        the threat's min-over-actions is otherwise neutralized by the
+        anchor.  Returns None when the state is not decision-critical,
+        every active root already has enough support for both actions,
+        the prior is too low, or the per-cell test budget is spent.
+        Purely learned signals - no task geometry.
         """
         if not self.feature_ids:
             return None
@@ -2561,6 +2578,19 @@ class NodeRuntime:
         if obs.shape[1] < self.obs_dim:
             return None
         obs = obs[:, :self.obs_dim]
+        # The graded threat read is a per-state scalar (the min over
+        # actions composed over firing roots), so the pending window is
+        # irrelevant here and zeros encode fine.
+        pending = np.zeros(self.lag, dtype=float)
+        encoded = np.concatenate(
+            [obs[0] / self.scales[:self.obs_dim], pending]
+        ).reshape(1, -1)
+        threat, _excess = self.pain_graded_batch(encoded)
+        if not np.isfinite(threat[0]):
+            return None
+        threat_value = float(threat[0])
+        if threat_value < self.voi_threat_min:
+            return None
         best = None
         for node_id in self.feature_ids:
             feature = self._feature_objects.get(node_id)
@@ -2577,13 +2607,25 @@ class NodeRuntime:
                 int(cells.get(action, [0, 0.0])[0])
                 for action in self.action_space
             ]
+            majority = max(counts)
             minority = int(np.argmin(counts))
+            # Starvation is relative: an absolute floor keeps tiny-data
+            # guides busy, and beyond it a cell counts as starved when it
+            # holds less than a quarter of the other action's evidence -
+            # the imbalance that neutralizes the min-over-actions at any
+            # data volume.
+            starved = (
+                counts[minority] < self.voi_target
+                or counts[minority] * 4 < majority
+            )
+            if not starved:
+                continue
             if self.voi_tests.get((node_id, minority), 0) >= self.voi_cell_cap:
                 continue
             deficit = self.voi_target - counts[minority]
             if deficit <= 0:
-                continue
-            score = base * deficit
+                deficit = 1
+            score = threat_value * deficit
             if best is None or score > best[0]:
                 best = (score, minority, node_id)
         if best is None:

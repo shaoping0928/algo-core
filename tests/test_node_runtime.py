@@ -657,6 +657,71 @@ class NodeRuntimeTests(unittest.TestCase):
             self.assertEqual(runtime.counterfactual_action(observation), 1)
         self.assertIsNone(runtime.counterfactual_action(observation))
 
+    def test_counterfactual_guide_targets_decision_critical_states(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40,
+            voi_min_prior=0.05,
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        observation = np.asarray([0.0])
+        # The readout considers the state safe: the threat read (the
+        # minimum over both actions' reads) sits below the gate even
+        # though the minority cell is starving - a test spent here buys
+        # no decision information.  The pre-v2 guide would have tested.
+        runtime.graph.nodes[feature_id].value = 0.1
+        runtime.feature_action_stats[feature_id] = {
+            0: [2, 0.0], 1: [2, 2.0],
+        }
+        self.assertIsNone(runtime.counterfactual_action(observation))
+        # At a dangerous state (the calibrated threat read at 0.5) the
+        # same starving cell becomes the target.
+        states = np.asarray([[0.0]] * 8)
+        pending = np.zeros((8, 1), dtype=float)
+        labels = np.asarray([1.0, 0.0] * 4)
+        runtime.fit_readout_calibration(states, pending, labels)
+        self.assertEqual(runtime.counterfactual_action(observation), 0)
+        self.assertEqual(
+            runtime.voi_tests[(feature_id, 0)], 1
+        )
+
+    def test_counterfactual_starvation_is_relative(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        observation = np.asarray([0.0])
+        runtime.graph.nodes[feature_id].value = 5.0 / 7.0
+        # A well-fed cell that still holds less than a quarter of the
+        # other action's evidence is starved: the absolute floor alone
+        # would let the guide go silent at any real data volume.
+        runtime.feature_action_stats[feature_id] = {
+            0: [200, 200.0], 1: [30, 30.0],
+        }
+        self.assertEqual(runtime.counterfactual_action(observation), 1)
+        # Balanced cells stay untouched even with a large deficit-free
+        # absolute count.
+        runtime.voi_tests.clear()
+        runtime.feature_action_stats[feature_id] = {
+            0: [120, 120.0], 1: [100, 100.0],
+        }
+        self.assertIsNone(runtime.counterfactual_action(observation))
+
     def test_collect_applies_the_counterfactual_budget(self):
         from substrate_generic import collect
 
