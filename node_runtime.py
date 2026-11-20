@@ -157,6 +157,7 @@ class NodeRuntime:
         contrast_objective: bool = False,
         value_trust_samples: float = 150.0,
         control_risk_weight: float = 0.0,
+        value_bank_only: bool = False,
         value_horizon: Optional[int] = None,
         ood_trust_scale: float = 0.0,
         obs_trust: float = 1.0,
@@ -413,6 +414,12 @@ class NodeRuntime:
         # take - entering a risky but action-dependent band is judged by
         # the value ledger, not by the hazard readout.
         self.control_risk_weight = float(control_risk_weight)
+        # L1: when on, the value readout averages only over the dedicated
+        # value-bank roots.  The union readout lets the risk bank's cells
+        # (learned mostly from drifting continuations) dilute the value
+        # signal everywhere - the before/after audit measured the dilution
+        # at -4 to -14 against the data's own return table.
+        self.value_bank_only = bool(value_bank_only)
         self._feature_all: List[str] = []
         self._feature_descendants: Dict[str, List[str]] = {}
         self._feature_objects: Dict[str, object] = {}
@@ -2008,6 +2015,11 @@ class NodeRuntime:
         baseline = float(self.value_baseline)
         result = np.full(len(states), baseline)
         roots = self._all_value_roots()
+        if self.value_bank_only and self.value_feature_ids:
+            # L1: the dedicated bank's predicates tile the decision-critical
+            # regions; the risk bank's cells carry drifting-continuation
+            # statistics that dilute the mean.
+            roots = list(self.value_feature_ids)
         if not roots:
             return result
         obs = states[:, :self.obs_dim]

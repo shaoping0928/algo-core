@@ -67,7 +67,8 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
           value_label_quantile=0.8, subgraph_cells=False,
           predicate_readouts=False, event_memory_risk=True,
           contrast_objective=False, value_trust_samples=150.0,
-          value_dispersion=False, control_risk_weight=0.0):
+          value_dispersion=False, control_risk_weight=0.0,
+          value_bank_only=False):
     world, agent = fit(
         seed, steps=steps, coverage=coverage, max_nodes=max_nodes,
         birth_threshold=birth_threshold, epochs=epochs,
@@ -87,6 +88,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
         value_trust_samples=value_trust_samples,
         value_dispersion=value_dispersion,
         control_risk_weight=control_risk_weight,
+        value_bank_only=value_bank_only,
     )
     # The same deterministic transitions `fit` trained on; used only to
     # measure whether both actions exist near the planner states.
@@ -480,6 +482,9 @@ def main():
                              "the trust scaling")
     parser.add_argument("--value-dispersion-labels", action="store_true",
                         help="induce the value bank on both return extremes")
+    parser.add_argument("--value-bank-only", action="store_true",
+                        help="read the value channel from the dedicated "
+                             "value-bank roots only")
     parser.add_argument("--control-risk-weight", type=float, default=0.0,
                         help="threat grading: weight of the controllable "
                              "excess on top of the real threat")
@@ -514,6 +519,7 @@ def main():
         value_trust_samples=args.value_trust_samples,
         value_dispersion=args.value_dispersion_labels,
         control_risk_weight=args.control_risk_weight,
+        value_bank_only=args.value_bank_only,
     )
 
 

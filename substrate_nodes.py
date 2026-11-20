@@ -67,8 +67,9 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            value_features=True, value_label_quantile=0.8,
            subgraph_cells=False, predicate_readouts=False,
            event_memory_risk=True, contrast_objective=False,
-           value_trust_samples=150.0, control_risk_weight=0.0,
-           value_dispersion=False):
+           value_trust_samples: float = 150.0, control_risk_weight: float = 0.0,
+        value_bank_only: bool = False,
+        value_dispersion=False):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -257,7 +258,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         subgraph_cells=False, predicate_readouts=False,
         event_memory_risk=True, contrast_objective=False,
         value_trust_samples=150.0, value_dispersion=False,
-        control_risk_weight=0.0):
+        control_risk_weight=0.0, value_bank_only=False):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -387,6 +388,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         contrast_objective=contrast_objective,
         value_trust_samples=value_trust_samples,
         control_risk_weight=control_risk_weight,
+        value_bank_only=value_bank_only,
         value_dispersion=value_dispersion,
     )
     world, agent = _train(transitions, **train_kwargs)
@@ -782,6 +784,7 @@ def run_seed(task):
     value_trust_samples = float(task.get("value_trust_samples", 150.0))
     value_dispersion = bool(task.get("value_dispersion", False))
     control_risk_weight = float(task.get("control_risk_weight", 0.0))
+    value_bank_only = bool(task.get("value_bank_only", False))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -830,6 +833,7 @@ def run_seed(task):
         value_trust_samples=value_trust_samples,
         value_dispersion=value_dispersion,
         control_risk_weight=control_risk_weight,
+        value_bank_only=value_bank_only,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -980,6 +984,10 @@ def main():
                              "excess (the avoidable share a plan takes by "
                              "its own action) on top of the real threat; "
                              "0 keeps controllable risk free to take")
+    parser.add_argument("--value-bank-only", action="store_true",
+                        help="read the value channel from the dedicated "
+                             "value-bank roots only, without the risk "
+                             "bank's drifting-continuation cells")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -1131,6 +1139,7 @@ def main():
             value_trust_samples=args.value_trust_samples,
             value_dispersion=args.value_dispersion_labels,
             control_risk_weight=args.control_risk_weight,
+            value_bank_only=args.value_bank_only,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -1263,6 +1272,7 @@ def main():
                 value_trust_samples=args.value_trust_samples,
                 value_dispersion=args.value_dispersion_labels,
                 control_risk_weight=args.control_risk_weight,
+                value_bank_only=args.value_bank_only,
                 self_evaluation=not bool(eval_seeds),
                 dagger_rounds=args.dagger_rounds,
                 dagger_episodes=args.dagger_episodes,
