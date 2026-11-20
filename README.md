@@ -44,6 +44,7 @@ substrate_graph_search.py 用学习世界模型 + 图记忆风险做搜索的原
 substrate_nodes.py        节点中心原型：在线节点价值 + 沙盒轨迹搜索
 node_runtime.py           节点运行时：动作条件边、MC 信用分配、事件记忆
 memory_credit_probe.py    记忆回溯修正的机制探针（修正量/召回率）
+feature_generalization_probe.py 特征根的 held-out 激活率与阈值脆弱性诊断
 eval_protocol.py          held-out 种子解析、中位数/IQR、聚类 bootstrap 区间
 signal_bank.py            每节点信号源：差分、积分/泄漏、逆泄漏、均值
 substrate_*.py            各算子、记忆、噪声、延迟和搜索的验证脚本
@@ -453,6 +454,13 @@ cost += w · (Φ(s_0) − Φ(s_H))            PBRS 势差，H 步求和后望远
 **未确认收益**：配对均值 −6.5、仅 1/3 正向，机制改变了训练轨迹（DAgger
 自采路径明显不同）但没有转成存活。按斩杀线**保持默认关**，记录为
 首轮 null；若要定论需第二波种子。
+
+**机制探针（seed 100，`memory_credit_probe.py`）**：修正臂 243 次 pain
+事件、1171 次早期记忆修正、3499 条上下文链接；记忆与特征根的
+membership 272 条（对照 264），接线正常。但评估轨迹上对照 **169/671**
+行能召回记忆、修正臂 **0/428**——修正臂诱导出的特征**根谓词在 held-out
+上全不触发**（只有子特征激活）。**首轮 null 的直接原因是特征归纳的
+OOD（表征抽签），不是修正逻辑本身**；继续跑种子只会重复抽签。
 
 ### 20 世界复验（2026-11，提前停止）
 
