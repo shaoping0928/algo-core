@@ -1681,9 +1681,9 @@ def main():
                              "recording once this many executed frames were "
                              "collected (0 = use --dagger-episodes as-is)")
     parser.add_argument("--benchmark", action="store_true",
-                        help="standard ruler: 1500 offline frames x 3 "
-                             "epochs, then one 3000-frame free-control "
-                             "round and retrain; evaluation cap 3000 frames")
+                        help="standard ruler: 1500 offline frames replayed "
+                             "once, then one 5000-frame free-control round "
+                             "and retrain; evaluation cap 5000 frames")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset: 1500 steps, 3 epochs, "
                              "1000 nodes, 400-frame evaluation")
@@ -1696,20 +1696,20 @@ def main():
         args.horizon = 8
     if args.benchmark:
         # The benchmark fixes both halves of the ruler: the offline leg is
-        # the fast bootstrap (1500 frames replayed over 3 epochs) and the
-        # online leg is one free-control round of 3000 executed frames.
-        # The evaluation cap matches the online budget, so a model that
-        # survives is no longer censored at the 400-frame dev cap.
+        # the fast bootstrap (1500 frames replayed once - no multi-epoch
+        # overfitting) and the online leg is one free-control round of 5000
+        # executed frames.  The evaluation cap matches the online budget,
+        # so a model that survives is not censored.
         args.steps = 1500
-        args.epochs = 3
+        args.epochs = 1
         args.max_nodes = 1000
         args.horizon = 8
-        args.cap = 3000
-        args.dagger_cap = 3000
+        args.cap = 5000
+        args.dagger_cap = 5000
         if args.dagger_rounds == 0:
             args.dagger_rounds = 1
         if args.dagger_frames == 0:
-            args.dagger_frames = 3000
+            args.dagger_frames = 5000
     if args.jobs < 1:
         raise ValueError("--jobs must be positive")
     if args.seeds < 1:
