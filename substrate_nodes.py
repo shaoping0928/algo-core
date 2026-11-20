@@ -49,7 +49,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            pain_horizon, voi_target, feature_value_weight,
            value_horizon=None, ood_trust_scale=0.0, obs_trust=1.0,
            feature_action_prior=2.0, feature_value_prior=4.0,
-           value_features=True, value_label_quantile=0.8):
+           value_features=True, value_label_quantile=0.8,
+           subgraph_cells=False):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -86,6 +87,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         obs_trust=obs_trust,
         feature_action_prior=feature_action_prior,
         feature_value_prior=feature_value_prior,
+        subgraph_cells=subgraph_cells,
     )
     episodes = {}
     for row in transitions:
@@ -224,7 +226,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         stride_includes_lag=False, value_horizon=0,
         ood_trust_scale=0.0, obs_trust=1.0,
         feature_action_prior=2.0, feature_value_prior=4.0,
-        value_features=True, value_label_quantile=0.8):
+        value_features=True, value_label_quantile=0.8,
+        subgraph_cells=False):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -344,6 +347,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         feature_value_prior=feature_value_prior,
         value_features=value_features,
         value_label_quantile=value_label_quantile,
+        subgraph_cells=subgraph_cells,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -650,6 +654,7 @@ def run_seed(task):
     feature_value_prior = float(task.get("feature_value_prior", 4.0))
     value_features = bool(task.get("value_features", True))
     value_label_quantile = float(task.get("value_label_quantile", 0.8))
+    subgraph_cells = bool(task.get("subgraph_cells", False))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -691,6 +696,7 @@ def run_seed(task):
         feature_value_prior=feature_value_prior,
         value_features=value_features,
         value_label_quantile=value_label_quantile,
+        subgraph_cells=subgraph_cells,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -813,6 +819,10 @@ def main():
                         help="return-distribution quantile that defines the "
                              "high-return labels for value-channel "
                              "induction")
+    parser.add_argument("--subgraph-cells", action="store_true",
+                        help="train and read feature statistics on rule "
+                             "branches (most specific active member wins); "
+                             "measured inert on survival, off by default")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -957,6 +967,7 @@ def main():
             feature_value_prior=args.feature_value_prior,
             value_features=not args.no_value_features,
             value_label_quantile=args.value_quantile,
+            subgraph_cells=args.subgraph_cells,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -1082,6 +1093,7 @@ def main():
                 precursor_labels=not args.instant_labels,
                 value_features=not args.no_value_features,
                 value_label_quantile=args.value_quantile,
+                subgraph_cells=args.subgraph_cells,
                 self_evaluation=not bool(eval_seeds),
                 dagger_rounds=args.dagger_rounds,
                 dagger_episodes=args.dagger_episodes,

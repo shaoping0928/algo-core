@@ -151,6 +151,7 @@ class NodeRuntime:
         voi_min_prior: float = 0.5,
         feature_value_prior: float = 4.0,
         feature_value_weight: float = 0.02,
+        subgraph_cells: bool = False,
         value_horizon: Optional[int] = None,
         ood_trust_scale: float = 0.0,
         obs_trust: float = 1.0,
@@ -365,7 +366,17 @@ class NodeRuntime:
         # Roots installed from the value bank.  Empty until such a bank is
         # installed; the value readout then covers the risk-bank roots only.
         self.value_feature_ids: List[str] = []
+        # D2: branch-level cells.  When on, every node of a rule's subgraph
+        # (root and its materialized descendants) trains its own statistics
+        # and the readout comes from the most specific active member, so an
+        # OR over two directions keeps them separated instead of averaging
+        # both into one root cell.  Measured inert on the survival
+        # benchmark (six seeds, two readout forms, bit-identical runs) -
+        # the planner's plan margins are wider than the read refinements -
+        # so it is kept available but off by default.
+        self.subgraph_cells = bool(subgraph_cells)
         self._feature_all: List[str] = []
+        self._feature_descendants: Dict[str, List[str]] = {}
         self._feature_objects: Dict[str, object] = {}
         self._feature_children: Dict[str, List[str]] = {}
         self._feature_keys: Dict[str, str] = {}
@@ -1287,10 +1298,32 @@ class NodeRuntime:
                 next_features=next_features,
             )
             active_by_horizon = {}
-            for fid in current_active:
-                active_by_horizon.setdefault(
-                    self._node_horizon(fid), []
-                ).append(fid)
+            active_set = set(current_active)
+            if self.subgraph_cells:
+                # D2: each active root trains its own window's labels, and
+                # every active descendant joins its root's group - a branch
+                # inherits the window of the rule it belongs to.  Shared
+                # sub-features are deduplicated so one sample updates a
+                # node once.
+                for root_id in current_features:
+                    group = active_by_horizon.setdefault(
+                        self._node_horizon(root_id), []
+                    )
+                    group.append(root_id)
+                    group.extend(
+                        node_id
+                        for node_id in self._feature_descendants.get(
+                            root_id, ()
+                        )
+                        if node_id in active_set
+                    )
+                for horizon, group in active_by_horizon.items():
+                    active_by_horizon[horizon] = list(dict.fromkeys(group))
+            else:
+                for fid in current_active:
+                    active_by_horizon.setdefault(
+                        self._node_horizon(fid), []
+                    ).append(fid)
             # Prediction-error loop: record what the readout predicts for
             # this state under the acting action *before* any update, then
             # compare it with the actual precursor label.  Surprises with
@@ -1333,6 +1366,16 @@ class NodeRuntime:
             value_roots = [
                 fid for fid in current_active if fid in value_roots_all
             ]
+            if self.subgraph_cells:
+                for root_id in value_roots:
+                    value_roots.extend(
+                        node_id
+                        for node_id in self._feature_descendants.get(
+                            root_id, ()
+                        )
+                        if node_id in active_set
+                    )
+                value_roots = list(dict.fromkeys(value_roots))
             steps.append((
                 current, action, next_node, float(signals[1]),
                 float(signals[0]), done, sources, signature,
@@ -1481,6 +1524,7 @@ class NodeRuntime:
         rules = self.rules.rules if rules is None else list(rules)
         for rule in rules:
             node_id = self._materialize_feature(rule.feature, "feature")
+            self._feature_descendants[node_id] = self._subtree_ids(node_id)
             node = self.graph.nodes[node_id]
             if channel == "value":
                 if node_id not in self.value_feature_ids:
@@ -1536,6 +1580,16 @@ class NodeRuntime:
             if node_id not in roots:
                 roots.append(node_id)
         return roots
+
+    def _subtree_ids(self, root_id: str) -> List[str]:
+        """All materialized descendant nodes below a rule root."""
+        descendants = []
+        stack = list(self._feature_children.get(root_id, ()))
+        while stack:
+            node_id = stack.pop()
+            descendants.append(node_id)
+            stack.extend(self._feature_children.get(node_id, ()))
+        return descendants
 
     def _update_feature_pain(self, feature_ids, pain: float) -> None:
         pain = float(pain)
@@ -1689,10 +1743,17 @@ class NodeRuntime:
     def feature_value_batch(self, states: np.ndarray) -> np.ndarray:
         """Expected discounted dopamine return at each state, in return units.
 
-        The read for a state is the support-shrunk mean over its active
-        feature roots of the ``(feature, pending[0])`` value cell; roots and
-        cells without data contribute the running global baseline, so the
-        readout degrades to a flat prior exactly where nothing was learned.
+        The read for a state is the support-shrunk ``(feature, pending[0])``
+        value cell of its active feature roots.  With subgraph cells on,
+        each active root reads its *most specific active member*: among the
+        root and its active branches, the one whose cell for this acting
+        action has the fewest observations wins, so an OR over two
+        directions reads the branch actually taken instead of the root's
+        pooled average while an AND keeps its narrower root.  Every read
+        shrinks toward the running global baseline with
+        `feature_value_prior` pseudo-counts, and members without data for
+        this action fall back to that baseline, so the readout degrades to
+        a flat prior exactly where nothing was learned.
         """
         states = np.asarray(states, dtype=float)
         baseline = float(self.value_baseline)
@@ -1704,30 +1765,47 @@ class NodeRuntime:
         acting = None
         if states.shape[1] > self.obs_dim:
             acting = np.rint(states[:, self.obs_dim]).astype(int)
+        prior = self.feature_value_prior
         total = np.zeros(len(states), dtype=float)
         weight = np.zeros(len(states), dtype=float)
         for node_id in roots:
-            feature = self._feature_objects.get(node_id)
-            if feature is None:
+            root_feature = self._feature_objects.get(node_id)
+            if root_feature is None:
                 continue
-            mask = feature.mask(obs)
-            if not mask.any():
+            root_mask = root_feature.mask(obs)
+            if not root_mask.any():
                 continue
+            subtree = [node_id]
+            if self.subgraph_cells:
+                subtree.extend(self._feature_descendants.get(node_id, ()))
             values = np.full(len(states), baseline)
-            if acting is not None:
+            best_count = np.full(len(states), np.inf)
+            for member_id in subtree:
+                feature = self._feature_objects.get(member_id)
+                if feature is None:
+                    continue
+                mask = feature.mask(obs)
+                if member_id != node_id:
+                    # A branch only contributes where its rule root fires.
+                    mask = mask & root_mask
+                if not mask.any() or acting is None:
+                    continue
                 for action_key, (count, total_return) in (
-                    self.feature_value_stats.get(node_id, {}).items()
+                    self.feature_value_stats.get(member_id, {}).items()
                 ):
                     if count <= 0:
                         continue
-                    selected = mask & (acting == int(action_key))
+                    selected = (
+                        mask & (acting == int(action_key))
+                        & (count < best_count)
+                    )
                     if selected.any():
-                        prior = self.feature_value_prior
+                        best_count[selected] = count
                         values[selected] = (
                             total_return + prior * baseline
                         ) / (count + prior)
-            total += np.where(mask, values, 0.0)
-            weight += mask.astype(float)
+            total += np.where(root_mask, values, 0.0)
+            weight += root_mask.astype(float)
         averaged = np.where(weight > 0.0, total / np.maximum(weight, 1e-9),
                             baseline)
         return averaged
@@ -1789,10 +1867,15 @@ class NodeRuntime:
         The readout is ``P(pain within lag+1 steps | feature, acting
         action)``.  The acting action is the first pending coordinate of the
         encoded state, so two plans whose pending actions differ receive
-        different risk at the same predicted state.  Observed
-        ``(feature, action)`` cells shrink toward the feature's scalar
-        precursor value with `feature_action_prior` pseudo-counts; cells
-        without data fall back to that scalar exactly as before.
+        different risk at the same predicted state.  With subgraph cells on,
+        a root's read comes from its *most specific active member*: among
+        the root and its active branches, the one whose cell for this
+        acting action has the fewest observations wins - an OR over two
+        directions reads the branch actually taken instead of the root's
+        pooled average, while an AND keeps its narrower root.  Members
+        without data for this action fall back to the root's scalar
+        precursor value exactly as before; with the flag off the read is
+        the root's own statistics only.
         """
         states = np.asarray(states, dtype=float)
         result = np.zeros(len(states), dtype=float)
@@ -1802,28 +1885,50 @@ class NodeRuntime:
         acting = None
         if states.shape[1] > self.obs_dim:
             acting = np.rint(states[:, self.obs_dim]).astype(int)
+        prior = self.feature_action_prior
         for node_id in self.feature_ids:
-            feature = self._feature_objects.get(node_id)
-            node = self.graph.nodes.get(node_id)
-            if feature is None or node is None:
+            root_feature = self._feature_objects.get(node_id)
+            if root_feature is None:
                 continue
-            mask = feature.mask(obs)
-            if not mask.any():
+            root_mask = root_feature.mask(obs)
+            if not root_mask.any():
                 continue
-            base = float(node.value)
+            subtree = [node_id]
+            if self.subgraph_cells:
+                subtree.extend(self._feature_descendants.get(node_id, ()))
+            base = float(self.graph.nodes[node_id].value)
+            # Fallback first: the root's scalar, as in the root-only read.
             values = np.full(len(states), base)
-            if acting is not None:
+            best_count = np.full(len(states), np.inf)
+            for member_id in subtree:
+                feature = self._feature_objects.get(member_id)
+                node = self.graph.nodes.get(member_id)
+                if feature is None or node is None:
+                    continue
+                mask = feature.mask(obs)
+                if member_id != node_id:
+                    # A branch only contributes where its rule root fires.
+                    mask = mask & root_mask
+                if not mask.any():
+                    continue
+                member_base = float(node.value)
+                if acting is None:
+                    continue
                 for action_key, (count, hits) in (
-                    self.feature_action_stats.get(node_id, {}).items()
+                    self.feature_action_stats.get(member_id, {}).items()
                 ):
                     if count <= 0:
                         continue
-                    selected = mask & (acting == int(action_key))
+                    selected = (
+                        mask & (acting == int(action_key))
+                        & (count < best_count)
+                    )
                     if selected.any():
+                        best_count[selected] = count
                         values[selected] = (
-                            hits + self.feature_action_prior * base
-                        ) / (count + self.feature_action_prior)
-            result = np.maximum(result, np.where(mask, values, 0.0))
+                            hits + prior * member_base
+                        ) / (count + prior)
+            result = np.maximum(result, np.where(root_mask, values, 0.0))
         return result
 
     def _feature_memory_risk_batch(self, states: np.ndarray) -> np.ndarray:

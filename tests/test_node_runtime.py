@@ -757,6 +757,117 @@ class NodeRuntimeTests(unittest.TestCase):
         # No pain-side statistics are accumulated for a value root.
         self.assertEqual(list(runtime.feature_action_stats), [])
 
+    def test_subgraph_cells_separate_or_branches(self):
+        from node_features import Composite, FeatureRule, Primitive
+
+        def build(subgraph):
+            runtime = self.make_runtime(
+                lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40,
+                gamma=0.5, subgraph_cells=subgraph,
+            )
+            runtime.rules.rules = [FeatureRule(
+                Composite("or", (
+                    Primitive(0, True, "<", 1.0),
+                    Primitive(0, True, ">", 3.0),
+                )),
+                5, 3, 0.6, 2, 1, 0.5, 0.7,
+            )]
+            runtime.install_feature_rules()
+            return runtime
+
+        on = build(True)
+        off = build(False)
+        root = on.feature_ids[0]
+        children = on._feature_children[root]
+        self.assertEqual(len(children), 2)
+        rows = []
+        # Episode 0: low states earn dopamine, no pain anywhere.
+        for index, obs in enumerate([0.0, 0.5]):
+            rows.append(dict(
+                obs=np.asarray([obs]), next_obs=np.asarray([obs + 0.1]),
+                history=np.asarray([0.0, 0.0]),
+                signals=np.asarray([1.0, 0.0]), done=index == 1,
+                episode=0,
+            ))
+        # Episode 1: high states hurt.
+        for index, obs in enumerate([4.0, 4.5]):
+            rows.append(dict(
+                obs=np.asarray([obs]), next_obs=np.asarray([obs - 0.1]),
+                history=np.asarray([0.0, 0.0]),
+                signals=np.asarray([0.0, 1.0]), done=index == 1,
+                episode=1,
+            ))
+        for runtime in (on, off):
+            for episode in (0, 1):
+                runtime.learn_episode(
+                    [row for row in rows if row["episode"] == episode]
+                )
+        low_state = np.asarray([[0.0, 0.0]])   # encoded: obs + pending 0
+        high_state = np.asarray([[4.0, 0.0]])
+        encoded = np.vstack([low_state, high_state])
+        # Pain side: the low branch has the fewest observations for this
+        # action, so its read wins over the root's pooled cell - and the
+        # low branch has seen only painless states.
+        risk_on = on.feature_risk_batch(encoded)
+        risk_off = off.feature_risk_batch(encoded)
+        self.assertAlmostEqual(risk_on[0], 0.0, places=9)
+        self.assertGreater(risk_on[1], 0.5)
+        self.assertAlmostEqual(risk_off[0], risk_off[1], places=9)
+        # Value side: the branch reads replace the root's pooled average.
+        values_on = on.feature_value_batch(encoded)
+        values_off = off.feature_value_batch(encoded)
+        prior = on.feature_value_prior
+        baseline = on.value_baseline
+        # Low branch: count 2, sum 2.5.  High branch: count 2, sum 0.
+        self.assertAlmostEqual(
+            values_on[0], (2.5 + prior * baseline) / (2.0 + prior), places=9
+        )
+        self.assertAlmostEqual(
+            values_on[1], (0.0 + prior * baseline) / (2.0 + prior), places=9
+        )
+        # The root-only read pools both directions into one number.
+        self.assertAlmostEqual(values_off[0], values_off[1], places=9)
+        self.assertAlmostEqual(
+            values_off[0], (2.5 + prior * baseline) / (4.0 + prior), places=9
+        )
+
+    def test_subgraph_branches_inherit_the_root_horizon(self):
+        from node_features import Composite, FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40, gamma=0.5,
+            subgraph_cells=True,
+        )
+        rule = FeatureRule(
+            Composite("and", (
+                Primitive(0, False, "<", 5.0),
+                Primitive(0, False, ">", -5.0),
+            )),
+            5, 3, 0.6, 2, 1, 0.5, 0.7,
+        )
+        runtime.install_feature_rules([rule], horizon=8)
+        root = runtime.feature_ids[0]
+        child = runtime._feature_children[root][0]
+        rows = []
+        # One episode of five rows whose only pain lands on the terminal
+        # state.  With the root's window (8) every row's precursor label is
+        # 1; with the default window (lag + 1 = 2) only the last two rows
+        # would see it.
+        for index in range(5):
+            pain = 1.0 if index == 4 else 0.0
+            rows.append(dict(
+                obs=np.asarray([float(index)]),
+                next_obs=np.asarray([float(index) + 0.1]),
+                history=np.asarray([0.0, 0.0]),
+                signals=np.asarray([1.0 - pain, pain]),
+                done=index == 4, episode=0,
+            ))
+        runtime.learn_episode(rows)
+        cell = runtime.feature_action_stats.get(child, {}).get(0)
+        self.assertEqual(cell, [5, 5.0])
+        root_cell = runtime.feature_action_stats.get(root, {}).get(0)
+        self.assertEqual(root_cell, [5, 5.0])
+
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()
         node = runtime._create_node(np.asarray([0.0]))

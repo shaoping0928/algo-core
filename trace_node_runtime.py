@@ -64,7 +64,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
           components=(), component_min_count=8, max_components=128,
           component_gating=False, pain_horizon=None, voi_fraction=0.0,
           feature_value_weight=0.02, value_features=True,
-          value_label_quantile=0.8):
+          value_label_quantile=0.8, subgraph_cells=False):
     world, agent = fit(
         seed, steps=steps, coverage=coverage, max_nodes=max_nodes,
         birth_threshold=birth_threshold, epochs=epochs,
@@ -77,6 +77,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
         feature_value_weight=feature_value_weight,
         value_features=value_features,
         value_label_quantile=value_label_quantile,
+        subgraph_cells=subgraph_cells,
     )
     # The same deterministic transitions `fit` trained on; used only to
     # measure whether both actions exist near the planner states.
@@ -452,6 +453,9 @@ def main():
                         help="return-distribution quantile defining the "
                              "high-return labels for value-channel "
                              "induction")
+    parser.add_argument("--subgraph-cells", action="store_true",
+                        help="train and read feature statistics on rule "
+                             "branches (most specific active member wins)")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset matching substrate_nodes")
     args = parser.parse_args()
@@ -476,6 +480,7 @@ def main():
         feature_value_weight=args.feature_value_weight,
         value_features=not args.no_value_features,
         value_label_quantile=args.value_quantile,
+        subgraph_cells=args.subgraph_cells,
     )
 
 
