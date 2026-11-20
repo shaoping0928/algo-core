@@ -152,6 +152,7 @@ class NodeRuntime:
         feature_value_prior: float = 4.0,
         feature_value_weight: float = 0.02,
         subgraph_cells: bool = False,
+        predicate_readouts: bool = False,
         value_horizon: Optional[int] = None,
         ood_trust_scale: float = 0.0,
         obs_trust: float = 1.0,
@@ -375,6 +376,12 @@ class NodeRuntime:
         # the planner's plan margins are wider than the read refinements -
         # so it is kept available but off by default.
         self.subgraph_cells = bool(subgraph_cells)
+        # D3: when on, the risk readout drops the prototype association
+        # channel entirely - prototypes stay as graph structure and event
+        # memory, and the generalization load moves to the coordinate
+        # predicates.  States outside every predicate read zero hazard
+        # instead of an extrapolated prototype statistic.
+        self.predicate_readouts = bool(predicate_readouts)
         self._feature_all: List[str] = []
         self._feature_descendants: Dict[str, List[str]] = {}
         self._feature_objects: Dict[str, object] = {}
@@ -771,31 +778,34 @@ class NodeRuntime:
         if len(states) == 0:
             return np.zeros(0)
         result = np.zeros(len(states), dtype=float)
-        indices, weights, nearest_min = self._soft_weights_batch(states)
-        if indices is not None:
-            for row in range(len(states)):
-                total = 0.0
-                weighted = 0.0
-                node_ids = []
-                for column, index in enumerate(indices[row]):
-                    node_id = self._prototype_ids[int(index)]
-                    node_weight = float(weights[row, column])
-                    node_ids.append(node_id)
-                    total += node_weight
-                    weighted += node_weight * self._pain_association(node_id)
-                for memory_id, strength in self.memories_for(
-                    node_ids
-                ).items():
-                    total += float(strength)
-                    weighted += float(strength) * self._pain_association(
-                        memory_id
-                    )
-                result[row] = weighted / total if total > 0.0 else 0.0
-            result = self._shrink_to_baseline(
-                result, nearest_min,
-                baseline=self.prototype_pain_baseline(),
-            )
-            result = result * self.obs_trust
+        if not self.predicate_readouts:
+            indices, weights, nearest_min = self._soft_weights_batch(states)
+            if indices is not None:
+                for row in range(len(states)):
+                    total = 0.0
+                    weighted = 0.0
+                    node_ids = []
+                    for column, index in enumerate(indices[row]):
+                        node_id = self._prototype_ids[int(index)]
+                        node_weight = float(weights[row, column])
+                        node_ids.append(node_id)
+                        total += node_weight
+                        weighted += node_weight * self._pain_association(
+                            node_id
+                        )
+                    for memory_id, strength in self.memories_for(
+                        node_ids
+                    ).items():
+                        total += float(strength)
+                        weighted += float(strength) * self._pain_association(
+                            memory_id
+                        )
+                    result[row] = weighted / total if total > 0.0 else 0.0
+                result = self._shrink_to_baseline(
+                    result, nearest_min,
+                    baseline=self.prototype_pain_baseline(),
+                )
+                result = result * self.obs_trust
         if self.feature_ids:
             result = np.maximum(result, self._feature_risk_batch(states))
             result = np.maximum(

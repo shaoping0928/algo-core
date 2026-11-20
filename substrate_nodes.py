@@ -50,7 +50,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            value_horizon=None, ood_trust_scale=0.0, obs_trust=1.0,
            feature_action_prior=2.0, feature_value_prior=4.0,
            value_features=True, value_label_quantile=0.8,
-           subgraph_cells=False):
+           subgraph_cells=False, predicate_readouts=False):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -88,6 +88,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         feature_action_prior=feature_action_prior,
         feature_value_prior=feature_value_prior,
         subgraph_cells=subgraph_cells,
+        predicate_readouts=predicate_readouts,
     )
     episodes = {}
     for row in transitions:
@@ -227,7 +228,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         ood_trust_scale=0.0, obs_trust=1.0,
         feature_action_prior=2.0, feature_value_prior=4.0,
         value_features=True, value_label_quantile=0.8,
-        subgraph_cells=False):
+        subgraph_cells=False, predicate_readouts=False):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -348,6 +349,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         value_features=value_features,
         value_label_quantile=value_label_quantile,
         subgraph_cells=subgraph_cells,
+        predicate_readouts=predicate_readouts,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -421,7 +423,12 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         pending = history[:, :agent.lag][:, ::-1]
         encoded = np.concatenate([states, pending], axis=1) / agent.scales
         pain, dopamine = agent.valence_state_batch(encoded)
-        risk = np.maximum(pain, agent.pain_signal_batch(encoded))
+        if getattr(agent, "predicate_readouts", False):
+            # D3: the terminal hazard comes from the predicates only; the
+            # prototype valence no longer bounds it.
+            risk = agent.pain_signal_batch(encoded)
+        else:
+            risk = np.maximum(pain, agent.pain_signal_batch(encoded))
         # Scalarized objective: accumulated hazard minus the sequence-level
         # value of the endpoint, so a plan that accepts local risk in
         # exchange for a long-survival alignment can win.
@@ -553,9 +560,12 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
     if not np.isfinite(encoded).all():
         return (float("inf"), float("inf"))
     pain, dopamine = agent.valence_state_batch(encoded)
-    terminal = max(
-        float(pain[0]), float(agent.pain_signal_batch(encoded)[0])
-    )
+    if getattr(agent, "predicate_readouts", False):
+        terminal = float(agent.pain_signal_batch(encoded)[0])
+    else:
+        terminal = max(
+            float(pain[0]), float(agent.pain_signal_batch(encoded)[0])
+        )
     value = float(agent.feature_value_batch(encoded)[0])
     total += terminal - agent.feature_value_weight * value
     return (total, -float(dopamine[0]))
@@ -655,6 +665,7 @@ def run_seed(task):
     value_features = bool(task.get("value_features", True))
     value_label_quantile = float(task.get("value_label_quantile", 0.8))
     subgraph_cells = bool(task.get("subgraph_cells", False))
+    predicate_readouts = bool(task.get("predicate_readouts", False))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -697,6 +708,7 @@ def run_seed(task):
         value_features=value_features,
         value_label_quantile=value_label_quantile,
         subgraph_cells=subgraph_cells,
+        predicate_readouts=predicate_readouts,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -823,6 +835,9 @@ def main():
                         help="train and read feature statistics on rule "
                              "branches (most specific active member wins); "
                              "measured inert on survival, off by default")
+    parser.add_argument("--predicate-readouts", action="store_true",
+                        help="drop the prototype channel from the risk "
+                             "readout; prototypes stay as event memory")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -968,6 +983,7 @@ def main():
             value_features=not args.no_value_features,
             value_label_quantile=args.value_quantile,
             subgraph_cells=args.subgraph_cells,
+            predicate_readouts=args.predicate_readouts,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -1094,6 +1110,7 @@ def main():
                 value_features=not args.no_value_features,
                 value_label_quantile=args.value_quantile,
                 subgraph_cells=args.subgraph_cells,
+                predicate_readouts=args.predicate_readouts,
                 self_evaluation=not bool(eval_seeds),
                 dagger_rounds=args.dagger_rounds,
                 dagger_episodes=args.dagger_episodes,

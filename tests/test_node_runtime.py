@@ -868,6 +868,51 @@ class NodeRuntimeTests(unittest.TestCase):
         root_cell = runtime.feature_action_stats.get(root, {}).get(0)
         self.assertEqual(root_cell, [5, 5.0])
 
+    def test_predicate_readouts_drop_the_prototype_channel(self):
+        from node_features import FeatureRule, Primitive
+
+        rows = []
+        # One episode whose last state is painful; the prototypes at obs
+        # 0, 1, 2 learn its association.
+        for index, pain in enumerate([0.0, 0.0, 1.0]):
+            rows.append(dict(
+                obs=np.asarray([float(index)]),
+                next_obs=np.asarray([float(index) + 1.0]),
+                history=np.asarray([0.0]),
+                signals=np.asarray([1.0 - pain, pain]),
+                done=index == 2, episode=0,
+            ))
+        prototype_mode = self.make_runtime()
+        prototype_mode.learn_episode(rows)
+        learned = prototype_mode.pain_signal_batch(
+            np.asarray([[2.0]])
+        )[0]
+        self.assertGreater(learned, 0.0)
+
+        predicate_mode = self.make_runtime(predicate_readouts=True)
+        predicate_mode.learn_episode(rows)
+        # Without predicates the honest read is zero, not an extrapolated
+        # prototype statistic.
+        self.assertAlmostEqual(
+            float(predicate_mode.pain_signal_batch(np.asarray([[2.0]]))[0]),
+            0.0, places=9,
+        )
+
+        # With a predicate installed, its cells carry the read again - and
+        # states outside every predicate stay at zero.
+        predicate_mode.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, ">", 1.5), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        predicate_mode.install_feature_rules()
+        predicate_mode.learn_episode(rows)
+        risk = predicate_mode.pain_signal_batch(
+            np.asarray([[2.0], [0.0]])
+        )
+        self.assertGreater(float(risk[0]), 0.0)
+        self.assertAlmostEqual(float(risk[1]), 0.0, places=9)
+
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()
         node = runtime._create_node(np.asarray([0.0]))
