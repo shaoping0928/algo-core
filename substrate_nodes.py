@@ -255,6 +255,17 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
             # threat read ranks below half of the negatives' reads.
             pending_all = _encoded_pending(transitions, lag)
             enc_all = np.concatenate([states, pending_all], axis=1)
+            if contrast_objective:
+                # The gap generations select against read levels, so the
+                # monotone calibration must be current: refit it on the
+                # stream with the cells as they stand now (online
+                # refresh), then measure the missed positives against the
+                # calibrated read.  Fitting once at the end of training
+                # would leave every generation selecting against the
+                # inflated levels the calibration exists to correct.
+                agent.fit_readout_calibration(
+                    states, pending_all, pain_short
+                )
             threat_read, _excess_read = agent.pain_graded_batch(enc_all)
             negative_levels = threat_read[pain_short <= 0.5]
             cut = float(np.median(negative_levels)) if len(

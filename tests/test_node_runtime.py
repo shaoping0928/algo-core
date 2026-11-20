@@ -1636,6 +1636,70 @@ class NodeRuntimeTests(unittest.TestCase):
         for row in transitions:
             self.assertTrue(0.0 <= float(row["propensity"]) <= 1.0)
 
+    def test_variance_birth_splits_a_mixed_cell(self):
+        runtime = self.make_runtime(
+            lag=0, scales=np.asarray([1.0]), max_nodes=40,
+            birth_threshold=0.45, component_min_count=2,
+        )
+        first = runtime._create_node(np.asarray([0.0]))
+        runtime._create_node(np.asarray([10.0]))
+        runtime._create_node(np.asarray([20.0]))
+        # A sharply mixed cell and two stable ones set the population bar
+        # below the mixed cell's variance.
+        runtime._node_pain_count[first] = 10
+        runtime._node_pain_m2[first] = 100.0 * 9.0
+        for other in ("concept_2", "concept_3"):
+            runtime._node_pain_count[other] = 10
+            runtime._node_pain_m2[other] = 1.0 * 9.0
+        runtime._refresh_variance_bar()
+        # A query well inside the mixed cell's territory but closer than
+        # the geometric birth threshold: the refinement birth fires.
+        born = runtime._assign(np.asarray([0.3]))
+        self.assertNotEqual(born, first)
+        self.assertTrue(np.allclose(
+            runtime.graph.nodes[born].features, [0.3]
+        ))
+        # A query at the center does not split.
+        same = runtime._assign(np.asarray([0.05]))
+        self.assertEqual(same, first)
+
+    def test_utility_pruning_merges_into_the_neighbour(self):
+        runtime = self.make_runtime(
+            lag=0, scales=np.asarray([1.0]), max_nodes=3,
+            birth_threshold=0.01,
+        )
+        runtime._assign(np.asarray([0.0]))
+        runtime._assign(np.asarray([10.0]))
+        runtime._assign(np.asarray([20.0]))
+        first_id = runtime._prototype_ids[0]
+        host_id = runtime._prototype_ids[1]
+        # concept_1 sits at value 1.0 next to concept_2 at 0.0 - a cheap
+        # near-duplicate.  concept_3 is far away with a distinct outcome:
+        # removing it would cost the most, so it must survive.
+        runtime.graph.nodes[first_id].value = 1.0
+        runtime.graph.nodes[runtime._prototype_ids[2]].value = 5.0
+        runtime._association_stats[first_id] = [3, 1.0]
+        # A fourth distinct state is blocked by the budget: the least
+        # useful prototype merges into its nearest neighbour and the
+        # birth proceeds, so the cover keeps refining at the cap.
+        born = runtime._assign(np.asarray([30.0]))
+        self.assertEqual(len(runtime._prototype_ids), 3)
+        self.assertNotIn(first_id, runtime.graph.nodes)
+        self.assertIn(runtime._prototype_ids[2], runtime.graph.nodes)
+        self.assertEqual(
+            len(runtime._prototype_matrix), len(runtime._prototype_ids)
+        )
+        # The victim's evidence is consolidated, not dropped: the merged
+        # value is the count-weighted mean (1 and 0 over two visits).
+        self.assertEqual(runtime.graph.nodes[host_id].count, 2)
+        self.assertAlmostEqual(
+            runtime.graph.nodes[host_id].value, 0.5, places=9
+        )
+        self.assertEqual(runtime._association_stats[host_id], [3, 1.0])
+        self.assertTrue(np.allclose(
+            runtime.graph.nodes[born].features, [30.0]
+        ))
+
 
 class PlanScoreTests(unittest.TestCase):
     def test_plan_score_matches_search_selection(self):

@@ -276,6 +276,8 @@ class NodeRuntime:
         feature_action_prior: float = 2.0,
         association_prior: float = 2.0,
         importance_weighting: bool = False,
+        variance_births: bool = True,
+        utility_pruning: bool = True,
         pain_horizon: Optional[int] = None,
         voi_target: int = 3,
         voi_cell_cap: int = 16,
@@ -433,6 +435,18 @@ class NodeRuntime:
         # and stay unweighted.
         self.importance_weighting = bool(importance_weighting)
         self.importance_target = 1.0 / len(self.action_space)
+        # Refinement births (P3): a cell whose valence variance stays
+        # above the population bar holds a mixture of futures; a query
+        # far enough inside its territory births a new center there.
+        self.variance_births = bool(variance_births)
+        # Utility pruning (P3): when the node budget blocks a birth, the
+        # least useful prototype is removed and its statistics merge into
+        # its nearest surviving neighbour, so growth keeps tracking the
+        # distribution instead of freezing at the first pass.
+        self.utility_pruning = bool(utility_pruning)
+        # Population variance bar for refinement births, recomputed once
+        # per episode (an O(nodes) pass per row would dominate training).
+        self._variance_bar = None
         self.action_temperature = float(action_temperature)
         self.action_uncertainty = float(action_uncertainty)
         # Per (feature root, acting action) pain statistics.  The acting
@@ -655,12 +669,147 @@ class NodeRuntime:
         node_id, distance = self._nearest(state)
         if node_id is None:
             node_id = self._create_node(state)
-        elif (create and len(self._prototype_ids) < self.max_nodes
-              and distance > self.birth_threshold):
-            node_id = self._create_node(state)
+        elif create and distance > self.birth_threshold:
+            if len(self._prototype_ids) < self.max_nodes:
+                node_id = self._create_node(state)
+            elif self.utility_pruning and len(self._prototype_ids) > 1:
+                # The budget blocks the birth: consolidate the least
+                # useful prototype into its neighbour first (GNG-U), so
+                # the cover keeps refining instead of absorbing far
+                # states into stale cells forever.
+                self._prune_prototypes()
+                node_id = self._create_node(state)
+        elif create and self.variance_births and self._variance_split(
+            node_id, distance
+        ):
+            # Refinement birth: the nearest cell holds a statistical
+            # mixture and the query sits far enough inside its territory
+            # to deserve its own statistics.
+            if len(self._prototype_ids) < self.max_nodes:
+                node_id = self._create_node(state)
+            elif self.utility_pruning and len(self._prototype_ids) > 1:
+                self._prune_prototypes()
+                node_id = self._create_node(state)
         if count:
             self.graph.nodes[node_id].count += 1
         return node_id
+
+    def _refresh_variance_bar(self) -> None:
+        """Population-relative valence-variance bar, once per episode."""
+        variances = []
+        for node_id, count in self._node_pain_count.items():
+            if count < self.component_min_count:
+                continue
+            variances.append(
+                self._node_pain_m2.get(node_id, 0.0) / max(count - 1, 1)
+            )
+        if len(variances) > 1:
+            self._variance_bar = float(
+                np.median(variances) + np.std(variances)
+            )
+        else:
+            self._variance_bar = None
+
+    def _variance_split(self, node_id: str, distance: float) -> bool:
+        """Refinement-birth test for the nearest cell.
+
+        The cell needs enough samples for its variance to mean anything,
+        the variance must sit above the same population-relative bar the
+        component binder uses, and the query must sit well inside the
+        cell's territory - a split at the periphery gives the mixture's
+        outer states their own center while the core keeps its history.
+        """
+        if self._variance_bar is None:
+            return False
+        count = self._node_pain_count.get(node_id, 0)
+        if count < self.component_min_count:
+            return False
+        variance = self._node_pain_m2.get(node_id, 0.0) / max(count - 1, 1)
+        if variance <= self._variance_bar:
+            return False
+        return distance > 0.5 * self.birth_threshold
+
+    def _prune_prototypes(self) -> Optional[str]:
+        """Remove the least useful prototype, merging it into its neighbour.
+
+        Utility follows the growing-neural-gas principle - the error a
+        removal would induce: a node's visit count times the squared
+        distance to its nearest neighbour plus the squared gap between
+        their valence values.  A rare cell far from every other cell with
+        a distinct outcome is expensive to delete and survives; a
+        near-duplicate of its neighbour is cheap and merges first, its
+        statistics carried over as count-weighted means so no evidence is
+        lost, only consolidated.
+        """
+        count_all = len(self._prototype_ids)
+        if count_all <= 1:
+            return None
+        matrix = self._prototype_matrix
+        state_norm = np.einsum("ij,ij->i", matrix, matrix)[:, None]
+        proto_norm = np.einsum("ij,ij->i", matrix, matrix)[None, :]
+        distances = state_norm + proto_norm - 2.0 * (matrix @ matrix.T)
+        np.fill_diagonal(distances, np.inf)
+        nearest_index = np.argmin(distances, axis=1)
+        nearest_distance = distances[np.arange(count_all), nearest_index]
+        utilities = np.empty(count_all, dtype=float)
+        for index, node_id in enumerate(self._prototype_ids):
+            node = self.graph.nodes[node_id]
+            other = self.graph.nodes[self._prototype_ids[nearest_index[index]]]
+            gap = node.value - other.value
+            utilities[index] = max(float(node.count), 1.0) * (
+                nearest_distance[index] ** 2 + gap * gap
+            )
+        victim_index = int(np.argmin(utilities))
+        victim_id = self._prototype_ids[victim_index]
+        host_id = self._prototype_ids[int(nearest_index[victim_index])]
+        victim = self.graph.nodes[victim_id]
+        host = self.graph.nodes[host_id]
+        victim_count = max(float(victim.count), 1.0)
+        host_count = max(float(host.count), 1.0)
+        total = victim_count + host_count
+        blend = victim_count / total
+        host.value += blend * (victim.value - host.value)
+        host.dopamine += blend * (victim.dopamine - host.dopamine)
+        host.immediate_pain += blend * (
+            victim.immediate_pain - host.immediate_pain
+        )
+        host.immediate_dopamine += blend * (
+            victim.immediate_dopamine - host.immediate_dopamine
+        )
+        host.count += victim.count
+        victim_stats = self._association_stats.pop(victim_id, None)
+        if victim_stats is not None:
+            host_stats = self._association_stats.setdefault(
+                host_id, [0, 0.0]
+            )
+            host_stats[0] += victim_stats[0]
+            host_stats[1] += victim_stats[1]
+        v_count = self._node_pain_count.pop(victim_id, None)
+        if v_count:
+            h_count = self._node_pain_count.get(host_id, 0)
+            v_mean = self._node_pain_mean.get(victim_id, 0.0)
+            h_mean = self._node_pain_mean.get(host_id, 0.0)
+            v_m2 = self._node_pain_m2.get(victim_id, 0.0)
+            h_m2 = self._node_pain_m2.get(host_id, 0.0)
+            merged_count = h_count + v_count
+            if merged_count > 0:
+                delta = v_mean - h_mean
+                merged_m2 = (
+                    h_m2 + v_m2
+                    + delta * delta * h_count * v_count / merged_count
+                )
+                self._node_pain_count[host_id] = merged_count
+                self._node_pain_mean[host_id] = (
+                    (h_count * h_mean + v_count * v_mean) / merged_count
+                )
+                self._node_pain_m2[host_id] = max(merged_m2, 0.0)
+        self._component_bound.discard(victim_id)
+        self.graph._remove_node(victim_id)
+        self._prototype_ids.pop(victim_index)
+        self._prototype_matrix = np.delete(
+            self._prototype_matrix, victim_index, axis=0
+        )
+        return victim_id
 
     def _note_pain(self, node_id: str, pain: float) -> None:
         pain = float(pain)
@@ -1585,6 +1734,9 @@ class NodeRuntime:
             horizon: future_pain_labels(rows, horizon)
             for horizon in sorted(horizons)
         }
+        # The refinement-birth bar is population-relative; one O(nodes)
+        # pass per episode keeps it fresh without dominating the loop.
+        self._refresh_variance_bar()
         value_roots_all = self._all_value_roots()
         steps = []
         # Per-row propensities within the episode: the window's clipped
