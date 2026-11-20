@@ -1792,6 +1792,74 @@ class NodeRuntime:
                 result = np.maximum(result, candidate)
         return np.where(any_fired, result, 0.0)
 
+    def fit_readout_calibration(self, states: np.ndarray,
+                                pending: np.ndarray,
+                                labels: np.ndarray,
+                                bins: int = 12) -> None:
+        """Fit a monotone calibration for the graded threat readout.
+
+        The composed readouts have no statistical meaning on their own:
+        the max-combination inflates the raw reads well above the
+        empirical danger rates, which corrupts every level-based consumer
+        down the pipeline - the objective's accounting and the residual
+        selection pressure of the gap generations alike.  This fits a
+        binned, pool-adjacent-violators monotone map from the raw graded
+        threat read to the empirical pain rate on the training stream
+        itself (no new data), so a calibrated read of 0.6 means a 0.6
+        empirical pain rate.  Monotonicity preserves the min/max algebra
+        of the graded decomposition.
+        """
+        pending_all = np.asarray(pending, dtype=float)
+        if pending_all.shape[0] != len(states):
+            raise ValueError("pending must have one row per state")
+        enc = np.concatenate([
+            np.asarray(states, dtype=float), pending_all
+        ], axis=1)
+        threat, _excess = self.pain_graded_batch(enc)
+        labels = np.asarray(labels, dtype=float)
+        finite = np.isfinite(threat)
+        threat = threat[finite]
+        target = labels[finite]
+        if len(threat) < bins * 2:
+            return
+        order = np.argsort(threat, kind="stable")
+        sorted_threat = threat[order]
+        sorted_target = target[order]
+        edges = np.quantile(sorted_threat,
+                            np.linspace(0.0, 1.0, bins + 1))
+        edges[0], edges[-1] = -np.inf, np.inf
+        rates = []
+        for low, high in zip(edges[:-1], edges[1:]):
+            in_bin = (sorted_threat >= low) & (sorted_threat < high)
+            if in_bin.sum() > 0:
+                rates.append(float(sorted_target[in_bin].mean()))
+            elif rates:
+                rates.append(rates[-1])
+            else:
+                rates.append(0.0)
+        # Pool adjacent violators so the map is non-decreasing.
+        rates = np.asarray(rates, dtype=float)
+        pooled = []
+        start = 0
+        while start < len(rates):
+            end = start + 1
+            total = rates[start] * 1.0
+            count = 1.0
+            while end < len(rates) and rates[end] < total / count:
+                total += rates[end]
+                count += 1.0
+                end += 1
+            pooled.extend([total / count] * (end - start))
+            start = end
+        self.readout_calibration = (edges.tolist(), pooled)
+
+    def _calibrate_threat(self, threat: np.ndarray) -> np.ndarray:
+        calibration = getattr(self, "readout_calibration", None)
+        if calibration is None:
+            return threat
+        edges, rates = calibration
+        return np.interp(threat, edges[1:-1], rates)
+
     def pain_graded_batch(self, states: np.ndarray,
                           mask_table: Optional[List] = None):
         """Grade the risk of each state: real threat vs controllable excess.
@@ -1853,6 +1921,13 @@ class NodeRuntime:
                     ) / (count + prior)
                 else:
                     reads[action_key] = base
+            calibration = getattr(self, "readout_calibration", None)
+            if calibration is not None:
+                edges, rates = calibration
+                for action_key in reads:
+                    reads[action_key] = float(np.interp(
+                        reads[action_key], edges[1:-1], rates
+                    ))
             threat_root = min(reads[action_key]
                               for action_key in self.action_space)
             for action_key in self.action_space:

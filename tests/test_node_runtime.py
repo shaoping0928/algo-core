@@ -1075,6 +1075,41 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(excess[0], 0.0, places=9)
         self.assertAlmostEqual(excess[1], read1 - read0, places=9)
 
+    def test_readout_calibration_maps_to_empirical_rates(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40, gamma=0.5
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        # Prime the cell so every read lands in one high raw bin: the
+        # raw read is inflated relative to the labels fed to the fit.
+        runtime._update_feature_action([feature_id], 0, 1.0)
+        runtime._update_feature_action([feature_id], 0, 1.0)
+        hold = np.asarray([1.0, 0.0])
+        flap = np.asarray([1.0, 1.0])
+        # Labels: half the covered states painful, half not - the
+        # calibrated read must land near 0.5 even though the raw read
+        # sits at the top of its bin.
+        states = np.asarray([[1.0], [1.0], [1.0], [1.0]])
+        pending = np.asarray([[0.0], [0.0], [0.0], [0.0]])
+        labels = np.asarray([1.0, 1.0, 0.0, 0.0])
+        runtime.fit_readout_calibration(
+            np.asarray([[1.0], [1.0], [1.0], [1.0]]), pending, labels
+        )
+        threat, _excess = runtime.pain_graded_batch(
+            np.vstack([hold, flap])
+        )
+        for value in threat:
+            self.assertLess(value, 0.95)
+            self.assertGreater(value, 0.05)
+
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()
         node = runtime._create_node(np.asarray([0.0]))

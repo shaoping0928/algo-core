@@ -258,6 +258,16 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                     agent.install_feature_rules(
                         gap_long.rules, horizon=long_window
                     )
+    if contrast_objective:
+        # F6: fit the monotone readout calibration on the training stream
+        # itself, so the graded threat read is an empirical pain rate
+        # rather than an inflated combination artifact - the objective's
+        # accounting and the planner's comparisons recover their meaning.
+        pending_final = np.asarray([
+            np.asarray(row["history"], dtype=float)[:lag][::-1]
+            for row in transitions
+        ], dtype=float)
+        agent.fit_readout_calibration(states, pending_final, pain_short)
     return world, agent
 
 
