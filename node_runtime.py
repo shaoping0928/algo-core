@@ -2030,22 +2030,42 @@ class NodeRuntime:
             table = self._feature_mask_table(obs)
         else:
             table = mask_table
+        # Per-root memory lists, computed once per batch.  The historical
+        # path re-ran the membership/association graph scans for every
+        # row; the merge below reproduces its exact order (per root: the
+        # node's own membership memories, then its one-hop association
+        # reach, merged by max), so the reads are bit-identical.
+        root_memories = {}
+        for node_id in self.feature_ids:
+            if mask_table is None:
+                feature = self._feature_objects.get(node_id)
+                if feature is None:
+                    continue
+                entry = feature.mask(obs)
+            else:
+                entry = mask_table[self._feature_all.index(node_id)]
+            if entry is not None and entry.any():
+                root_memories[node_id] = self.memories_for([node_id])
         for row in range(len(states)):
-            active = [
+            feature_ids = [
                 node_id
                 for node_id, mask in zip(self._feature_all, table)
                 if mask is not None and bool(mask[row])
-            ]
-            feature_ids = [
-                node_id for node_id in active if node_id in self.feature_ids
+                and node_id in self.feature_ids
             ]
             if not feature_ids:
                 continue
+            merged: Dict[str, float] = {}
+            for node_id in feature_ids:
+                for memory_id, strength in (
+                    root_memories[node_id].items()
+                ):
+                    merged[memory_id] = max(
+                        merged.get(memory_id, 0.0), strength
+                    )
             total = 0.0
             weighted = 0.0
-            for memory_id, strength in self.memories_for(
-                feature_ids
-            ).items():
+            for memory_id, strength in merged.items():
                 memory = self.graph.nodes.get(memory_id)
                 if memory is None or memory.kind != MEMORY:
                     continue
