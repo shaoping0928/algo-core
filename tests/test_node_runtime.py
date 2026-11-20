@@ -590,6 +590,45 @@ class NodeRuntimeTests(unittest.TestCase):
             self.assertEqual(agent.curiosity_weight, 0.0)
         self.assertEqual(agent.curiosity_weight, 0.5)
 
+    def test_point_labels_use_only_the_entered_state_pain(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40,
+            point_labels=True,
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        rows = [
+            dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
+                history=np.asarray([1.0, 0.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([1.0]), next_obs=np.asarray([2.0]),
+                history=np.asarray([0.0, 1.0]),
+                signals=np.asarray([1.0, 1.0]), done=True, episode=0,
+            ),
+        ]
+        runtime.learn_episode(rows)
+        cells = runtime.feature_action_stats[feature_id]
+        # Row 0's acting action is history[1]=0 and the world reported no
+        # pain on its entered state - even though a collision follows at the
+        # next state, the point label for row 0 stays zero.  Row 1 acts
+        # with 1 and its entered state is the collision, so that cell is
+        # the only positive one.
+        self.assertEqual(cells[0], [1, 0.0])
+        self.assertEqual(cells[1], [1, 1.0])
+        # The runtime pins every root's label window to the single step;
+        # the historical precursor window is not silently applied.
+        self.assertEqual(runtime._node_horizon(feature_id), 1)
+
     def test_feature_windows_are_per_node(self):
         from node_features import FeatureRule, Primitive
         from node_graph import NodeGraph

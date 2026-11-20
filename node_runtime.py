@@ -279,6 +279,7 @@ class NodeRuntime:
         variance_births: bool = True,
         utility_pruning: bool = True,
         pain_horizon: Optional[int] = None,
+        point_labels: bool = False,
         voi_target: int = 3,
         voi_cell_cap: int = 16,
         voi_min_prior: float = 0.5,
@@ -514,6 +515,12 @@ class NodeRuntime:
         self.pain_horizon = (
             int(pain_horizon) if pain_horizon is not None else int(self.lag) + 1
         )
+        # Point-event labels: the only pain the world emits is the feedback
+        # of the state just entered.  In this mode every root trains on that
+        # single next-state pain (the transition's own outcome), not on a
+        # hand-chosen precursor window; `_node_horizon` is pinned to one so
+        # the graded readout keeps treating all roots as governable.
+        self.point_labels = bool(point_labels)
         self.gated_edges: Dict[
             Tuple[str, Tuple[int, ...], int], Dict[str, dict]
         ] = {}
@@ -1767,10 +1774,23 @@ class NodeRuntime:
         # own horizon and get that window's labels.
         horizons = {self._node_horizon(fid) for fid in self.feature_ids}
         horizons.add(self.pain_horizon)
-        labels_by_horizon = {
-            horizon: future_pain_labels(rows, horizon)
-            for horizon in sorted(horizons)
-        }
+        if self.point_labels:
+            # The world's pain is the feedback of the entered state; with
+            # no window that single value is every root's label.  Nothing
+            # is spread back onto states where the world reported normal
+            # flight.
+            point = [
+                float(np.asarray(row["signals"], dtype=float)[1] > 0.5)
+                for row in rows
+            ]
+            labels_by_horizon = {
+                horizon: point for horizon in sorted(horizons)
+            }
+        else:
+            labels_by_horizon = {
+                horizon: future_pain_labels(rows, horizon)
+                for horizon in sorted(horizons)
+            }
         # The refinement-birth bar is population-relative; one O(nodes)
         # pass per episode keeps it fresh without dominating the loop.
         self._refresh_variance_bar()
@@ -2125,6 +2145,10 @@ class NodeRuntime:
             self._feature_children.pop(node_id, None)
 
     def _node_horizon(self, node_id: str) -> int:
+        if self.point_labels:
+            # Point-event mode has no window: every root predicts the pain
+            # of the state the transition entered.
+            return 1
         node = self.graph.nodes.get(node_id)
         if node is not None and node.pain_horizon is not None:
             return int(node.pain_horizon)

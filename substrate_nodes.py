@@ -168,6 +168,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         importance_weighting=importance_weighting,
         voi_threat_min=voi_threat_min,
         curiosity_weight=curiosity_weight,
+        point_labels=(not precursor_labels),
     )
     episodes = {}
     for row in transitions:
@@ -200,16 +201,18 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         else:
             pain_short = pain
     else:
-        # Pre-precursor behavior: rules on the entered state with its own
-        # pain label.
+        # Point-event pain: the world only reports pain on the transition
+        # that ended in a collision.  The predicate describes the state the
+        # action was taken from, and its label is the entered state's own
+        # feedback - one step, no precursor window.
         long_window = None
-        pain_short = None
         states = np.asarray(
-            [row["next_obs"] for row in transitions], dtype=float
+            [row["obs"] for row in transitions], dtype=float
         ) / scales[:obs_dim]
         pain = np.asarray(
             [row["signals"][1] > 0.5 for row in transitions], dtype=float
         )
+        pain_short = pain
     groups = np.asarray([row["episode"] for row in transitions])
     order = np.unique(groups)
     # Interleaved episode split: every fifth episode is held out.  A contiguous
@@ -366,7 +369,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                         fid for fid in agent.feature_ids if fid not in before
                     )
     if (
-        compose_readout and precursor_labels and len(states)
+        compose_readout and pain_short is not None and len(states)
         and getattr(agent, "feature_ids", ())
     ):
         # P2: the stacked non-negative composition replaces the
@@ -583,7 +586,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         max_components=128, component_weight=0.5,
         component_gating=False, memory_weight=0.1,
         association_rate=0.0, induce_features=True,
-        precursor_labels=True, pain_horizon=None,
+        precursor_labels=False, pain_horizon=None,
         voi_fraction=0.0, voi_target=3, feature_value_weight=0.02,
         voi_threat_min=0.25,
         dagger_rounds=0, dagger_episodes=2, dagger_cap=1200,
@@ -1328,7 +1331,7 @@ def run_seed(task):
     memory_weight = float(task.get("memory_weight", 0.1))
     association_rate = float(task.get("association_rate", 0.0))
     induce_features = bool(task.get("induce_features", True))
-    precursor_labels = bool(task.get("precursor_labels", True))
+    precursor_labels = bool(task.get("precursor_labels", False))
     pain_horizon = int(task.get("pain_horizon", 0))
     voi_fraction = float(task.get("voi_fraction", 0.0))
     voi_target = int(task.get("voi_target", 3))
@@ -1486,10 +1489,17 @@ def main():
     parser.add_argument("--no-features", action="store_true",
                         help="disable the compositional feature layer")
     parser.add_argument("--instant-labels", action="store_true",
-                        help="induce rules on the entered state with its own "
-                             "pain label instead of precursor labels")
+                        help="deprecated alias: point-event pain is now the "
+                             "default, so this flag is accepted but has no "
+                             "effect")
+    parser.add_argument("--precursor-labels", action="store_true",
+                        help="opt into the historical precursor window "
+                             "(P(pain within k), k = --pain-horizon); it "
+                             "assigns pain to normal-flight states before a "
+                             "collision, which is not world feedback")
     parser.add_argument("--pain-horizon", type=int, default=0,
-                        help="precursor label window in entered states; "
+                        help="precursor label window in entered states "
+                             "(only with --precursor-labels); "
                              "0 uses the default lag + 1")
     parser.add_argument("--voi-fraction", type=float, default=0.0,
                         help="fraction of collection steps guided by the "
@@ -1765,7 +1775,7 @@ def main():
             memory_weight=args.memory_weight,
             association_rate=args.association_rate,
             induce_features=not args.no_features,
-            precursor_labels=not args.instant_labels,
+            precursor_labels=args.precursor_labels,
             pain_horizon=args.pain_horizon,
             voi_fraction=args.voi_fraction,
             voi_target=args.voi_target,
@@ -1917,7 +1927,7 @@ def main():
                 feature_value_prior=args.feature_value_prior,
                 feature_value_weight=args.feature_value_weight,
                 features=not args.no_features,
-                precursor_labels=not args.instant_labels,
+                precursor_labels=args.precursor_labels,
                 value_features=not args.no_value_features,
                 value_label_quantile=args.value_quantile,
                 subgraph_cells=args.subgraph_cells,
