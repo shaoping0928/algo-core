@@ -755,14 +755,12 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     planner_rows: List[dict] = []
     for _round in range(int(dagger_rounds)):
         # A frame budget buys a fixed amount of on-policy experience even
-        # when episodes die early; the episode count stays the hard limit
-        # on world resets, so ten resets per cap-sized episode is ample.
+        # when episodes die early.  Each episode contributes at least one
+        # frame, so `dagger_frames` resets guarantee the budget can be
+        # reached; collection still stops as soon as the budget is met.
         planner_episodes = int(dagger_episodes)
         if int(dagger_frames) > 0:
-            planner_episodes = max(
-                planner_episodes,
-                int(np.ceil(int(dagger_frames) / max(int(dagger_cap), 1))) * 10,
-            )
+            planner_episodes = max(planner_episodes, int(dagger_frames))
         planner, _frames = collect_planner(
             seed, world, agent, episodes=planner_episodes,
             cap=dagger_cap, horizon=dagger_horizon, lag=lag,
