@@ -1624,6 +1624,7 @@ def main():
         args.max_nodes = 1000
         args.horizon = 8
         args.cap = 3000
+        args.dagger_cap = 3000
         if args.dagger_rounds == 0:
             args.dagger_rounds = 1
         if args.dagger_frames == 0:
