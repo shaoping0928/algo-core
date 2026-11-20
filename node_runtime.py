@@ -155,6 +155,7 @@ class NodeRuntime:
         predicate_readouts: bool = False,
         event_memory_risk: bool = True,
         contrast_objective: bool = False,
+        value_trust_samples: float = 150.0,
         value_horizon: Optional[int] = None,
         ood_trust_scale: float = 0.0,
         obs_trust: float = 1.0,
@@ -179,6 +180,8 @@ class NodeRuntime:
             raise ValueError("alpha_mc must be in (0, 1]")
         if float(birth_threshold) <= 0.0:
             raise ValueError("birth_threshold must be positive")
+        if float(value_trust_samples) < 0.0:
+            raise ValueError("value_trust_samples must be non-negative")
         if int(max_nodes) < 1:
             raise ValueError("max_nodes must be positive")
         if not 0.0 <= float(exploration) <= 1.0:
@@ -396,6 +399,13 @@ class NodeRuntime:
         # traversing a genuinely hazardous band no longer penalizes the
         # plans that must go through it.
         self.contrast_objective = bool(contrast_objective)
+        # D4: evidence-proportional trust.  In the contrast objective the
+        # endpoint value term is scaled by cbar/(cbar + K) with cbar the
+        # mean observation count behind that state's value read - a thin
+        # value cell speaks softly, a well-sampled one at full weight - so
+        # the influence of the value channel grows with the evidence
+        # behind it instead of being a fixed hyperparameter.
+        self.value_trust_samples = float(value_trust_samples)
         self._feature_all: List[str] = []
         self._feature_descendants: Dict[str, List[str]] = {}
         self._feature_objects: Dict[str, object] = {}
@@ -1884,7 +1894,8 @@ class NodeRuntime:
         )
 
     def feature_value_batch(self, states: np.ndarray,
-                            mask_table: Optional[List] = None) -> np.ndarray:
+                            mask_table: Optional[List] = None,
+                            return_support: bool = False):
         """Expected discounted dopamine return at each state, in return units.
 
         The read for a state is the support-shrunk ``(feature, pending[0])``
@@ -1914,6 +1925,7 @@ class NodeRuntime:
         prior = self.feature_value_prior
         total = np.zeros(len(states), dtype=float)
         weight = np.zeros(len(states), dtype=float)
+        count_sum = np.zeros(len(states), dtype=float)
         for node_id in roots:
             root_feature = self._feature_objects.get(node_id)
             if root_feature is None:
@@ -1951,6 +1963,7 @@ class NodeRuntime:
                     )
                     if selected.any():
                         best_count[selected] = count
+                        count_sum[selected] += count
                         values[selected] = (
                             total_return + prior * baseline
                         ) / (count + prior)
@@ -1958,7 +1971,13 @@ class NodeRuntime:
             weight += root_mask.astype(float)
         averaged = np.where(weight > 0.0, total / np.maximum(weight, 1e-9),
                             baseline)
-        return averaged
+        if not return_support:
+            return averaged
+        # Mean observation count of the cells behind each state's read:
+        # the evidence the value channel carries at that state.
+        support = np.where(weight > 0.0, count_sum / np.maximum(weight, 1e-9),
+                           0.0)
+        return averaged, support
 
     def prediction_report(self) -> dict:
         """Calibration of the readout: prediction vs actual per cell."""

@@ -951,6 +951,42 @@ class NodeRuntimeTests(unittest.TestCase):
             0.0, places=9,
         )
 
+    def test_feature_value_batch_reports_its_evidence(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40, gamma=0.5
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        hold = np.asarray([0.0, 0.0])    # encoded: obs + pending 0
+        flap = np.asarray([0.0, 1.0])
+        # Both actions carry value evidence; action 0 has twice the count.
+        runtime._update_feature_value([feature_id], 0, 2.0)
+        runtime._update_feature_value([feature_id], 0, 3.0)
+        runtime._update_feature_value([feature_id], 1, 1.0)
+        encoded = np.vstack([hold, flap])
+        values, support = runtime.feature_value_batch(
+            encoded, return_support=True
+        )
+        self.assertEqual(support[0], 2.0)
+        self.assertEqual(support[1], 1.0)
+        prior = runtime.feature_value_prior
+        baseline = runtime.value_baseline
+        self.assertAlmostEqual(
+            values[0], (5.0 + prior * baseline) / (2.0 + prior), places=9
+        )
+        # D4: with the trust half-count K, the thin-evidence action's
+        # endpoint contribution is scaled down relative to the rich one.
+        trust0 = 2.0 / (2.0 + runtime.value_trust_samples)
+        trust1 = 1.0 / (1.0 + runtime.value_trust_samples)
+        self.assertGreater(trust0, trust1)
+
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()
         node = runtime._create_node(np.asarray([0.0]))

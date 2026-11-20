@@ -66,7 +66,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
           feature_value_weight=0.02, value_features=True,
           value_label_quantile=0.8, subgraph_cells=False,
           predicate_readouts=False, event_memory_risk=True,
-          contrast_objective=False):
+          contrast_objective=False, value_trust_samples=150.0):
     world, agent = fit(
         seed, steps=steps, coverage=coverage, max_nodes=max_nodes,
         birth_threshold=birth_threshold, epochs=epochs,
@@ -83,6 +83,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
         predicate_readouts=predicate_readouts,
         event_memory_risk=event_memory_risk,
         contrast_objective=contrast_objective,
+        value_trust_samples=value_trust_samples,
     )
     # The same deterministic transitions `fit` trained on; used only to
     # measure whether both actions exist near the planner states.
@@ -470,6 +471,10 @@ def main():
     parser.add_argument("--contrast-objective", action="store_true",
                         help="F1: per-step cost is the action contrast and "
                              "the endpoint cost is the value term alone")
+    parser.add_argument("--value-trust-samples", type=float, default=150.0,
+                        help="D4: mean value-cell sample count at which the "
+                             "value channel earns half weight; 0 disables "
+                             "the trust scaling")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset matching substrate_nodes")
     args = parser.parse_args()
@@ -498,6 +503,7 @@ def main():
         predicate_readouts=args.predicate_readouts,
         event_memory_risk=not args.no_event_memory_risk,
         contrast_objective=args.contrast_objective,
+        value_trust_samples=args.value_trust_samples,
     )
 
 

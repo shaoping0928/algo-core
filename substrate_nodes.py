@@ -51,7 +51,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            feature_action_prior=2.0, feature_value_prior=4.0,
            value_features=True, value_label_quantile=0.8,
            subgraph_cells=False, predicate_readouts=False,
-           event_memory_risk=True, contrast_objective=False):
+           event_memory_risk=True, contrast_objective=False,
+           value_trust_samples=150.0):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -92,6 +93,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         predicate_readouts=predicate_readouts,
         event_memory_risk=event_memory_risk,
         contrast_objective=contrast_objective,
+        value_trust_samples=value_trust_samples,
     )
     episodes = {}
     for row in transitions:
@@ -232,7 +234,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         feature_action_prior=2.0, feature_value_prior=4.0,
         value_features=True, value_label_quantile=0.8,
         subgraph_cells=False, predicate_readouts=False,
-        event_memory_risk=True, contrast_objective=False):
+        event_memory_risk=True, contrast_objective=False,
+        value_trust_samples=150.0):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -292,6 +295,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("feature_value_prior must be non-negative")
     if not 0.0 < float(value_label_quantile) < 1.0:
         raise ValueError("value_label_quantile must be in (0, 1)")
+    if float(value_trust_samples) < 0.0:
+        raise ValueError("value_trust_samples must be non-negative")
     lag = int(lag)
     voi_fraction = float(voi_fraction)
     if voi_fraction > 0.0:
@@ -356,6 +361,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         predicate_readouts=predicate_readouts,
         event_memory_risk=event_memory_risk,
         contrast_objective=contrast_objective,
+        value_trust_samples=value_trust_samples,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -432,8 +438,14 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             mask_table = agent._feature_mask_table(
                 encoded[:, :agent.obs_dim]
             )
-            value = agent.feature_value_batch(encoded, mask_table)
-            cost = -agent.feature_value_weight * value
+            value, support = agent.feature_value_batch(
+                encoded, mask_table, return_support=True
+            )
+            # D4: the value channel speaks with the evidence behind it -
+            # a state whose value cells are thin contributes proportionally
+            # less to the endpoint cost.
+            trust = support / (support + agent.value_trust_samples)
+            cost = -agent.feature_value_weight * trust * value
             return np.column_stack([cost, -dopamine]), np.isfinite(
                 encoded
             ).all(axis=1)
@@ -624,9 +636,11 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
     pain, dopamine = agent.valence_state_batch(encoded)
     mask_table = agent._feature_mask_table(encoded[:, :agent.obs_dim])
     if contrast:
-        total -= agent.feature_value_weight * float(
-            agent.feature_value_batch(encoded, mask_table)[0]
+        value, support = agent.feature_value_batch(
+            encoded, mask_table, return_support=True
         )
+        trust = support / (support + agent.value_trust_samples)
+        total -= agent.feature_value_weight * trust * float(value[0])
         return (total, -float(dopamine[0]))
     if getattr(agent, "predicate_readouts", False):
         terminal = float(agent.pain_signal_batch(encoded, mask_table)[0])
@@ -737,6 +751,7 @@ def run_seed(task):
     predicate_readouts = bool(task.get("predicate_readouts", False))
     event_memory_risk = bool(task.get("event_memory_risk", True))
     contrast_objective = bool(task.get("contrast_objective", False))
+    value_trust_samples = float(task.get("value_trust_samples", 150.0))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -782,6 +797,7 @@ def run_seed(task):
         predicate_readouts=predicate_readouts,
         event_memory_risk=event_memory_risk,
         contrast_objective=contrast_objective,
+        value_trust_samples=value_trust_samples,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -919,6 +935,10 @@ def main():
                              "the endpoint cost is the value term alone, "
                              "so genuinely hazardous bands no longer "
                              "penalize the plans that must cross them")
+    parser.add_argument("--value-trust-samples", type=float, default=150.0,
+                        help="D4: mean value-cell sample count at which the "
+                             "value channel earns half weight; 0 disables "
+                             "the trust scaling")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -1067,6 +1087,7 @@ def main():
             predicate_readouts=args.predicate_readouts,
             event_memory_risk=not args.no_event_memory_risk,
             contrast_objective=args.contrast_objective,
+            value_trust_samples=args.value_trust_samples,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -1196,6 +1217,7 @@ def main():
                 predicate_readouts=args.predicate_readouts,
                 event_memory_risk=not args.no_event_memory_risk,
                 contrast_objective=args.contrast_objective,
+                value_trust_samples=args.value_trust_samples,
                 self_evaluation=not bool(eval_seeds),
                 dagger_rounds=args.dagger_rounds,
                 dagger_episodes=args.dagger_episodes,
