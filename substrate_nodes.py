@@ -520,6 +520,50 @@ def learn_objective_weight(rows, min_decisions: int = 8) -> Optional[float]:
     return best_weight
 
 
+def ledger_survival_report(rows, weight: float,
+                           min_decisions: int = 8) -> Optional[dict]:
+    """Monotone regression of each ledger component on realized survival.
+
+    P4 diagnostic: the objective's components are supposed to predict
+    what actually happens - a plan whose ledger says "expensive" should
+    not outlive one whose ledger says "cheap".  For every executed
+    decision this reports the rank agreement of each component with the
+    realized remaining survival (the hazard share and the value share
+    should both correlate negatively with survival: more hazard and more
+    value both mean a lower scalarized cost) and the agreement of the
+    scalarized cost at the objective's current weight.  A component near
+    zero is not predicting survival - exactly the misfit that flags an
+    objective term worth re-learning or dropping.
+    """
+    hazards = []
+    values = []
+    outcomes = []
+    last_index = {}
+    for index, row in enumerate(rows):
+        if row.get("ledger"):
+            last_index[row["episode"]] = index
+    for index, row in enumerate(rows):
+        ledger = row.get("ledger")
+        if not ledger:
+            continue
+        hazards.append(float(ledger[0]))
+        values.append(float(ledger[1]))
+        outcomes.append(float(last_index[row["episode"]] - index + 1))
+    if len(hazards) < min_decisions or len(set(outcomes)) < 2:
+        return None
+    hazards = np.asarray(hazards, dtype=float)
+    values = np.asarray(values, dtype=float)
+    outcomes = np.asarray(outcomes, dtype=float)
+    return {
+        "decisions": len(hazards),
+        "hazard_agreement": _spearman(-hazards, outcomes),
+        "value_agreement": _spearman(values, outcomes),
+        "scalar_agreement": _spearman(
+            -(hazards + float(weight) * values), outcomes
+        ),
+    }
+
+
 def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         birth_threshold=0.45, epochs=5, lag=LAG,
         component_kinds=(), component_min_count=8,
@@ -708,6 +752,11 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             if learned is not None:
                 agent.feature_value_weight = learned
                 dagger_log[-1]["learned_value_weight"] = learned
+            report = ledger_survival_report(
+                planner_rows, agent.feature_value_weight
+            )
+            if report:
+                dagger_log[-1]["ledger_report"] = report
     agent.dagger_log = dagger_log
     return world, agent
 

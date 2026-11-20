@@ -1638,7 +1638,6 @@ class NodeRuntimeTests(unittest.TestCase):
 
     def test_learn_objective_weight_follows_realized_survival(self):
         from substrate_nodes import learn_objective_weight
-
         # Hazard and |value share| fall along the stream while the
         # realized remaining survival falls with it too: the hazard-only
         # read ranks survival backwards (a high-cost early decision
@@ -1659,6 +1658,27 @@ class NodeRuntimeTests(unittest.TestCase):
             dict(episode=e, ledger=(1.0, -1.0)) for e in range(12)
         ]
         self.assertIsNone(learn_objective_weight(flat))
+
+    def test_ledger_survival_report_flags_blind_components(self):
+        from substrate_nodes import ledger_survival_report
+
+        # The hazard share rises along the stream while the realized
+        # remaining survival falls with it: the hazard component ranks
+        # survival correctly (more hazard, shorter life), while the value
+        # share is a constant - a blind component whose agreement is
+        # exactly zero.
+        rows = []
+        for index in range(10):
+            rows.append(dict(
+                episode=0,
+                ledger=(float(index + 1), -1.0),
+            ))
+        report = ledger_survival_report(rows, weight=0.05)
+        self.assertEqual(report["decisions"], 10)
+        self.assertGreater(report["hazard_agreement"], 0.9)
+        self.assertAlmostEqual(report["value_agreement"], 0.0, places=9)
+        # Too few decisions report nothing.
+        self.assertIsNone(ledger_survival_report(rows[:4], weight=0.05))
 
     def test_planner_rows_carry_the_decision_ledger(self):
         from substrate_nodes import collect_planner, fit
