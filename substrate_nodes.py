@@ -833,8 +833,13 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             stride_includes_lag=stride_includes_lag,
             # Each round must get fresh episode ids: merging two rollouts
             # under one id would make the backward pass treat the second as
-            # a continuation of the first.
-            offset=dagger_offset + _round * int(dagger_episodes),
+            # a continuation of the first.  The stride between rounds is
+            # the number of episode ids a round can actually consume (the
+            # frame budget can stretch `planner_episodes` far beyond
+            # `dagger_episodes`), so a `dagger_episodes`-sized stride would
+            # collide ids across rounds and splice distinct real episodes
+            # into one list.
+            offset=dagger_offset + _round * int(planner_episodes),
             max_frames=(int(dagger_frames) or None),
         )
         if not planner:

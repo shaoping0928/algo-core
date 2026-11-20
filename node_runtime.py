@@ -2077,6 +2077,17 @@ class NodeRuntime:
             ))
             if done:
                 self.reset()
+                # Rows from distinct real episodes can arrive concatenated
+                # in one call.  The backward pass below still walks every
+                # recorded step, so restore prune protection for every
+                # node those steps reference - the reset above dropped the
+                # running episode's own set, and a later birth in this call
+                # could otherwise delete a node the backward pass needs.
+                for step in steps:
+                    self._episode_nodes.add(step[0])
+                    self._episode_nodes.update(step[6])
+                    if step[2] is not None:
+                        self._episode_nodes.add(step[2])
                 recent_propensities.clear()
 
         running_pain = 0.0

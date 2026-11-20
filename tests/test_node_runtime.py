@@ -677,6 +677,44 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertTrue(bool(table[0][0]))
         self.assertFalse(bool(table[0][1]))
 
+    def test_merged_episode_keeps_backward_references_alive(self):
+        # Two real episodes concatenated in one call (what colliding DAgger
+        # episode ids used to produce): the mid-call reset must not drop
+        # the prune protection of the first half's nodes, or the backward
+        # pass references a prototype deleted during the same call.
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), birth_threshold=0.5,
+            max_nodes=3,
+        )
+
+        def row(obs_value, next_value, action, pain, done, episode):
+            return dict(
+                obs=np.asarray([obs_value]),
+                next_obs=np.asarray([next_value]),
+                history=np.asarray([float(action), 0.0]),
+                signals=np.asarray([0.1, float(pain)]),
+                done=done, episode=episode,
+            )
+
+        # The first episode fills the graph to its cap.
+        first = [
+            row(0.0, 10.0, 0, 0.0, False, 0),
+            row(10.0, 20.0, 1, 0.0, False, 0),
+            row(20.0, 30.0, 0, 0.0, True, 0),
+        ]
+        # The second episode's far states hit the cap: with the bug, the
+        # reset between the halves cleared the protection and a birth here
+        # deleted a node the backward pass still references.
+        second = [
+            row(100.0, 110.0, 1, 0.0, False, 1),
+            row(110.0, 120.0, 0, 1.0, True, 1),
+        ]
+        runtime.learn_episode(first + second)
+        # No node was deleted during the call: the births were absorbed
+        # because every referenced node stays protected until the backward
+        # pass has run.
+        self.assertEqual(len(runtime._prototype_ids), 3)
+
     def test_feature_windows_are_per_node(self):
         from node_features import FeatureRule, Primitive
         from node_graph import NodeGraph
