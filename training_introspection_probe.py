@@ -36,7 +36,7 @@ import numpy as np
 import node_runtime
 import substrate_nodes as sn
 from eval_protocol import parse_seed_spec
-from node_graph import MEMORY
+from node_graph import MEMBERSHIP, MEMORY
 from node_runtime import NodeRuntime
 from substrate_nodes import (
     LAG,
@@ -376,21 +376,59 @@ def snapshot(agent, world, phase, total_rows, args, probe_rows):
                 action_rate=float(np.mean(actions)) if actions else 0.0,
             ))
 
-    # Memory growth and reinforcement.
+    # Memory growth, membership strength and retrieval reach.  `count` is
+    # a creation marker (set to 1 once and never incremented), so the
+    # meaningful quantities are the membership weights the per-transition
+    # refresh pushes up and the per-episode decay pulls down, plus how
+    # often the probe stream retrieves any memory at all.
     memory_nodes = [
         node for node in agent.graph.nodes.values()
         if node.kind == MEMORY
     ]
     counts = [int(node.count) for node in memory_nodes]
+    membership_weights = []
+    for node in memory_nodes:
+        for key in agent.graph.outgoing.get(node.id, []):
+            if key[2] == MEMBERSHIP:
+                membership_weights.append(
+                    float(agent.graph.edges[key].weight)
+                )
+    retrieval = []
+    for row in encoded:
+        node_id, _distance = agent._nearest(row)
+        retrieval.append(
+            0 if node_id is None else len(agent.memories_for([node_id]))
+        )
+    retrieval = np.asarray(retrieval, dtype=float)
+    pain_mixed, _dopamine_mixed = agent.valence_state_batch(encoded)
+    saved_weight = agent.memory_weight
+    agent.memory_weight = 0.0
+    pain_unmixed, _dopamine_unmixed = agent.valence_state_batch(encoded)
+    agent.memory_weight = saved_weight
+    memory_shift = pain_mixed - pain_unmixed
     memories = dict(
         count=len(memory_nodes),
-        reinforced=sum(1 for count in counts if count > 1),
+        count_gt_one=sum(1 for count in counts if count > 1),
         mean_count=float(np.mean(counts)) if counts else 0.0,
         max_count=int(max(counts)) if counts else 0,
         mean_abs_value=(
             float(np.mean([abs(node.value) for node in memory_nodes]))
             if memory_nodes else 0.0
         ),
+        membership_edges=len(membership_weights),
+        membership_weight_mean=(
+            float(np.mean(membership_weights))
+            if membership_weights else 0.0
+        ),
+        membership_weight_max=(
+            float(np.max(membership_weights))
+            if membership_weights else 0.0
+        ),
+        retrieval_rate=float(np.mean(retrieval > 0)),
+        retrieval_mean=float(np.mean(retrieval)),
+        terminal_shift_mean=float(np.mean(memory_shift)),
+        terminal_shift_max=float(np.max(np.abs(memory_shift))),
+        terminal_shift_rows=float(np.mean(np.abs(memory_shift) > 1e-9)),
     )
 
     # Prototype value spread: how far the value channel has differentiated.
@@ -540,9 +578,19 @@ def print_summary(report):
                experience["recorded_predictions"])
         )
         print(
-            "  memories: %d (reinforced %d)  eval mean %.1f median %.1f"
-            % (phase["memories"]["count"], phase["memories"]["reinforced"],
-               phase["eval_mean"], phase["eval_median"])
+            "  memories: %d (count>1: %d)  membership w mean %.3f max %.3f  "
+            "retrieval %.1f%%  terminal shift %.4f (%.0f%% rows)"
+            % (phase["memories"]["count"],
+               phase["memories"]["count_gt_one"],
+               phase["memories"]["membership_weight_mean"],
+               phase["memories"]["membership_weight_max"],
+               100.0 * phase["memories"]["retrieval_rate"],
+               phase["memories"]["terminal_shift_mean"],
+               100.0 * phase["memories"]["terminal_shift_rows"])
+        )
+        print(
+            "  eval mean %.1f median %.1f"
+            % (phase["eval_mean"], phase["eval_median"])
         )
     print()
 
