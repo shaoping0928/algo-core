@@ -43,6 +43,7 @@ trace_graph_memory.py     在真实 Flappy 转移上评估图记忆风险
 substrate_graph_search.py 用学习世界模型 + 图记忆风险做搜索的原型
 substrate_nodes.py        节点中心原型：在线节点价值 + 沙盒轨迹搜索
 node_runtime.py           节点运行时：动作条件边、MC 信用分配、事件记忆
+memory_credit_probe.py    记忆回溯修正的机制探针（修正量/召回率）
 eval_protocol.py          held-out 种子解析、中位数/IQR、聚类 bootstrap 区间
 signal_bank.py            每节点信号源：差分、积分/泄漏、逆泄漏、均值
 substrate_*.py            各算子、记忆、噪声、延迟和搜索的验证脚本

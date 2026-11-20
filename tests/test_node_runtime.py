@@ -641,6 +641,9 @@ class NodeRuntimeTests(unittest.TestCase):
         # state label was rewritten.
         self.assertAlmostEqual(stats[0], decay, places=6)
         self.assertAlmostEqual(stats[1], decay, places=6)
+        self.assertEqual(runtime.memory_credit_stats["events"], 1)
+        self.assertEqual(runtime.memory_credit_stats["corrected"], 1)
+        self.assertIn(earlier, runtime.memory_credit_stats["corrected_ids"])
 
     def test_memory_credit_links_the_event_to_prior_context(self):
         from node_graph import MEMBERSHIP

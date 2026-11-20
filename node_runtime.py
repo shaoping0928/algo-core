@@ -530,6 +530,16 @@ class NodeRuntime:
         # much of it reaches an earlier memory.
         self.memory_credit = bool(memory_credit)
         self._memory_traces: Dict[str, float] = {}
+        # Diagnostic counters: how many pain events corrected an earlier
+        # memory, how much eligibility mass moved, and how many context
+        # links the event added.  Read-only; the probe script reports them.
+        self.memory_credit_stats = {
+            "events": 0,
+            "corrected": 0,
+            "weight": 0.0,
+            "links": 0,
+            "corrected_ids": set(),
+        }
         # Resource bound on how many preceding context nodes one event
         # memory links to; not a semantic window.
         self.memory_context_limit = 32
@@ -1212,6 +1222,8 @@ class NodeRuntime:
             traces[created_memory] = traces.get(created_memory, 0.0) + 1.0
         if pain <= 0.0:
             return
+        stats = self.memory_credit_stats
+        stats["events"] += 1
         current = set(active) | set(memories)
         if created_memory is not None:
             current.add(created_memory)
@@ -1221,9 +1233,11 @@ class NodeRuntime:
             node = self.graph.nodes.get(node_id)
             if node is None or node.kind != MEMORY:
                 continue
-            self._note_valence_weighted(
-                [node_id], pain, min(1.0, float(eligibility))
-            )
+            weight = min(1.0, float(eligibility))
+            self._note_valence_weighted([node_id], pain, weight)
+            stats["corrected"] += 1
+            stats["weight"] += weight
+            stats["corrected_ids"].add(node_id)
         target = created_memory
         if target is None and memories:
             target = max(memories, key=lambda mid: traces.get(mid, 0.0))
@@ -1237,9 +1251,11 @@ class NodeRuntime:
             and self.graph.nodes[node_id].kind != MEMORY
         ]
         context.sort(key=lambda item: -item[1])
-        for member_id, eligibility in context[:self.memory_context_limit]:
+        chosen = context[:self.memory_context_limit]
+        for member_id, eligibility in chosen:
             edge = self.graph.add_membership(target, member_id)
             edge.weight = max(edge.weight, min(1.0, eligibility))
+        stats["links"] += len(chosen)
 
     def _association_base(self) -> float:
         """Global pain rate per transition, a 1/n cumulative mean."""
