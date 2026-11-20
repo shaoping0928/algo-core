@@ -89,7 +89,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            event_memory_risk=True, contrast_objective=False,
            value_trust_samples: float = 150.0, control_risk_weight: float = 0.0,
         value_bank_only: bool = False,
-        value_dispersion=False, iterative_induction=False):
+        value_dispersion=False, iterative_induction=False,
+        compose_readout: bool = True):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -280,6 +281,24 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                     agent.install_feature_rules(
                         gap_long.rules, horizon=long_window
                     )
+    if (
+        compose_readout and precursor_labels and len(states)
+        and getattr(agent, "feature_ids", ())
+    ):
+        # P2: the stacked non-negative composition replaces the
+        # hand-written max over correlated channels - its fixed point
+        # is E[max of correlated estimates], structurally above the
+        # truths, and it is exactly the default objective's readout.
+        # Fitted to the short-window labels (the same family the
+        # channels train on), then monotone-mapped to empirical
+        # rates.  The report records the fit's own error against the
+        # historical max for the trace.
+        pending_final = _encoded_pending(transitions, lag)
+        report = agent.fit_hazard_composition(
+            states, pending_final, pain_short
+        )
+        if report:
+            agent.composition_report = report
     if contrast_objective:
         # F6: fit the monotone readout calibration on the training stream
         # itself, so the graded threat read is an empirical pain rate
@@ -333,7 +352,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         event_memory_risk=True, contrast_objective=False,
         value_trust_samples=150.0, value_dispersion=False,
         control_risk_weight=0.0, value_bank_only=False,
-        iterative_induction=False):
+        iterative_induction=False, compose_readout=True):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -466,6 +485,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         value_bank_only=value_bank_only,
         value_dispersion=value_dispersion,
         iterative_induction=iterative_induction,
+        compose_readout=compose_readout,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -871,6 +891,7 @@ def run_seed(task):
     control_risk_weight = float(task.get("control_risk_weight", 0.0))
     value_bank_only = bool(task.get("value_bank_only", False))
     iterative_induction = bool(task.get("iterative_induction", False))
+    compose_readout = bool(task.get("compose_readout", True))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -921,6 +942,7 @@ def run_seed(task):
         control_risk_weight=control_risk_weight,
         value_bank_only=value_bank_only,
         iterative_induction=iterative_induction,
+        compose_readout=compose_readout,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1079,6 +1101,12 @@ def main():
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
                              "as the next generation's targets")
+    parser.add_argument("--no-compose-readout", dest="compose_readout",
+                        action="store_false",
+                        help="keep the hand-written max-combination in "
+                             "pain_signal_batch instead of the stacked "
+                             "non-negative composition fitted to the "
+                             "precursor labels")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -1232,6 +1260,7 @@ def main():
             control_risk_weight=args.control_risk_weight,
             value_bank_only=args.value_bank_only,
             iterative_induction=args.iterative_induction,
+            compose_readout=args.compose_readout,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,

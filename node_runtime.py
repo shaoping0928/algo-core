@@ -109,6 +109,135 @@ def future_return_labels(rows, gamma: float) -> List[float]:
     return labels
 
 
+def _isotonic_map(reads: np.ndarray,
+                  targets: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Fit the monotone (isotonic) map from raw reads to empirical rates.
+
+    Pool adjacent violators over the sorted (read, label) pairs - the
+    classic isotonic regression.  Each block carries its mean read
+    (centroid) and mean label (rate), and the returned map interpolates
+    between centroids, so every read value in between maps to an
+    empirical rate: no quantile bin is involved, and an untested read
+    level cannot inherit an empty bin's carried plateau.  Clamping nodes
+    are pinned just outside the finite range so ``numpy.interp`` holds
+    the end rates in the tails.
+    """
+    reads = np.asarray(reads, dtype=float)
+    targets = np.asarray(targets, dtype=float)
+    blocks = []
+    for index in np.argsort(reads, kind="stable"):
+        blocks.append([float(reads[index]), float(targets[index]), 1.0])
+        while len(blocks) >= 2 and (
+            blocks[-2][1] / blocks[-2][2] > blocks[-1][1] / blocks[-1][2]
+        ):
+            top = blocks.pop()
+            below = blocks.pop()
+            blocks.append([
+                below[0] + top[0], below[1] + top[1], below[2] + top[2],
+            ])
+    block_reads = np.asarray(
+        [total_read / weight for total_read, _total, weight in blocks],
+        dtype=float,
+    )
+    block_rates = np.asarray(
+        [total_label / weight for _total_read, total_label, weight in blocks],
+        dtype=float,
+    )
+    span = max(float(block_reads.max() - block_reads.min()), 1e-9)
+    mids = np.concatenate([
+        [block_reads[0] - span - 1.0], block_reads,
+        [block_reads[-1] + span + 1.0],
+    ])
+    rates = np.concatenate([
+        [block_rates[0]], block_rates, [block_rates[-1]],
+    ])
+    return mids, rates
+
+
+def _nnls(design: np.ndarray, target: np.ndarray,
+          ridge: float = 0.0, tol: float = 1e-10,
+          max_sweeps: int = 200) -> np.ndarray:
+    """Lawson-Hanson active-set non-negative least squares.
+
+    Solves ``min ||A w - b||`` subject to ``w >= 0``.  With `ridge > 0`
+    the normal problem is Tikhonov-augmented (``sqrt(ridge) * I`` rows
+    against a zero target), which keeps the active-set solves stable when
+    channel columns are collinear and shrinks the solution toward zero -
+    the classical regularized stacking form.  Column counts here are a
+    handful, so the implementation is the textbook loop over
+    ``numpy.linalg.lstsq`` on the passive set.
+    """
+    a = np.asarray(design, dtype=float)
+    b = np.asarray(target, dtype=float)
+    if a.ndim != 2 or b.ndim != 1 or a.shape[0] != b.shape[0]:
+        raise ValueError("design must be (rows, columns), target (rows,)")
+    columns = a.shape[1]
+    if columns == 0:
+        return np.zeros(0)
+    if ridge > 0.0:
+        a = np.vstack([a, np.sqrt(float(ridge)) * np.eye(columns)])
+        b = np.concatenate([b, np.zeros(columns)])
+    weights = np.zeros(columns)
+    passive: List[int] = []
+    active = list(range(columns))
+    for _ in range(max_sweeps):
+        if not active:
+            break
+        gradient = a.T @ (b - a @ weights)
+        best = max(active, key=lambda index: gradient[index])
+        if gradient[best] <= tol:
+            break
+        passive.append(best)
+        active.remove(best)
+        while True:
+            columns_active = a[:, passive]
+            solution, *_ = np.linalg.lstsq(
+                columns_active, b, rcond=None
+            )
+            if (solution >= -tol).all():
+                weights = np.zeros(columns)
+                for position, index in enumerate(passive):
+                    weights[index] = max(float(solution[position]), 0.0)
+                break
+            # Step back along the line from the current weights to the
+            # unconstrained solution until the first component hits zero,
+            # then release that column back to the active set.
+            step = 1.0
+            for position, index in enumerate(passive):
+                if solution[position] <= 0.0:
+                    current = weights[index]
+                    gap = current - solution[position]
+                    if gap > tol:
+                        step = min(step, current / gap)
+            weights = weights + step * (
+                _expand(solution, passive, columns) - weights
+            )
+            released = [
+                index for index in passive if weights[index] <= tol
+            ]
+            if not released:
+                # Degenerate step (numerically flat): release the most
+                # negative component to guarantee progress.
+                worst = min(
+                    range(len(passive)),
+                    key=lambda position: solution[position],
+                )
+                released = [passive[worst]]
+            for index in released:
+                weights[index] = 0.0
+                passive.remove(index)
+                active.append(index)
+    return weights
+
+
+def _expand(solution: np.ndarray, passive: List[int],
+            columns: int) -> np.ndarray:
+    full = np.zeros(columns)
+    for position, index in enumerate(passive):
+        full[index] = solution[position]
+    return full
+
+
 class NodeRuntime:
     """Online concept graph with action-conditioned valence learning."""
 
@@ -440,6 +569,13 @@ class NodeRuntime:
         # signal everywhere - the before/after audit measured the dilution
         # at -4 to -14 against the data's own return table.
         self.value_bank_only = bool(value_bank_only)
+        # Stacked hazard composition (P2): when fitted, `pain_signal_batch`
+        # reports a non-negative least-squares composition of its channels
+        # instead of the hand-written max, followed by a monotone map to
+        # the empirical danger rate.  Unfitted (None), the historical
+        # max-combination runs unchanged.
+        self.hazard_composition: Optional[Dict[str, float]] = None
+        self.hazard_calibration: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self._feature_all: List[str] = []
         self._feature_descendants: Dict[str, List[str]] = {}
         self._feature_objects: Dict[str, object] = {}
@@ -874,14 +1010,22 @@ class NodeRuntime:
             )
         return learned
 
-    def pain_signal_batch(self, states: np.ndarray,
-                          mask_table: Optional[List] = None) -> np.ndarray:
+    def _hazard_channels(self, states: np.ndarray,
+                         mask_table: Optional[List] = None
+                         ) -> Dict[str, np.ndarray]:
+        """The individual hazard readouts the signal composes.
+
+        Each channel reports its own estimate; `pain_signal_batch` either
+        max-combines them (the historical hand-written composition) or,
+        when the stacked composition is fitted, takes the learned
+        non-negative weighted sum.  Keeping the channels in one place
+        guarantees the fit and the consumers always see the same columns.
+        """
         states = np.asarray(states, dtype=float)
-        if len(states) == 0:
-            return np.zeros(0)
-        result = np.zeros(len(states), dtype=float)
+        channels: Dict[str, np.ndarray] = {}
         if not self.predicate_readouts:
             indices, weights, nearest_min = self._soft_weights_batch(states)
+            prototype = np.zeros(len(states), dtype=float)
             if indices is not None:
                 for row in range(len(states)):
                     total = 0.0
@@ -902,28 +1046,62 @@ class NodeRuntime:
                         weighted += float(strength) * self._pain_association(
                             memory_id
                         )
-                    result[row] = weighted / total if total > 0.0 else 0.0
-                result = self._shrink_to_baseline(
-                    result, nearest_min,
+                    prototype[row] = weighted / total if total > 0.0 else 0.0
+                prototype = self._shrink_to_baseline(
+                    prototype, nearest_min,
                     baseline=self.prototype_pain_baseline(),
                 )
-                result = result * self.obs_trust
+                prototype = prototype * self.obs_trust
+            channels["prototype"] = prototype
         if self.feature_ids:
             if mask_table is None:
                 mask_table = self._feature_mask_table(
                     states[:, :self.obs_dim]
                 )
-            result = np.maximum(
-                result, self._feature_risk_batch(states, mask_table)
+            channels["feature"] = self._feature_risk_batch(
+                states, mask_table
             )
             if self.event_memory_risk:
-                result = np.maximum(
-                    result,
-                    self._feature_memory_risk_batch(states, mask_table),
+                channels["memory"] = self._feature_memory_risk_batch(
+                    states, mask_table
                 )
         elif self.rules.rules:
-            rule_risk = self.rules.activate(states[:, :self.obs_dim])
-            result = np.maximum(result, rule_risk)
+            channels["rules"] = self.rules.activate(
+                states[:, :self.obs_dim]
+            )
+        return channels
+
+    def pain_signal_batch(self, states: np.ndarray,
+                          mask_table: Optional[List] = None) -> np.ndarray:
+        states = np.asarray(states, dtype=float)
+        if len(states) == 0:
+            return np.zeros(0)
+        channels = self._hazard_channels(states, mask_table)
+        composition = self.hazard_composition
+        if composition:
+            # P2 stacked composition: the non-negative least-squares
+            # weights were fitted to the precursor labels, so the read is
+            # the channels' own regression estimate instead of the
+            # hand-written max (whose fixed point is E[max of correlated
+            # estimates], structurally above max of the truths).  The
+            # monotone map then holds the composed level to the empirical
+            # rate.
+            read = np.zeros(len(states), dtype=float)
+            for name, weight in composition.items():
+                column = channels.get(name)
+                if column is not None and weight > 0.0:
+                    read = read + float(weight) * column
+            calibration = self.hazard_calibration
+            if calibration is not None:
+                mids, rates = calibration
+                read = np.interp(read, mids, rates)
+            return read
+        result = np.zeros(len(states), dtype=float)
+        if "prototype" in channels:
+            result = np.maximum(result, channels["prototype"])
+        for name in ("feature", "memory", "rules"):
+            if name in channels:
+                result = np.maximum(result, channels[name])
         return result
 
     def _signature(self, node_id: str) -> Tuple[int, ...]:        return tuple(
@@ -1943,44 +2121,60 @@ class NodeRuntime:
         targets = np.concatenate(target_column)
         if len(reads) < 2:
             return
-        # Pool adjacent violators over the sorted (read, label) pairs -
-        # the classic isotonic regression.  Each block carries its mean
-        # read (centroid) and mean label (rate), and the map interpolates
-        # between centroids, so every read value in between maps to an
-        # empirical rate: no quantile bin is involved, and an untested
-        # read level cannot inherit an empty bin's carried plateau.
-        order = np.argsort(reads, kind="stable")
-        blocks = []
-        for index in order:
-            blocks.append([float(reads[index]), float(targets[index]), 1.0])
-            while len(blocks) >= 2 and (
-                blocks[-2][1] / blocks[-2][2] > blocks[-1][1] / blocks[-1][2]
-            ):
-                top = blocks.pop()
-                below = blocks.pop()
-                blocks.append([
-                    below[0] + top[0], below[1] + top[1],
-                    below[2] + top[2],
-                ])
-        block_reads = np.asarray(
-            [total_read / weight for total_read, _total, weight in blocks],
-            dtype=float,
-        )
-        block_rates = np.asarray(
-            [total_label / weight for _total_read, total_label, weight in blocks],
-            dtype=float,
-        )
-        # Clamping nodes pinned just outside the finite range so np.interp
-        # holds the end rates in the tails.
-        span = max(float(block_reads.max() - block_reads.min()), 1e-9)
-        mids = np.concatenate([
-            [block_reads[0] - span - 1.0], block_reads,
-            [block_reads[-1] + span + 1.0],
-        ])
-        rates = np.concatenate([
-            [block_rates[0]], block_rates, [block_rates[-1]],
-        ])
-        self.readout_calibration = (mids, rates)
+        self.readout_calibration = _isotonic_map(reads, targets)
+
+    def fit_hazard_composition(self, states: np.ndarray,
+                               pending: np.ndarray,
+                               labels: np.ndarray,
+                               ridge: float = 1e-6) -> dict:
+        """Fit the stacked non-negative composition of the hazard channels.
+
+        Breiman stacked regressions with a non-negativity constraint: the
+        hand-written max over correlated channel reads has
+        ``E[max of correlated estimates]`` as its fixed point -
+        structurally above max of the truths - and no consistency loss
+        ever tied the composition to the data.  Here the channel columns
+        are regressed on the precursor labels in closed form with
+        ``w >= 0`` (exact zeros de-duplicate overlapping or inflating
+        members), and a monotone map then holds the composed level to the
+        empirical rate, the same estimator the graded readout uses.
+        Unfitted, `pain_signal_batch` keeps the historical max-combine.
+
+        Returns a small report (per-channel weights, mean absolute error
+        of the composed read vs the labels, and the same error for the
+        historical max-combine) so the fit's effect stays measurable.
+        """
+        states = np.asarray(states, dtype=float)
+        pending_all = np.asarray(pending, dtype=float)
+        if pending_all.shape[0] != len(states):
+            raise ValueError("pending must have one row per state")
+        labels = np.asarray(labels, dtype=float)
+        enc = np.concatenate([states, pending_all], axis=1)
+        channels = self._hazard_channels(enc)
+        names = sorted(channels)
+        if not names:
+            return {}
+        design = np.column_stack([channels[name] for name in names])
+        weights = _nnls(design, labels, ridge=ridge)
+        composed = design @ weights
+        self.hazard_composition = {
+            name: float(weight) for name, weight in zip(names, weights)
+        }
+        self.hazard_calibration = _isotonic_map(composed, labels)
+        mids, rates = self.hazard_calibration
+        mapped = np.interp(composed, mids, rates)
+        maximum = np.zeros(len(states), dtype=float)
+        for name in names:
+            maximum = np.maximum(maximum, channels[name])
+        return {
+            "weights": dict(self.hazard_composition),
+            # The composed read as the consumer sees it (stacked, then
+            # mapped) against the historical consumer (raw max-combine).
+            "composed_mae": float(np.mean(np.abs(mapped - labels))),
+            "maximum_mae": float(np.mean(np.abs(maximum - labels))),
+            "composed_rate": float(np.mean(mapped)),
+            "label_rate": float(np.mean(labels)),
+        }
 
     def _calibrate_threat(self, threat: np.ndarray) -> np.ndarray:
         calibration = getattr(self, "readout_calibration", None)

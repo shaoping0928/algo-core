@@ -71,6 +71,33 @@
     OFF 回归**预期持续到 P2 落地**；不以此为理由保留工件。
     注意 fast 上限饱和：旧 OFF seed 100 range 顶到 392/400（饱和），
     fast 数字本身被 cap 混淆，真实规模判定需 N=5000（例外协议）。
+- **P2 组合学习已实施（2026-11-20，本轮）**：
+  - **NNLS 求解器**：`node_runtime._nnls`——Lawson-Hanson 主动集法
+    （Tikhonov ridge 增广保持共线列稳定；教科书循环 + lstsq）。
+  - **通道抽离**：`_hazard_channels` 把原型/特征/记忆/rules 四通道
+    收进一处——拟合与消费看到相同的列；`pain_signal_batch` 在
+    `hazard_composition` 已拟合时输出 **NNLS 加权和 + isotonic 映射**，
+    未拟合时逐位保持历史 max 路径（重构位等价）。
+  - **拟合**：`fit_hazard_composition(states, pending, labels)`——对
+    precursor 标签闭式拟合 w≥0（Breiman 非负堆叠：零权重恰好去重
+    冗余/通胀成员），随后 `_isotonic_map`（从校准拟合中抽出的共享
+    PAV helper）把组合水平钉到经验率；返回报告（权重、组合 MAE vs
+    旧 max MAE、率对齐）存 `agent.composition_report`。
+  - **接线**：`_train` 末尾对 precursor 标签流拟合（`compose_readout`
+    默认开，`--no-compose-readout` 保留旧路径）；fit/run_seed/CLI
+    全链贯通。
+  - **机制验证（fast 单种子探针）**：composed MAE **0.0358 vs 旧 max
+    0.0783（减半）**；组合率 0.0996 vs 标签率 0.0987（水平对齐）；
+    NNLS 权重 = prototype 3.23 / feature 0.39 / **memory 0.0**
+    （非负性把冻结快照记忆通道归零——审计预测的效应）。
+  - **行为（fast 配对，3 种子）**：OFF+组合 76.0 vs pre-P2 91.5 vs
+    旧工件基线 197.4——组合层正确但 OFF 臂**未恢复**：诚实读出之下
+    默认目标在薄数据上没有可用长视野项（价值通道被信任缩放静音、
+    危险率读出近平坦）。**旧 197 是通胀保守性工件**（上限饱和）。
+    OFF 臂的后续修复属于 P3（结构选择压力）/P4（目标学习），不在
+    组合层。142 测试全过（新增 _nnls/组合拟合/回退 3 条——其中
+    _nnls 测试纠正了一个经典误设：裁剪无约束解 ≠ NNLS 最优，
+    边界面上的 [0.5, 0] 才是）。
 - 所有后台实验已停止，代码与文档已提交；工作树应为干净。
 - **资源裁定（2026-11-20，用户）**：验证运行**每轮共 3 个种子**
   （`--jobs 3` 一波跑完），臂与臂串行；**默认验证任务 5–10 分钟内出

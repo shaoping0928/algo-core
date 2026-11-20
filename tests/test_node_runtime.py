@@ -1419,6 +1419,79 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertGreater(threat[0], 0.8)
         self.assertLess(threat[1], 0.2)
 
+    def test_nnls_solves_the_non_negative_least_squares(self):
+        from node_runtime import _nnls
+
+        # The unconstrained solution here is [1, -1], but clipping it is
+        # not the constrained optimum: on the w1 = 0 face the best w0 is
+        # 0.5 (residual [0.5, -0.5] with a non-positive gradient on the
+        # released column).  The active set must find the boundary point.
+        np.testing.assert_allclose(
+            _nnls(np.asarray([[1.0, 0.0], [1.0, 1.0]]),
+                  np.asarray([1.0, 0.0])),
+            [0.5, 0.0], atol=1e-9,
+        )
+        # An exactly solvable interior case keeps both weights.
+        np.testing.assert_allclose(
+            _nnls(np.asarray([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+                  np.asarray([1.0, 1.0, 2.0])),
+            [1.0, 1.0], atol=1e-9,
+        )
+        # The ridge keeps collinear columns stable and non-negative.
+        shrunk = _nnls(
+            np.asarray([[1.0, 1.0], [1.0, 1.0]]),
+            np.asarray([2.0, 2.0]), ridge=1.0,
+        )
+        self.assertTrue((shrunk >= 0.0).all())
+
+    def test_hazard_composition_replaces_the_max_combine(self):
+        runtime = self.make_runtime()
+        readings = {
+            "prototype": np.asarray([0.9, 0.1, 0.9, 0.1]),
+            "feature": np.asarray([0.9, 0.9, 0.1, 0.1]),
+        }
+        labels = np.asarray([1.0, 0.0, 0.0, 0.0])
+        runtime._hazard_channels = (
+            lambda states, mask_table=None: readings
+        )
+        report = runtime.fit_hazard_composition(
+            np.zeros((4, 1)), np.zeros((4, 0)), labels
+        )
+        weights = runtime.hazard_composition
+        # Weights are non-negative, and the fitted composition beats the
+        # hand-written max against the same labels: the max's false
+        # positive on row 1 (both channels high, label clean) is deflated.
+        self.assertTrue(all(weight >= 0.0 for weight in weights.values()))
+        self.assertLess(report["composed_mae"], report["maximum_mae"])
+        read = runtime.pain_signal_batch(np.zeros((4, 1)))
+        composed = np.zeros(4)
+        for name, weight in weights.items():
+            composed = composed + weight * readings[name]
+        mids, rates = runtime.hazard_calibration
+        np.testing.assert_allclose(
+            read, np.interp(composed, mids, rates), atol=1e-9
+        )
+        self.assertLess(
+            read[1],
+            max(readings["prototype"][1], readings["feature"][1]),
+        )
+
+    def test_pain_signal_keeps_the_max_without_a_composition(self):
+        runtime = self.make_runtime(
+            lag=0, scales=np.asarray([1.0]), soft_neighbors=1
+        )
+        first = runtime._create_node(np.asarray([0.0]))
+        runtime._create_node(np.asarray([1.0]))
+        # Rate semantics (P0): the prototype channel reads each node's
+        # transition pain rate.  The first node saw ten painful
+        # transitions; the second has no samples and reads the global
+        # base rate (10 pain mass over 20 transitions).
+        runtime._association_stats[first] = [10, 10.0]
+        runtime._association_global = [20, 10.0]
+        read = runtime.pain_signal_batch(np.asarray([[0.0], [1.0]]))
+        self.assertAlmostEqual(float(read[0]), 11.0 / 12.0, places=9)
+        self.assertAlmostEqual(float(read[1]), 0.5, places=9)
+
 
 class PlanScoreTests(unittest.TestCase):
     def test_plan_score_matches_search_selection(self):
