@@ -57,19 +57,6 @@ def value_dispersion_labels(returns, quantile: float) -> np.ndarray:
     return ((returns > high_cut) | (returns < low_cut)).astype(float)
 
 
-def stream_acting_column(transitions, lag: int) -> np.ndarray:
-    """The acting action of every transition, as a pending column.
-
-    The behavior stream's own actions: the readout is evaluated under the
-    continuation that actually happened, which is what the residual
-    coverage of the next induction generation measures.
-    """
-    return np.asarray([
-        float(np.asarray(row["history"], dtype=float)[lag])
-        for row in transitions
-    ])[:, None]
-
-
 def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            component_kinds, component_min_count, max_components,
            component_weight, component_gating, memory_weight,
@@ -177,7 +164,6 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
     test = (episode_index % 5 == 4)
     train = ~test
 
-    acting_col = stream_acting_column(transitions, lag)
     for epoch in range(epochs):
         for episode in ordered:
             agent.learn_episode(episode)
@@ -238,8 +224,14 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
             # readout fails to flag become the next generation's targets.
             # Installing additionally keeps every earlier generation's
             # rules alive (predicate-keyed materialization preserves their
-            # nodes and statistics).
-            enc_all = np.concatenate([states, acting_col], axis=1) / scales
+            # nodes and statistics).  The readout is evaluated under the
+            # behavior continuation, with each row's pending window built
+            # exactly as the search builds it.
+            pending_all = np.asarray([
+                np.asarray(row["history"], dtype=float)[:lag][::-1]
+                for row in transitions
+            ], dtype=float)
+            enc_all = np.concatenate([states, pending_all], axis=1)
             pain_read = agent.pain_signal_batch(enc_all)
             missed_short = (pain_read < 0.5) & (pain_short > 0.5)
             if missed_short.sum() >= 5:
