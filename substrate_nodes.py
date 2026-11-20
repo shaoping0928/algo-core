@@ -1,4 +1,4 @@
-﻿"""Node-centric planning on Flappy using only signals, not task rules.
+"""Node-centric planning on Flappy using only signals, not task rules.
 
 The runtime receives:
 
@@ -119,7 +119,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         value_bank_only: bool = False,
         value_dispersion=False, iterative_induction=False,
         compose_readout: bool = True, importance_weighting=False,
-        voi_threat_min: float = 0.25):
+        voi_threat_min: float = 0.25, curiosity_weight: float = 0.0,
+        dagger_frames: int = 0):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -165,6 +166,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         value_bank_only=value_bank_only,
         importance_weighting=importance_weighting,
         voi_threat_min=voi_threat_min,
+        curiosity_weight=curiosity_weight,
     )
     episodes = {}
     for row in transitions:
@@ -414,15 +416,20 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
 
 def collect_planner(seed, world, agent, episodes=2, cap=1200, horizon=10,
                     lag=LAG, step_stride=2, stride_includes_lag=False,
-                    offset=50000):
+                    offset=50000, max_frames=None):
     """Record the trajectories the planner actually executes.
 
     These are real transitions with real world feedback, in the same schema
     as `collect`; no counterfactual prediction enters the stream.  The world
     seeds are offset from the behavior stream so episode ids cannot collide.
+    With `max_frames`, collection stops as soon as that many executed frames
+    have been recorded (the last episode may overshoot); `episodes` stays
+    the hard limit that bounds the number of world resets.
     """
     transitions = []
     frames = []
+    total = 0
+    limit = max_frames if max_frames is not None else None
     for episode in range(int(episodes)):
         env_seed = int(seed) * 10000 + int(offset) + episode
         length, _actions, rows = evaluate(
@@ -434,6 +441,9 @@ def collect_planner(seed, world, agent, episodes=2, cap=1200, horizon=10,
         )
         transitions.extend(rows)
         frames.append(int(length))
+        total += int(length)
+        if limit is not None and total >= int(limit):
+            break
     return transitions, frames
 
 
@@ -576,7 +586,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         voi_fraction=0.0, voi_target=3, feature_value_weight=0.02,
         voi_threat_min=0.25,
         dagger_rounds=0, dagger_episodes=2, dagger_cap=1200,
-        dagger_offset=50000, dagger_horizon=10, step_stride=2,
+        dagger_offset=50000, dagger_horizon=10, dagger_frames=0, step_stride=2,
         stride_includes_lag=False, value_horizon=0,
         ood_trust_scale=0.0, obs_trust=1.0,
         feature_action_prior=2.0, feature_value_prior=4.0,
@@ -586,7 +596,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         value_trust_samples=150.0, value_dispersion=False,
         control_risk_weight=0.0, value_bank_only=False,
         iterative_induction=False, compose_readout=True,
-        importance_weighting=False, learn_objective=True):
+        importance_weighting=False, learn_objective=True,
+        curiosity_weight=0.0):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -632,6 +643,10 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("dagger_offset must be non-negative")
     if int(dagger_horizon) < 1:
         raise ValueError("dagger_horizon must be positive")
+    if int(dagger_frames) < 0:
+        raise ValueError("dagger_frames must be non-negative")
+    if int(dagger_frames) > 0 and int(dagger_rounds) < 1:
+        raise ValueError("dagger_frames requires at least one dagger round")
     if int(step_stride) < 1:
         raise ValueError("step_stride must be positive")
     if int(value_horizon) < 0:
@@ -650,6 +665,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("value_trust_samples must be non-negative")
     if float(control_risk_weight) < 0.0:
         raise ValueError("control_risk_weight must be non-negative")
+    if float(curiosity_weight) < 0.0:
+        raise ValueError("curiosity_weight must be non-negative")
     lag = int(lag)
     voi_fraction = float(voi_fraction)
     if voi_fraction > 0.0:
@@ -730,13 +747,24 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         iterative_induction=iterative_induction,
         compose_readout=compose_readout,
         importance_weighting=importance_weighting,
+        curiosity_weight=curiosity_weight,
+        dagger_frames=dagger_frames,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
     planner_rows: List[dict] = []
     for _round in range(int(dagger_rounds)):
+        # A frame budget buys a fixed amount of on-policy experience even
+        # when episodes die early; the episode count stays the hard limit
+        # on world resets, so ten resets per cap-sized episode is ample.
+        planner_episodes = int(dagger_episodes)
+        if int(dagger_frames) > 0:
+            planner_episodes = max(
+                planner_episodes,
+                int(np.ceil(int(dagger_frames) / max(int(dagger_cap), 1))) * 10,
+            )
         planner, _frames = collect_planner(
-            seed, world, agent, episodes=dagger_episodes,
+            seed, world, agent, episodes=planner_episodes,
             cap=dagger_cap, horizon=dagger_horizon, lag=lag,
             step_stride=step_stride,
             stride_includes_lag=stride_includes_lag,
@@ -744,6 +772,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             # under one id would make the backward pass treat the second as
             # a continuation of the first.
             offset=dagger_offset + _round * int(dagger_episodes),
+            max_frames=(int(dagger_frames) or None),
         )
         if not planner:
             break
@@ -773,6 +802,38 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     return world, agent
 
 
+def _curiosity_potential(support):
+    """Curiosity potential: high where the readout's evidence is thin.
+
+    ``Φ(s) = 1/sqrt(1 + evidence(s))`` with evidence the mean observation
+    count behind the state's active cells.  It is bounded in (0, 1], so
+    the shaped objective cannot out-scale the hazard and value terms, and
+    it needs no task knowledge - only the counters the learner already
+    maintains.
+    """
+    support = np.asarray(support, dtype=float)
+    return 1.0 / np.sqrt(1.0 + np.maximum(support, 0.0))
+
+
+def _curiosity_term(phi_start, phi_end, weight, discount, horizon):
+    """Potential-based curiosity shaping summed over a fixed-horizon plan.
+
+    PBRS adds ``γΦ(s') - Φ(s)`` per step; over H steps the sum telescopes
+    to ``γ^H Φ(s_H) - Φ(s_0)``.  The planner's step costs are accumulated
+    without a per-step discount (``γ = 1`` in the rollout), so the term
+    enters as ``w * (Φ(s_0) - Φ(s_H))``: a less-supported endpoint lowers
+    the cost.  Every plan shares ``s_0``, so the start term is a constant;
+    because this is a potential difference the shaped objective has the
+    same optimum as the unshaped one, which is the guardrail against
+    curiosity reward hacking.  `discount` is kept explicit so a future
+    discounted rollout can pass its own factor.
+    """
+    phi_end = np.asarray(phi_end, dtype=float)
+    return float(weight) * (
+        float(phi_start) - float(discount) ** int(horizon) * phi_end
+    )
+
+
 def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   step_stride=2, stride_includes_lag=False):
     initial = np.asarray(env.obs(), dtype=float)
@@ -780,6 +841,22 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
     action_dim = int(lag) + 1
     step_stride = max(int(step_stride), 1)
     lag = int(lag)
+    # Decision-side curiosity: the potential at the shared start state is
+    # a constant across plans, but it is evaluated so the term is exactly
+    # the potential difference (PBRS identity), not a bare endpoint bonus.
+    curiosity_weight = float(getattr(agent, "curiosity_weight", 0.0))
+    phi_start = 0.0
+    if curiosity_weight > 0.0:
+        pending_start = (
+            pending_prefix[:lag][::-1] if lag > 0
+            else np.zeros(0, dtype=float)
+        )
+        encoded_start = np.concatenate(
+            [initial.reshape(1, -1), pending_start.reshape(1, -1)], axis=1
+        ) / agent.scales
+        phi_start = float(
+            _curiosity_potential(agent.evidence_batch(encoded_start))[0]
+        )
 
     def predict_batch(states, sequences, step):
         history = history_features(
@@ -801,7 +878,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 stride_includes_lag and step == lag
             ):
                 return (
-                    np.zeros((len(states), 4)),
+                    np.zeros((len(states), 5)),
                     np.isfinite(states).all(axis=1),
                 )
             history = history_features(
@@ -813,7 +890,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             cost = threat + agent.control_risk_weight * excess
             zeros = np.zeros(len(states))
             return (
-                np.column_stack([cost, zeros, cost, zeros]),
+                np.column_stack([cost, zeros, cost, zeros, zeros]),
                 np.isfinite(encoded).all(axis=1),
             )
 
@@ -835,9 +912,19 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             # less to the endpoint cost.
             trust = support / (support + agent.value_trust_samples)
             value_term = -agent.feature_value_weight * trust * value
+            if curiosity_weight > 0.0:
+                phi_end = _curiosity_potential(
+                    agent.evidence_batch(encoded, mask_table)
+                )
+                curiosity = _curiosity_term(
+                    phi_start, phi_end, curiosity_weight, 1.0, horizon,
+                )
+            else:
+                curiosity = np.zeros(len(states))
             return (
                 np.column_stack([
-                    value_term, -dopamine, np.zeros(len(states)), value_term,
+                    value_term + curiosity, -dopamine,
+                    np.zeros(len(states)), value_term, curiosity,
                 ]),
                 np.isfinite(encoded).all(axis=1),
             )
@@ -851,7 +938,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 stride_includes_lag and step == lag
             ):
                 return (
-                    np.zeros((len(states), 4)),
+                    np.zeros((len(states), 5)),
                     np.isfinite(states).all(axis=1),
                 )
             history = history_features(
@@ -864,7 +951,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             risk = agent.pain_signal_batch(encoded)
             zeros = np.zeros(len(states))
             return (
-                np.column_stack([risk, zeros, risk, zeros]),
+                np.column_stack([risk, zeros, risk, zeros, zeros]),
                 np.isfinite(encoded).all(axis=1),
             )
 
@@ -905,9 +992,20 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             trust_samples = getattr(agent, "value_trust_samples", 150.0)
             trust = support / (support + trust_samples)
             value_term = -agent.feature_value_weight * trust * value
-            cost = risk + value_term
+            if curiosity_weight > 0.0:
+                phi_end = _curiosity_potential(
+                    agent.evidence_batch(encoded, mask_table)
+                )
+                curiosity = _curiosity_term(
+                    phi_start, phi_end, curiosity_weight, 1.0, horizon,
+                )
+            else:
+                curiosity = np.zeros(len(states))
+            cost = risk + value_term + curiosity
             return (
-                np.column_stack([cost, -dopamine, risk, value_term]),
+                np.column_stack([
+                    cost, -dopamine, risk, value_term, curiosity,
+                ]),
                 np.isfinite(encoded).all(axis=1),
             )
 
@@ -969,6 +1067,18 @@ def cell_q_action(env, world, agent, prefix, lag=LAG):
         history = np.asarray([columns], dtype=float)
         state = np.asarray(world.predict(state, history), dtype=float)
     scores = {}
+    curiosity_weight = float(getattr(agent, "curiosity_weight", 0.0))
+    phi_current = 0.0
+    if curiosity_weight > 0.0 and lag > 0:
+        current_columns = [float(pending[0])] + [
+            float(item) for item in pending[1:]
+        ]
+        encoded_current = np.concatenate(
+            [state, np.asarray([current_columns], dtype=float)], axis=1
+        ) / agent.scales
+        phi_current = float(_curiosity_potential(
+            agent.evidence_batch(encoded_current)
+        )[0])
     for action in (0, 1):
         columns = [float(action)] + [float(item) for item in pending[1:]]
         encoded = np.concatenate(
@@ -976,7 +1086,15 @@ def cell_q_action(env, world, agent, prefix, lag=LAG):
         ) / agent.scales
         risk = float(agent.feature_risk_batch(encoded)[0])
         value = float(agent.feature_value_batch(encoded)[0])
-        scores[action] = risk - agent.feature_value_weight * value
+        score = risk - agent.feature_value_weight * value
+        if curiosity_weight > 0.0:
+            phi_next = _curiosity_potential(
+                agent.evidence_batch(encoded)
+            )
+            score += float(_curiosity_term(
+                phi_current, phi_next, curiosity_weight, 1.0, 1,
+            )[0])
+        scores[action] = score
     return int(min(scores, key=lambda key: (scores[key], key)))
 
 
@@ -989,7 +1107,9 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
     plan's objective ledger - the hazard and value shares of the
     scalarized cost, split by `policy_result`'s third and fourth score
     columns - is appended so the executed decision's components can be
-    regressed against its realized outcome (P4 objective learning).
+    regressed against its realized outcome (P4 objective learning).  The
+    curiosity share (column 4) is a fixed shaping term and is deliberately
+    not part of that ledger.
     """
     if decision == "search":
         result = policy_result(
@@ -1020,7 +1140,9 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
     states plus the terminal risk, minus the sequence-level value of the
     endpoint; under the contrast objective it is the accumulated action
     contrast minus the value term.  Column 1 is the negative terminal
-    dopamine.  Used by diagnostics that compare fixed plans against the
+    dopamine.  With a non-zero curiosity weight the scalar also carries
+    ``w * (Φ(s_0) - Φ(s_H))`` (the potential-difference shaping term).
+    Used by diagnostics that compare fixed plans against the
     searched plan, and later by plan-level posteriors.
     """
     initial = np.asarray(initial_state, dtype=float).reshape(1, -1)
@@ -1029,6 +1151,19 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
     step_stride = max(int(step_stride), 1)
     lag = int(lag)
     plan = np.asarray(plan, dtype=float).reshape(1, -1)
+    curiosity_weight = float(getattr(agent, "curiosity_weight", 0.0))
+    phi_start = 0.0
+    if curiosity_weight > 0.0:
+        pending_start = (
+            pending_prefix[:lag][::-1] if lag > 0
+            else np.zeros(0, dtype=float)
+        )
+        encoded_start = np.concatenate(
+            [initial, pending_start.reshape(1, -1)], axis=1
+        ) / agent.scales
+        phi_start = float(
+            _curiosity_potential(agent.evidence_batch(encoded_start))[0]
+        )
     states = initial.copy()
     total = 0.0
     contrast = getattr(agent, "contrast_objective", False)
@@ -1058,12 +1193,21 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
         return (float("inf"), float("inf"))
     pain, dopamine = agent.valence_state_batch(encoded)
     mask_table = agent._feature_mask_table(encoded[:, :agent.obs_dim])
+    curiosity = 0.0
+    if curiosity_weight > 0.0:
+        phi_end = _curiosity_potential(
+            agent.evidence_batch(encoded, mask_table)
+        )
+        curiosity = float(_curiosity_term(
+            phi_start, phi_end, curiosity_weight, 1.0, horizon,
+        )[0])
     if contrast:
         value, support = agent.feature_value_batch(
             encoded, mask_table, return_support=True
         )
         trust = support / (support + agent.value_trust_samples)
         total -= agent.feature_value_weight * trust * float(value[0])
+        total += curiosity
         return (total, -float(dopamine[0]))
     if getattr(agent, "predicate_readouts", False):
         terminal = float(agent.pain_signal_batch(encoded, mask_table)[0])
@@ -1074,6 +1218,7 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
         )
     value = float(agent.feature_value_batch(encoded, mask_table)[0])
     total += terminal - agent.feature_value_weight * value
+    total += curiosity
     return (total, -float(dopamine[0]))
 
 
@@ -1192,6 +1337,7 @@ def run_seed(task):
     compose_readout = bool(task.get("compose_readout", True))
     importance_weighting = bool(task.get("importance_weighting", False))
     learn_objective = bool(task.get("learn_objective", True))
+    curiosity_weight = float(task.get("curiosity_weight", 0.0))
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
@@ -1200,6 +1346,7 @@ def run_seed(task):
     dagger_cap = int(task.get("dagger_cap", 1200))
     dagger_offset = int(task.get("dagger_offset", 50000))
     dagger_horizon = int(task.get("dagger_horizon", horizon))
+    dagger_frames = int(task.get("dagger_frames", 0))
 
     value_horizon = int(task.get("value_horizon", 0))
 
@@ -1225,6 +1372,7 @@ def run_seed(task):
         dagger_cap=dagger_cap,
         dagger_offset=dagger_offset,
         dagger_horizon=dagger_horizon,
+        dagger_frames=dagger_frames,
         step_stride=step_stride,
         stride_includes_lag=stride_includes_lag,
         value_horizon=value_horizon,
@@ -1247,6 +1395,7 @@ def run_seed(task):
         importance_weighting=importance_weighting,
         learn_objective=learn_objective,
         voi_threat_min=voi_threat_min,
+        curiosity_weight=curiosity_weight,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1406,6 +1555,11 @@ def main():
                         help="read the value channel from the dedicated "
                              "value-bank roots only, without the risk "
                              "bank's drifting-continuation cells")
+    parser.add_argument("--curiosity-weight", type=float, default=0.0,
+                        help="decision-side curiosity: weight of the "
+                             "potential-difference novelty term "
+                             "w*(phi(s0) - gamma^H*phi(sH)), phi = "
+                             "1/sqrt(1+evidence); 0 disables it")
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
@@ -1443,6 +1597,14 @@ def main():
     parser.add_argument("--dagger-horizon", type=int, default=0,
                         help="search horizon while recording planner data; "
                              "0 uses --horizon")
+    parser.add_argument("--dagger-frames", type=int, default=0,
+                        help="on-policy frame budget per DAgger round: stop "
+                             "recording once this many executed frames were "
+                             "collected (0 = use --dagger-episodes as-is)")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="standard ruler: 1500 offline frames x 3 "
+                             "epochs, then one 3000-frame free-control "
+                             "round and retrain; evaluation cap 3000 frames")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset: 1500 steps, 3 epochs, "
                              "1000 nodes, 400-frame evaluation")
@@ -1453,6 +1615,21 @@ def main():
         args.max_nodes = 1000
         args.cap = 400
         args.horizon = 8
+    if args.benchmark:
+        # The benchmark fixes both halves of the ruler: the offline leg is
+        # the fast bootstrap (1500 frames replayed over 3 epochs) and the
+        # online leg is one free-control round of 3000 executed frames.
+        # The evaluation cap matches the online budget, so a model that
+        # survives is no longer censored at the 400-frame dev cap.
+        args.steps = 1500
+        args.epochs = 3
+        args.max_nodes = 1000
+        args.horizon = 8
+        args.cap = 3000
+        if args.dagger_rounds == 0:
+            args.dagger_rounds = 1
+        if args.dagger_frames == 0:
+            args.dagger_frames = 3000
     if args.jobs < 1:
         raise ValueError("--jobs must be positive")
     if args.seeds < 1:
@@ -1481,6 +1658,8 @@ def main():
         raise ValueError("--voi-target must be positive")
     if args.feature_value_weight < 0.0:
         raise ValueError("--feature-value-weight must be non-negative")
+    if args.curiosity_weight < 0.0:
+        raise ValueError("--curiosity-weight must be non-negative")
     if not 0.0 < args.value_quantile < 1.0:
         raise ValueError("--value-quantile must be in (0, 1)")
     if args.component_min_count < 1:
@@ -1509,6 +1688,10 @@ def main():
         raise ValueError("--dagger-horizon must be non-negative")
     if args.dagger_horizon == 0:
         args.dagger_horizon = args.horizon
+    if args.dagger_frames < 0:
+        raise ValueError("--dagger-frames must be non-negative")
+    if args.dagger_frames > 0 and args.dagger_rounds < 1:
+        raise ValueError("--dagger-frames requires --dagger-rounds")
     if args.value_horizon < 0:
         raise ValueError("--value-horizon must be non-negative")
     if args.ood_trust_scale < 0.0:
@@ -1586,6 +1769,7 @@ def main():
             compose_readout=args.compose_readout,
             importance_weighting=args.importance_weighting,
             learn_objective=args.learn_objective,
+            curiosity_weight=args.curiosity_weight,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -1593,6 +1777,7 @@ def main():
             dagger_cap=args.dagger_cap,
             dagger_offset=args.dagger_offset,
             dagger_horizon=args.dagger_horizon,
+            dagger_frames=args.dagger_frames,
         )
         for seed in seeds
     ]

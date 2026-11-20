@@ -187,6 +187,22 @@ class NodeRuntimeTests(unittest.TestCase):
             self.assertEqual(row["done"], row["terminal"])
             self.assertGreaterEqual(row["episode"], 50000)
 
+    def test_planner_collection_honours_a_frame_budget(self):
+        from substrate_nodes import collect_planner, fit
+        world, agent = fit(
+            100, steps=80, epochs=1, max_nodes=100, lag=3,
+            induce_features=False,
+        )
+        rows, frames = collect_planner(
+            100, world, agent, episodes=40, cap=10, horizon=2, lag=3,
+            step_stride=1, max_frames=20,
+        )
+        self.assertGreaterEqual(sum(frames), 20)
+        # Each episode contributes at most `cap` frames, so the budget is
+        # reached well before the 40-reset hard limit.
+        self.assertLessEqual(len(frames), 20)
+        self.assertEqual(len(rows), sum(frames))
+
     def test_cell_q_action_decides_without_search(self):
         from latent_world import latent
         from substrate_nodes import cell_q_action, fit
@@ -506,6 +522,56 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertLess(separated[0], prior_value)
         self.assertGreater(separated[1], prior_value)
         self.assertGreater(separated[1], separated[0])
+
+    def test_evidence_batch_counts_the_active_cells(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        # No learned cells yet: reported evidence is zero, not a prior.
+        states = np.asarray([[0.0, 0.0], [0.0, 1.0], [5.0, 0.0]])
+        np.testing.assert_allclose(runtime.evidence_batch(states), 0.0)
+        runtime.feature_action_stats[feature_id] = {
+            0: [10, 0.0], 1: [3, 0.0],
+        }
+        # Either channel supports the state's read: the value cell's count
+        # wins where it is larger, the risk cell's where the value one is
+        # absent.
+        runtime.feature_value_stats[feature_id] = {
+            0: (20, 0.0, {1}),
+        }
+        np.testing.assert_allclose(
+            runtime.evidence_batch(states), [20.0, 3.0, 0.0]
+        )
+
+    def test_curiosity_term_is_a_potential_difference(self):
+        from substrate_nodes import _curiosity_potential, _curiosity_term
+
+        # The potential falls as evidence grows; it stays bounded by 1.
+        potential = _curiosity_potential(np.asarray([0.0, 3.0, 99.0]))
+        self.assertAlmostEqual(float(potential[0]), 1.0, places=9)
+        self.assertLess(float(potential[1]), float(potential[0]))
+        self.assertGreater(float(potential[2]), 0.0)
+        # A less-supported endpoint lowers the cost (negative term); the
+        # same potential at both ends cancels exactly, so no free reward.
+        term = _curiosity_term(0.2, np.asarray([0.8]), 1.0, 0.99, 1)
+        self.assertLess(float(term[0]), 0.0)
+        self.assertAlmostEqual(
+            float(_curiosity_term(0.5, np.asarray([0.5]), 1.0, 1.0, 1)[0]),
+            0.0, places=9,
+        )
+        self.assertAlmostEqual(
+            float(_curiosity_term(0.2, np.asarray([0.8]), 0.0, 0.99, 1)[0]),
+            0.0, places=9,
+        )
 
     def test_feature_windows_are_per_node(self):
         from node_features import FeatureRule, Primitive
@@ -1935,9 +2001,11 @@ class PlanScoreTests(unittest.TestCase):
         result = policy_result(env, world, agent, prefix, horizon=1, lag=3)
         score = result.score
         # P4: the score carries the objective's ledger - the scalarized
-        # column is the sum of its hazard and value shares.
-        self.assertEqual(len(score), 4)
-        self.assertAlmostEqual(score[0], score[2] + score[3], places=6)
+        # column is the sum of its hazard, value and curiosity shares.
+        self.assertEqual(len(score), 5)
+        self.assertAlmostEqual(
+            score[0], score[2] + score[3] + score[4], places=6
+        )
         scores = [
             plan_score(
                 env.obs(), world, agent, prefix, [float(action)], 1, lag=3
@@ -1948,6 +2016,29 @@ class PlanScoreTests(unittest.TestCase):
         self.assertEqual(int(result.actions[0]), best)
         self.assertAlmostEqual(result.score[0], scores[best][0], places=6)
         self.assertAlmostEqual(result.score[1], scores[best][1], places=6)
+
+    def test_plan_score_carries_the_curiosity_share(self):
+        from latent_world import latent
+        from substrate_nodes import fit, plan_score, policy_result
+
+        world, agent = fit(100, steps=300, epochs=1, max_nodes=200, lag=3)
+        agent.curiosity_weight = 0.5
+        env = latent[3](100)
+        prefix = np.zeros(3, dtype=float)
+        result = policy_result(env, world, agent, prefix, horizon=3, lag=3)
+        score = result.score
+        self.assertEqual(len(score), 5)
+        self.assertAlmostEqual(
+            score[0], score[2] + score[3] + score[4], places=6
+        )
+        scores = [
+            plan_score(
+                env.obs(), world, agent, prefix, plan, 3, lag=3
+            )
+            for plan in np.ndindex(*(2,) * 3)
+        ]
+        best = min(range(len(scores)), key=lambda index: scores[index])
+        self.assertAlmostEqual(result.score[0], scores[best][0], places=6)
 
     def test_plan_score_matches_search_at_the_lag_point(self):
         """The lag point is the first state a plan action can affect."""

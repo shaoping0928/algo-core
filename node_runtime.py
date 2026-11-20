@@ -291,6 +291,7 @@ class NodeRuntime:
         contrast_objective: bool = False,
         value_trust_samples: float = 150.0,
         control_risk_weight: float = 0.0,
+        curiosity_weight: float = 0.0,
         value_bank_only: bool = False,
         value_horizon: Optional[int] = None,
         ood_trust_scale: float = 0.0,
@@ -318,6 +319,8 @@ class NodeRuntime:
             raise ValueError("birth_threshold must be positive")
         if float(value_trust_samples) < 0.0:
             raise ValueError("value_trust_samples must be non-negative")
+        if float(curiosity_weight) < 0.0:
+            raise ValueError("curiosity_weight must be non-negative")
         if int(max_nodes) < 1:
             raise ValueError("max_nodes must be positive")
         if not 0.0 <= float(exploration) <= 1.0:
@@ -600,6 +603,14 @@ class NodeRuntime:
         # take - entering a risky but action-dependent band is judged by
         # the value ledger, not by the hazard readout.
         self.control_risk_weight = float(control_risk_weight)
+        # Decision-side curiosity: the planner's cost is shaped by a
+        # potential over the evidence behind a state's active cells
+        # (higher potential = less evidence = more novel).  It is applied
+        # as a potential difference, so the shaped objective keeps the same
+        # optimum as the unshaped one (Ng-Harada-Russell); this is not the
+        # collection-side VOI override, whose two forms both tested
+        # negative.  Zero disables the term.
+        self.curiosity_weight = float(curiosity_weight)
         # L1: when on, the value readout averages only over the dedicated
         # value-bank roots.  The union readout lets the risk bank's cells
         # (learned mostly from drifting continuations) dilute the value
@@ -2797,6 +2808,63 @@ class NodeRuntime:
             0.0,
         )
         return averaged, support
+
+    def evidence_batch(self, states: np.ndarray,
+                       mask_table: Optional[List] = None) -> np.ndarray:
+        """Mean observation count behind each state's active cells.
+
+        A task-agnostic evidence read: for every active feature root it
+        looks up that root's ``(feature, acting action)`` cell in the risk
+        and value counters and keeps the larger count (either channel
+        supports the state's read), then averages over the roots active in
+        the state.  States with no active root report zero.  Used only by
+        the decision-side curiosity potential - less evidence means more
+        novelty - never by the hazard or value readouts.
+        """
+        states = np.asarray(states, dtype=float)
+        result = np.zeros(len(states), dtype=float)
+        roots = self._all_value_roots()
+        if not roots or states.shape[1] <= self.obs_dim:
+            return result
+        obs = states[:, :self.obs_dim]
+        if mask_table is None:
+            mask_table = self._feature_mask_table(obs)
+        acting = np.rint(states[:, self.obs_dim]).astype(int)
+        total = np.zeros(len(states), dtype=float)
+        weight = np.zeros(len(states), dtype=float)
+        for node_id in roots:
+            feature = self._feature_objects.get(node_id)
+            if feature is None:
+                continue
+            root_mask = self._table_entry(
+                mask_table, node_id, feature, obs
+            )
+            if root_mask is None or not root_mask.any():
+                continue
+            counts = np.zeros(len(states), dtype=float)
+            for action_key, cell in (
+                self.feature_action_stats.get(node_id, {}).items()
+            ):
+                if cell[0] <= 0:
+                    continue
+                selected = root_mask & (acting == int(action_key))
+                counts[selected] = np.maximum(
+                    counts[selected], float(cell[0])
+                )
+            for action_key, cell in (
+                self.feature_value_stats.get(node_id, {}).items()
+            ):
+                if cell[0] <= 0:
+                    continue
+                selected = root_mask & (acting == int(action_key))
+                counts[selected] = np.maximum(
+                    counts[selected], float(cell[0])
+                )
+            total += np.where(root_mask, counts, 0.0)
+            weight += root_mask.astype(float)
+        return np.where(
+            weight > 0.0, total / np.maximum(weight, 1e-9), 0.0
+        )
 
     def prediction_report(self) -> dict:
         """Calibration of the readout: prediction vs actual per cell."""
