@@ -68,7 +68,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
           predicate_readouts=False, event_memory_risk=True,
           contrast_objective=False, value_trust_samples=150.0,
           value_dispersion=False, control_risk_weight=0.0,
-          value_bank_only=False):
+          value_bank_only=False, iterative_induction=False):
     world, agent = fit(
         seed, steps=steps, coverage=coverage, max_nodes=max_nodes,
         birth_threshold=birth_threshold, epochs=epochs,
@@ -89,6 +89,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
         value_dispersion=value_dispersion,
         control_risk_weight=control_risk_weight,
         value_bank_only=value_bank_only,
+        iterative_induction=iterative_induction,
     )
     # The same deterministic transitions `fit` trained on; used only to
     # measure whether both actions exist near the planner states.
@@ -485,6 +486,10 @@ def main():
     parser.add_argument("--value-bank-only", action="store_true",
                         help="read the value channel from the dedicated "
                              "value-bank roots only")
+    parser.add_argument("--iterative-induction", action="store_true",
+                        help="F5: re-induce gap banks every epoch with the "
+                             "previous generation's missed positives as "
+                             "the next generation's targets")
     parser.add_argument("--control-risk-weight", type=float, default=0.0,
                         help="threat grading: weight of the controllable "
                              "excess on top of the real threat")
@@ -520,6 +525,7 @@ def main():
         value_dispersion=args.value_dispersion_labels,
         control_risk_weight=args.control_risk_weight,
         value_bank_only=args.value_bank_only,
+        iterative_induction=args.iterative_induction,
     )
 
 

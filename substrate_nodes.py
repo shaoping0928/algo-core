@@ -57,6 +57,19 @@ def value_dispersion_labels(returns, quantile: float) -> np.ndarray:
     return ((returns > high_cut) | (returns < low_cut)).astype(float)
 
 
+def stream_acting_column(transitions, lag: int) -> np.ndarray:
+    """The acting action of every transition, as a pending column.
+
+    The behavior stream's own actions: the readout is evaluated under the
+    continuation that actually happened, which is what the residual
+    coverage of the next induction generation measures.
+    """
+    return np.asarray([
+        float(np.asarray(row["history"], dtype=float)[lag])
+        for row in transitions
+    ])[:, None]
+
+
 def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            component_kinds, component_min_count, max_components,
            component_weight, component_gating, memory_weight,
@@ -69,7 +82,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            event_memory_risk=True, contrast_objective=False,
            value_trust_samples: float = 150.0, control_risk_weight: float = 0.0,
         value_bank_only: bool = False,
-        value_dispersion=False):
+        value_dispersion=False, iterative_induction=False):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -164,6 +177,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
     test = (episode_index % 5 == 4)
     train = ~test
 
+    acting_col = stream_acting_column(transitions, lag)
     for epoch in range(epochs):
         for episode in ordered:
             agent.learn_episode(episode)
@@ -215,6 +229,40 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                         agent.install_feature_rules(
                             value_bank.rules, channel="value"
                         )
+        elif induce_features and iterative_induction and (
+            1 <= epoch < epochs - 1
+        ):
+            # F5: gap-focused re-induction - the structure search runs
+            # every generation, and the selection pressure is the previous
+            # generation's residual coverage: positive events the current
+            # readout fails to flag become the next generation's targets.
+            # Installing additionally keeps every earlier generation's
+            # rules alive (predicate-keyed materialization preserves their
+            # nodes and statistics).
+            enc_all = np.concatenate([states, acting_col], axis=1) / scales
+            pain_read = agent.pain_signal_batch(enc_all)
+            missed_short = (pain_read < 0.5) & (pain_short > 0.5)
+            if missed_short.sum() >= 5:
+                gap_bank = FeatureRuleBank()
+                gap_bank.induce(
+                    states[train], (pain_short * missed_short)[train],
+                    states[test], (pain_short * missed_short)[test],
+                )
+                if gap_bank.rules:
+                    agent.install_feature_rules(
+                        gap_bank.rules, horizon=lag + 1
+                    )
+            missed_long = (pain_read < 0.5) & (pain > 0.5)
+            if missed_long.sum() >= 5 and long_window is not None:
+                gap_long = FeatureRuleBank()
+                gap_long.induce(
+                    states[train], (pain * missed_long)[train],
+                    states[test], (pain * missed_long)[test],
+                )
+                if gap_long.rules:
+                    agent.install_feature_rules(
+                        gap_long.rules, horizon=long_window
+                    )
     return world, agent
 
 
@@ -260,7 +308,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         subgraph_cells=False, predicate_readouts=False,
         event_memory_risk=True, contrast_objective=False,
         value_trust_samples=150.0, value_dispersion=False,
-        control_risk_weight=0.0, value_bank_only=False):
+        control_risk_weight=0.0, value_bank_only=False,
+        iterative_induction=False):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -392,6 +441,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         control_risk_weight=control_risk_weight,
         value_bank_only=value_bank_only,
         value_dispersion=value_dispersion,
+        iterative_induction=iterative_induction,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -787,6 +837,7 @@ def run_seed(task):
     value_dispersion = bool(task.get("value_dispersion", False))
     control_risk_weight = float(task.get("control_risk_weight", 0.0))
     value_bank_only = bool(task.get("value_bank_only", False))
+    iterative_induction = bool(task.get("iterative_induction", False))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -836,6 +887,7 @@ def run_seed(task):
         value_dispersion=value_dispersion,
         control_risk_weight=control_risk_weight,
         value_bank_only=value_bank_only,
+        iterative_induction=iterative_induction,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -990,6 +1042,10 @@ def main():
                         help="read the value channel from the dedicated "
                              "value-bank roots only, without the risk "
                              "bank's drifting-continuation cells")
+    parser.add_argument("--iterative-induction", action="store_true",
+                        help="F5: re-induce gap banks every epoch, with "
+                             "the previous generation's missed positives "
+                             "as the next generation's targets")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -1142,6 +1198,7 @@ def main():
             value_dispersion=args.value_dispersion_labels,
             control_risk_weight=args.control_risk_weight,
             value_bank_only=args.value_bank_only,
+            iterative_induction=args.iterative_induction,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -1275,6 +1332,7 @@ def main():
                 value_dispersion=args.value_dispersion_labels,
                 control_risk_weight=args.control_risk_weight,
                 value_bank_only=args.value_bank_only,
+                iterative_induction=args.iterative_induction,
                 self_evaluation=not bool(eval_seeds),
                 dagger_rounds=args.dagger_rounds,
                 dagger_episodes=args.dagger_episodes,
