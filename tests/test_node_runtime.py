@@ -1,4 +1,4 @@
-﻿import types
+import types
 import unittest
 from pathlib import Path
 
@@ -912,6 +912,44 @@ class NodeRuntimeTests(unittest.TestCase):
         )
         self.assertGreater(float(risk[0]), 0.0)
         self.assertAlmostEqual(float(risk[1]), 0.0, places=9)
+
+    def test_pain_contrast_centers_on_the_action_mean(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40, gamma=0.5
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        # Action 0 survives the band far more often than action 1.
+        runtime._update_feature_action([feature_id], 0, 0.0)
+        runtime._update_feature_action([feature_id], 0, 0.0)
+        runtime._update_feature_action([feature_id], 1, 1.0)
+        hold = np.asarray([0.0, 0.0])    # encoded: obs + pending 0
+        flap = np.asarray([0.0, 1.0])
+        contrast = runtime.pain_contrast_batch(np.vstack([hold, flap]))
+        prior = runtime.feature_action_prior
+        base = runtime.graph.nodes[feature_id].value
+        read0 = (0.0 + prior * base) / (2.0 + prior)
+        read1 = (1.0 + prior * base) / (1.0 + prior)
+        mean_read = (read0 + read1) / 2.0
+        # The absolute lethality cancels: the reads are centered, so the
+        # two actions land symmetrically around zero regardless of base.
+        self.assertAlmostEqual(contrast[0], read0 - mean_read, places=9)
+        self.assertAlmostEqual(contrast[1], read1 - mean_read, places=9)
+        self.assertLess(abs(contrast[0]), abs(read0))
+        self.assertGreater(abs(contrast[1] - contrast[0]), 0.0)
+        # A state outside every predicate reads zero, not a extrapolation.
+        outside = np.asarray([5.0, 0.0])
+        self.assertAlmostEqual(
+            float(runtime.pain_contrast_batch(outside[None, :])[0]),
+            0.0, places=9,
+        )
 
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()

@@ -65,7 +65,8 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
           component_gating=False, pain_horizon=None, voi_fraction=0.0,
           feature_value_weight=0.02, value_features=True,
           value_label_quantile=0.8, subgraph_cells=False,
-          predicate_readouts=False, event_memory_risk=True):
+          predicate_readouts=False, event_memory_risk=True,
+          contrast_objective=False):
     world, agent = fit(
         seed, steps=steps, coverage=coverage, max_nodes=max_nodes,
         birth_threshold=birth_threshold, epochs=epochs,
@@ -81,6 +82,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
         subgraph_cells=subgraph_cells,
         predicate_readouts=predicate_readouts,
         event_memory_risk=event_memory_risk,
+        contrast_objective=contrast_objective,
     )
     # The same deterministic transitions `fit` trained on; used only to
     # measure whether both actions exist near the planner states.
@@ -465,6 +467,9 @@ def main():
     parser.add_argument("--no-event-memory-risk", action="store_true",
                         help="drop the feature-keyed event-memory readout "
                              "from the risk max-combine")
+    parser.add_argument("--contrast-objective", action="store_true",
+                        help="F1: per-step cost is the action contrast and "
+                             "the endpoint cost is the value term alone")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset matching substrate_nodes")
     args = parser.parse_args()
@@ -492,6 +497,7 @@ def main():
         subgraph_cells=args.subgraph_cells,
         predicate_readouts=args.predicate_readouts,
         event_memory_risk=not args.no_event_memory_risk,
+        contrast_objective=args.contrast_objective,
     )
 
 

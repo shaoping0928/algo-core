@@ -154,6 +154,7 @@ class NodeRuntime:
         subgraph_cells: bool = False,
         predicate_readouts: bool = False,
         event_memory_risk: bool = True,
+        contrast_objective: bool = False,
         value_horizon: Optional[int] = None,
         ood_trust_scale: float = 0.0,
         obs_trust: float = 1.0,
@@ -389,6 +390,12 @@ class NodeRuntime:
         # channel to measure how much of the large-data degradation it
         # carries.
         self.event_memory_risk = bool(event_memory_risk)
+        # F1: path-relative search objective.  When on, the per-step cost
+        # is the action contrast (per-state relative action quality) and
+        # the endpoint cost is the value term alone, so the fixed toll of
+        # traversing a genuinely hazardous band no longer penalizes the
+        # plans that must go through it.
+        self.contrast_objective = bool(contrast_objective)
         self._feature_all: List[str] = []
         self._feature_descendants: Dict[str, List[str]] = {}
         self._feature_objects: Dict[str, object] = {}
@@ -1694,6 +1701,70 @@ class NodeRuntime:
             count, hits = int(cell[0]), float(cell[1])
             return (hits + prior * base) / (count + prior), count
         return base, 0
+
+    def pain_contrast_batch(self, states: np.ndarray,
+                            mask_table: Optional[List] = None) -> np.ndarray:
+        """Action contrast of the feature risk cells, per encoded state.
+
+        For every active root the per-action risk reads are taken over the
+        whole action space and centered on their mean, so a state's read is
+        the quality of the acting action *relative to the other action* and
+        the band's absolute lethality cancels - a plan that goes through
+        the band no longer pays the toll a drifting plan avoids inside a
+        short horizon.  Roots without data contribute a zero contrast (their
+        fallback read is identical for every action); rows where no root
+        fires read zero.
+        """
+        states = np.asarray(states, dtype=float)
+        if len(states) == 0:
+            return np.zeros(0)
+        result = np.full(len(states), -np.inf)
+        any_fired = np.zeros(len(states), dtype=bool)
+        if not self.feature_ids:
+            return np.zeros(len(states), dtype=float)
+        obs = states[:, :self.obs_dim]
+        if mask_table is None:
+            mask_table = self._feature_mask_table(obs)
+        acting = None
+        if states.shape[1] > self.obs_dim:
+            acting = np.rint(states[:, self.obs_dim]).astype(int)
+        if acting is None:
+            return np.zeros(len(states), dtype=float)
+        prior = self.feature_action_prior
+        for node_id in self.feature_ids:
+            root_feature = self._feature_objects.get(node_id)
+            if root_feature is None:
+                continue
+            root_mask = self._table_entry(
+                mask_table, node_id, root_feature, obs
+            )
+            if root_mask is None or not root_mask.any():
+                continue
+            any_fired |= root_mask
+            base = float(self.graph.nodes[node_id].value)
+            reads = {}
+            for action_key in self.action_space:
+                cell = self.feature_action_stats.get(node_id, {}).get(
+                    int(action_key)
+                )
+                if cell is not None and cell[0] > 0:
+                    count, hits = int(cell[0]), float(cell[1])
+                    reads[action_key] = (
+                        hits + prior * base
+                    ) / (count + prior)
+                else:
+                    reads[action_key] = base
+            mean_read = float(np.mean(
+                [reads[action_key] for action_key in self.action_space]
+            ))
+            for action_key in self.action_space:
+                selected = root_mask & (acting == int(action_key))
+                if not selected.any():
+                    continue
+                candidate = np.full(len(states), -np.inf)
+                candidate[selected] = reads[action_key] - mean_read
+                result = np.maximum(result, candidate)
+        return np.where(any_fired, result, 0.0)
 
     def _record_prediction(self, root_ids, acting: int, actual: float,
                            state) -> None:

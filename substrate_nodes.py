@@ -51,7 +51,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            feature_action_prior=2.0, feature_value_prior=4.0,
            value_features=True, value_label_quantile=0.8,
            subgraph_cells=False, predicate_readouts=False,
-           event_memory_risk=True):
+           event_memory_risk=True, contrast_objective=False):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -91,6 +91,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         subgraph_cells=subgraph_cells,
         predicate_readouts=predicate_readouts,
         event_memory_risk=event_memory_risk,
+        contrast_objective=contrast_objective,
     )
     episodes = {}
     for row in transitions:
@@ -231,7 +232,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         feature_action_prior=2.0, feature_value_prior=4.0,
         value_features=True, value_label_quantile=0.8,
         subgraph_cells=False, predicate_readouts=False,
-        event_memory_risk=True):
+        event_memory_risk=True, contrast_objective=False):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -354,6 +355,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         subgraph_cells=subgraph_cells,
         predicate_readouts=predicate_readouts,
         event_memory_risk=event_memory_risk,
+        contrast_objective=contrast_objective,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -396,54 +398,102 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         )
         return world.predict(states, history)
 
-    def evaluate_step(states, sequences, step):
-        # `lag` is the first predicted state whose acting action comes from
-        # the plan rather than the pending prefix, so a plain stride can step
-        # over the first point the plan can actually influence.
-        if step % step_stride != 0 and not (
-            stride_includes_lag and step == lag
-        ):
+    if getattr(agent, "contrast_objective", False):
+        # F1: the per-step cost is the action contrast (per-state relative
+        # action quality, absolute lethality cancels) and the endpoint cost
+        # is the value term alone - the value channel books the long
+        # survival that pays for traversing a genuinely hazardous band.
+        def evaluate_step(states, sequences, step):
+            if step % step_stride != 0 and not (
+                stride_includes_lag and step == lag
+            ):
+                return (
+                    np.zeros((len(states), 2)),
+                    np.isfinite(states).all(axis=1),
+                )
+            history = history_features(
+                sequences, step + 1, pending_prefix, action_dim=action_dim
+            )
+            pending = history[:, :agent.lag][:, ::-1]
+            encoded = np.concatenate([states, pending], axis=1) / agent.scales
+            contrast = agent.pain_contrast_batch(encoded)
             return (
-                np.zeros((len(states), 2)),
-                np.isfinite(states).all(axis=1),
+                np.column_stack([contrast, np.zeros(len(states))]),
+                np.isfinite(encoded).all(axis=1),
             )
-        history = history_features(
-            sequences, step + 1, pending_prefix, action_dim=action_dim
-        )
-        pending = history[:, :agent.lag][:, ::-1]
-        encoded = np.concatenate([states, pending], axis=1) / agent.scales
-        risk = agent.pain_signal_batch(encoded)
-        return (
-            np.column_stack([risk, np.zeros(len(states))]),
-            np.isfinite(encoded).all(axis=1),
-        )
 
-    def evaluate_terminal(states, sequences):
-        history = history_features(
-            sequences, horizon, pending_prefix, action_dim=action_dim
-        )
-        # `history` is newest-first; the node state stores pending actions
-        # oldest-first and only the last `lag` actions remain pending.
-        pending = history[:, :agent.lag][:, ::-1]
-        encoded = np.concatenate([states, pending], axis=1) / agent.scales
-        pain, dopamine = agent.valence_state_batch(encoded)
-        mask_table = agent._feature_mask_table(encoded[:, :agent.obs_dim])
-        if getattr(agent, "predicate_readouts", False):
-            # D3: the terminal hazard comes from the predicates only; the
-            # prototype valence no longer bounds it.
-            risk = agent.pain_signal_batch(encoded, mask_table)
-        else:
-            risk = np.maximum(
-                pain, agent.pain_signal_batch(encoded, mask_table)
+        def evaluate_terminal(states, sequences):
+            history = history_features(
+                sequences, horizon, pending_prefix, action_dim=action_dim
             )
-        # Scalarized objective: accumulated hazard minus the sequence-level
-        # value of the endpoint, so a plan that accepts local risk in
-        # exchange for a long-survival alignment can win.
-        value = agent.feature_value_batch(encoded, mask_table)
-        cost = risk - agent.feature_value_weight * value
-        return np.column_stack([cost, -dopamine]), np.isfinite(encoded).all(
-            axis=1
-        )
+            pending = history[:, :agent.lag][:, ::-1]
+            encoded = np.concatenate([states, pending], axis=1) / agent.scales
+            _pain, dopamine = agent.valence_state_batch(encoded)
+            mask_table = agent._feature_mask_table(
+                encoded[:, :agent.obs_dim]
+            )
+            value = agent.feature_value_batch(encoded, mask_table)
+            cost = -agent.feature_value_weight * value
+            return np.column_stack([cost, -dopamine]), np.isfinite(
+                encoded
+            ).all(axis=1)
+    else:
+        def evaluate_step(states, sequences, step):
+            # `lag` is the first predicted state whose acting action comes
+            # from the plan rather than the pending prefix, so a plain
+            # stride can step over the first point the plan can actually
+            # influence.
+            if step % step_stride != 0 and not (
+                stride_includes_lag and step == lag
+            ):
+                return (
+                    np.zeros((len(states), 2)),
+                    np.isfinite(states).all(axis=1),
+                )
+            history = history_features(
+                sequences, step + 1, pending_prefix, action_dim=action_dim
+            )
+            pending = history[:, :agent.lag][:, ::-1]
+            encoded = (
+                np.concatenate([states, pending], axis=1) / agent.scales
+            )
+            risk = agent.pain_signal_batch(encoded)
+            return (
+                np.column_stack([risk, np.zeros(len(states))]),
+                np.isfinite(encoded).all(axis=1),
+            )
+
+        def evaluate_terminal(states, sequences):
+            history = history_features(
+                sequences, horizon, pending_prefix, action_dim=action_dim
+            )
+            # `history` is newest-first; the node state stores pending
+            # actions oldest-first and only the last `lag` actions remain
+            # pending.
+            pending = history[:, :agent.lag][:, ::-1]
+            encoded = (
+                np.concatenate([states, pending], axis=1) / agent.scales
+            )
+            pain, dopamine = agent.valence_state_batch(encoded)
+            mask_table = agent._feature_mask_table(
+                encoded[:, :agent.obs_dim]
+            )
+            if getattr(agent, "predicate_readouts", False):
+                # D3: the terminal hazard comes from the predicates only;
+                # the prototype valence no longer bounds it.
+                risk = agent.pain_signal_batch(encoded, mask_table)
+            else:
+                risk = np.maximum(
+                    pain, agent.pain_signal_batch(encoded, mask_table)
+                )
+            # Scalarized objective: accumulated hazard minus the
+            # sequence-level value of the endpoint, so a plan that accepts
+            # local risk in exchange for a long-survival alignment can win.
+            value = agent.feature_value_batch(encoded, mask_table)
+            cost = risk - agent.feature_value_weight * value
+            return np.column_stack([cost, -dopamine]), np.isfinite(
+                encoded
+            ).all(axis=1)
 
     result = exhaustive_search(
         initial_state=initial,
@@ -531,12 +581,13 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
     """Score one fixed plan with the same objective as `policy_result`.
 
     Reproduces the `exhaustive_search` scoring under
-    ``score_combine=("sum", "sum")``: column 0 is the accumulated
-    `pain_signal` hazard over the strided predicted states plus the
-    terminal risk, minus the sequence-level value of the endpoint; column 1
-    is the negative terminal dopamine.  Used by diagnostics that compare
-    fixed plans against the searched plan, and later by plan-level
-    posteriors.
+    ``score_combine=("sum", "sum")``.  Under the default objective column 0
+    is the accumulated `pain_signal` hazard over the strided predicted
+    states plus the terminal risk, minus the sequence-level value of the
+    endpoint; under the contrast objective it is the accumulated action
+    contrast minus the value term.  Column 1 is the negative terminal
+    dopamine.  Used by diagnostics that compare fixed plans against the
+    searched plan, and later by plan-level posteriors.
     """
     initial = np.asarray(initial_state, dtype=float).reshape(1, -1)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
@@ -546,6 +597,7 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
     plan = np.asarray(plan, dtype=float).reshape(1, -1)
     states = initial.copy()
     total = 0.0
+    contrast = getattr(agent, "contrast_objective", False)
     for step in range(horizon):
         history = history_features(
             plan, step + 1, pending_prefix, action_dim=action_dim
@@ -558,7 +610,10 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
             encoded = np.concatenate([states, pending], axis=1) / agent.scales
             if not np.isfinite(encoded).all():
                 return (float("inf"), float("inf"))
-            total += float(agent.pain_signal_batch(encoded)[0])
+            if contrast:
+                total += float(agent.pain_contrast_batch(encoded)[0])
+            else:
+                total += float(agent.pain_signal_batch(encoded)[0])
     history = history_features(
         plan, horizon, pending_prefix, action_dim=action_dim
     )
@@ -568,6 +623,11 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
         return (float("inf"), float("inf"))
     pain, dopamine = agent.valence_state_batch(encoded)
     mask_table = agent._feature_mask_table(encoded[:, :agent.obs_dim])
+    if contrast:
+        total -= agent.feature_value_weight * float(
+            agent.feature_value_batch(encoded, mask_table)[0]
+        )
+        return (total, -float(dopamine[0]))
     if getattr(agent, "predicate_readouts", False):
         terminal = float(agent.pain_signal_batch(encoded, mask_table)[0])
     else:
@@ -676,6 +736,7 @@ def run_seed(task):
     subgraph_cells = bool(task.get("subgraph_cells", False))
     predicate_readouts = bool(task.get("predicate_readouts", False))
     event_memory_risk = bool(task.get("event_memory_risk", True))
+    contrast_objective = bool(task.get("contrast_objective", False))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -720,6 +781,7 @@ def run_seed(task):
         subgraph_cells=subgraph_cells,
         predicate_readouts=predicate_readouts,
         event_memory_risk=event_memory_risk,
+        contrast_objective=contrast_objective,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -852,6 +914,11 @@ def main():
     parser.add_argument("--no-event-memory-risk", action="store_true",
                         help="drop the feature-keyed event-memory readout "
                              "from the risk max-combine")
+    parser.add_argument("--contrast-objective", action="store_true",
+                        help="F1: per-step cost is the action contrast and "
+                             "the endpoint cost is the value term alone, "
+                             "so genuinely hazardous bands no longer "
+                             "penalize the plans that must cross them")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -999,6 +1066,7 @@ def main():
             subgraph_cells=args.subgraph_cells,
             predicate_readouts=args.predicate_readouts,
             event_memory_risk=not args.no_event_memory_risk,
+            contrast_objective=args.contrast_objective,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -1127,6 +1195,7 @@ def main():
                 subgraph_cells=args.subgraph_cells,
                 predicate_readouts=args.predicate_readouts,
                 event_memory_risk=not args.no_event_memory_risk,
+                contrast_objective=args.contrast_objective,
                 self_evaluation=not bool(eval_seeds),
                 dagger_rounds=args.dagger_rounds,
                 dagger_episodes=args.dagger_episodes,
