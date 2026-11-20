@@ -629,6 +629,32 @@ class NodeRuntimeTests(unittest.TestCase):
         # the historical precursor window is not silently applied.
         self.assertEqual(runtime._node_horizon(feature_id), 1)
 
+    def test_memory_credit_corrects_an_earlier_memory(self):
+        runtime = self.make_runtime(point_labels=True)
+        earlier = runtime._new_memory()
+        runtime._memory_traces = {earlier: 1.0}
+        runtime._advance_memory_traces([], [], None, 1.0)
+        decay = runtime.gamma * runtime.lam
+        stats = runtime._association_stats[earlier]
+        # The pain event contributes a fractional sample at the decayed
+        # eligibility: the earlier memory's rate moves toward pain, but no
+        # state label was rewritten.
+        self.assertAlmostEqual(stats[0], decay, places=6)
+        self.assertAlmostEqual(stats[1], decay, places=6)
+
+    def test_memory_credit_links_the_event_to_prior_context(self):
+        from node_graph import MEMBERSHIP
+
+        runtime = self.make_runtime(point_labels=True)
+        context = runtime._create_node(np.asarray([0.0]))
+        event = runtime._new_memory()
+        runtime._memory_traces = {context: 1.0, event: 0.1}
+        runtime._advance_memory_traces([], [], event, 1.0)
+        edge = runtime.graph.edges[(event, context, MEMBERSHIP)]
+        decay = runtime.gamma * runtime.lam
+        self.assertAlmostEqual(edge.weight, decay, places=6)
+        self.assertIn(context, runtime.graph.nodes[event].members)
+
     def test_feature_windows_are_per_node(self):
         from node_features import FeatureRule, Primitive
         from node_graph import NodeGraph

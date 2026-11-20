@@ -121,7 +121,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         value_dispersion=False, iterative_induction=False,
         compose_readout: bool = True, importance_weighting=False,
         voi_threat_min: float = 0.25, curiosity_weight: float = 0.0,
-        dagger_frames: int = 0):
+        dagger_frames: int = 0, memory_credit: bool = False):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -169,6 +169,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         voi_threat_min=voi_threat_min,
         curiosity_weight=curiosity_weight,
         point_labels=(not precursor_labels),
+        memory_credit=memory_credit,
     )
     episodes = {}
     for row in transitions:
@@ -601,7 +602,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         control_risk_weight=0.0, value_bank_only=False,
         iterative_induction=False, compose_readout=True,
         importance_weighting=False, learn_objective=True,
-        curiosity_weight=0.5):
+        curiosity_weight=0.5, memory_credit=False):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -753,6 +754,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         importance_weighting=importance_weighting,
         curiosity_weight=curiosity_weight,
         dagger_frames=dagger_frames,
+        memory_credit=memory_credit,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -1358,6 +1360,7 @@ def run_seed(task):
     importance_weighting = bool(task.get("importance_weighting", False))
     learn_objective = bool(task.get("learn_objective", True))
     curiosity_weight = float(task.get("curiosity_weight", 0.5))
+    memory_credit = bool(task.get("memory_credit", False))
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
@@ -1416,6 +1419,7 @@ def run_seed(task):
         learn_objective=learn_objective,
         voi_threat_min=voi_threat_min,
         curiosity_weight=curiosity_weight,
+        memory_credit=memory_credit,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1593,6 +1597,11 @@ def main():
                              "bounded by +/-w); it shapes training-time "
                              "execution only - evaluation always runs with "
                              "w=0. 0 disables it")
+    parser.add_argument("--memory-credit", action="store_true",
+                        help="on a pain event, correct earlier memories' "
+                             "risk rates by an eligibility trace and link "
+                             "the event memory back to the preceding "
+                             "context; the pain itself stays a point event")
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
@@ -1804,6 +1813,7 @@ def main():
             importance_weighting=args.importance_weighting,
             learn_objective=args.learn_objective,
             curiosity_weight=args.curiosity_weight,
+            memory_credit=args.memory_credit,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,

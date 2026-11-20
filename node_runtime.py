@@ -280,6 +280,7 @@ class NodeRuntime:
         utility_pruning: bool = True,
         pain_horizon: Optional[int] = None,
         point_labels: bool = False,
+        memory_credit: bool = False,
         voi_target: int = 3,
         voi_cell_cap: int = 16,
         voi_min_prior: float = 0.5,
@@ -521,6 +522,17 @@ class NodeRuntime:
         # hand-chosen precursor window; `_node_horizon` is pinned to one so
         # the graded readout keeps treating all roots as governable.
         self.point_labels = bool(point_labels)
+        # Retrospective memory credit: a pain event also corrects the
+        # memories that were active just before it, and links its event
+        # memory back to that preceding context.  The pain stays a point
+        # event - no state label is rewritten - but the eligibility trace
+        # (gamma*lambda, the same constants as the TD path) decides how
+        # much of it reaches an earlier memory.
+        self.memory_credit = bool(memory_credit)
+        self._memory_traces: Dict[str, float] = {}
+        # Resource bound on how many preceding context nodes one event
+        # memory links to; not a semantic window.
+        self.memory_context_limit = 32
         self.gated_edges: Dict[
             Tuple[str, Tuple[int, ...], int], Dict[str, dict]
         ] = {}
@@ -944,18 +956,23 @@ class NodeRuntime:
     def _interact(self, current: str, next_node: str, pain: float = 0.0,
                   dopamine: float = 0.0,
                   current_features: Iterable[str] = (),
-                  next_features: Iterable[str] = ()) -> None:
+                  next_features: Iterable[str] = (),
+                  learn_memory_credit: bool = False) -> None:
         """Create association, causal transition and signal-driven memory."""
         pain = float(pain)
         dopamine = float(dopamine)
+        current_features = list(dict.fromkeys(current_features))
+        next_features = list(dict.fromkeys(next_features))
         if current == next_node:
             # A self-loop is still a visit: the per-node valence rate must
             # see every transition through the node, even the ones that
             # cannot learn a structural edge.
             self._note_valence([current], pain)
+            if learn_memory_credit:
+                self._advance_memory_traces(
+                    [current] + current_features, (), None, pain
+                )
             return
-        current_features = list(dict.fromkeys(current_features))
-        next_features = list(dict.fromkeys(next_features))
         self.graph.activate([current, next_node], [1.0, 1.0])
         self.graph.observe_association(
             [current, next_node], rate=self.graph_rate
@@ -1007,6 +1024,11 @@ class NodeRuntime:
         if created_memory is not None:
             extra.append(created_memory)
         self._learn_pain_association(pain, extra)
+        if learn_memory_credit:
+            self._advance_memory_traces(
+                [current, next_node] + current_features + next_features,
+                list(memories), created_memory, pain,
+            )
 
     def memories_for(self, node_ids: Iterable[str]) -> Dict[str, float]:
         """Find memory nodes through membership edges of active nodes."""
@@ -1139,6 +1161,85 @@ class NodeRuntime:
             stats = self._association_stats.setdefault(node_id, [0, 0.0])
             stats[0] += 1
             stats[1] += pain
+
+    def _note_valence_weighted(self, node_ids, pain: float,
+                               weight: float) -> None:
+        """Record a fractional outcome sample (retrospective credit).
+
+        An eligibility trace gives the pain event a decayed weight at an
+        earlier memory; this adds that fractional observation to the same
+        per-node rate statistics a real transition would, so the memory's
+        risk read is corrected without ever labelling a flight state as
+        painful.
+        """
+        weight = float(weight)
+        if weight <= 0.0:
+            return
+        pain = float(pain)
+        self._association_global[0] += weight
+        self._association_global[1] += weight * pain
+        for node_id in dict.fromkeys(node_ids):
+            stats = self._association_stats.setdefault(node_id, [0.0, 0.0])
+            stats[0] += weight
+            stats[1] += weight * pain
+
+    def _advance_memory_traces(self, active, memories, created_memory,
+                               pain: float) -> None:
+        """Advance the episode's memory eligibility and apply the pain event.
+
+        Two corrections happen on a real pain event, both driven only by
+        that event and by the episode's own eligibility trace:
+
+        * the values (association rates) of memories that were active
+          earlier are corrected by a fractional sample weighted by
+          ``(gamma*lambda)^distance``;
+        * the event memory is linked back to the preceding context, so a
+          similar lead-in retrieves it before the collision state itself.
+
+        No state label is rewritten: the pain stays on the transition that
+        produced it.  The context link list is capped by
+        ``memory_context_limit`` purely as a resource bound.
+        """
+        decay = self.gamma * self.lam
+        traces = self._memory_traces
+        for node_id in list(traces):
+            traces[node_id] *= decay
+            if traces[node_id] < 1e-4:
+                del traces[node_id]
+        for node_id in dict.fromkeys(list(active) + list(memories)):
+            traces[node_id] = traces.get(node_id, 0.0) + 1.0
+        if created_memory is not None:
+            traces[created_memory] = traces.get(created_memory, 0.0) + 1.0
+        if pain <= 0.0:
+            return
+        current = set(active) | set(memories)
+        if created_memory is not None:
+            current.add(created_memory)
+        for node_id, eligibility in list(traces.items()):
+            if node_id in current:
+                continue
+            node = self.graph.nodes.get(node_id)
+            if node is None or node.kind != MEMORY:
+                continue
+            self._note_valence_weighted(
+                [node_id], pain, min(1.0, float(eligibility))
+            )
+        target = created_memory
+        if target is None and memories:
+            target = max(memories, key=lambda mid: traces.get(mid, 0.0))
+        if target is None:
+            return
+        context = [
+            (node_id, float(eligibility))
+            for node_id, eligibility in traces.items()
+            if node_id != target and eligibility >= 0.05
+            and self.graph.nodes.get(node_id) is not None
+            and self.graph.nodes[node_id].kind != MEMORY
+        ]
+        context.sort(key=lambda item: -item[1])
+        for member_id, eligibility in context[:self.memory_context_limit]:
+            edge = self.graph.add_membership(target, member_id)
+            edge.weight = max(edge.weight, min(1.0, eligibility))
 
     def _association_base(self) -> float:
         """Global pain rate per transition, a 1/n cumulative mean."""
@@ -1676,6 +1777,7 @@ class NodeRuntime:
         self.last_sources = []
         self.last_signature = ()
         self._traces.clear()
+        self._memory_traces.clear()
         self._episode_nodes = set()
 
     def learn_transition(self, observation, action, next_observation,
@@ -1862,6 +1964,7 @@ class NodeRuntime:
                 float(signals[1]), float(signals[0]),
                 current_features=current_features,
                 next_features=next_features,
+                learn_memory_credit=self.memory_credit,
             )
             active_by_horizon = {}
             active_set = set(current_active)
