@@ -19,6 +19,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     as_completed,
 )
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -346,6 +347,91 @@ def collect_planner(seed, world, agent, episodes=2, cap=1200, horizon=10,
     return transitions, frames
 
 
+def _rankdata(values) -> np.ndarray:
+    """Average ranks (1-based, ties averaged) - enough for Spearman."""
+    values = np.asarray(values, dtype=float)
+    order = np.argsort(values, kind="stable")
+    ranks = np.empty(len(values), dtype=float)
+    index = 0
+    while index < len(values):
+        end = index + 1
+        while end < len(values) and values[order[end]] == values[order[index]]:
+            end += 1
+        average = 0.5 * (index + end - 1) + 1.0
+        for position in range(index, end):
+            ranks[order[position]] = average
+        index = end
+    return ranks
+
+
+def _spearman(first, second) -> float:
+    first_rank = _rankdata(first)
+    second_rank = _rankdata(second)
+    if first_rank.size < 2:
+        return 0.0
+    first_dev = first_rank - first_rank.mean()
+    second_dev = second_rank - second_rank.mean()
+    denominator = np.sqrt(
+        (first_dev * first_dev).sum() * (second_dev * second_dev).sum()
+    )
+    if denominator <= 0.0:
+        return 0.0
+    return float((first_dev * second_dev).sum() / denominator)
+
+
+def learn_objective_weight(rows, min_decisions: int = 8) -> Optional[float]:
+    """Select the objective's value weight from the planner's own outcomes.
+
+    P4: the trade-off between one unit of accumulated hazard and one unit
+    of endpoint value - the objective's hand-tuned scalarization - is
+    measured from the executed decisions: every decision row carries its
+    plan's ledger (the hazard share and the value share of the
+    scalarized cost) and its realized remaining survival.  For each
+    candidate weight the scalarized cost rebuilds as
+    ``hazard + weight * value_share`` (the value share already carries
+    the trust scale, and scales linearly in the weight), and the weight
+    whose rebuilt cost ranks survival best across decisions wins.
+    Candidate weights are scale-free: geometric around the ratio of the
+    data's own median hazard and value magnitudes, plus zero (an honest
+    answer when the value channel does not predict survival).  Returns
+    None when the executed data cannot rank the candidates.
+    """
+    hazards = []
+    values = []
+    outcomes = []
+    last_index = {}
+    for index, row in enumerate(rows):
+        ledger = row.get("ledger")
+        if not ledger:
+            continue
+        last_index[row["episode"]] = index
+    for index, row in enumerate(rows):
+        ledger = row.get("ledger")
+        if not ledger:
+            continue
+        hazards.append(float(ledger[0]))
+        values.append(float(ledger[1]))
+        outcomes.append(float(last_index[row["episode"]] - index + 1))
+    if len(hazards) < min_decisions or len(set(outcomes)) < 2:
+        return None
+    hazards = np.asarray(hazards, dtype=float)
+    values = np.asarray(values, dtype=float)
+    outcomes = np.asarray(outcomes, dtype=float)
+    hazard_scale = float(np.median(np.abs(hazards)))
+    value_scale = float(np.median(np.abs(values)))
+    center = hazard_scale / max(value_scale, 1e-9)
+    grid = [0.0] + [center * factor for factor in (0.25, 0.5, 1.0, 2.0, 4.0)]
+    best_weight = None
+    best_agreement = -np.inf
+    for weight in grid:
+        rebuilt = -(hazards + weight * values)
+        agreement = _spearman(rebuilt, outcomes)
+        if agreement > best_agreement:
+            best_agreement = agreement
+            best_weight = float(weight)
+    return best_weight
+
+
 def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         birth_threshold=0.45, epochs=5, lag=LAG,
         component_kinds=(), component_min_count=8,
@@ -365,7 +451,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         value_trust_samples=150.0, value_dispersion=False,
         control_risk_weight=0.0, value_bank_only=False,
         iterative_induction=False, compose_readout=True,
-        importance_weighting=False):
+        importance_weighting=False, learn_objective=True):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -503,6 +589,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
+    planner_rows: List[dict] = []
     for _round in range(int(dagger_rounds)):
         planner, _frames = collect_planner(
             seed, world, agent, episodes=dagger_episodes,
@@ -524,6 +611,15 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             total_steps=len(transitions),
         ))
         world, agent = _train(transitions, **train_kwargs)
+        if learn_objective and planner:
+            # P4: the planner's own executed decisions measure the
+            # objective's trade-off; the learned weight rides into the
+            # next round's planner and the returned agent.
+            planner_rows.extend(planner)
+            learned = learn_objective_weight(planner_rows)
+            if learned is not None:
+                agent.feature_value_weight = learned
+                dagger_log[-1]["learned_value_weight"] = learned
     agent.dagger_log = dagger_log
     return world, agent
 
@@ -547,12 +643,16 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         # action quality, absolute lethality cancels) and the endpoint cost
         # is the value term alone - the value channel books the long
         # survival that pays for traversing a genuinely hazardous band.
+        # Columns 2-3 carry the objective's ledger - the hazard and value
+        # shares of the scalarized column 0 - so the executed plan's
+        # components can be regressed against its realized outcome without
+        # a second pass (P4 objective learning).
         def evaluate_step(states, sequences, step):
             if step % step_stride != 0 and not (
                 stride_includes_lag and step == lag
             ):
                 return (
-                    np.zeros((len(states), 2)),
+                    np.zeros((len(states), 4)),
                     np.isfinite(states).all(axis=1),
                 )
             history = history_features(
@@ -562,8 +662,9 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             encoded = np.concatenate([states, pending], axis=1) / agent.scales
             threat, excess = agent.pain_graded_batch(encoded)
             cost = threat + agent.control_risk_weight * excess
+            zeros = np.zeros(len(states))
             return (
-                np.column_stack([cost, np.zeros(len(states))]),
+                np.column_stack([cost, zeros, cost, zeros]),
                 np.isfinite(encoded).all(axis=1),
             )
 
@@ -584,10 +685,13 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             # a state whose value cells are thin contributes proportionally
             # less to the endpoint cost.
             trust = support / (support + agent.value_trust_samples)
-            cost = -agent.feature_value_weight * trust * value
-            return np.column_stack([cost, -dopamine]), np.isfinite(
-                encoded
-            ).all(axis=1)
+            value_term = -agent.feature_value_weight * trust * value
+            return (
+                np.column_stack([
+                    value_term, -dopamine, np.zeros(len(states)), value_term,
+                ]),
+                np.isfinite(encoded).all(axis=1),
+            )
     else:
         def evaluate_step(states, sequences, step):
             # `lag` is the first predicted state whose acting action comes
@@ -598,7 +702,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 stride_includes_lag and step == lag
             ):
                 return (
-                    np.zeros((len(states), 2)),
+                    np.zeros((len(states), 4)),
                     np.isfinite(states).all(axis=1),
                 )
             history = history_features(
@@ -609,8 +713,9 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 np.concatenate([states, pending], axis=1) / agent.scales
             )
             risk = agent.pain_signal_batch(encoded)
+            zeros = np.zeros(len(states))
             return (
-                np.column_stack([risk, np.zeros(len(states))]),
+                np.column_stack([risk, zeros, risk, zeros]),
                 np.isfinite(encoded).all(axis=1),
             )
 
@@ -650,10 +755,12 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             )
             trust_samples = getattr(agent, "value_trust_samples", 150.0)
             trust = support / (support + trust_samples)
-            cost = risk - agent.feature_value_weight * trust * value
-            return np.column_stack([cost, -dopamine]), np.isfinite(
-                encoded
-            ).all(axis=1)
+            value_term = -agent.feature_value_weight * trust * value
+            cost = risk + value_term
+            return (
+                np.column_stack([cost, -dopamine, risk, value_term]),
+                np.isfinite(encoded).all(axis=1),
+            )
 
     result = exhaustive_search(
         initial_state=initial,
@@ -663,7 +770,10 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         evaluate_step=evaluate_step,
         evaluate_terminal=evaluate_terminal,
         batch_size=2 ** horizon,
-        score_combine=("sum", "sum"),
+        # "sum" expands to one mode per objective column, so the ledger
+        # columns (hazard and value shares) sum alongside the scalarized
+        # cost and the dopamine tie-break without changing their contract.
+        score_combine="sum",
     )
     return result
 
@@ -723,15 +833,30 @@ def cell_q_action(env, world, agent, prefix, lag=LAG):
 
 def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                     step_stride=2, stride_includes_lag=False,
-                    decision="search"):
-    """Dispatch one decision to the searched or the cell-Q-only policy."""
+                    decision="search", ledger_out=None):
+    """Dispatch one decision to the searched or the cell-Q-only policy.
+
+    With `ledger_out` (a list) and the search decision, the winning
+    plan's objective ledger - the hazard and value shares of the
+    scalarized cost, split by `policy_result`'s third and fourth score
+    columns - is appended so the executed decision's components can be
+    regressed against its realized outcome (P4 objective learning).
+    """
     if decision == "search":
-        return policy_action(
+        result = policy_result(
             env, world, agent, prefix, horizon, lag=lag,
             step_stride=step_stride,
             stride_includes_lag=stride_includes_lag,
         )
+        if ledger_out is not None:
+            score = result.score
+            ledger_out.append((
+                float(score[2]), float(score[3]),
+            ))
+        return int(result.actions[0])
     if decision == "cellq":
+        if ledger_out is not None:
+            ledger_out.append((0.0, 0.0))
         return cell_q_action(env, world, agent, prefix, lag=lag)
     raise ValueError("unknown decision mode %r" % decision)
 
@@ -829,11 +954,13 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
     transitions = []
     while not env.dead and env.t < cap:
         obs = np.asarray(env.obs(), dtype=float)
+        ledger: List[Tuple[float, float]] = []
+        ledger_out = ledger if record else None
         action = decision_action(
             env, world, agent, prefix, horizon, lag=lag,
             step_stride=step_stride,
             stride_includes_lag=stride_includes_lag,
-            decision=decision,
+            decision=decision, ledger_out=ledger_out,
         )
         history = np.asarray([float(action)] + recent[:lag], dtype=float)
         actions.append(action)
@@ -854,6 +981,11 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
                 # The planner's choice is deterministic: its rows are
                 # already on the target policy, so their IS weight is one.
                 propensity=1.0,
+                # The executed plan's objective ledger (hazard share,
+                # value share of the scalarized cost): the row's realized
+                # remaining survival is the outcome these components must
+                # predict (P4 objective learning).
+                ledger=(ledger[0] if ledger else (0.0, 0.0)),
             ))
         recent = [float(action)] + recent[:-1]
     return env.t, actions, transitions
@@ -910,6 +1042,7 @@ def run_seed(task):
     iterative_induction = bool(task.get("iterative_induction", False))
     compose_readout = bool(task.get("compose_readout", True))
     importance_weighting = bool(task.get("importance_weighting", False))
+    learn_objective = bool(task.get("learn_objective", True))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -962,6 +1095,7 @@ def run_seed(task):
         iterative_induction=iterative_induction,
         compose_readout=compose_readout,
         importance_weighting=importance_weighting,
+        learn_objective=learn_objective,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1133,6 +1267,12 @@ def main():
                              "actions, rebalancing the cells' "
                              "state-action mix away from the behavior "
                              "policy's occupancy")
+    parser.add_argument("--no-learn-objective", dest="learn_objective",
+                        action="store_false",
+                        help="keep the hand-set value weight in the "
+                             "planning objective instead of selecting "
+                             "it from the planner's executed decisions "
+                             "by rank agreement with realized survival")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -1288,6 +1428,7 @@ def main():
             iterative_induction=args.iterative_induction,
             compose_readout=args.compose_readout,
             importance_weighting=args.importance_weighting,
+            learn_objective=args.learn_objective,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,

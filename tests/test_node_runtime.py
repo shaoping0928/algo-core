@@ -1636,6 +1636,51 @@ class NodeRuntimeTests(unittest.TestCase):
         for row in transitions:
             self.assertTrue(0.0 <= float(row["propensity"]) <= 1.0)
 
+    def test_learn_objective_weight_follows_realized_survival(self):
+        from substrate_nodes import learn_objective_weight
+
+        # Hazard and |value share| fall along the stream while the
+        # realized remaining survival falls with it too: the hazard-only
+        # read ranks survival backwards (a high-cost early decision
+        # outlives every later one), and a weight past the hazard/value
+        # ratio restores the ordering.
+        rows = []
+        for index in range(8):
+            hazard = float(8 - index)
+            rows.append(dict(episode=0, ledger=(hazard, -10.0 * hazard)))
+        learned = learn_objective_weight(rows)
+        self.assertIsNotNone(learned)
+        self.assertGreater(learned, 0.1)
+        # Too few decisions cannot rank the candidates.
+        self.assertIsNone(learn_objective_weight(rows[:4]))
+        # A single distinct outcome cannot rank the candidates: every row
+        # in its own episode realizes one remaining frame.
+        flat = [
+            dict(episode=e, ledger=(1.0, -1.0)) for e in range(12)
+        ]
+        self.assertIsNone(learn_objective_weight(flat))
+
+    def test_planner_rows_carry_the_decision_ledger(self):
+        from substrate_nodes import collect_planner, fit
+
+        world, agent = fit(
+            100, steps=80, epochs=1, max_nodes=100, lag=3,
+            induce_features=False,
+        )
+        rows, _frames = collect_planner(
+            100, world, agent, episodes=1, cap=20, horizon=2, lag=3,
+            step_stride=1,
+        )
+        for row in rows:
+            self.assertEqual(len(row["ledger"]), 2)
+            hazard, value_share = row["ledger"]
+            self.assertTrue(np.isfinite(hazard))
+            self.assertTrue(np.isfinite(value_share))
+            # Under the default objective the hazard share is
+            # non-negative and the value share is a discount.
+            self.assertGreaterEqual(hazard, 0.0)
+            self.assertLessEqual(value_share, 0.0)
+
     def test_variance_birth_splits_a_mixed_cell(self):
         runtime = self.make_runtime(
             lag=0, scales=np.asarray([1.0]), max_nodes=40,
@@ -1710,6 +1755,11 @@ class PlanScoreTests(unittest.TestCase):
         env = latent[3](100)
         prefix = np.zeros(3, dtype=float)
         result = policy_result(env, world, agent, prefix, horizon=1, lag=3)
+        score = result.score
+        # P4: the score carries the objective's ledger - the scalarized
+        # column is the sum of its hazard and value shares.
+        self.assertEqual(len(score), 4)
+        self.assertAlmostEqual(score[0], score[2] + score[3], places=6)
         scores = [
             plan_score(
                 env.obs(), world, agent, prefix, [float(action)], 1, lag=3

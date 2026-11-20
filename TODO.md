@@ -154,6 +154,33 @@
     max（c_m = held-out 精度导出；正权重下 min/求和可交换，分级代数
     存活；会重塑已验证的 graded 目标——需独立 A/B）；(iii) held-out
     早停 + 回滚（需要根卸载机制）；(iv) 硬负例级联。
+- **P4 第一片已实施（2026-11-20，本轮）**：
+  - **账本拆分**：`policy_result` 的评分列从 2 列扩到 4 列
+    [标量化成本, −dopamine, 危险份额, 价值份额]——选择契约不变
+    （列 0-1 语义逐位不变，lexicographic 平局列依旧几乎永不生效）；
+    恒等式 score[0] == score[2] + score[3] 两分支都精确成立；
+    `score_combine` 改字符串 "sum"（自动按列扩展）。
+  - **执行决策记账**：`decision_action(ledger_out=...)` 把选中计划的
+    (危险份额, 价值份额) 交给 `evaluate(record=True)` 写进行
+    `ledger` 字段——同一行里"账本分量 → 实际剩余存活"配对即成。
+  - **w 学习器**：`learn_objective_weight(rows)`——对每个候选 w 把
+    标量化成本重建为 h + w·v（价值份额对 w 线性、已含信任尺度），
+    Spearman 秩一致性选优；候选格**从数据尺度导出**（median|h|/
+    median|v| 的几何邻域 {0.25,0.5,1,2,4}c + 0.0——价值通道不预测
+    存活时的诚实答案），任务无关；<8 决策或 outcome 无变化 → None。
+  - **闭环**：dagger 轮内学得 w 应用于下一轮规划器与返回 agent
+    （`agent.feature_value_weight`；dagger_log 记录 learned w）；
+    非 dagger 运行完全向后兼容；`--no-learn-objective` 保留手设 w。
+  - **fast A/B（dagger 1 轮，±学习）**：71.8 vs 72.0——逐位近乎
+    相同；探针：学得 w = **0.0**（fast 规模价值份额被信任压到 ≈0，
+    秩一致性找不到价值信号 = 诚实"无证据"）。机制就位，权衡在
+    价值格子有证据的规模才活。
+  - **P4 剩余（记录在案）**：Bradley-Terry 偏好回归（计划对上拟合
+    θ，比秩选择更细）、账本→存活的单调回归诊断表、
+    control_risk_weight/trust 一并学习、PBRS 势差护栏（价值项写为
+    γΦ(s')−Φ(s)）。
+  - 测试 148 → 150（账本恒等式、学习者方向性/退化分支、
+    planner 行账本字段）。
 - **资源裁定（2026-11-20，用户）**：验证运行**每轮共 3 个种子**
   （`--jobs 3` 一波跑完），臂与臂串行；**默认验证任务 5–10 分钟内出
   结果**——fast 协议（1500 步/3 epochs/H=8，3 种子一波 ≈ 2–5 分钟）
