@@ -75,6 +75,40 @@ def future_pain_labels(rows, window: int) -> List[float]:
     return labels
 
 
+def future_return_labels(rows, gamma: float) -> List[float]:
+    """Monte-Carlo discounted dopamine return following each transition.
+
+    The label of row ``t`` is ``sum gamma^j dopamine_{t+j}`` over the rest
+    of its episode, truncated at the first terminal step - exactly the
+    quantity the backward pass feeds the sequence-level value cells, so a
+    predicate selected on these labels tiles the states whose value cells
+    actually carry data.  `rows` are transition dicts ordered in time.
+    """
+    rows = list(rows)
+    dopamines = []
+    dones = []
+    episodes = []
+    for row in rows:
+        signals = np.asarray(row["signals"], dtype=float).reshape(-1)
+        dopamines.append(float(signals[0]))
+        dones.append(bool(row["done"]))
+        episodes.append(row.get("episode"))
+    discount_base = float(gamma)
+    labels = []
+    for index in range(len(rows)):
+        value = 0.0
+        discount = 1.0
+        for position in range(index, len(rows)):
+            if episodes[position] != episodes[index]:
+                break
+            value += discount * dopamines[position]
+            discount *= discount_base
+            if dones[position]:
+                break
+        labels.append(value)
+    return labels
+
+
 class NodeRuntime:
     """Online concept graph with action-conditioned valence learning."""
 
@@ -323,7 +357,14 @@ class NodeRuntime:
         # Optional second bank induced on a longer precursor window; roots
         # installed from it carry their own `pain_horizon` tag.
         self.rules_long = None
+        # Optional bank induced from high-return coverage instead of pain
+        # coverage: its roots join the sequence-level value readout, giving
+        # the value channel predicates where the pain labels have no reach.
+        self.rules_value = None
         self.feature_ids: List[str] = []
+        # Roots installed from the value bank.  Empty until such a bank is
+        # installed; the value readout then covers the risk-bank roots only.
+        self.value_feature_ids: List[str] = []
         self._feature_all: List[str] = []
         self._feature_objects: Dict[str, object] = {}
         self._feature_children: Dict[str, List[str]] = {}
@@ -1205,6 +1246,7 @@ class NodeRuntime:
             horizon: future_pain_labels(rows, horizon)
             for horizon in sorted(horizons)
         }
+        value_roots_all = self._all_value_roots()
         steps = []
         for index, row in enumerate(rows):
             action = int(row["history"][0])
@@ -1289,7 +1331,7 @@ class NodeRuntime:
             self._note_pain(next_node, float(signals[1]))
             self._component_step(next_node, signals)
             value_roots = [
-                fid for fid in current_active if fid in self.feature_ids
+                fid for fid in current_active if fid in value_roots_all
             ]
             steps.append((
                 current, action, next_node, float(signals[1]),
@@ -1419,7 +1461,8 @@ class NodeRuntime:
         return node_id
 
     def install_feature_rules(self, rules=None,
-                              horizon: Optional[int] = None) -> List[str]:
+                              horizon: Optional[int] = None,
+                              channel: str = "pain") -> List[str]:
         """Materialize induced rules as a shared feature graph.
 
         Primitive and composite nodes are shared by every rule that uses the
@@ -1427,11 +1470,22 @@ class NodeRuntime:
         children.  Root nodes keep the learned P(pain | feature) in ``value``
         and, when `horizon` is given, the precursor window their value and
         action cells are trained with.
+
+        `channel` selects which readout trains on the installed roots:
+        "pain" roots carry the precursor statistics, "value" roots join the
+        sequence-level value readout.  Sub-feature nodes are shared between
+        channels - only root bookkeeping differs.
         """
+        if channel not in ("pain", "value"):
+            raise ValueError("unknown feature channel %r" % channel)
         rules = self.rules.rules if rules is None else list(rules)
         for rule in rules:
             node_id = self._materialize_feature(rule.feature, "feature")
             node = self.graph.nodes[node_id]
+            if channel == "value":
+                if node_id not in self.value_feature_ids:
+                    self.value_feature_ids.append(node_id)
+                continue
             # Initialize from train counts only: the held-out split that
             # selected the rule must not also seed its predictor value.
             prior = (float(rule.hits) + 1.0) / (float(rule.support) + 2.0)
@@ -1442,6 +1496,8 @@ class NodeRuntime:
             )
             if node_id not in self.feature_ids:
                 self.feature_ids.append(node_id)
+        if channel == "value":
+            return list(self.value_feature_ids)
         return list(self.feature_ids)
 
     def _node_horizon(self, node_id: str) -> int:
@@ -1466,6 +1522,20 @@ class NodeRuntime:
         return [
             node_id for node_id in self.feature_ids if node_id in active
         ]
+
+    def _all_value_roots(self) -> List[str]:
+        """Roots carrying sequence-level value cells.
+
+        Risk-bank roots always do; dedicated value-channel roots join them
+        when installed.  Keeping the risk roots lets the learned value of
+        the states the pain labels do cover stay readable, while the value
+        bank adds resolution everywhere else.
+        """
+        roots = list(self.feature_ids)
+        for node_id in self.value_feature_ids:
+            if node_id not in roots:
+                roots.append(node_id)
+        return roots
 
     def _update_feature_pain(self, feature_ids, pain: float) -> None:
         pain = float(pain)
@@ -1627,7 +1697,8 @@ class NodeRuntime:
         states = np.asarray(states, dtype=float)
         baseline = float(self.value_baseline)
         result = np.full(len(states), baseline)
-        if not self.feature_ids:
+        roots = self._all_value_roots()
+        if not roots:
             return result
         obs = states[:, :self.obs_dim]
         acting = None
@@ -1635,7 +1706,7 @@ class NodeRuntime:
             acting = np.rint(states[:, self.obs_dim]).astype(int)
         total = np.zeros(len(states), dtype=float)
         weight = np.zeros(len(states), dtype=float)
-        for node_id in self.feature_ids:
+        for node_id in roots:
             feature = self._feature_objects.get(node_id)
             if feature is None:
                 continue

@@ -372,6 +372,32 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertEqual(labels[:6], [0.0, 1.0, 1.0, 1.0, 0.0, 0.0])
         self.assertEqual(labels[5], 0.0)
 
+    def test_future_return_labels_match_the_mc_backward_pass(self):
+        from node_runtime import future_return_labels
+
+        rows = []
+        # Episode 0: dopamine 1, 1, 1 then a terminal step earning 0; the
+        # discounted returns run 1.75, 1.5, 1.0, 0.0 with gamma = 0.5.
+        for index in range(4):
+            rows.append(dict(
+                obs=np.asarray([float(index)]),
+                next_obs=np.asarray([float(index + 1)]),
+                history=np.asarray([0.0, 0.0]),
+                signals=np.asarray([1.0, 0.0]) if index < 3
+                else np.asarray([0.0, 1.0]),
+                done=index == 3, episode=0,
+            ))
+        # A second episode whose stream just stops (truncated, no terminal):
+        # its only step's return is its own dopamine.
+        rows.append(dict(
+            obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
+            history=np.asarray([0.0, 0.0]),
+            signals=np.asarray([2.0, 0.0]), done=False, episode=1,
+        ))
+        labels = future_return_labels(rows, 0.5)
+        self.assertEqual(labels[:4], [1.75, 1.5, 1.0, 0.0])
+        self.assertEqual(labels[4], 2.0)
+
     def test_feature_pain_learns_the_precursor_label(self):
         from node_features import FeatureRule, Primitive
 
@@ -698,6 +724,38 @@ class NodeRuntimeTests(unittest.TestCase):
             values[1], (1.0 + prior * baseline) / (1 + prior), places=9
         )
         self.assertGreater(values[0], values[1])
+
+    def test_value_channel_installs_and_reads_separately(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40, gamma=0.5
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        ids = runtime.install_feature_rules(channel="value")
+        # The value bank owns its roots; the risk-side bookkeeping and the
+        # pain-prior initialization stay untouched.
+        self.assertEqual(runtime.value_feature_ids, ids)
+        self.assertEqual(runtime.feature_ids, [])
+        self.assertEqual(runtime.graph.nodes[ids[0]].count, 0)
+        # The union readout covers the dedicated root even without any
+        # risk-bank roots, and the pain readout stays at zero for them.
+        runtime._update_feature_value(ids, 0, 2.0)
+        hold = np.asarray([0.0, 0.0])
+        flap = np.asarray([0.0, 1.0])
+        values = runtime.feature_value_batch(np.vstack([hold, flap]))
+        prior = runtime.feature_value_prior
+        baseline = runtime.value_baseline
+        self.assertAlmostEqual(
+            values[0], (2.0 + prior * baseline) / (1.0 + prior), places=9
+        )
+        self.assertAlmostEqual(values[1], baseline, places=9)
+        # No pain-side statistics are accumulated for a value root.
+        self.assertEqual(list(runtime.feature_action_stats), [])
 
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()

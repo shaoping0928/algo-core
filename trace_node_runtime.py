@@ -63,7 +63,8 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
           epochs=10, max_nodes=5000, birth_threshold=0.45,
           components=(), component_min_count=8, max_components=128,
           component_gating=False, pain_horizon=None, voi_fraction=0.0,
-          feature_value_weight=0.02):
+          feature_value_weight=0.02, value_features=True,
+          value_label_quantile=0.8):
     world, agent = fit(
         seed, steps=steps, coverage=coverage, max_nodes=max_nodes,
         birth_threshold=birth_threshold, epochs=epochs,
@@ -74,6 +75,8 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
         pain_horizon=pain_horizon,
         voi_fraction=voi_fraction,
         feature_value_weight=feature_value_weight,
+        value_features=value_features,
+        value_label_quantile=value_label_quantile,
     )
     # The same deterministic transitions `fit` trained on; used only to
     # measure whether both actions exist near the planner states.
@@ -305,6 +308,11 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
             )
             print("  near-pipe both actions in %d nearest: %.3f"
                   % (knn, float(near_both.mean())))
+    print("  value roots: %d (%d from the high-return bank)"
+          % (len(agent._all_value_roots()), len(agent.value_feature_ids)))
+    if agent.rules_value is not None:
+        for label in agent.rules_value.describe():
+            print("    %s" % label)
 
     print("\n[4] action edges and plans")
     print("  edge both actions supported: %.3f  chosen count mean %.1f  other count mean %.1f"
@@ -437,6 +445,13 @@ def main():
                         help="counterfactual collection budget fraction")
     parser.add_argument("--feature-value-weight", type=float, default=0.02,
                         help="sequence-level value weight in the objective")
+    parser.add_argument("--no-value-features", action="store_true",
+                        help="keep the value readout on the pain-coverage "
+                             "roots only")
+    parser.add_argument("--value-quantile", type=float, default=0.8,
+                        help="return-distribution quantile defining the "
+                             "high-return labels for value-channel "
+                             "induction")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset matching substrate_nodes")
     args = parser.parse_args()
@@ -459,6 +474,8 @@ def main():
         pain_horizon=(args.pain_horizon or None),
         voi_fraction=args.voi_fraction,
         feature_value_weight=args.feature_value_weight,
+        value_features=not args.no_value_features,
+        value_label_quantile=args.value_quantile,
     )
 
 

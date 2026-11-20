@@ -29,7 +29,7 @@ from eval_protocol import (
 )
 from latent_world import SEEDS, latent
 from node_features import FeatureRuleBank
-from node_runtime import NodeRuntime, future_pain_labels
+from node_runtime import NodeRuntime, future_pain_labels, future_return_labels
 from substrate_generic import (
     LinearObservationModel,
     collect,
@@ -48,7 +48,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            association_rate, induce_features, precursor_labels,
            pain_horizon, voi_target, feature_value_weight,
            value_horizon=None, ood_trust_scale=0.0, obs_trust=1.0,
-           feature_action_prior=2.0, feature_value_prior=4.0):
+           feature_action_prior=2.0, feature_value_prior=4.0,
+           value_features=True, value_label_quantile=0.8):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -152,6 +153,36 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                 )
                 agent.rules_long = bank
                 agent.install_feature_rules(bank.rules, horizon=long_window)
+            # Value-channel bank: the same grammar, but the labels are the
+            # top of the empirical discounted-return distribution instead
+            # of pain.  The selected predicates tile the states whose value
+            # cells carry data - regions the pain labels never cover - so
+            # the sequence-level value readout gains its own resolution.
+            # Same transitions, no extra collection.
+            if value_features:
+                returns = np.asarray(
+                    future_return_labels(transitions, agent.gamma),
+                    dtype=float,
+                )
+                cut = float(np.quantile(returns, value_label_quantile))
+                high = (returns > cut).astype(float)
+                if high.sum() >= 2:
+                    if not precursor_labels:
+                        value_states = np.asarray(
+                            [row["obs"] for row in transitions], dtype=float
+                        ) / scales[:obs_dim]
+                    else:
+                        value_states = states
+                    value_bank = FeatureRuleBank()
+                    value_bank.induce(
+                        value_states[train], high[train],
+                        value_states[test], high[test],
+                    )
+                    if value_bank.rules:
+                        agent.rules_value = value_bank
+                        agent.install_feature_rules(
+                            value_bank.rules, channel="value"
+                        )
     return world, agent
 
 
@@ -192,7 +223,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         dagger_offset=50000, dagger_horizon=10, step_stride=2,
         stride_includes_lag=False, value_horizon=0,
         ood_trust_scale=0.0, obs_trust=1.0,
-        feature_action_prior=2.0, feature_value_prior=4.0):
+        feature_action_prior=2.0, feature_value_prior=4.0,
+        value_features=True, value_label_quantile=0.8):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -250,6 +282,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("feature_action_prior must be non-negative")
     if float(feature_value_prior) < 0.0:
         raise ValueError("feature_value_prior must be non-negative")
+    if not 0.0 < float(value_label_quantile) < 1.0:
+        raise ValueError("value_label_quantile must be in (0, 1)")
     lag = int(lag)
     voi_fraction = float(voi_fraction)
     if voi_fraction > 0.0:
@@ -308,6 +342,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         obs_trust=obs_trust,
         feature_action_prior=feature_action_prior,
         feature_value_prior=feature_value_prior,
+        value_features=value_features,
+        value_label_quantile=value_label_quantile,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -612,6 +648,8 @@ def run_seed(task):
     obs_trust = float(task.get("obs_trust", 1.0))
     feature_action_prior = float(task.get("feature_action_prior", 2.0))
     feature_value_prior = float(task.get("feature_value_prior", 4.0))
+    value_features = bool(task.get("value_features", True))
+    value_label_quantile = float(task.get("value_label_quantile", 0.8))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -651,6 +689,8 @@ def run_seed(task):
         obs_trust=obs_trust,
         feature_action_prior=feature_action_prior,
         feature_value_prior=feature_value_prior,
+        value_features=value_features,
+        value_label_quantile=value_label_quantile,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -765,6 +805,14 @@ def main():
                         help="pseudo-counts shrinking value cells toward the "
                              "baseline; lower = more trust in verified "
                              "success cells")
+    parser.add_argument("--no-value-features", action="store_true",
+                        help="keep the value readout on the pain-coverage "
+                             "roots instead of adding a dedicated "
+                             "high-return bank")
+    parser.add_argument("--value-quantile", type=float, default=0.8,
+                        help="return-distribution quantile that defines the "
+                             "high-return labels for value-channel "
+                             "induction")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -817,6 +865,8 @@ def main():
         raise ValueError("--voi-target must be positive")
     if args.feature_value_weight < 0.0:
         raise ValueError("--feature-value-weight must be non-negative")
+    if not 0.0 < args.value_quantile < 1.0:
+        raise ValueError("--value-quantile must be in (0, 1)")
     if args.component_min_count < 1:
         raise ValueError("--component-min-count must be positive")
     if args.max_components < 0:
@@ -905,6 +955,8 @@ def main():
             obs_trust=args.obs_trust,
             feature_action_prior=args.feature_action_prior,
             feature_value_prior=args.feature_value_prior,
+            value_features=not args.no_value_features,
+            value_label_quantile=args.value_quantile,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -1028,6 +1080,8 @@ def main():
                 feature_value_weight=args.feature_value_weight,
                 features=not args.no_features,
                 precursor_labels=not args.instant_labels,
+                value_features=not args.no_value_features,
+                value_label_quantile=args.value_quantile,
                 self_evaluation=not bool(eval_seeds),
                 dagger_rounds=args.dagger_rounds,
                 dagger_episodes=args.dagger_episodes,
