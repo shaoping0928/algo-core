@@ -90,7 +90,11 @@ def _recall_stats(agent, rows):
     rates = []
     active_counts = []
     for row in rows:
-        active = agent._active_feature_ids(np.asarray(row["obs"], dtype=float))
+        scaled = (
+            np.asarray(row["obs"], dtype=float)[:agent.obs_dim]
+            / agent.scales[:agent.obs_dim]
+        )
+        active = agent._active_feature_ids(scaled)
         active_counts.append(len(active))
         recalled = agent.memories_for(active)
         if recalled:

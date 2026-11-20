@@ -357,10 +357,12 @@
   特征归纳 OOD/表征抽签，不是修正逻辑**。根因由
   `feature_generalization_probe.py` 量化，见下一条。
 - **特征根泛化诊断（2026-11-20，`feature_generalization_probe.py`）**：
-  对照臂 8 根中 **7 根 held-out 零激活**、7 根有“稀有合取”；平均
-  held-out 激活 3.15%（全部来自唯一一条宽规则，而它的 test precision
-  只有 0.333）。memory-credit 臂 **8/8 零激活**、平均 0%。典型死根：
-  `f0>2.357`（support 12，行为流/held-out 均 0%）、
+  **探针修正**：最初用原始观测匹配标准化后的规则（规划器是 `obs/scales`），
+  激活率读数失真；下表数字作废，探针已修正尺度并重测中。
+  以下为修正前读数（留档）：对照臂 8 根中 7 根 held-out 零激活、7 根有
+  “稀有合取”；平均 held-out 激活 3.15%（全部来自唯一一条宽规则，而它的
+  test precision 只有 0.333）。memory-credit 臂 8/8 零激活、平均 0%。
+  典型死根：`f0>2.357`（support 12，行为流/held-out 均 0%）、
   `|f1|>0.959`（support 27，均 0%）、
   `(f2<0.324 & (f3<-0.686 | f3>0.885))` 的瓶颈原语 held-out 0%。
   **根因**：归纳只按 precision/z 选规则，无覆盖率门槛；极端阈值只在

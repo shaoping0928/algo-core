@@ -54,9 +54,10 @@ def run(seed, eval_seeds, memory_credit,
         rule_validation_frames=rule_validation_frames,
     )
     behavior, _counts = collect(seed, 1500, coverage=0.1, lag=3)
+    scale = agent.scales[:agent.obs_dim]
     behavior_obs = np.asarray(
         [row["obs"] for row in behavior], dtype=float
-    )
+    ) / scale
     eval_rows = []
     with _curiosity_off(agent):
         for eval_seed in eval_seeds:
@@ -67,6 +68,7 @@ def run(seed, eval_seeds, memory_credit,
             )
             eval_rows.extend(rows)
     eval_obs = np.asarray([row["obs"] for row in eval_rows], dtype=float)
+    eval_obs = eval_obs / agent.scales[:agent.obs_dim]
 
     rules = list(agent.rules.rules)
     roots = []
