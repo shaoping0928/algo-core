@@ -50,7 +50,20 @@ def _memory_stats(agent):
     memberships = sum(
         1 for key in agent.graph.edges if key[2] == MEMBERSHIP
     )
+    root_set = set(agent.feature_ids)
+    feature_memberships = sum(
+        1 for key in agent.graph.edges
+        if key[2] == MEMBERSHIP and key[1] in root_set
+    )
+    memories_with_feature_member = sum(
+        1 for node_id in memories
+        if any(member in root_set for member in agent.graph.nodes[node_id].members)
+    )
     return dict(
+        features=len(agent.feature_ids),
+        feature_all=len(agent._feature_all),
+        feature_memberships=feature_memberships,
+        memories_with_feature_member=memories_with_feature_member,
         memories=len(memories),
         memberships=memberships,
         corrected_ids=len(corrected),
@@ -75,8 +88,10 @@ def _recall_stats(agent, rows):
     corrected_recall_rows = 0
     hit_ids = set()
     rates = []
+    active_counts = []
     for row in rows:
         active = agent._active_feature_ids(np.asarray(row["obs"], dtype=float))
+        active_counts.append(len(active))
         recalled = agent.memories_for(active)
         if recalled:
             any_memory += 1
@@ -87,6 +102,10 @@ def _recall_stats(agent, rows):
             rates.extend(float(agent._pain_association(mid)) for mid in hits)
     return dict(
         eval_rows=len(rows),
+        rows_with_active_features=sum(1 for c in active_counts if c),
+        mean_active_roots=(
+            round(float(np.mean(active_counts)), 2) if active_counts else 0.0
+        ),
         rows_recalling_any_memory=any_memory,
         rows_recalling_corrected=corrected_recall_rows,
         corrected_ids_recalled=len(hit_ids),
