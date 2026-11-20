@@ -220,20 +220,23 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         ):
             # F5: gap-focused re-induction - the structure search runs
             # every generation, and the selection pressure is the previous
-            # generation's residual coverage: positive events the current
-            # readout fails to flag become the next generation's targets.
-            # Installing additionally keeps every earlier generation's
-            # rules alive (predicate-keyed materialization preserves their
-            # nodes and statistics).  The readout is evaluated under the
-            # behavior continuation, with each row's pending window built
-            # exactly as the search builds it.
+            # generation's residual coverage.  The criterion is
+            # rank-based, not level-based: the deployed readout's
+            # max-combination reads are inflated well above the empirical
+            # danger rates, so a level threshold would mark nothing as
+            # missed; a positive counts as unexplained when its graded
+            # threat read ranks below half of the negatives' reads.
             pending_all = np.asarray([
                 np.asarray(row["history"], dtype=float)[:lag][::-1]
                 for row in transitions
             ], dtype=float)
             enc_all = np.concatenate([states, pending_all], axis=1)
-            pain_read = agent.pain_signal_batch(enc_all)
-            missed_short = (pain_read < 0.5) & (pain_short > 0.5)
+            threat_read, _excess_read = agent.pain_graded_batch(enc_all)
+            negative_levels = threat_read[pain_short <= 0.5]
+            cut = float(np.median(negative_levels)) if len(
+                negative_levels
+            ) else 0.5
+            missed_short = (pain_short > 0.5) & (threat_read <= cut)
             if missed_short.sum() >= 5:
                 gap_bank = FeatureRuleBank()
                 gap_bank.induce(
@@ -244,7 +247,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                     agent.install_feature_rules(
                         gap_bank.rules, horizon=lag + 1
                     )
-            missed_long = (pain_read < 0.5) & (pain > 0.5)
+            missed_long = (pain > 0.5) & (threat_read <= cut)
             if missed_long.sum() >= 5 and long_window is not None:
                 gap_long = FeatureRuleBank()
                 gap_long.induce(
