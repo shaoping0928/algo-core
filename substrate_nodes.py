@@ -50,7 +50,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            value_horizon=None, ood_trust_scale=0.0, obs_trust=1.0,
            feature_action_prior=2.0, feature_value_prior=4.0,
            value_features=True, value_label_quantile=0.8,
-           subgraph_cells=False, predicate_readouts=False):
+           subgraph_cells=False, predicate_readouts=False,
+           event_memory_risk=True):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -89,6 +90,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         feature_value_prior=feature_value_prior,
         subgraph_cells=subgraph_cells,
         predicate_readouts=predicate_readouts,
+        event_memory_risk=event_memory_risk,
     )
     episodes = {}
     for row in transitions:
@@ -228,7 +230,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         ood_trust_scale=0.0, obs_trust=1.0,
         feature_action_prior=2.0, feature_value_prior=4.0,
         value_features=True, value_label_quantile=0.8,
-        subgraph_cells=False, predicate_readouts=False):
+        subgraph_cells=False, predicate_readouts=False,
+        event_memory_risk=True):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -350,6 +353,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         value_label_quantile=value_label_quantile,
         subgraph_cells=subgraph_cells,
         predicate_readouts=predicate_readouts,
+        event_memory_risk=event_memory_risk,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -671,6 +675,7 @@ def run_seed(task):
     value_label_quantile = float(task.get("value_label_quantile", 0.8))
     subgraph_cells = bool(task.get("subgraph_cells", False))
     predicate_readouts = bool(task.get("predicate_readouts", False))
+    event_memory_risk = bool(task.get("event_memory_risk", True))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -714,6 +719,7 @@ def run_seed(task):
         value_label_quantile=value_label_quantile,
         subgraph_cells=subgraph_cells,
         predicate_readouts=predicate_readouts,
+        event_memory_risk=event_memory_risk,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -843,6 +849,9 @@ def main():
     parser.add_argument("--predicate-readouts", action="store_true",
                         help="drop the prototype channel from the risk "
                              "readout; prototypes stay as event memory")
+    parser.add_argument("--no-event-memory-risk", action="store_true",
+                        help="drop the feature-keyed event-memory readout "
+                             "from the risk max-combine")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -989,6 +998,7 @@ def main():
             value_label_quantile=args.value_quantile,
             subgraph_cells=args.subgraph_cells,
             predicate_readouts=args.predicate_readouts,
+            event_memory_risk=not args.no_event_memory_risk,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -1116,6 +1126,7 @@ def main():
                 value_label_quantile=args.value_quantile,
                 subgraph_cells=args.subgraph_cells,
                 predicate_readouts=args.predicate_readouts,
+                event_memory_risk=not args.no_event_memory_risk,
                 self_evaluation=not bool(eval_seeds),
                 dagger_rounds=args.dagger_rounds,
                 dagger_episodes=args.dagger_episodes,

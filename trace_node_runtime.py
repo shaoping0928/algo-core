@@ -65,7 +65,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
           component_gating=False, pain_horizon=None, voi_fraction=0.0,
           feature_value_weight=0.02, value_features=True,
           value_label_quantile=0.8, subgraph_cells=False,
-          predicate_readouts=False):
+          predicate_readouts=False, event_memory_risk=True):
     world, agent = fit(
         seed, steps=steps, coverage=coverage, max_nodes=max_nodes,
         birth_threshold=birth_threshold, epochs=epochs,
@@ -80,6 +80,7 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
         value_label_quantile=value_label_quantile,
         subgraph_cells=subgraph_cells,
         predicate_readouts=predicate_readouts,
+        event_memory_risk=event_memory_risk,
     )
     # The same deterministic transitions `fit` trained on; used only to
     # measure whether both actions exist near the planner states.
@@ -461,6 +462,9 @@ def main():
     parser.add_argument("--predicate-readouts", action="store_true",
                         help="drop the prototype channel from the risk "
                              "readout; prototypes stay as event memory")
+    parser.add_argument("--no-event-memory-risk", action="store_true",
+                        help="drop the feature-keyed event-memory readout "
+                             "from the risk max-combine")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset matching substrate_nodes")
     args = parser.parse_args()
@@ -487,6 +491,7 @@ def main():
         value_label_quantile=args.value_quantile,
         subgraph_cells=args.subgraph_cells,
         predicate_readouts=args.predicate_readouts,
+        event_memory_risk=not args.no_event_memory_risk,
     )
 
 

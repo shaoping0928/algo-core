@@ -153,6 +153,7 @@ class NodeRuntime:
         feature_value_weight: float = 0.02,
         subgraph_cells: bool = False,
         predicate_readouts: bool = False,
+        event_memory_risk: bool = True,
         value_horizon: Optional[int] = None,
         ood_trust_scale: float = 0.0,
         obs_trust: float = 1.0,
@@ -382,6 +383,12 @@ class NodeRuntime:
         # predicates.  States outside every predicate read zero hazard
         # instead of an extrapolated prototype statistic.
         self.predicate_readouts = bool(predicate_readouts)
+        # The feature-keyed event memories also ride the risk readout
+        # through the max-combine; each death memory keeps its predicate's
+        # whole band flagged as hazardous.  This switch removes that
+        # channel to measure how much of the large-data degradation it
+        # carries.
+        self.event_memory_risk = bool(event_memory_risk)
         self._feature_all: List[str] = []
         self._feature_descendants: Dict[str, List[str]] = {}
         self._feature_objects: Dict[str, object] = {}
@@ -815,9 +822,11 @@ class NodeRuntime:
             result = np.maximum(
                 result, self._feature_risk_batch(states, mask_table)
             )
-            result = np.maximum(
-                result, self._feature_memory_risk_batch(states, mask_table)
-            )
+            if self.event_memory_risk:
+                result = np.maximum(
+                    result,
+                    self._feature_memory_risk_batch(states, mask_table),
+                )
         elif self.rules.rules:
             rule_risk = self.rules.activate(states[:, :self.obs_dim])
             result = np.maximum(result, rule_risk)
