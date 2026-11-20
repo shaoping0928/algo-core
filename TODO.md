@@ -262,6 +262,122 @@
   - **P4 目标学习（D BP5）**：执行计划-结局对上的偏好回归
     （Bradley-Terry；DAgger 回合即数据）；价值项写成势差
     （PBRS 护栏防倒置）。
+
+## 四子代理解剖附录（2026-11-20）
+
+### A · 信息流台账要点（43 读写点全图；此处记风险榜）
+R1 原型危险关联是单调包络：pain 边只增不减（_learn_pain_association
+   对 pain≤0 提前返回），graph.decay 全管线从未调用 → trace 饱和 →
+   原型通道读"是否曾经相邻过"而非基率（node_runtime.py:757-778,
+   824-842; node_graph.py:267-276, 323-328）。
+R2 默认目标的 max 组合（原型/特征/记忆三通道 + 终端第四 max）
+   从未校准——校准只在 contrast 路径的 pain_graded_batch 内生效。
+R3 格子按 acting=history[lag] 键控，标签却在 pain_horizon 个状态上
+   取 max（其余 lag 帧由其他 pending 动作掌管）→ 动作对比被共同
+   原因稀释；排除谓词双向失火（缺口银行 horizon=4 被训不读；
+   未标记根继承 runtime horizon=8 混入 threat）。
+R4 **离线配对错位一行**：校准/残差扫描的 pending=history[:lag][::-1]
+   是运行时给下一行状态的编码 → F6 校准在错位配对上拟合（真 bug）。
+R5 事件记忆是冻结快照：memory.value 创建后永不更新；
+   memory.immediate_pain 从未赋值（恒 0）；memories_for 按 max 合并
+   去重并吞并共享事件；自环转移提前返回丢弃学习。
+R6 value_baseline：一个标量池化所有 (根,动作,窗) 回报；只在根激活
+   行上更新（偏样本）；rate 0.02 → 遗忘 50 事件。
+R7 聚合不一致：风险=max、价值=mean（低水平有梯度承重，L1 否证）；
+   subgraph 下"最具体=最小计数"把特异性与稀缺混同。
+R8 动作边 Q 按 history[0]（刚发出）键控而转移结果由 history[lag]
+   （真正掌管）决定——错位归属；且 policy 从不读（死写）。
+R9 遗忘按"中位以下 + count≤1"删——恰好删除稀有原因证据。
+R10 future_pain_labels 的 max 语义抹去窗口内的时序/多重性。
+R11 条件缺陷：association 传播（若开）会把特征根值向 0 扩散；
+    组件过滤器跨 episode 泄漏；obs_trust 不对称（pain 有、dopamine
+    无）；MC/TD 两套 node.value 写法（目标含/不含 immediate）打架。
+
+### 死机制清单（写了、管线从不消费）
+_calibrate_threat（死代码）、pain_contrast_batch（仅测试）、
+逐行预测误差回路（feature_calibration/surprise_buffer 仅诊断——
+"反事实目标缓冲"从未被学习消费）、count_sum、
+ActionEdge.prediction_error、eligibility_*、act()/observe()/
+learn_transition 专属状态（_traces/last_*/action_nodes）、
+rules_long/rules_value 对象（仅诊断）、非根特征统计（默认路径）、
+excess 通道（control=0 时）、终端 _pain（contrast 下被弃）、
+终端 dopamine 列（lexicographic 下几乎永不生效）、
+row["terminal"] 键、value_snapshot/_k_step（value_horizon=0 时）、
+graph.decay/graph.prune（从未调用）。
+
+### B · 逐规则收敛判定（8 条主规则）
+1 原型出生/指派：无标量不动点；pass 1 后冻结（非压缩映射）；
+   顺序与流依赖 = 表征级种子彩票。pass1 出生 2201，此后 0。
+2 节点值/多巴胺 EMA（MC 反向，α=0.2）：常数步长 → 只在分布意义
+   收敛，残差 sd ≈ 0.33σ 永存；不动点 = E_μ[折扣未来 pain|节点]
+   = 行为连续行动预测，非"最优可达"。实测 p50 三遍爬升
+   0.196→0.353→0.478。
+3 特征前兆格子：hits/count 收敛 a.s.，但锚点 base 是事件加权 EMA
+   永不落定（残差 sd≈0.16σ_label）→ 复合读出无单一不动点；
+   计数极偏（1/171/4331）而先验固定 p=2：宽根无感、薄根被支配；
+   未观测动作的读出 = 池化行为边际（min_a 被中和）。
+4 价值格子：sum/count 收敛，锚点 b 不收敛（规则5）→ 无联合
+   不动点；value_horizon>0 时 bootstrap 通道错配（pain 值注入
+   dopamine 目标）——默认关但路径有缺陷。
+5 value_baseline EMA（rate 0.02，记忆 50 事件）：不动点 = 事件
+   混合（权重由"哪些格子开火"决定）；实测 sd 4.28、终值 13.80 =
+   最后 episode 的新近均值——无流级含义；既是收缩目标又是未覆盖
+   读出（56.9% 状态坐在其上）；其噪声（±0.086 hazard 单位）与
+   它要稳定的动作差（0.10–0.17）同阶。
+6 动作边 Q：不动点 = 按经验下一状态分布的计数加权边际
+   E_μ[R|s,a]（掌管动作错位）；边集 pass 2 后冻结；未知动作罚
+   prior+0.5 → 策略回避无数据格子（而 VOI 预算默认关）。
+7 MC 反向归属：递归本身精确；归属无收敛内容——重放只重平均；
+   γ=0.99 在 33 步中位 episode 内几乎不衰减 → 终局事件几乎全额
+   记给每个前缀存储 = "episode 命运"。**无任何优势分解**。
+8 预测误差回路：池化均值混合代际（pass1 锚点主导 vs 后期格子
+   主导——代际加权混合被流顺序冻结）；surprise 缓冲单调棘轮向
+   陈旧（pass1 后冻结于 64）；无学习消费者（回路开放）。
+
+### C · 手工常数表要点（16 行；此处记排序与四大横切缺陷）
+横切缺陷：F1 校准粒度错配（组合拟合 vs 逐根消费；
+_calibrate_threat 死代码）；F2 分级排除谓词过宽（缺口银行根被
+静音——F5 对自己的产品失明）；F3 锚点只上不下（max 播种）；
+F4 空格子 = 自由参数（漂移锚点定价未测动作）。
+排序（收敛链恢复）：1 组合层校准（逐根/逐动作 PAV 或单调组合器）
+→ 2 收缩锚点经验贝叶斯化（held-out 锚点、动作池化回退）→
+3-4 价值组合 NNLS + 目标权重学习（w/K/control 一并，执行计划
+数据）→ 5 危险账按查询步归一（消除 w 的 horizon/stride 依赖）→
+6 分级排除谓词修复（恢复 F5 反馈）→ 8-9 归纳门控多重性校正
+（BH/置换校准 z、Wilson 下界支撑门）与预算肘部 → 10-16 原型
+sigma/记忆权重/标签窗/折扣/阈值格/VOI/平局列/回退语义。
+
+### D · 文献方法表要点（五断点 × 成熟方法）
+断点1 一次结构搜索: Friedman 梯度提升（残差→弱学习器→收缩系数ν
+  追加；子采样+held-out 早停）；SLIPPER 自弃权规则 + Viola-Jones
+  硬负例级联；steady-state GA + NAS 一次性代理教训。
+  适配: 全栈 LS_Boost 代循环——校准残差直接算（rank 判据降为
+  平局）、每规则系数 ν·c_m 加性投票替代 max、代际接受以 held-out
+  残差损失改善为准、幸存负例作下一代负例。
+断点2 原型冻结: ART 警戒+match tracking（预测误差抬高警戒→
+  强制搜新类）；Growing Neural Gas + 效用修剪（局部误差最高处
+  出生、最低效用节点删除并就近并格）；DP-means λ 出生 + RAN
+  新颖性出生（距离×预测残差）。适配: 出生 = 距离超阈 OR 预测
+  残差超阈；λ 单旋钮；max_nodes 满时按效用删并转移格子计数。
+断点3 边际混杂（最高杠杆）: 逐决策截断 IS（Precup/Sutton；
+  Retrace min(1,ρ)）；双重稳健（Jiang&Li；图作 V̂ 控制变量）；
+  基线中心化优势（GAE；HCA 后验归因）。适配: 窗口内逐行权重
+  Π min(1, π/b)；格子学习 E[pain|f,a] − min_a（可控优势）；
+  DR 项 = ρ·(V̂_graph(s') − V̂_model(s'))。
+断点4 手工组合: 经典 RBF 输出层闭式最小二乘（Broomhead&Lowe;
+  Moody&Darken）；OLS 误差缩减比选中心（Chen 等）；Breiman 非负
+  堆叠（NNLS 恰好归零通胀成员）+ 校准后置。适配: 设计矩阵 Φ
+  （各通道×动作作列）对 precursor 标签 NNLS；OLS 误差缩减比
+  控制根准入；现有 max/mean 保留为库成员之一。
+断点5 手工目标: MaxEnt IRL（Ng&Russell；经验特征计数差梯度）；
+  Bradley-Terry 偏好回归（Christiano 等；DAgger 回合即偏好对）；
+  meta-gradient RL（Xu 等）+ PBT + OPE 选择；PBRS 势函数护栏
+  （Ng-Harada-Russell：γΦ(s')−Φ(s) 不改最优策略）。适配:
+  (计划账本分量 → 实际存活) 单调回归；执行计划对的权重回归；
+  价值项写为势差。
+**D 最高杠杆**: 断点3 修正（逐决策 IS + 截断 + 基线中心化优势
+  + 图 TD 作 DR 控制变量）——三个更新循环的修改，非架构重写；
+  次选 = BP4 NNLS 输出层。
 - **评测方法裁定（2026-11-20，用户）**：训练应当只强不弱；出现
   非单调（如学习曲线 1000→1500 下落）时**先查训崩原因**，不得直接
   解读为机制结论。第一步：**评测用多条 episode**（`--eval-episodes ≥ 3`，
