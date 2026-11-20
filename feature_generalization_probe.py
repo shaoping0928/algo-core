@@ -37,18 +37,21 @@ def _rate(mask):
 
 
 def run(seed, eval_seeds, memory_credit,
-        rule_min_coverage=0.0, rule_min_primitive_coverage=0.0):
+        rule_min_coverage=0.0, rule_min_primitive_coverage=0.0,
+        rule_validation_seed=0, rule_validation_frames=600):
     world, agent = fit(
         seed,
-        steps=1500, epochs=3, max_nodes=1000,
+        steps=1500, epochs=1, max_nodes=1000,
         birth_threshold=0.45, lag=3,
         curiosity_weight=0.5,
-        dagger_rounds=1, dagger_episodes=2, dagger_cap=3000,
-        dagger_frames=3000, dagger_horizon=8,
+        dagger_rounds=1, dagger_episodes=2, dagger_cap=5000,
+        dagger_frames=5000, dagger_horizon=8,
         step_stride=2,
         memory_credit=memory_credit,
         rule_min_coverage=rule_min_coverage,
         rule_min_primitive_coverage=rule_min_primitive_coverage,
+        rule_validation_seed=rule_validation_seed,
+        rule_validation_frames=rule_validation_frames,
     )
     behavior, _counts = collect(seed, 1500, coverage=0.1, lag=3)
     behavior_obs = np.asarray(
@@ -128,12 +131,16 @@ def main():
     parser.add_argument(
         "--rule-min-primitive-coverage", type=float, default=0.0
     )
+    parser.add_argument("--rule-validation-seed", type=int, default=0)
+    parser.add_argument("--rule-validation-frames", type=int, default=600)
     parser.add_argument("--report", default="")
     args = parser.parse_args()
     report = run(
         args.seed, parse_seed_spec(args.eval_seeds), args.memory_credit,
         rule_min_coverage=args.rule_min_coverage,
         rule_min_primitive_coverage=args.rule_min_primitive_coverage,
+        rule_validation_seed=args.rule_validation_seed,
+        rule_validation_frames=args.rule_validation_frames,
     )
     print(json.dumps(report, indent=2, default=str))
     if args.report:

@@ -2150,7 +2150,7 @@ class NodeRuntime:
         self.reset()
 
     def induce_rules(self, train_states, train_pain,
-                     test_states=None, test_pain=None):
+                     test_states=None, test_pain=None, coverage_states=None):
         """Induce compositional precursor rules over encoded states.
 
         Only the observation part is used.  With precursor labels the target
@@ -2172,9 +2172,18 @@ class NodeRuntime:
                     "test states must have at least obs_dim columns"
                 )
             test_obs = test_states[:, :self.obs_dim]
+        coverage_obs = None
+        if coverage_states is not None:
+            coverage_states = np.asarray(coverage_states, dtype=float)
+            if (coverage_states.ndim != 2
+                    or coverage_states.shape[1] < self.obs_dim):
+                raise ValueError(
+                    "coverage states must have at least obs_dim columns"
+                )
+            coverage_obs = coverage_states[:, :self.obs_dim]
         return self.rules.induce(
             train_states[:, :self.obs_dim], train_pain,
-            test_obs, test_pain,
+            test_obs, test_pain, coverage_x=coverage_obs,
         )
 
     def _materialize_feature(self, feature, role: str) -> str:

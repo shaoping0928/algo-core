@@ -201,7 +201,8 @@ class FeatureRuleBank:
         return list(unique.values())
 
     # ---- induction --------------------------------------------------------
-    def induce(self, train_x, train_y, test_x=None, test_y=None):
+    def induce(self, train_x, train_y, test_x=None, test_y=None,
+               coverage_x=None):
         train_x = np.asarray(train_x, dtype=float)
         train_y = np.asarray(train_y, dtype=float).reshape(-1)
         if train_x.ndim != 2 or len(train_x) != len(train_y):
@@ -210,6 +211,10 @@ class FeatureRuleBank:
         test_y = train_y if test_y is None else np.asarray(
             test_y, dtype=float
         ).reshape(-1)
+        gate_x = (
+            test_x if coverage_x is None
+            else np.asarray(coverage_x, dtype=float)
+        )
         base_train = float(train_y.mean()) if len(train_y) else 0.0
         base_test = float(test_y.mean()) if len(test_y) else 0.0
         positives = train_y > 0.5
@@ -227,8 +232,8 @@ class FeatureRuleBank:
         def primitive_rate(predicate):
             if predicate not in primitive_rates:
                 primitive_rates[predicate] = (
-                    float(predicate.mask(test_x).mean())
-                    if len(test_x) else 0.0
+                    float(predicate.mask(gate_x).mean())
+                    if len(gate_x) else 0.0
                 )
             return primitive_rates[predicate]
 
@@ -241,8 +246,8 @@ class FeatureRuleBank:
             return result
 
         def coverage_ok(feature, test_stats):
-            if self.min_coverage > 0.0 and len(test_x):
-                coverage = test_stats["support"] / float(len(test_x))
+            if self.min_coverage > 0.0 and len(gate_x):
+                coverage = float(feature.mask(gate_x).mean())
                 if coverage < self.min_coverage:
                     return False
             if self.min_primitive_coverage > 0.0:

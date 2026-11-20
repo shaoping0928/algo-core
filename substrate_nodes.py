@@ -123,7 +123,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         voi_threat_min: float = 0.25, curiosity_weight: float = 0.0,
         dagger_frames: int = 0, memory_credit: bool = False,
         rule_min_coverage: float = 0.0,
-        rule_min_primitive_coverage: float = 0.0):
+        rule_min_primitive_coverage: float = 0.0,
+        rule_coverage_x=None):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -141,6 +142,12 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         observation_scale > 1e-8, observation_scale, 1.0
     )
     scales = np.concatenate([observation_scale, np.ones(lag, dtype=float)])
+    coverage_scaled = None
+    if rule_coverage_x is not None:
+        coverage_scaled = (
+            np.asarray(rule_coverage_x, dtype=float)
+            / scales[:obs_dim]
+        )
     agent = NodeRuntime(
         obs_dim=obs_dim, action_space=(0, 1), lag=lag,
         birth_threshold=birth_threshold, max_nodes=max_nodes,
@@ -237,7 +244,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         if induce_features and epoch == 0:
             primary = pain_short if long_window is not None else pain
             agent.induce_rules(
-                states[train], primary[train], states[test], primary[test]
+                states[train], primary[train], states[test], primary[test],
+                coverage_states=coverage_scaled,
             )
             # The primary bank is selected on the short-window labels, so
             # its roots must train and read with that same window: an
@@ -251,7 +259,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                     min_primitive_coverage=rule_min_primitive_coverage,
                 )
                 bank.induce(
-                    states[train], pain[train], states[test], pain[test]
+                    states[train], pain[train], states[test], pain[test],
+                    coverage_x=coverage_scaled,
                 )
                 agent.rules_long = bank
                 agent.install_feature_rules(bank.rules, horizon=long_window)
@@ -287,6 +296,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                     value_bank.induce(
                         value_states[train], high[train],
                         value_states[test], high[test],
+                        coverage_x=coverage_scaled,
                     )
                     if value_bank.rules:
                         agent.rules_value = value_bank
@@ -356,6 +366,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                 gap_bank.induce(
                     states[train], (pain_short * missed_short)[train],
                     states[test], (pain_short * missed_short)[test],
+                    coverage_x=coverage_scaled,
                 )
                 if gap_bank.rules:
                     before = set(agent.feature_ids)
@@ -374,6 +385,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                 gap_long.induce(
                     states[train], (pain * missed_long)[train],
                     states[test], (pain * missed_long)[test],
+                    coverage_x=coverage_scaled,
                 )
                 if gap_long.rules:
                     before = set(agent.feature_ids)
@@ -617,7 +629,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         iterative_induction=False, compose_readout=True,
         importance_weighting=False, learn_objective=True,
         curiosity_weight=0.5, memory_credit=False,
-        rule_min_coverage=0.0, rule_min_primitive_coverage=0.0):
+        rule_min_coverage=0.0, rule_min_primitive_coverage=0.0,
+        rule_validation_seed=0, rule_validation_frames=600):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -691,6 +704,10 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("rule_min_coverage must be in [0, 1]")
     if not 0.0 <= float(rule_min_primitive_coverage) <= 1.0:
         raise ValueError("rule_min_primitive_coverage must be in [0, 1]")
+    if int(rule_validation_seed) < 0:
+        raise ValueError("rule_validation_seed must be non-negative")
+    if int(rule_validation_frames) < 1:
+        raise ValueError("rule_validation_frames must be positive")
     lag = int(lag)
     voi_fraction = float(voi_fraction)
     if voi_fraction > 0.0:
@@ -738,6 +755,19 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         transitions, _counts = collect(seed, steps, coverage=coverage, lag=lag)
     if not transitions:
         raise ValueError("collection produced no transitions")
+    rule_validation_x = None
+    if int(rule_validation_seed) > 0:
+        # Cross-world activation check: the validation stream supplies
+        # states only (no labels, no training), so a rule that only fires
+        # in the training world can be rejected before it is installed.
+        validation_rows, _ = collect(
+            int(rule_validation_seed), steps=int(rule_validation_frames),
+            coverage=coverage, lag=lag,
+        )
+        if validation_rows:
+            rule_validation_x = np.asarray(
+                [row["obs"] for row in validation_rows], dtype=float
+            )
     train_kwargs = dict(
         seed=seed, epochs=epochs, lag=lag,
         max_nodes=max_nodes, birth_threshold=birth_threshold,
@@ -776,6 +806,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         memory_credit=memory_credit,
         rule_min_coverage=rule_min_coverage,
         rule_min_primitive_coverage=rule_min_primitive_coverage,
+        rule_coverage_x=rule_validation_x,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -1386,6 +1417,8 @@ def run_seed(task):
     rule_min_primitive_coverage = float(
         task.get("rule_min_primitive_coverage", 0.0)
     )
+    rule_validation_seed = int(task.get("rule_validation_seed", 0))
+    rule_validation_frames = int(task.get("rule_validation_frames", 600))
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
@@ -1447,6 +1480,8 @@ def run_seed(task):
         memory_credit=memory_credit,
         rule_min_coverage=rule_min_coverage,
         rule_min_primitive_coverage=rule_min_primitive_coverage,
+        rule_validation_seed=rule_validation_seed,
+        rule_validation_frames=rule_validation_frames,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1639,6 +1674,13 @@ def main():
                              "primitive must activate on at least this "
                              "fraction of the validation states "
                              "(0 = off)")
+    parser.add_argument("--rule-validation-seed", type=int, default=0,
+                        help="cross-world activation check: collect this "
+                             "many frames from an independent world seed "
+                             "and use its states (no labels) for the "
+                             "coverage gates; 0 = use the training split")
+    parser.add_argument("--rule-validation-frames", type=int, default=600,
+                        help="frames collected from --rule-validation-seed")
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
@@ -1744,6 +1786,10 @@ def main():
         raise ValueError("--rule-min-coverage must be in [0, 1]")
     if not 0.0 <= args.rule_min_primitive_coverage <= 1.0:
         raise ValueError("--rule-min-primitive-coverage must be in [0, 1]")
+    if args.rule_validation_seed < 0:
+        raise ValueError("--rule-validation-seed must be non-negative")
+    if args.rule_validation_frames < 1:
+        raise ValueError("--rule-validation-frames must be positive")
     if not 0.0 < args.value_quantile < 1.0:
         raise ValueError("--value-quantile must be in (0, 1)")
     if args.component_min_count < 1:
@@ -1857,6 +1903,8 @@ def main():
             memory_credit=args.memory_credit,
             rule_min_coverage=args.rule_min_coverage,
             rule_min_primitive_coverage=args.rule_min_primitive_coverage,
+            rule_validation_seed=args.rule_validation_seed,
+            rule_validation_frames=args.rule_validation_frames,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,

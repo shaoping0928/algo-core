@@ -52,6 +52,22 @@ class FeatureRuleTests(unittest.TestCase):
         self.assertTrue(rule_gate.induce(
             x[train], common[train], x[test], common[test]
         ))
+        # An explicit cross-world coverage stream takes precedence: the
+        # same rule passes on the training split but is rejected when an
+        # independent stream never reaches its region.
+        split_gate = FeatureRuleBank(
+            min_z=1.0, min_lift=1.5, min_coverage=0.01
+        )
+        self.assertTrue(split_gate.induce(
+            x[train], rare[train], x[test], rare[test]
+        ))
+        cross_gate = FeatureRuleBank(
+            min_z=1.0, min_lift=1.5, min_coverage=0.01
+        )
+        self.assertFalse(cross_gate.induce(
+            x[train], rare[train], x[test], rare[test],
+            coverage_x=np.zeros((100, 1)),
+        ))
 
     def test_bank_recovers_and_composition(self):
         rng = np.random.RandomState(7)
