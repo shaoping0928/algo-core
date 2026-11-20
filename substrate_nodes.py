@@ -111,6 +111,9 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         event_memory_risk=event_memory_risk,
         contrast_objective=contrast_objective,
         value_trust_samples=value_trust_samples,
+        control_risk_weight=control_risk_weight,
+        value_bank_only=value_bank_only,
+        value_dispersion=value_dispersion,
     )
     episodes = {}
     for row in transitions:
