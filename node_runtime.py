@@ -1942,12 +1942,35 @@ class NodeRuntime:
         return result
 
     def _feature_memory_risk_batch(self, states: np.ndarray) -> np.ndarray:
+        """Risk from the event memories attached to active feature roots.
+
+        Same result as the historical per-row activation sweep - every
+        node's mask is now computed once for the whole batch and each row
+        looks the activations up in that table, in the same
+        materialization order and with the same memory merge.  The sweep
+        used to dominate evaluation time: it recomputed every mask for
+        every batch row, and the cost grew with both the batch size and
+        the number of materialized sub-features.
+        """
         states = np.asarray(states, dtype=float)
         result = np.zeros(len(states), dtype=float)
         if not self.feature_ids:
             return result
-        for row, state in enumerate(states):
-            feature_ids = self._active_feature_roots(state)
+        obs = states[:, :self.obs_dim]
+        table = [
+            None if node_id not in self._feature_objects
+            else self._feature_objects[node_id].mask(obs)
+            for node_id in self._feature_all
+        ]
+        for row in range(len(states)):
+            active = [
+                node_id
+                for node_id, mask in zip(self._feature_all, table)
+                if mask is not None and bool(mask[row])
+            ]
+            feature_ids = [
+                node_id for node_id in active if node_id in self.feature_ids
+            ]
             if not feature_ids:
                 continue
             total = 0.0
