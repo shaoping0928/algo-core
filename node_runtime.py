@@ -773,7 +773,8 @@ class NodeRuntime:
             )
         return learned
 
-    def pain_signal_batch(self, states: np.ndarray) -> np.ndarray:
+    def pain_signal_batch(self, states: np.ndarray,
+                          mask_table: Optional[List] = None) -> np.ndarray:
         states = np.asarray(states, dtype=float)
         if len(states) == 0:
             return np.zeros(0)
@@ -807,9 +808,15 @@ class NodeRuntime:
                 )
                 result = result * self.obs_trust
         if self.feature_ids:
-            result = np.maximum(result, self._feature_risk_batch(states))
+            if mask_table is None:
+                mask_table = self._feature_mask_table(
+                    states[:, :self.obs_dim]
+                )
             result = np.maximum(
-                result, self._feature_memory_risk_batch(states)
+                result, self._feature_risk_batch(states, mask_table)
+            )
+            result = np.maximum(
+                result, self._feature_memory_risk_batch(states, mask_table)
             )
         elif self.rules.rules:
             rule_risk = self.rules.activate(states[:, :self.obs_dim])
@@ -1256,6 +1263,25 @@ class NodeRuntime:
         if not rows:
             return
         self.reset()
+        # Every node's activation over this episode is computed once: the
+        # per-row sweeps used to re-evaluate all masks for both the current
+        # and the next state of every row.
+        scale = self.scales[:self.obs_dim]
+        obs_table = self._feature_mask_table(
+            np.asarray(
+                [np.asarray(row["obs"], dtype=float) / scale for row in rows],
+                dtype=float,
+            )
+        )
+        next_table = self._feature_mask_table(
+            np.asarray(
+                [
+                    np.asarray(row["next_obs"], dtype=float) / scale
+                    for row in rows
+                ],
+                dtype=float,
+            )
+        )
         # Precursor labels: a feature on the *current* state is trained to
         # predict pain within its own window (`pain_horizon`, default
         # `lag + 1`), so it can fire while the action can still change the
@@ -1280,7 +1306,11 @@ class NodeRuntime:
             state = self.encode(row["obs"])
             current = self._assign(state, create=True, count=True)
             self._component_step(current)
-            current_active = self._active_feature_ids(state)
+            current_active = [
+                node_id
+                for node_id, mask in zip(self._feature_all, obs_table)
+                if mask is not None and bool(mask[index])
+            ]
             self._activate_features(current_active)
             current_features = [
                 node_id for node_id in current_active
@@ -1295,7 +1325,11 @@ class NodeRuntime:
             self.pending.append(action)
             next_state = self.encode(row["next_obs"])
             next_node = self._assign(next_state, create=True, count=True)
-            next_active = self._active_feature_ids(next_state)
+            next_active = [
+                node_id
+                for node_id, mask in zip(self._feature_all, next_table)
+                if mask is not None and bool(mask[index])
+            ]
             self._activate_features(next_active)
             next_features = [
                 node_id for node_id in next_active
@@ -1571,6 +1605,25 @@ class NodeRuntime:
             and bool(self._feature_objects[node_id].mask(row)[0])
         ]
 
+    def _table_entry(self, mask_table, node_id, feature, obs):
+        """A node's mask from a shared table, or computed on the spot."""
+        if mask_table is None:
+            return feature.mask(obs)
+        return mask_table[self._feature_all.index(node_id)]
+
+    def _feature_mask_table(self, obs: np.ndarray) -> List:
+        """Every node's activation over a batch of raw observations.
+
+        The masks are pure threshold comparisons, so one vectorized pass
+        over the batch yields exactly the booleans the per-row sweep
+        produced - computed once instead of once per row.
+        """
+        return [
+            None if node_id not in self._feature_objects
+            else self._feature_objects[node_id].mask(obs)
+            for node_id in self._feature_all
+        ]
+
     def _active_feature_roots(self, state) -> List[str]:
         active = set(self._active_feature_ids(state))
         return [
@@ -1750,7 +1803,8 @@ class NodeRuntime:
             value - self.value_baseline
         )
 
-    def feature_value_batch(self, states: np.ndarray) -> np.ndarray:
+    def feature_value_batch(self, states: np.ndarray,
+                            mask_table: Optional[List] = None) -> np.ndarray:
         """Expected discounted dopamine return at each state, in return units.
 
         The read for a state is the support-shrunk ``(feature, pending[0])``
@@ -1772,6 +1826,8 @@ class NodeRuntime:
         if not roots:
             return result
         obs = states[:, :self.obs_dim]
+        if mask_table is None:
+            mask_table = self._feature_mask_table(obs)
         acting = None
         if states.shape[1] > self.obs_dim:
             acting = np.rint(states[:, self.obs_dim]).astype(int)
@@ -1782,8 +1838,10 @@ class NodeRuntime:
             root_feature = self._feature_objects.get(node_id)
             if root_feature is None:
                 continue
-            root_mask = root_feature.mask(obs)
-            if not root_mask.any():
+            root_mask = self._table_entry(
+                mask_table, node_id, root_feature, obs
+            )
+            if root_mask is None or not root_mask.any():
                 continue
             subtree = [node_id]
             if self.subgraph_cells:
@@ -1794,10 +1852,12 @@ class NodeRuntime:
                 feature = self._feature_objects.get(member_id)
                 if feature is None:
                     continue
-                mask = feature.mask(obs)
-                if member_id != node_id:
-                    # A branch only contributes where its rule root fires.
-                    mask = mask & root_mask
+                mask = self._table_entry(
+                    mask_table, member_id, feature, obs
+                )
+                if mask is None:
+                    continue
+                mask = mask if member_id == node_id else mask & root_mask
                 if not mask.any() or acting is None:
                     continue
                 for action_key, (count, total_return) in (
@@ -1871,7 +1931,8 @@ class NodeRuntime:
         """Public read of the action-conditioned feature risk cells."""
         return self._feature_risk_batch(states)
 
-    def _feature_risk_batch(self, states: np.ndarray) -> np.ndarray:
+    def _feature_risk_batch(self, states: np.ndarray,
+                            mask_table: Optional[List] = None) -> np.ndarray:
         """Action-conditioned feature risk.
 
         The readout is ``P(pain within lag+1 steps | feature, acting
@@ -1892,6 +1953,8 @@ class NodeRuntime:
         if not self.feature_ids:
             return result
         obs = states[:, :self.obs_dim]
+        if mask_table is None:
+            mask_table = self._feature_mask_table(obs)
         acting = None
         if states.shape[1] > self.obs_dim:
             acting = np.rint(states[:, self.obs_dim]).astype(int)
@@ -1900,8 +1963,10 @@ class NodeRuntime:
             root_feature = self._feature_objects.get(node_id)
             if root_feature is None:
                 continue
-            root_mask = root_feature.mask(obs)
-            if not root_mask.any():
+            root_mask = self._table_entry(
+                mask_table, node_id, root_feature, obs
+            )
+            if root_mask is None or not root_mask.any():
                 continue
             subtree = [node_id]
             if self.subgraph_cells:
@@ -1915,10 +1980,12 @@ class NodeRuntime:
                 node = self.graph.nodes.get(member_id)
                 if feature is None or node is None:
                     continue
-                mask = feature.mask(obs)
-                if member_id != node_id:
-                    # A branch only contributes where its rule root fires.
-                    mask = mask & root_mask
+                mask = self._table_entry(
+                    mask_table, member_id, feature, obs
+                )
+                if mask is None:
+                    continue
+                mask = mask if member_id == node_id else mask & root_mask
                 if not mask.any():
                     continue
                 member_base = float(node.value)
@@ -1941,7 +2008,9 @@ class NodeRuntime:
             result = np.maximum(result, np.where(root_mask, values, 0.0))
         return result
 
-    def _feature_memory_risk_batch(self, states: np.ndarray) -> np.ndarray:
+    def _feature_memory_risk_batch(self, states: np.ndarray,
+                                   mask_table: Optional[List] = None
+                                   ) -> np.ndarray:
         """Risk from the event memories attached to active feature roots.
 
         Same result as the historical per-row activation sweep - every
@@ -1957,11 +2026,10 @@ class NodeRuntime:
         if not self.feature_ids:
             return result
         obs = states[:, :self.obs_dim]
-        table = [
-            None if node_id not in self._feature_objects
-            else self._feature_objects[node_id].mask(obs)
-            for node_id in self._feature_all
-        ]
+        if mask_table is None:
+            table = self._feature_mask_table(obs)
+        else:
+            table = mask_table
         for row in range(len(states)):
             active = [
                 node_id

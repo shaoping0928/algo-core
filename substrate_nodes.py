@@ -423,16 +423,19 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         pending = history[:, :agent.lag][:, ::-1]
         encoded = np.concatenate([states, pending], axis=1) / agent.scales
         pain, dopamine = agent.valence_state_batch(encoded)
+        mask_table = agent._feature_mask_table(encoded[:, :agent.obs_dim])
         if getattr(agent, "predicate_readouts", False):
             # D3: the terminal hazard comes from the predicates only; the
             # prototype valence no longer bounds it.
-            risk = agent.pain_signal_batch(encoded)
+            risk = agent.pain_signal_batch(encoded, mask_table)
         else:
-            risk = np.maximum(pain, agent.pain_signal_batch(encoded))
+            risk = np.maximum(
+                pain, agent.pain_signal_batch(encoded, mask_table)
+            )
         # Scalarized objective: accumulated hazard minus the sequence-level
         # value of the endpoint, so a plan that accepts local risk in
         # exchange for a long-survival alignment can win.
-        value = agent.feature_value_batch(encoded)
+        value = agent.feature_value_batch(encoded, mask_table)
         cost = risk - agent.feature_value_weight * value
         return np.column_stack([cost, -dopamine]), np.isfinite(encoded).all(
             axis=1
@@ -560,13 +563,15 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
     if not np.isfinite(encoded).all():
         return (float("inf"), float("inf"))
     pain, dopamine = agent.valence_state_batch(encoded)
+    mask_table = agent._feature_mask_table(encoded[:, :agent.obs_dim])
     if getattr(agent, "predicate_readouts", False):
-        terminal = float(agent.pain_signal_batch(encoded)[0])
+        terminal = float(agent.pain_signal_batch(encoded, mask_table)[0])
     else:
         terminal = max(
-            float(pain[0]), float(agent.pain_signal_batch(encoded)[0])
+            float(pain[0]),
+            float(agent.pain_signal_batch(encoded, mask_table)[0]),
         )
-    value = float(agent.feature_value_batch(encoded)[0])
+    value = float(agent.feature_value_batch(encoded, mask_table)[0])
     total += terminal - agent.feature_value_weight * value
     return (total, -float(dopamine[0]))
 
