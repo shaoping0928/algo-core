@@ -145,6 +145,7 @@ class NodeRuntime:
         valence_rate: float = 0.2,
         feature_rate: float = 0.05,
         feature_action_prior: float = 2.0,
+        association_prior: float = 2.0,
         pain_horizon: Optional[int] = None,
         voi_target: int = 3,
         voi_cell_cap: int = 16,
@@ -222,6 +223,8 @@ class NodeRuntime:
             raise ValueError("action_temperature must be non-negative")
         if float(feature_action_prior) < 0.0:
             raise ValueError("feature_action_prior must be non-negative")
+        if float(association_prior) < 0.0:
+            raise ValueError("association_prior must be non-negative")
         if pain_horizon is not None and int(pain_horizon) < 1:
             raise ValueError("pain_horizon must be positive")
         if int(voi_target) < 1:
@@ -275,8 +278,21 @@ class NodeRuntime:
         self.memory_weight = float(memory_weight)
         self.association_rate = float(association_rate)
         self.valence_rate = float(valence_rate)
+        # Retained for API compatibility: the feature pain anchor is now a
+        # 1/n cumulative mean (see `_update_feature_pain`), so no EMA rate
+        # drives it anymore.
         self.feature_rate = float(feature_rate)
         self.feature_action_prior = float(feature_action_prior)
+        # Pseudo-counts shrinking a node's association-channel pain rate
+        # toward the global base rate while its own sample count is thin.
+        self.association_prior = float(association_prior)
+        # Per-node valence rate statistics: how many transitions ran
+        # through each node and how much pain they carried.  Both clean
+        # and painful transitions are samples - pain-only evidence would
+        # make the channel a monotone "ever adjacent to pain" envelope
+        # instead of a base rate.
+        self._association_stats = {}
+        self._association_global = [0, 0.0]
         self.action_temperature = float(action_temperature)
         self.action_uncertainty = float(action_uncertainty)
         # Per (feature root, acting action) pain statistics.  The acting
@@ -318,7 +334,11 @@ class NodeRuntime:
         # keeps the historical max-combination behaviour.
         self.obs_trust = float(obs_trust)
         self.value_baseline = 0.0
+        # Retained for API compatibility: the baseline is a 1/n cumulative
+        # mean of the value targets (see `_update_feature_value`), not a
+        # constant-rate EMA.
         self.value_baseline_rate = 0.02
+        self._value_baseline_count = 0
         # Precursor label window: how many entered states ahead a pain event
         # still labels the current state.  Defaults to lag + 1, the first
         # state an action issued now can physically affect.
@@ -587,7 +607,13 @@ class NodeRuntime:
                   current_features: Iterable[str] = (),
                   next_features: Iterable[str] = ()) -> None:
         """Create association, causal transition and signal-driven memory."""
+        pain = float(pain)
+        dopamine = float(dopamine)
         if current == next_node:
+            # A self-loop is still a visit: the per-node valence rate must
+            # see every transition through the node, even the ones that
+            # cannot learn a structural edge.
+            self._note_valence([current], pain)
             return
         current_features = list(dict.fromkeys(current_features))
         next_features = list(dict.fromkeys(next_features))
@@ -598,10 +624,15 @@ class NodeRuntime:
         edge = self.graph.observe_transition(
             current, next_node, rate=self.graph_rate
         )
-        pain = float(pain)
-        dopamine = float(dopamine)
         memories = self.memories_for(
             [current, next_node] + current_features + next_features
+        )
+        # Valence rate statistics: every transition through a node - clean
+        # or painful - is a sample of its local pain rate.  Pain-only
+        # evidence would make the channel a monotone envelope ("has this
+        # neighborhood ever been adjacent to pain") instead of a rate.
+        self._note_valence(
+            [current, next_node] + list(memories), pain
         )
         created_memory = None
         if pain > 0.0 and not memories:
@@ -620,6 +651,7 @@ class NodeRuntime:
                 current_features + next_features
             ):
                 self.graph.add_membership(created_memory, feature_id)
+            self._note_valence([created_memory], pain)
         if pain > 0.0:
             # Features are installed after the first epoch.  Later pain
             # events reuse the existing memories, so index those memories
@@ -754,6 +786,28 @@ class NodeRuntime:
                     component_id.rsplit(":", 1)[0]
                 )
 
+    def _note_valence(self, node_ids, pain: float) -> None:
+        """Record one transition's outcome as a sample of each node's rate.
+
+        `pain` is the entered state's valence mass.  Clean transitions are
+        samples too: without them a node's read would be the frequency of
+        pain among pain-adjacent events, not among its transitions.
+        """
+        pain = float(pain)
+        self._association_global[0] += 1
+        self._association_global[1] += pain
+        for node_id in dict.fromkeys(node_ids):
+            stats = self._association_stats.setdefault(node_id, [0, 0.0])
+            stats[0] += 1
+            stats[1] += pain
+
+    def _association_base(self) -> float:
+        """Global pain rate per transition, a 1/n cumulative mean."""
+        count, hits = self._association_global
+        if count <= 0:
+            return 0.0
+        return hits / count
+
     def _learn_pain_association(self, pain: float,
                                 extra_nodes: Iterable[str] = ()) -> None:
         pain = float(pain)
@@ -769,13 +823,22 @@ class NodeRuntime:
             )
 
     def _pain_association(self, node_id: str) -> float:
-        key = (
-            min(node_id, self.pain_node),
-            max(node_id, self.pain_node),
-            ASSOCIATION,
-        )
-        edge = self.graph.edges.get(key)
-        return float(edge.weight) if edge is not None else 0.0
+        """Empirical pain rate of a node's transitions, shrunk to the base rate.
+
+        The read is ``(pain mass + prior * base) / (transitions + prior)``
+        over every transition that ran through the node, clean ones
+        included, so it estimates ``E[pain at the entered state |
+        transition through the node]`` - a rate whose uncertainty shrinks
+        at 1/count.  A node with no samples reads the global base rate,
+        the neutral hazard prior for unseen regions.
+        """
+        prior = self.association_prior
+        base = self._association_base()
+        stats = self._association_stats.get(node_id)
+        if stats is None or stats[0] <= 0:
+            return float(base)
+        count, hits = stats
+        return (hits + prior * base) / (count + prior)
 
     def pain_signal_from_weights(self, weights) -> float:
         total = 0.0
@@ -1495,15 +1558,22 @@ class NodeRuntime:
             node.dopamine += self.alpha_mc * (
                 return_dopamine - node.immediate_dopamine - node.dopamine
             )
+            # The transition's outcome is governed by the action issued
+            # `lag` steps earlier (`acting`), not by the one just issued -
+            # keying the Q table by the just-issued action would attribute
+            # the outcome of one action to another.
             self._update_action_edges(
-                sources, action, next_node, return_pain, return_dopamine
+                sources,
+                acting if acting is not None else action,
+                next_node, return_pain, return_dopamine,
             )
             self._update_transition_value(
                 current, next_node, return_pain, return_dopamine
             )
             self._update_gated(
-                current, signature, action, next_node,
-                return_pain, return_dopamine,
+                current, signature,
+                acting if acting is not None else action,
+                next_node, return_pain, return_dopamine,
             )
             if acting is not None and value_roots:
                 # Sequence-level value: a (feature, acting action) cell
@@ -1702,8 +1772,12 @@ class NodeRuntime:
             node = self.graph.nodes.get(node_id)
             if node is None:
                 continue
-            node.value += self.feature_rate * (pain - node.value)
+            # 1/n cumulative mean of the window labels: the root's
+            # marginal pain rate.  A constant-rate EMA would leave a
+            # residual noise floor that never decays with more data, and
+            # every thin cell inherits that noise through this anchor.
             node.count += 1
+            node.value += (pain - node.value) / node.count
 
     def _update_feature_action(self, feature_ids, action: int,
                                pain: float) -> None:
@@ -1796,75 +1870,117 @@ class NodeRuntime:
                                 pending: np.ndarray,
                                 labels: np.ndarray,
                                 bins: int = 12) -> None:
-        """Fit a monotone calibration for the graded threat readout.
+        """Fit a monotone calibration for the graded per-action reads.
 
-        The composed readouts have no statistical meaning on their own:
-        the max-combination inflates the raw reads well above the
-        empirical danger rates, which corrupts every level-based consumer
-        down the pipeline - the objective's accounting and the residual
-        selection pressure of the gap generations alike.  This fits a
-        binned, pool-adjacent-violators monotone map from the raw graded
-        threat read to the empirical pain rate on the training stream
-        itself (no new data), so a calibrated read of 0.6 means a 0.6
-        empirical pain rate.  Monotonicity preserves the min/max algebra
-        of the graded decomposition.
+        The graded composition consumes the map one read at a time - each
+        (root, action) cell read is mapped, then min/max over the mapped
+        reads is recomposed - so the map must be fitted at that same
+        granularity: pairs of (raw per-action read, the realized window
+        label of the state whose acting action the read prices).  A map
+        fitted on the composed threat would calibrate a quantity the
+        readout never consumes, because min/max over mapped reads differs
+        from the mapped min/max whenever more than one read enters the
+        composition.
+
+        Only the acting action's read pairs with a state's label - the
+        realized outcome reveals that action's price, not the other
+        actions'.  The fit pools all (root, acting action) pairs over the
+        training stream so one monotone map is shared across roots;
+        per-root maps would have sparse tails.  Monotonicity preserves the
+        min/max algebra of the graded decomposition.  (`bins` is retained
+        for API compatibility; the estimator is plain isotonic regression
+        over the pooled pairs.)
         """
+        states = np.asarray(states, dtype=float)
         pending_all = np.asarray(pending, dtype=float)
         if pending_all.shape[0] != len(states):
             raise ValueError("pending must have one row per state")
-        enc = np.concatenate([
-            np.asarray(states, dtype=float), pending_all
-        ], axis=1)
-        threat, _excess = self.pain_graded_batch(enc)
         labels = np.asarray(labels, dtype=float)
-        finite = np.isfinite(threat)
-        threat = threat[finite]
-        target = labels[finite]
-        if len(threat) < bins * 2:
+        if len(states) == 0 or not self.feature_ids:
             return
-        order = np.argsort(threat, kind="stable")
-        sorted_threat = threat[order]
-        sorted_target = target[order]
-        edges = np.quantile(sorted_threat,
-                            np.linspace(0.0, 1.0, bins + 1))
-        edges[0], edges[-1] = -np.inf, np.inf
-        rates = []
-        for low, high in zip(edges[:-1], edges[1:]):
-            in_bin = (sorted_threat >= low) & (sorted_threat < high)
-            if in_bin.sum() > 0:
-                rates.append(float(sorted_target[in_bin].mean()))
-            elif rates:
-                rates.append(rates[-1])
-            else:
-                rates.append(0.0)
-        # Pool adjacent violators so the map is non-decreasing.
-        rates = np.asarray(rates, dtype=float)
-        pooled = []
-        start = 0
-        while start < len(rates):
-            end = start + 1
-            total = rates[start] * 1.0
-            count = 1.0
-            while end < len(rates) and rates[end] < total / count:
-                total += rates[end]
-                count += 1.0
-                end += 1
-            pooled.extend([total / count] * (end - start))
-            start = end
-        # Interpolation nodes: each bin's midpoint, with the unbounded
-        # edge bins pinned just outside the finite range so np.interp
-        # clamps the tails to the end rates.
-        finite = edges[1:-1]
-        mids = []
-        for index in range(len(rates)):
-            low, high = edges[index], edges[index + 1]
-            if not np.isfinite(low):
-                low = finite[0] - 1.0
-            if not np.isfinite(high):
-                high = finite[-1] + 1.0
-            mids.append((low + high) / 2.0)
-        self.readout_calibration = (np.asarray(mids, dtype=float),
-                                    np.asarray(pooled, dtype=float))
+        enc = np.concatenate([states, pending_all], axis=1)
+        obs = enc[:, :self.obs_dim]
+        acting = None
+        if enc.shape[1] > self.obs_dim:
+            acting = np.rint(enc[:, self.obs_dim]).astype(int)
+        if acting is None:
+            return
+        mask_table = self._feature_mask_table(obs)
+        prior = self.feature_action_prior
+        governable = self.lag + 1
+        read_column = []
+        target_column = []
+        for node_id in self.feature_ids:
+            node = self.graph.nodes.get(node_id)
+            if node is None or self._node_horizon(node_id) > governable:
+                continue
+            root_feature = self._feature_objects.get(node_id)
+            if root_feature is None:
+                continue
+            root_mask = self._table_entry(
+                mask_table, node_id, root_feature, obs
+            )
+            if root_mask is None or not root_mask.any():
+                continue
+            base = float(node.value)
+            for action_key in self.action_space:
+                cell = self.feature_action_stats.get(node_id, {}).get(
+                    int(action_key)
+                )
+                if cell is not None and cell[0] > 0:
+                    count, hits = int(cell[0]), float(cell[1])
+                    read = (hits + prior * base) / (count + prior)
+                else:
+                    read = base
+                selected = root_mask & (acting == int(action_key))
+                if not selected.any():
+                    continue
+                read_column.append(np.full(int(selected.sum()), read))
+                target_column.append(labels[selected])
+        if not read_column:
+            return
+        reads = np.concatenate(read_column)
+        targets = np.concatenate(target_column)
+        if len(reads) < 2:
+            return
+        # Pool adjacent violators over the sorted (read, label) pairs -
+        # the classic isotonic regression.  Each block carries its mean
+        # read (centroid) and mean label (rate), and the map interpolates
+        # between centroids, so every read value in between maps to an
+        # empirical rate: no quantile bin is involved, and an untested
+        # read level cannot inherit an empty bin's carried plateau.
+        order = np.argsort(reads, kind="stable")
+        blocks = []
+        for index in order:
+            blocks.append([float(reads[index]), float(targets[index]), 1.0])
+            while len(blocks) >= 2 and (
+                blocks[-2][1] / blocks[-2][2] > blocks[-1][1] / blocks[-1][2]
+            ):
+                top = blocks.pop()
+                below = blocks.pop()
+                blocks.append([
+                    below[0] + top[0], below[1] + top[1],
+                    below[2] + top[2],
+                ])
+        block_reads = np.asarray(
+            [total_read / weight for total_read, _total, weight in blocks],
+            dtype=float,
+        )
+        block_rates = np.asarray(
+            [total_label / weight for _total_read, total_label, weight in blocks],
+            dtype=float,
+        )
+        # Clamping nodes pinned just outside the finite range so np.interp
+        # holds the end rates in the tails.
+        span = max(float(block_reads.max() - block_reads.min()), 1e-9)
+        mids = np.concatenate([
+            [block_reads[0] - span - 1.0], block_reads,
+            [block_reads[-1] + span + 1.0],
+        ])
+        rates = np.concatenate([
+            [block_rates[0]], block_rates, [block_rates[-1]],
+        ])
+        self.readout_calibration = (mids, rates)
 
     def _calibrate_threat(self, threat: np.ndarray) -> np.ndarray:
         calibration = getattr(self, "readout_calibration", None)
@@ -1907,9 +2023,16 @@ class NodeRuntime:
         if acting is None:
             return np.zeros(n, dtype=float), np.zeros(n, dtype=float)
         prior = self.feature_action_prior
+        # The governable span is the pending window: a label window of
+        # `lag + 1` states is exactly the span whose governing actions are
+        # the pending ones plus the action being decided.  The gate tests
+        # the *window length*, not the presence of a horizon tag - a
+        # tag-based test would both mute short-window roots that carry a
+        # tag and admit untagged roots trained on a longer runtime window.
+        governable = self.lag + 1
         for node_id in self.feature_ids:
             node = self.graph.nodes.get(node_id)
-            if node is None or node.pain_horizon is not None:
+            if node is None or self._node_horizon(node_id) > governable:
                 # Long-window roots: their labels see beyond the pending
                 # window, so their per-action reads are not causal.
                 continue
@@ -2078,8 +2201,13 @@ class NodeRuntime:
             cell[1] += value
             if episode_id is not None:
                 cell[2][episode_id] = cell[2].get(episode_id, 0) + 1
-        self.value_baseline += self.value_baseline_rate * (
-            value - self.value_baseline
+        # 1/n cumulative mean of the value targets: the anchor converges
+        # to the stream's marginal mean return instead of tracking a
+        # 50-event recency window whose wander is the same order as the
+        # per-action differences it is meant to stabilize.
+        self._value_baseline_count += 1
+        self.value_baseline += (
+            (value - self.value_baseline) / self._value_baseline_count
         )
 
     def feature_value_batch(self, states: np.ndarray,
@@ -2109,6 +2237,11 @@ class NodeRuntime:
             # statistics that dilute the mean.
             roots = list(self.value_feature_ids)
         if not roots:
+            if return_support:
+                # No roots at all: report zero support so every consumer
+                # treating the read as evidence-scaled sees "no data",
+                # not a bare array that unpacks element-wise.
+                return result, np.zeros(len(states), dtype=float)
             return result
         obs = states[:, :self.obs_dim]
         if mask_table is None:
@@ -2374,8 +2507,13 @@ class NodeRuntime:
                 if memory is None or memory.kind != MEMORY:
                     continue
                 total += float(strength)
-                weighted += float(strength) * (
-                    memory.value + memory.immediate_pain
+                # The channel reads the memory's live valence rate - the
+                # same association statistics every other node reports -
+                # not the creation-time snapshot, which would report a
+                # single event's pain forever no matter what later
+                # transitions through the same region showed.
+                weighted += float(strength) * self._pain_association(
+                    memory_id
                 )
             if total > 0.0:
                 result[row] = weighted / total

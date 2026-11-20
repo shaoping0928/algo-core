@@ -1192,6 +1192,233 @@ class NodeRuntimeTests(unittest.TestCase):
         ):
             self.assertNotIn(token, adapter, "%s in substrate_nodes.py" % token)
 
+    def test_offline_pending_matches_the_runtime_encoding(self):
+        from substrate_nodes import _encoded_pending
+
+        # history is newest-first: [a_t, a_{t-1}, a_{t-2}, a_{t-3}].  The
+        # runtime encodes this row's state with the actions issued
+        # *before* it, oldest first: [a_{t-3}, a_{t-2}, a_{t-1}].
+        rows = [dict(history=np.asarray([3.0, 2.0, 1.0, 0.0]))]
+        np.testing.assert_allclose(
+            _encoded_pending(rows, 3), [[0.0, 1.0, 2.0]]
+        )
+        # A short history degrades to what exists, zero-padded on the left.
+        rows = [dict(history=np.asarray([2.0, 1.0]))]
+        np.testing.assert_allclose(
+            _encoded_pending(rows, 3), [[0.0, 0.0, 1.0]]
+        )
+
+    def test_graded_read_includes_tagged_short_window_roots(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        rule = FeatureRule(
+            Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+        )
+        runtime.install_feature_rules([rule], horizon=2)
+        feature_id = runtime.feature_ids[0]
+        runtime._update_feature_action([feature_id], 0, 0.0)
+        runtime._update_feature_action([feature_id], 0, 0.0)
+        runtime._update_feature_action([feature_id], 1, 1.0)
+        hold = np.asarray([1.0, 0.0])
+        worse = np.asarray([1.0, 1.0])
+        threat, excess = runtime.pain_graded_batch(np.vstack([hold, worse]))
+        prior = runtime.feature_action_prior
+        base = runtime.graph.nodes[feature_id].value
+        read0 = (0.0 + prior * base) / (2.0 + prior)
+        read1 = (1.0 + prior * base) / (1.0 + prior)
+        # The tag carries the root's own window (lag + 1 = the governable
+        # span), so the root must be read: excluding it by tag presence
+        # would mute every re-induced short-window root.
+        self.assertAlmostEqual(threat[0], read0, places=9)
+        self.assertAlmostEqual(threat[1], read0, places=9)
+        self.assertAlmostEqual(excess[1], read1 - read0, places=9)
+
+    def test_association_channel_reports_a_rate_not_an_envelope(self):
+        runtime = self.make_runtime(
+            lag=0, scales=np.asarray([1.0]), max_nodes=40
+        )
+        node = runtime._create_node(np.asarray([0.0]))
+        # Four self-loop transitions, one painful: the read is the shrunk
+        # rate, not the monotone envelope 1.0 a pain-only channel would
+        # report.  Self-loops are visits and must be counted.
+        for pain in (1.0, 0.0, 0.0, 0.0):
+            runtime.reset()
+            runtime.learn_episode([dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([0.0]),
+                history=np.asarray([0.0]),
+                signals=np.asarray([1.0, pain]), done=False, episode=0,
+            )])
+        stats = runtime._association_stats[node]
+        self.assertEqual(stats, [4, 1.0])
+        base = runtime._association_base()
+        self.assertAlmostEqual(base, 0.25, places=9)
+        prior = runtime.association_prior
+        self.assertAlmostEqual(
+            runtime._pain_association(node),
+            (1.0 + prior * 0.25) / (4.0 + prior),
+            places=9,
+        )
+        # Clean transitions through the same node pull the read down:
+        # negative evidence is information.  The prior keeps a floor
+        # under a single pain event, but the rate must decay toward the
+        # base rate instead of pinning at the envelope.
+        for _ in range(8):
+            runtime.reset()
+            runtime.learn_episode([dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([0.0]),
+                history=np.asarray([0.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=1,
+            )])
+        decayed = runtime._pain_association(node)
+        self.assertLess(decayed, 0.15)
+        self.assertLess(
+            decayed, (1.0 + prior * 0.25) / (4.0 + prior)
+        )
+        # A node with no samples reads the global base rate, not zero.
+        fresh = runtime._create_node(np.asarray([9.0]))
+        self.assertAlmostEqual(
+            runtime._pain_association(fresh), runtime._association_base(),
+            places=9,
+        )
+
+    def test_memory_risk_reads_the_live_rate(self):
+        runtime = self.make_runtime(
+            lag=0, scales=np.asarray([1.0]), max_nodes=40
+        )
+        runtime._create_node(np.asarray([0.0]))
+        runtime._create_node(np.asarray([3.0]))
+        # A pain event creates a memory indexed to the transition.
+        runtime.reset()
+        runtime.learn_episode([dict(
+            obs=np.asarray([0.0]), next_obs=np.asarray([3.0]),
+            history=np.asarray([0.0]),
+            signals=np.asarray([1.0, 1.0]), done=False, episode=0,
+        )])
+        memory_ids = [
+            node_id for node_id, node in runtime.graph.nodes.items()
+            if node.kind == "memory"
+        ]
+        self.assertEqual(len(memory_ids), 1)
+        memory_id = memory_ids[0]
+        created = runtime._pain_association(memory_id)
+        # The creation snapshot stays frozen, but the channel's read is
+        # the live rate: clean transitions through the same region pull
+        # it down below the creation-time value.
+        for _ in range(8):
+            runtime.reset()
+            runtime.learn_episode([dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([3.0]),
+                history=np.asarray([0.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=1,
+            )])
+        self.assertLess(runtime._pain_association(memory_id), created)
+
+    def test_action_edges_key_on_the_governing_action(self):
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        rows = [
+            dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
+                history=np.asarray([1.0, 0.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([1.0]), next_obs=np.asarray([2.0]),
+                history=np.asarray([0.0, 1.0]),
+                signals=np.asarray([1.0, 1.0]), done=True, episode=0,
+            ),
+        ]
+        runtime.learn_episode(rows)
+        keyed = {}
+        for source, _target, action in runtime.graph.action_edges:
+            keyed[float(runtime.graph.nodes[source].features[0])] = action
+        # Row 0's outcome is governed by history[lag]=0, row 1's by 1 -
+        # keying by the just-issued action would attribute each outcome
+        # to the other action.
+        self.assertEqual(keyed, {0.0: 0, 1.0: 1})
+
+    def test_pain_anchor_is_a_cumulative_mean(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        node = runtime.graph.nodes[feature_id]
+        node.value = 0.0
+        node.count = 0
+        for _ in range(10):
+            runtime._update_feature_pain([feature_id], 0.4)
+        # A 1/n mean converges to the label rate; a constant-rate EMA
+        # would stall short of it forever and drag every thin cell's
+        # read along.
+        self.assertAlmostEqual(node.value, 0.4, places=9)
+
+    def test_value_baseline_is_a_cumulative_mean(self):
+        runtime = self.make_runtime(max_nodes=40)
+        for value in (2.0, 4.0, 6.0):
+            runtime._update_feature_value([], 0, value)
+        self.assertAlmostEqual(runtime.value_baseline, 4.0, places=9)
+
+    def test_feature_value_support_reports_no_data_without_roots(self):
+        runtime = self.make_runtime(max_nodes=40)
+        value, support = runtime.feature_value_batch(
+            np.asarray([[0.0], [1.0], [2.0]]), return_support=True
+        )
+        np.testing.assert_allclose(value, runtime.value_baseline)
+        # No roots means no evidence: support must read zero, not a bare
+        # array that would unpack element-wise at the caller.
+        np.testing.assert_allclose(support, 0.0)
+
+    def test_calibration_fits_the_per_read_granularity(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40
+        )
+        hot_rule = FeatureRule(
+            Primitive(0, True, "<", 1.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+        )
+        cold_rule = FeatureRule(
+            Primitive(0, True, ">", 3.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+        )
+        runtime.install_feature_rules([hot_rule], horizon=2)
+        runtime.install_feature_rules([cold_rule], horizon=2)
+        hot_id, cold_id = runtime.feature_ids
+        runtime.graph.nodes[hot_id].value = 0.9
+        runtime.graph.nodes[cold_id].value = 0.1
+        runtime._update_feature_action([hot_id], 0, 1.0)
+        runtime._update_feature_action([hot_id], 0, 1.0)
+        runtime._update_feature_action([cold_id], 0, 0.0)
+        runtime._update_feature_action([cold_id], 0, 0.0)
+        # Twelve states under the hot root (all painful) and twelve under
+        # the cold root (all clean): the per-read pairs are
+        # (0.95, 1.0) and (0.05, 0.0).
+        states = np.asarray([[0.5]] * 12 + [[4.0]] * 12)
+        pending = np.zeros((24, 1), dtype=float)
+        labels = np.asarray([1.0] * 12 + [0.0] * 12)
+        runtime.fit_readout_calibration(states, pending, labels)
+        self.assertIsNotNone(runtime.readout_calibration)
+        threat, _excess = runtime.pain_graded_batch(
+            np.asarray([[0.5, 0.0], [4.0, 0.0]])
+        )
+        # The map is consumed per (root, action) read, so it must have
+        # been fitted on those reads: the hot root's read maps near its
+        # empirical rate, the cold root's near zero.  A map fitted on the
+        # composed threat would calibrate a level no read ever carries.
+        self.assertGreater(threat[0], 0.8)
+        self.assertLess(threat[1], 0.2)
+
 
 class PlanScoreTests(unittest.TestCase):
     def test_plan_score_matches_search_selection(self):

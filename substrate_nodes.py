@@ -57,6 +57,26 @@ def value_dispersion_labels(returns, quantile: float) -> np.ndarray:
     return ((returns > high_cut) | (returns < low_cut)).astype(float)
 
 
+def _encoded_pending(rows, lag: int) -> np.ndarray:
+    """The pending-action window the runtime's own encoder pairs with each row.
+
+    `encode` builds a state from the actions issued *before* it (the
+    pending deque is read before the current action is appended), oldest
+    first.  For a row whose history is ``[a_t, a_{t-1}, ..., a_{t-lag}]``
+    (most recent first) that window is ``history[1:lag+1][::-1]``.  Using
+    ``history[:lag][::-1]`` instead would pair every offline readout with
+    the encoding of the *next* row's state - a one-row shift that silently
+    misaligns calibration and residual scans.
+    """
+    window = np.zeros((len(rows), int(lag)), dtype=float)
+    for index, row in enumerate(rows):
+        history = np.asarray(row["history"], dtype=float).reshape(-1)
+        take = min(int(lag), max(history.size - 1, 0))
+        if take:
+            window[index, int(lag) - take:] = history[1:1 + take][::-1]
+    return window
+
+
 def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            component_kinds, component_min_count, max_components,
            component_weight, component_gating, memory_weight,
@@ -172,7 +192,12 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
             agent.induce_rules(
                 states[train], primary[train], states[test], primary[test]
             )
-            agent.install_feature_rules()
+            # The primary bank is selected on the short-window labels, so
+            # its roots must train and read with that same window: an
+            # untagged root would inherit the runtime's configured window
+            # and train on longer labels than its selection used - and a
+            # longer window would also push it out of the graded readout.
+            agent.install_feature_rules(horizon=lag + 1)
             if long_window is not None:
                 bank = FeatureRuleBank()
                 bank.induce(
@@ -226,10 +251,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
             # danger rates, so a level threshold would mark nothing as
             # missed; a positive counts as unexplained when its graded
             # threat read ranks below half of the negatives' reads.
-            pending_all = np.asarray([
-                np.asarray(row["history"], dtype=float)[:lag][::-1]
-                for row in transitions
-            ], dtype=float)
+            pending_all = _encoded_pending(transitions, lag)
             enc_all = np.concatenate([states, pending_all], axis=1)
             threat_read, _excess_read = agent.pain_graded_batch(enc_all)
             negative_levels = threat_read[pain_short <= 0.5]
@@ -263,10 +285,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         # itself, so the graded threat read is an empirical pain rate
         # rather than an inflated combination artifact - the objective's
         # accounting and the planner's comparisons recover their meaning.
-        pending_final = np.asarray([
-            np.asarray(row["history"], dtype=float)[:lag][::-1]
-            for row in transitions
-        ], dtype=float)
+        pending_final = _encoded_pending(transitions, lag)
         agent.fit_readout_calibration(states, pending_final, pain_short)
     return world, agent
 
@@ -587,8 +606,17 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             # Scalarized objective: accumulated hazard minus the
             # sequence-level value of the endpoint, so a plan that accepts
             # local risk in exchange for a long-survival alignment can win.
-            value = agent.feature_value_batch(encoded, mask_table)
-            cost = risk - agent.feature_value_weight * value
+            # D4 everywhere: the value channel speaks with the evidence
+            # behind it.  Without the trust scale an uncovered endpoint
+            # would be credited with the population-average return, so the
+            # planner would be paid (or charged) for states nothing was
+            # ever learned about.
+            value, support = agent.feature_value_batch(
+                encoded, mask_table, return_support=True
+            )
+            trust_samples = getattr(agent, "value_trust_samples", 150.0)
+            trust = support / (support + trust_samples)
+            cost = risk - agent.feature_value_weight * trust * value
             return np.column_stack([cost, -dopamine]), np.isfinite(
                 encoded
             ).all(axis=1)
