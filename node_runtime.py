@@ -1869,11 +1869,9 @@ class NodeRuntime:
                 dtype=float,
             )
         )
-        # Precursor labels: a feature on the *current* state is trained to
-        # predict pain within its own window (`pain_horizon`, default
-        # `lag + 1`), so it can fire while the action can still change the
-        # outcome.  Roots installed from a longer-window bank carry their
-        # own horizon and get that window's labels.
+        # Label regime: point-event pain (default) trains every root on the
+        # entered state's own feedback; the precursor-window path (opt-in)
+        # trains each root on P(pain within its configured window).
         horizons = {self._node_horizon(fid) for fid in self.feature_ids}
         horizons.add(self.pain_horizon)
         if self.point_labels:

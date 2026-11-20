@@ -177,14 +177,12 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
     ordered = [episodes[key] for key in sorted(episodes)]
 
     # Rules are induced after the first pass, then materialized as feature
-    # nodes.  Precursor labels let a rule describe the *current* state and
-    # predict pain within its own window, so it can fire while the action
-    # can still change the outcome.  A short window (default `lag + 1`)
-    # detects imminent death; a longer optional window gives the approach
-    # phase positive coverage.  Both banks are installed and every root
-    # trains with its own window's labels.  Later epochs train transitions,
-    # action edges and memories with those feature nodes active, so features
-    # take part in learning rather than only in the final readout.
+    # nodes.  With point-event labels (default) the predicate describes the
+    # state the action was taken from and predicts the entered state's own
+    # pain; the opt-in precursor path instead uses a window.  Later epochs
+    # train transitions, action edges and memories with those feature nodes
+    # active, so features take part in learning rather than only in the
+    # final readout.
     long_window = None
     if precursor_labels:
         window = int(pain_horizon) if pain_horizon else lag + 1
