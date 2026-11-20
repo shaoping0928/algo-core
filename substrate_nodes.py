@@ -19,6 +19,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     as_completed,
 )
+from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -597,7 +598,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         control_risk_weight=0.0, value_bank_only=False,
         iterative_induction=False, compose_readout=True,
         importance_weighting=False, learn_objective=True,
-        curiosity_weight=0.0):
+        curiosity_weight=0.5):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -830,6 +831,24 @@ def _curiosity_term(phi_start, phi_end, weight, discount, horizon):
     return float(weight) * (
         float(phi_start) - float(discount) ** int(horizon) * phi_end
     )
+
+
+@contextmanager
+def _curiosity_off(agent):
+    """Evaluation reads the objective without the curiosity term.
+
+    Curiosity is a training-side exploration incentive: it changes which
+    plans the planner executes while collecting on-policy data, and those
+    executed transitions are real.  The ruler must not be shaped, so every
+    evaluation episode runs with the weight set to zero and the training
+    value restored afterwards.
+    """
+    saved = float(getattr(agent, "curiosity_weight", 0.0))
+    agent.curiosity_weight = 0.0
+    try:
+        yield
+    finally:
+        agent.curiosity_weight = saved
 
 
 def policy_result(env, world, agent, prefix, horizon, lag=LAG,
@@ -1335,7 +1354,7 @@ def run_seed(task):
     compose_readout = bool(task.get("compose_readout", True))
     importance_weighting = bool(task.get("importance_weighting", False))
     learn_objective = bool(task.get("learn_objective", True))
-    curiosity_weight = float(task.get("curiosity_weight", 0.0))
+    curiosity_weight = float(task.get("curiosity_weight", 0.5))
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
@@ -1399,34 +1418,38 @@ def run_seed(task):
     if not explicit_eval:
         eval_seeds = [seed]
     rows = []
-    for eval_seed in eval_seeds:
-        for episode in range(eval_episodes):
-            if explicit_eval:
-                # Match `collect`'s world-naming scheme so evaluation worlds
-                # are reproducible and disjoint from the training stream.
-                env_seed = int(eval_seed) * 10000 + episode
-            elif episode == 0:
-                # Historical self-evaluation world.
-                env_seed = int(eval_seed)
-            else:
-                env_seed = int(eval_seed) * 10000 + episode
-            frames, actions, _ = evaluate(
-                seed, world, agent, cap=cap, horizon=horizon, lag=lag,
-                step_stride=step_stride,
-                stride_includes_lag=stride_includes_lag,
-                env_seed=env_seed,
-                decision=decision,
-            )
-            rows.append(dict(
-                train_seed=seed,
-                eval_seed=int(eval_seed),
-                episode=episode,
-                env_seed=int(env_seed),
-                frames=int(frames),
-                action_rate=(
-                    float(np.mean(actions)) if actions else 0.0
-                ),
-            ))
+    # The ruler is unshaped: curiosity shapes training-time execution (its
+    # transitions are real data), never the evaluation episode.
+    with _curiosity_off(agent):
+        for eval_seed in eval_seeds:
+            for episode in range(eval_episodes):
+                if explicit_eval:
+                    # Match `collect`'s world-naming scheme so evaluation
+                    # worlds are reproducible and disjoint from the
+                    # training stream.
+                    env_seed = int(eval_seed) * 10000 + episode
+                elif episode == 0:
+                    # Historical self-evaluation world.
+                    env_seed = int(eval_seed)
+                else:
+                    env_seed = int(eval_seed) * 10000 + episode
+                frames, actions, _ = evaluate(
+                    seed, world, agent, cap=cap, horizon=horizon, lag=lag,
+                    step_stride=step_stride,
+                    stride_includes_lag=stride_includes_lag,
+                    env_seed=env_seed,
+                    decision=decision,
+                )
+                rows.append(dict(
+                    train_seed=seed,
+                    eval_seed=int(eval_seed),
+                    episode=episode,
+                    env_seed=int(env_seed),
+                    frames=int(frames),
+                    action_rate=(
+                        float(np.mean(actions)) if actions else 0.0
+                    ),
+                ))
     return dict(
         seed=seed,
         frames=rows[0]["frames"],
@@ -1553,11 +1576,13 @@ def main():
                         help="read the value channel from the dedicated "
                              "value-bank roots only, without the risk "
                              "bank's drifting-continuation cells")
-    parser.add_argument("--curiosity-weight", type=float, default=0.0,
-                        help="decision-side curiosity: weight of the "
-                             "potential-difference novelty term "
-                             "w*(phi(s0) - gamma^H*phi(sH)), phi = "
-                             "1/sqrt(1+evidence); 0 disables it")
+    parser.add_argument("--curiosity-weight", type=float, default=0.5,
+                        help="decision-side curiosity: the maximum absolute "
+                             "share the potential-difference term may take "
+                             "in the objective (phi in (0,1] so the term is "
+                             "bounded by +/-w); it shapes training-time "
+                             "execution only - evaluation always runs with "
+                             "w=0. 0 disables it")
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "

@@ -572,6 +572,23 @@ class NodeRuntimeTests(unittest.TestCase):
             float(_curiosity_term(0.2, np.asarray([0.8]), 0.0, 0.99, 1)[0]),
             0.0, places=9,
         )
+        # phi is bounded in (0, 1], so the term never exceeds the weight:
+        # that bound is the objective-share parameter.
+        for start in (0.0, 0.25, 1.0):
+            for end in (0.0, 0.3, 1.0):
+                term = float(_curiosity_term(
+                    start, np.asarray([end]), 0.5, 1.0, 3,
+                )[0])
+                self.assertLessEqual(abs(term), 0.5 + 1e-12)
+
+    def test_curiosity_is_disabled_for_evaluation_and_restored(self):
+        import types
+        from substrate_nodes import _curiosity_off
+
+        agent = types.SimpleNamespace(curiosity_weight=0.5)
+        with _curiosity_off(agent):
+            self.assertEqual(agent.curiosity_weight, 0.0)
+        self.assertEqual(agent.curiosity_weight, 0.5)
 
     def test_feature_windows_are_per_node(self):
         from node_features import FeatureRule, Primitive
