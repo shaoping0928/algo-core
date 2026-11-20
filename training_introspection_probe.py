@@ -203,9 +203,12 @@ def snapshot(agent, world, phase, total_rows, args, probe_rows):
     scale = agent.scales[:agent.obs_dim]
 
     # Fixed probe stream (same states at every phase, same world seed).
+    # Encode once: raw observations with the row's pending actions, then
+    # a single division by the agent's scales - a pre-scaled observation
+    # column would be divided twice and distort every threshold read.
     observations = np.asarray(
         [row["obs"] for row in probe_rows], dtype=float
-    ) / scale
+    )
     pending = np.asarray(
         [
             np.asarray(row["history"], dtype=float)[1:agent.lag + 1][::-1]
