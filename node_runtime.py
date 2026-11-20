@@ -29,6 +29,7 @@ import numpy as np
 from node_components import ComponentBank
 from node_features import (
     FeatureRuleBank,
+    expand_observation,
     feature_from_state,
     feature_state,
 )
@@ -283,6 +284,7 @@ class NodeRuntime:
         memory_credit: bool = False,
         rule_min_coverage: float = 0.0,
         rule_min_primitive_coverage: float = 0.0,
+        pairwise_features: bool = True,
         voi_target: int = 3,
         voi_cell_cap: int = 16,
         voi_min_prior: float = 0.5,
@@ -583,9 +585,11 @@ class NodeRuntime:
         }
         self.last_action_probs = (1.0, 0.0)
         self.rules = FeatureRuleBank(
+            pairwise_features=pairwise_features,
             min_coverage=rule_min_coverage,
             min_primitive_coverage=rule_min_primitive_coverage,
         )
+        self.pairwise_features = bool(pairwise_features)
         # Optional second bank induced on a longer precursor window; roots
         # installed from it carry their own `pain_horizon` tag.
         self.rules_long = None
@@ -2290,6 +2294,8 @@ class NodeRuntime:
             return []
         obs = np.asarray(state, dtype=float).reshape(-1)[:self.obs_dim]
         row = obs.reshape(1, -1)
+        if self.pairwise_features:
+            row = expand_observation(row)
         return [
             node_id for node_id in self._feature_all
             if node_id in self._feature_objects
@@ -2307,8 +2313,12 @@ class NodeRuntime:
 
         The masks are pure threshold comparisons, so one vectorized pass
         over the batch yields exactly the booleans the per-row sweep
-        produced - computed once instead of once per row.
+        produced - computed once instead of once per row.  With pairwise
+        features on, the observation is expanded once before the pass.
         """
+        obs = np.asarray(obs, dtype=float)
+        if self.pairwise_features:
+            obs = expand_observation(obs)
         return [
             None if node_id not in self._feature_objects
             else self._feature_objects[node_id].mask(obs)

@@ -7,12 +7,40 @@ from node_features import (
     FeatureRule,
     FeatureRuleBank,
     Primitive,
+    expand_observation,
 )
 from node_graph import CONCEPT, DERIVATION, NodeGraph
 from node_runtime import NodeRuntime
 
 
 class FeatureRuleTests(unittest.TestCase):
+    def test_pairwise_difference_coordinates(self):
+        x = np.asarray([[1.0, 0.0], [0.0, 2.0]])
+        expanded = expand_observation(x)
+        self.assertEqual(expanded.shape, (2, 3))
+        np.testing.assert_allclose(expanded[:, 2], [1.0, -2.0])
+        # A rule over the difference coordinate is induced and read back.
+        rng = np.random.RandomState(3)
+        data = rng.uniform(-1.0, 1.0, (600, 2))
+        target = ((data[:, 0] - data[:, 1]) > 0.5).astype(float)
+        train = np.arange(450)
+        test = np.arange(450, 600)
+        bank = FeatureRuleBank(min_z=1.0, min_lift=1.5,
+                               pairwise_features=True)
+        rules = bank.induce(
+            data[train], target[train], data[test], target[test]
+        )
+        self.assertTrue(rules)
+        dims = set()
+        def collect(feature):
+            if isinstance(feature, Primitive):
+                dims.add(feature.dim)
+            for child in getattr(feature, "children", ()):
+                collect(child)
+        for rule in rules:
+            collect(rule.feature)
+        self.assertIn(2, dims)
+
     def test_primitive_and_composite_masks(self):
         x = np.asarray([
             [0.0, 0.5], [0.01, 0.5], [0.0, 0.0], [0.5, 0.0],

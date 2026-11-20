@@ -658,6 +658,25 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(edge.weight, decay, places=6)
         self.assertIn(context, runtime.graph.nodes[event].members)
 
+    def test_pairwise_feature_reads_use_the_expanded_state(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            obs_dim=2, scales=np.asarray([1.0, 1.0]), max_nodes=20
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(2, False, ">", 0.0), 10, 8.0, 0.8,
+                5, 4.0, 0.8, 0.8,
+            )
+        ]
+        runtime.install_feature_rules()
+        table = runtime._feature_mask_table(
+            np.asarray([[1.0, 0.0], [0.0, 1.0]])
+        )
+        self.assertTrue(bool(table[0][0]))
+        self.assertFalse(bool(table[0][1]))
+
     def test_feature_windows_are_per_node(self):
         from node_features import FeatureRule, Primitive
         from node_graph import NodeGraph

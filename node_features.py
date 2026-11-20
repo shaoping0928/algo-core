@@ -96,6 +96,34 @@ def _stats(mask: np.ndarray, target: np.ndarray) -> dict:
     return dict(support=support, hits=hits, precision=precision, z=float(z))
 
 
+def expand_observation(x: np.ndarray) -> np.ndarray:
+    """Append every pairwise coordinate difference to the observation.
+
+    The expansion is purely algebraic: for an observation vector
+    ``x_0 .. x_{d-1}`` it appends ``x_i - x_j`` for every ``i < j``.  It
+    carries no task semantics - the indices are array positions - and it
+    gives the threshold grammar coordinates whose values are centred near
+    zero and spread over a wider range than the raw absolute coordinates.
+    """
+    values = np.asarray(x, dtype=float)
+    single = values.ndim == 1
+    if single:
+        values = values.reshape(1, -1)
+    if values.ndim != 2:
+        raise ValueError("observations must be a vector or a matrix")
+    width = values.shape[1]
+    if width < 2:
+        return values[0] if single else values
+    parts = [values]
+    for first in range(width):
+        for second in range(first + 1, width):
+            parts.append(
+                (values[:, first] - values[:, second])[:, None]
+            )
+    expanded = np.concatenate(parts, axis=1)
+    return expanded[0] if single else expanded
+
+
 class FeatureRuleBank:
     """Induce and store compositional pain rules.
 
@@ -106,7 +134,9 @@ class FeatureRuleBank:
     def __init__(self, max_rules: int = 8, min_support: int = 5,
                  max_per_group: int = 8, min_z: float = 2.0,
                  min_lift: float = 2.0, min_coverage: float = 0.0,
-                 min_primitive_coverage: float = 0.0):
+                 min_primitive_coverage: float = 0.0,
+                 pairwise_features: bool = True,
+                 max_candidates: int = 240):
         self.max_rules = int(max_rules)
         self.min_support = int(min_support)
         self.max_per_group = int(max_per_group)
@@ -119,6 +149,13 @@ class FeatureRuleBank:
         # only ever see rare planner states.
         self.min_coverage = float(min_coverage)
         self.min_primitive_coverage = float(min_primitive_coverage)
+        # Generic coordinate difference expansion (task-agnostic algebra).
+        self.pairwise_features = bool(pairwise_features)
+        # Budget on the univariate candidate pool that feeds the AND/OR
+        # search; the pairwise expansion multiplies the coordinate count,
+        # and the composition step is quadratic in this pool.  Selection
+        # is by the same univariate z used everywhere else.
+        self.max_candidates = int(max_candidates)
         self.rules: List[FeatureRule] = []
 
     # ---- candidates -------------------------------------------------------
@@ -215,6 +252,10 @@ class FeatureRuleBank:
             test_x if coverage_x is None
             else np.asarray(coverage_x, dtype=float)
         )
+        if self.pairwise_features:
+            train_x = expand_observation(train_x)
+            test_x = expand_observation(test_x)
+            gate_x = expand_observation(gate_x)
         base_train = float(train_y.mean()) if len(train_y) else 0.0
         base_test = float(test_y.mean()) if len(test_y) else 0.0
         positives = train_y > 0.5
@@ -225,6 +266,10 @@ class FeatureRuleBank:
         candidates = self._primitives(
             train_x, train_y, min_support=min_support
         )
+        if len(candidates) > self.max_candidates:
+            candidates = sorted(
+                candidates, key=lambda item: item[0], reverse=True
+            )[:self.max_candidates]
         considered = []
         seen = set()
         primitive_rates = {}
@@ -433,6 +478,8 @@ class FeatureRuleBank:
     # ---- use --------------------------------------------------------------
     def activate(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=float)
+        if self.pairwise_features:
+            x = expand_observation(x)
         result = np.zeros(len(x), dtype=float)
         for rule in self.rules:
             result = np.maximum(

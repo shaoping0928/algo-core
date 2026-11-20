@@ -17,7 +17,7 @@ import json
 import numpy as np
 
 from eval_protocol import parse_seed_spec
-from node_features import Primitive
+from node_features import Primitive, expand_observation
 from substrate_nodes import _curiosity_off, collect, evaluate, fit
 
 
@@ -69,6 +69,9 @@ def run(seed, eval_seeds, memory_credit,
             eval_rows.extend(rows)
     eval_obs = np.asarray([row["obs"] for row in eval_rows], dtype=float)
     eval_obs = eval_obs / agent.scales[:agent.obs_dim]
+    if getattr(agent, "pairwise_features", False):
+        behavior_obs = expand_observation(behavior_obs)
+        eval_obs = expand_observation(eval_obs)
 
     rules = list(agent.rules.rules)
     roots = []

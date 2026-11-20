@@ -124,7 +124,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         dagger_frames: int = 0, memory_credit: bool = False,
         rule_min_coverage: float = 0.0,
         rule_min_primitive_coverage: float = 0.0,
-        rule_coverage_x=None):
+        rule_coverage_x=None, pairwise_features: bool = True):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -181,6 +181,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         memory_credit=memory_credit,
         rule_min_coverage=rule_min_coverage,
         rule_min_primitive_coverage=rule_min_primitive_coverage,
+        pairwise_features=pairwise_features,
     )
     episodes = {}
     for row in transitions:
@@ -257,6 +258,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                 bank = FeatureRuleBank(
                     min_coverage=rule_min_coverage,
                     min_primitive_coverage=rule_min_primitive_coverage,
+                    pairwise_features=pairwise_features,
                 )
                 bank.induce(
                     states[train], pain[train], states[test], pain[test],
@@ -292,6 +294,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                     value_bank = FeatureRuleBank(
                     min_coverage=rule_min_coverage,
                     min_primitive_coverage=rule_min_primitive_coverage,
+                    pairwise_features=pairwise_features,
                 )
                     value_bank.induce(
                         value_states[train], high[train],
@@ -362,6 +365,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                 gap_bank = FeatureRuleBank(
                     min_coverage=rule_min_coverage,
                     min_primitive_coverage=rule_min_primitive_coverage,
+                    pairwise_features=pairwise_features,
                 )
                 gap_bank.induce(
                     states[train], (pain_short * missed_short)[train],
@@ -381,6 +385,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                 gap_long = FeatureRuleBank(
                         min_coverage=rule_min_coverage,
                         min_primitive_coverage=rule_min_primitive_coverage,
+                        pairwise_features=pairwise_features,
                     )
                 gap_long.induce(
                     states[train], (pain * missed_long)[train],
@@ -630,7 +635,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         importance_weighting=False, learn_objective=True,
         curiosity_weight=0.5, memory_credit=False,
         rule_min_coverage=0.0, rule_min_primitive_coverage=0.0,
-        rule_validation_seed=0, rule_validation_frames=600):
+        rule_validation_seed=0, rule_validation_frames=600,
+        pairwise_features=True):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -807,6 +813,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         rule_min_coverage=rule_min_coverage,
         rule_min_primitive_coverage=rule_min_primitive_coverage,
         rule_coverage_x=rule_validation_x,
+        pairwise_features=pairwise_features,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -1419,6 +1426,7 @@ def run_seed(task):
     )
     rule_validation_seed = int(task.get("rule_validation_seed", 0))
     rule_validation_frames = int(task.get("rule_validation_frames", 600))
+    pairwise_features = bool(task.get("pairwise_features", True))
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
@@ -1482,6 +1490,7 @@ def run_seed(task):
         rule_min_primitive_coverage=rule_min_primitive_coverage,
         rule_validation_seed=rule_validation_seed,
         rule_validation_frames=rule_validation_frames,
+        pairwise_features=pairwise_features,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1681,6 +1690,10 @@ def main():
                              "coverage gates; 0 = use the training split")
     parser.add_argument("--rule-validation-frames", type=int, default=600,
                         help="frames collected from --rule-validation-seed")
+    parser.add_argument("--no-pairwise-features", dest="pairwise_features",
+                        action="store_false",
+                        help="disable the generic pairwise coordinate "
+                             "differences in the induction grammar")
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
@@ -1905,6 +1918,7 @@ def main():
             rule_min_primitive_coverage=args.rule_min_primitive_coverage,
             rule_validation_seed=args.rule_validation_seed,
             rule_validation_frames=args.rule_validation_frames,
+            pairwise_features=args.pairwise_features,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
