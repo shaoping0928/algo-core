@@ -38,7 +38,11 @@ class GenericWorldTests(unittest.TestCase):
             for row in transitions
         ]
         digest = hashlib.md5(repr(items).encode("utf-8")).hexdigest()
-        self.assertEqual(digest, "223efe3797fedc251aa4bdbfab96395f")
+        # 223efe3797fedc251aa4bdbfab96395f was the six-coordinate stream;
+        # the world wrapper now appends the flight distance (the integral
+        # of its own dopamine feedback) as a seventh observable, which is
+        # a conscious schema change recorded with this hash.
+        self.assertEqual(digest, "6bb2a643250c008c06b5d841f14663b7")
 
     def test_history_features_fill_early_steps_from_prefix(self):
         sequences = np.asarray([[1.0, 0.0]])

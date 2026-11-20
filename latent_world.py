@@ -25,20 +25,33 @@ class Latent(Env):
 
     def __init__(self, seed):
         self._q = deque([0] * (self.lag + 1), maxlen=self.lag + 1)
+        self._alive = 0.0
         super().__init__(seed)
         self.max_t = CAP
 
     def reset(self):
         super().reset()
         self._q = deque([0] * (self.lag + 1), maxlen=self.lag + 1)
+        self._alive = 0.0
         self.max_t = CAP
 
     def step(self, flap):
         self._q.append(int(flap))
-        return super().step(self._q[0])       # the impulse issued `lag` steps ago
+        obs, dopamine, dead = super().step(self._q[0])
+        # The flight distance in reward units: the integral of the world's
+        # own dopamine feedback.  Exposed as an observable so the learner
+        # can condition its predictions and scoring on how far the flight
+        # has already gone - the world states a fact, the interpretation
+        # stays with the learner.
+        self._alive += dopamine
+        return obs, dopamine, dead
 
     def pending(self):
         return list(self._q)[1:]              # a(t-lag) .. a(t-1)
+
+    def obs(self):
+        base = super().obs()
+        return np.concatenate([base, [self._alive]]).astype(np.float32)
 
 
 latent = {lag: type("Latent%d" % lag, (Latent,), {"lag": lag}) for lag in range(4)}
