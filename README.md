@@ -2,6 +2,12 @@
 
 这是从主工作区 `algo_lab/` 中整理出的独立实验目录，聚焦离散节点基座、节点强度信号算子、规则/关系发现，以及在 Flappy Bird 延迟世界中的价值学习与策略搜索验证。源文件从主工作区复制而来；本目录可独立配置 Git，不包含其他工作区项目或临时实验。
 
+**当前状态（2026-11-20）**：节点中心路径（`substrate_nodes.py`/`node_runtime.py`）
+是活跃开发线；其机制三栏表、当前测量与收敛链见下文"节点运行时"章节。
+完整的逐批实验记录、四子代理解剖（收敛问题全解）与下一设计以
+`TODO.md` 为准——本文档描述结构与如何运行，`TODO.md` 记录发生了什么
+和为什么。
+
 ## 当前结构
 
 ```text
@@ -134,40 +140,95 @@ python math_memory_search.py
 
 ## 节点运行时：只给信号，不标注风险
 
-`substrate_nodes.py` / `node_runtime.py` 是新的节点中心原型，和上面的风险头路径并列：
+`substrate_nodes.py` / `node_runtime.py` 是节点中心路径。人类只规定
+`obs`、`action`、`dopamine/pain`；`done` 只作为 episode 边界，不作为
+风险标签。这条路径不读取 `GAP/2`、`target_gap`、`BIRD_X`、碰撞窗口
+或 near-pipe 区域，也没有 `TerminalRiskHead`。
 
-- 人类只规定 `obs`、`action`、`dopamine/pain`；`done` 只作为 episode 边界，用于 bootstrap 截断和 reset，不作为风险标签。
-- `NodeGraph` 新增动作条件转移边 `(source, action) -> target`，记录 count、`Q_pain`、`Q_dopamine` 和预测误差。
-- `NodeRuntime` 在线出生 concept 节点；用 Monte-Carlo 回报把 world pain 反向传播到此前被激活的节点和边；节点价值 = 未来回报 + 当前状态 immediate pain，避免“终止节点 V=0”把危险终点评成安全。
-- 运行时用 soft neighbours 聚合节点价值；`substrate_nodes.py` 用学到的 `LinearObservationModel` 预测候选轨迹，并用节点学到的 valence 给终点打分。
-- 这条路径不读取 `GAP/2`、`target_gap`、`BIRD_X`、碰撞窗口或 near-pipe 区域，也没有 `TerminalRiskHead`。
+### 机制三栏表（2026-11-20）
+
+"实现"= 代码存在且有回归测试；"训练"= 管线会写入它的统计；
+"被控制器读取"= 进入 `policy_result` 的规划目标。三栏全勾才是
+"学习的机制真的在驱动决策"。
+
+| 机制 | 实现 | 训练 | 被控制器读取 |
+|---|---|---|---|
+| 原型格子（几何出生 + 方差精化出生 + GNG-U 效用修剪合并） | ✓ | ✓ | ✓ 软邻域通道 |
+| 特征谓词库（短窗主银行 + 长窗银行 + 缺口代 + held-out 回拟合回滚） | ✓ | ✓ | 短窗 ✓（两目标）；长窗仅默认目标 |
+| (根,动作) 痛格子（1/n 收敛锚 + 校准后逐读映射） | ✓ | ✓（IS 加权默认关） | ✓ threat/excess |
+| 序列价值格子（1/n 基线 + D4 信任缩放） | ✓ | ✓ | ✓ 两个目标的终端项 |
+| 关联通道（逐节点转移级 pain 率，洁净转移也是样本） | ✓ | ✓ | ✓ |
+| 事件记忆（风险通道读活体率；终端混合仍读冻结值 ✗） | ✓ | ✓ | ✓ 风险通道 |
+| NNLS 堆叠组合 + isotonic 后置校准 | ✓ | 训练末拟合 | ✓ `pain_signal_batch` |
+| 分级校准（逐（根，acting）读出配对，逐代刷新） | ✓ | ✓ | ✓ 分级目标 |
+| 动作边 Q（acting 键控） | ✓ | ✓ | ✗ `act()` 专属路径，管线不读 |
+| 组件 / sign 节点 | ✓ | ✓ | ✗ 死重（已记录，待接线） |
+| 预测误差回路 / 反事实缓冲 | ✓ | ✓ | ✗ 纯诊断 |
+| F5 缺口代 + held-out 回拟合检验（劣化即回滚） | ✓ | ✓ | ✓ |
+| 目标账本（4 列评分）+ 执行计划-结局选 w | ✓ | dagger 轮 | ✓ |
+| VOI 向导 v2（威胁 ≥0.25 定向 + 相对饥饿 + 整流重采集） | ✓ | 采集期 | 采集期 |
+| IS 重要性加权（均匀目标，逐决策截断） | ✓ | 默认关 | — |
+
+死机制（写了、管线不读）在 TODO 附录有完整清单；组件接线和记忆
+终端混合是其中已定位的两项。
+
+### 当前测量（2026-11-20，N=5000 台阶：3 种子 × 15 episode）
+
+| 配置 | 均值 | 逐种子 | 中位 | 范围 |
+|---|---:|---|---:|---|
+| OFF（默认目标 + NNLS 堆叠） | **133.9** | 90.7/178.7/132.3 | 139 | 72–312 |
+| graded+dispersion | 124.4 | 122.1/108.7/142.5 | 72 | 24–559 |
+| （旧代码同协议参照） | OFF 95.8 / graded 127.0 | | | |
+
+任务基线 1027 帧 ≈ 12 管；当前均值 ≈1.6 管。机制验证要点：
+堆叠组合把默认目标读出的 MAE 减半（0.036 vs 0.078）并将冻结记忆
+通道权重归零；fast 规模的 OFF"回归"被真实规模推翻（旧 fast 数字
+是上限饱和的通胀保守性工件）。**目标排序反转：默认目标+堆叠现在
+强于分级路径**。
+
+### 收敛链与已知瓶颈（2026-11-20）
+
+四子代理解剖（TODO 附录 A–D）定位的收敛链
+"格子收敛 → 组合保真 → 结构获得选择压力 → 目标被学习"已全链实施
+（P0 配对/门控/基率/键控 → P1 1/n 锚与无数据语义 → P2 堆叠 →
+P3 结构回拟合 → P4 账本目标）。当前瓶颈按证据排序：
+
+1. **死亡归因探针**：死亡前 5 决策的账本危险份额 3.09 vs 平稳段
+   1.08，死亡行校准威胁 0.77 vs 中位 0.00——**读出与账本都知道
+   死亡临近，但死亡窗口拍翅率 0.000**（平稳段 0.228）→ 决策侧
+   不足而非抽象侧。
+2. **VOI v1/v2 双负**（N=5000 配对 −33.6 / −12.4）：在危险状态
+   强制少数动作，覆盖收益 < 死亡碎片化代价。方向已关闭。
+3. **接近段项**（下一设计）：危险在死亡前 ~10 帧才被读出，逃生
+   必须更早；长窗读出作为独立加权成本列进分级目标（账本可见、
+   权重可学），不违反 threat 的因果不变量。
+4. **每轮独立采集**（用户设计，验证中）：1/n 修复后同一数据的
+   第 2+ 遍重放 ≈ 空操作——信息瓶颈是唯一帧数；fast 引导 + 3 轮
+   真实世界闭环的实验见 TODO。
 
 ```bash
-# 训练 8 个种子，在 held-out 120–124 上评估（推荐协议）
-python substrate_nodes.py --seed 100 --seeds 8 --jobs 8 \
-    --eval-seeds 120-124 --eval-episodes 1 \
-    --report eval.json \
-    --steps 5000 --coverage 0.1 --horizon 10 --epochs 10
+# 训练 3 种子（资源裁定：每轮 3 种子一波，臂与臂串行）
+python substrate_nodes.py --seed 100 --seeds 3 --jobs 3 \
+    --eval-episodes 15 --steps 5000 --epochs 5
 
-# 快速开发：held-out 评估 + 报告
-python substrate_nodes.py --fast --seed 100 --seeds 8 --jobs 8 \
-    --eval-seeds 120-124 --eval-episodes 1
+# 分级目标 + 分散标签（历史前向路径）
+python substrate_nodes.py --seeds 3 --jobs 3 --eval-episodes 15 \
+    --contrast-objective --feature-value-weight 0.05 \
+    --value-dispersion-labels
 
-# DAgger 闭环：记录规划器实际执行的轨迹并重训（不记录反事实预测）
-python substrate_nodes.py --fast --seed 100 --seeds 8 --jobs 8 \
-    --eval-seeds 120-124 --dagger-rounds 2 --dagger-episodes 2 \
-    --dagger-cap 400
+# 结构代循环（F5 + held-out 回拟合）
+python substrate_nodes.py --seeds 3 --jobs 3 --eval-episodes 15 \
+    --contrast-objective --feature-value-weight 0.05 \
+    --value-dispersion-labels --iterative-induction
+
+# 闭环 + 目标账本学习（w 逐轮从执行计划-结局对中选）
+python substrate_nodes.py --fast --seeds 3 --jobs 3 \
+    --dagger-rounds 3 --dagger-episodes 8 --dagger-cap 400
 ```
 
-`--eval-seeds` 为空时保留旧的 self-eval 并打印警告；`--report` 写出逐 episode
-行、按训练种子/评估种子的汇总，以及按训练模型聚类的 bootstrap 95% 区间。
-同一模型的多个 episode 不是独立证据，因此区间重采样的是训练模型，不是 episode。
-
-当前测量（8 种子，5000 步练习，H=10，10 epochs，max_nodes=2000）：存活
-**232/48/31/78/151/72/152/99** 帧，均值 **107.9**、中位数 **88.5**；每个种子都达到
-2000 节点上限、约 3100–3160 条动作边。状态尺度不是硬编码常量，而是从真实观测的标准差估计。
-它仍然低于世界反馈风险头路径（190.1）和任务基线（1026.9）；节点上限被顶满说明当前
-“距离出生、无剪枝”的生命周期需要下一步处理，而不是靠任务常数调参。
+`--eval-seeds` 为空时保留旧的 self-eval 并打印警告；`--report` 写出
+逐 episode 行、汇总与聚类 bootstrap 区间。完整证据链、逐批实验
+记录与下一设计见 `TODO.md`（会话状态 + 四子代理解剖附录）。
 
 ### 评估协议（2026-11）
 
