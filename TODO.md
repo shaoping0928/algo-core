@@ -391,6 +391,25 @@
   `d_ij = x_i − x_j`（所有 i<j，纯代数，索引无语义）；谓词/文法不变，
   阈值仍取分位数；候选池按单变量 z 截到 240 条以控组合成本。
   `--no-pairwise-features` 关闭。A/B（新基准、3 种子）与根激活探针中。
+- **训练内省探针（2026-11-20，`training_introspection_probe.py`）**：
+  挂在真实 `fit` 路径上的只读包装器（`_train` 每阶段快照、
+  `learn_episode` 记录每 episode 价值修正量、`_record_prediction` 记录
+  每行"更新前预测 vs 实际"），时间点 = 离线腿 + 每个 planner 轮次。
+  **暴露并修复了一条潜在 bug 链（`65ed8fd`，168 测试含新回归）**：
+  ① `fit` 的 DAgger 轮次偏移量按 `dagger_episodes(=2)` 步进，而每轮
+  实际可消耗 `dagger_frames(=5000)` 个 episode id → rounds≥2 时
+  **跨轮 id 重叠**；② `_train` 按 id 分组把两个真实轮次的行拼进
+  同一"episode"；③ `learn_episode` 在中途 `done` 处 `reset()` 清空
+  `_episode_nodes`（剪枝保护集）；④ cap(1000) 下后半段 birth 触发
+  剪枝删掉前半段节点；⑤ 反向传播引用已删节点 → `KeyError:
+  concept_1017/1063`。基准 `rounds=1` 时 id 不重叠所以从未触发。
+  修复：偏移量按 `planner_episodes` 步进 + 中途 reset 后对已记录
+  steps 引用的节点恢复剪枝保护（对 rounds=1 行为不变）。
+  **初步观察（待全尺寸确认）**：现役基准 `epochs=1` 下特征归纳发生在
+  唯一一遍 episode 学习**之后** → (特征,动作) 格子/价值格子/预测账本
+  全空 → Φ≡1 → **好奇心项恒为 0**（其证据源被基准换代切断）；
+  逐 episode 的真实修正只发生在原型/边/记忆层。全尺寸两臂
+  （epochs=1 vs epochs=2 回拟合）出数后更新五能力对比。
 - **死亡归因探针（2026-11-20，临时脚本 death_abstraction_probe.py，seed 101/3000 步）**：
   判别"抽象不足 vs 决策不足"：死亡前 5 决策的账本危险份额 **3.09** vs
   平稳段 1.08；死亡行分级威胁读出 **0.77** vs 平稳段中位 0.00——
