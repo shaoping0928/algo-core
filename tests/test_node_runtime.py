@@ -707,8 +707,8 @@ class NodeRuntimeTests(unittest.TestCase):
         # dopamine returns, computed backward: the final transition earns 0
         # (died), the middle one 1, the first one 1 + gamma.
         cells = runtime.feature_value_stats[feature_id]
-        self.assertEqual(cells[0], [1, 1.5])   # row 0: 1 + 0.5 * 1
-        self.assertEqual(cells[1], [1, 1.0])   # row 1: acting = row0's action
+        self.assertEqual(cells[0][:2], [1, 1.5])   # row 0: 1 + 0.5 * 1
+        self.assertEqual(cells[1][:2], [1, 1.0])   # row 1: acting = row0's action
         self.assertGreater(runtime.value_baseline, 0.0)
         # The readout separates the same state by the acting action; both
         # reads shrink toward the running global baseline.
@@ -986,6 +986,94 @@ class NodeRuntimeTests(unittest.TestCase):
         trust0 = 2.0 / (2.0 + runtime.value_trust_samples)
         trust1 = 1.0 / (1.0 + runtime.value_trust_samples)
         self.assertGreater(trust0, trust1)
+
+    def test_value_cells_track_episode_diversity(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40, gamma=0.5
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        hold = np.asarray([0.0, 0.0])
+        # Three updates: two from one episode, one from another - the raw
+        # count is three but the evidence spans two world instances.
+        runtime._update_feature_value([feature_id], 0, 2.0, episode_id=7)
+        runtime._update_feature_value([feature_id], 0, 3.0, episode_id=7)
+        runtime._update_feature_value([feature_id], 0, 1.0, episode_id=9)
+        values, support = runtime.feature_value_batch(
+            hold[None, :], return_support=True
+        )
+        prior = runtime.feature_value_prior
+        baseline = runtime.value_baseline
+        self.assertAlmostEqual(
+            values[0],
+            (6.0 + prior * baseline) / (3.0 + prior),
+            places=9,
+        )
+        # Trust counts distinct episodes, not repetitions.
+        self.assertEqual(support[0], 2.0)
+        cell = runtime.feature_value_stats[feature_id][0]
+        self.assertEqual(cell[0], 3)
+        self.assertEqual(sorted(cell[2]), [7, 9])
+
+    def test_value_dispersion_labels_cover_both_extremes(self):
+        from substrate_nodes import value_dispersion_labels
+
+        returns = np.asarray([0.0, 1.0, 2.0, 3.0, 4.0, 5.0,
+                              6.0, 7.0, 8.0, 9.0], dtype=float)
+        labels = value_dispersion_labels(returns, 0.8)
+        # Top 20% (returns > 7.2) and bottom 20% (returns < 1.8).
+        self.assertEqual(labels.tolist(),
+                         [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0])
+
+    def test_pain_grading_splits_threat_from_controllable_excess(self):
+        from node_features import Composite, FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            lag=1, scales=np.asarray([1.0, 1.0]), max_nodes=40, gamma=0.5
+        )
+        # A short-window rule whose two actions differ a lot, and a
+        # long-window rule that must be excluded from the graded read.
+        short_rule = FeatureRule(
+            Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+        )
+        long_rule = FeatureRule(
+            Primitive(0, True, ">", 0.5), 5, 4, 0.8, 2, 2, 1.0, 0.75
+        )
+        runtime.rules.rules = [short_rule, long_rule]
+        runtime.install_feature_rules([short_rule])
+        runtime.install_feature_rules([long_rule], horizon=8)
+        feature_id = runtime.feature_ids[0]
+        long_id = runtime.feature_ids[1]
+        runtime._update_feature_action([feature_id], 0, 0.0)
+        runtime._update_feature_action([feature_id], 0, 0.0)
+        runtime._update_feature_action([feature_id], 1, 1.0)
+        # The long root must not contaminate the graded read.
+        runtime._update_feature_action([long_id], 0, 1.0)
+        runtime._update_feature_action([long_id], 1, 1.0)
+        hold = np.asarray([1.0, 0.0])
+        flap = np.asarray([1.0, 1.0])
+        threat, excess = runtime.pain_graded_batch(
+            np.vstack([hold, flap])
+        )
+        prior = runtime.feature_action_prior
+        base = runtime.graph.nodes[feature_id].value
+        read0 = (0.0 + prior * base) / (2.0 + prior)
+        read1 = (1.0 + prior * base) / (1.0 + prior)
+        # Threat is the unavoidable share: the better action's read,
+        # identical for both pendings.
+        self.assertAlmostEqual(threat[0], read0, places=9)
+        self.assertAlmostEqual(threat[1], read0, places=9)
+        # Excess is what the plan's own action adds on top: zero for the
+        # better action, the full contrast for the worse one.
+        self.assertAlmostEqual(excess[0], 0.0, places=9)
+        self.assertAlmostEqual(excess[1], read1 - read0, places=9)
 
     def test_components_attach_to_runtime_nodes(self):
         runtime = self.make_runtime()

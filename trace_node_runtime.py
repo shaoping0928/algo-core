@@ -66,7 +66,8 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
           feature_value_weight=0.02, value_features=True,
           value_label_quantile=0.8, subgraph_cells=False,
           predicate_readouts=False, event_memory_risk=True,
-          contrast_objective=False, value_trust_samples=150.0):
+          contrast_objective=False, value_trust_samples=150.0,
+          value_dispersion=False, control_risk_weight=0.0):
     world, agent = fit(
         seed, steps=steps, coverage=coverage, max_nodes=max_nodes,
         birth_threshold=birth_threshold, epochs=epochs,
@@ -84,6 +85,8 @@ def trace(seed, steps=5000, coverage=0.1, cap=1500, horizon=10,
         event_memory_risk=event_memory_risk,
         contrast_objective=contrast_objective,
         value_trust_samples=value_trust_samples,
+        value_dispersion=value_dispersion,
+        control_risk_weight=control_risk_weight,
     )
     # The same deterministic transitions `fit` trained on; used only to
     # measure whether both actions exist near the planner states.
@@ -475,6 +478,11 @@ def main():
                         help="D4: mean value-cell sample count at which the "
                              "value channel earns half weight; 0 disables "
                              "the trust scaling")
+    parser.add_argument("--value-dispersion-labels", action="store_true",
+                        help="induce the value bank on both return extremes")
+    parser.add_argument("--control-risk-weight", type=float, default=0.0,
+                        help="threat grading: weight of the controllable "
+                             "excess on top of the real threat")
     parser.add_argument("--fast", action="store_true",
                         help="small development preset matching substrate_nodes")
     args = parser.parse_args()
@@ -504,6 +512,8 @@ def main():
         event_memory_risk=not args.no_event_memory_risk,
         contrast_objective=args.contrast_objective,
         value_trust_samples=args.value_trust_samples,
+        value_dispersion=args.value_dispersion_labels,
+        control_risk_weight=args.control_risk_weight,
     )
 
 

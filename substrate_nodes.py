@@ -42,6 +42,21 @@ DEFAULT_JOBS = min(8, os.cpu_count() or 1)
 FREE_THREADED = not getattr(sys, "_is_gil_enabled", lambda: True)()
 
 
+def value_dispersion_labels(returns, quantile: float) -> np.ndarray:
+    """Labels for the decision-critical regions of a return distribution.
+
+    A state matters for decisions when its outcome is far from typical on
+    either side: the top quantile (the aligned, high-return continuation)
+    or the bottom quantile (the dying one).  Selecting predicates on the
+    union tiles both faces of the regions where actions change the
+    outcome, instead of only the cruising half of the high-return mass.
+    """
+    returns = np.asarray(returns, dtype=float)
+    high_cut = float(np.quantile(returns, quantile))
+    low_cut = float(np.quantile(returns, 1.0 - quantile))
+    return ((returns > high_cut) | (returns < low_cut)).astype(float)
+
+
 def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            component_kinds, component_min_count, max_components,
            component_weight, component_gating, memory_weight,
@@ -52,7 +67,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
            value_features=True, value_label_quantile=0.8,
            subgraph_cells=False, predicate_readouts=False,
            event_memory_risk=True, contrast_objective=False,
-           value_trust_samples=150.0):
+           value_trust_samples=150.0, control_risk_weight=0.0,
+           value_dispersion=False):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -172,8 +188,13 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                     future_return_labels(transitions, agent.gamma),
                     dtype=float,
                 )
-                cut = float(np.quantile(returns, value_label_quantile))
-                high = (returns > cut).astype(float)
+                if value_dispersion:
+                    high = value_dispersion_labels(
+                        returns, value_label_quantile
+                    )
+                else:
+                    cut = float(np.quantile(returns, value_label_quantile))
+                    high = (returns > cut).astype(float)
                 if high.sum() >= 2:
                     if not precursor_labels:
                         value_states = np.asarray(
@@ -235,7 +256,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         value_features=True, value_label_quantile=0.8,
         subgraph_cells=False, predicate_readouts=False,
         event_memory_risk=True, contrast_objective=False,
-        value_trust_samples=150.0):
+        value_trust_samples=150.0, value_dispersion=False,
+        control_risk_weight=0.0):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -297,6 +319,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("value_label_quantile must be in (0, 1)")
     if float(value_trust_samples) < 0.0:
         raise ValueError("value_trust_samples must be non-negative")
+    if float(control_risk_weight) < 0.0:
+        raise ValueError("control_risk_weight must be non-negative")
     lag = int(lag)
     voi_fraction = float(voi_fraction)
     if voi_fraction > 0.0:
@@ -362,6 +386,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         event_memory_risk=event_memory_risk,
         contrast_objective=contrast_objective,
         value_trust_samples=value_trust_samples,
+        control_risk_weight=control_risk_weight,
+        value_dispersion=value_dispersion,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -422,9 +448,10 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             )
             pending = history[:, :agent.lag][:, ::-1]
             encoded = np.concatenate([states, pending], axis=1) / agent.scales
-            contrast = agent.pain_contrast_batch(encoded)
+            threat, excess = agent.pain_graded_batch(encoded)
+            cost = threat + agent.control_risk_weight * excess
             return (
-                np.column_stack([contrast, np.zeros(len(states))]),
+                np.column_stack([cost, np.zeros(len(states))]),
                 np.isfinite(encoded).all(axis=1),
             )
 
@@ -623,7 +650,8 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
             if not np.isfinite(encoded).all():
                 return (float("inf"), float("inf"))
             if contrast:
-                total += float(agent.pain_contrast_batch(encoded)[0])
+                threat, excess = agent.pain_graded_batch(encoded)
+                total += threat + agent.control_risk_weight * excess
             else:
                 total += float(agent.pain_signal_batch(encoded)[0])
     history = history_features(
@@ -752,6 +780,8 @@ def run_seed(task):
     event_memory_risk = bool(task.get("event_memory_risk", True))
     contrast_objective = bool(task.get("contrast_objective", False))
     value_trust_samples = float(task.get("value_trust_samples", 150.0))
+    value_dispersion = bool(task.get("value_dispersion", False))
+    control_risk_weight = float(task.get("control_risk_weight", 0.0))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
     dagger_rounds = int(task.get("dagger_rounds", 0))
@@ -798,6 +828,8 @@ def run_seed(task):
         event_memory_risk=event_memory_risk,
         contrast_objective=contrast_objective,
         value_trust_samples=value_trust_samples,
+        value_dispersion=value_dispersion,
+        control_risk_weight=control_risk_weight,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -939,6 +971,15 @@ def main():
                         help="D4: mean value-cell sample count at which the "
                              "value channel earns half weight; 0 disables "
                              "the trust scaling")
+    parser.add_argument("--value-dispersion-labels", action="store_true",
+                        help="induce the value bank on both return extremes "
+                             "(top and bottom quantiles) so its predicates "
+                             "tile the decision-critical regions")
+    parser.add_argument("--control-risk-weight", type=float, default=0.0,
+                        help="threat grading: weight of the controllable "
+                             "excess (the avoidable share a plan takes by "
+                             "its own action) on top of the real threat; "
+                             "0 keeps controllable risk free to take")
     parser.add_argument("--report", default="",
                         help="write per-episode rows and summaries as JSON")
     parser.add_argument("--dagger-rounds", type=int, default=0,
@@ -1088,6 +1129,8 @@ def main():
             event_memory_risk=not args.no_event_memory_risk,
             contrast_objective=args.contrast_objective,
             value_trust_samples=args.value_trust_samples,
+            value_dispersion=args.value_dispersion_labels,
+            control_risk_weight=args.control_risk_weight,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -1218,6 +1261,8 @@ def main():
                 event_memory_risk=not args.no_event_memory_risk,
                 contrast_objective=args.contrast_objective,
                 value_trust_samples=args.value_trust_samples,
+                value_dispersion=args.value_dispersion_labels,
+                control_risk_weight=args.control_risk_weight,
                 self_evaluation=not bool(eval_seeds),
                 dagger_rounds=args.dagger_rounds,
                 dagger_episodes=args.dagger_episodes,

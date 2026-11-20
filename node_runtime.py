@@ -156,6 +156,7 @@ class NodeRuntime:
         event_memory_risk: bool = True,
         contrast_objective: bool = False,
         value_trust_samples: float = 150.0,
+        control_risk_weight: float = 0.0,
         value_horizon: Optional[int] = None,
         ood_trust_scale: float = 0.0,
         obs_trust: float = 1.0,
@@ -406,6 +407,12 @@ class NodeRuntime:
         # the influence of the value channel grows with the evidence
         # behind it instead of being a fixed hyperparameter.
         self.value_trust_samples = float(value_trust_samples)
+        # Threat grading: under the contrast objective the step cost is the
+        # real threat (the unavoidable share) plus this weight times the
+        # controllable excess.  Zero keeps the controllable risk free to
+        # take - entering a risky but action-dependent band is judged by
+        # the value ledger, not by the hazard readout.
+        self.control_risk_weight = float(control_risk_weight)
         self._feature_all: List[str] = []
         self._feature_descendants: Dict[str, List[str]] = {}
         self._feature_objects: Dict[str, object] = {}
@@ -1502,7 +1509,9 @@ class NodeRuntime:
                     )
                     if value_snapshot is not None else return_dopamine
                 )
-                self._update_feature_value(value_roots, acting, target)
+                self._update_feature_value(
+                    value_roots, acting, target, rows[0].get("episode")
+                )
             if terminal:
                 entered = self.graph.nodes[next_node]
                 entered.value += self.alpha_mc * (
@@ -1776,6 +1785,82 @@ class NodeRuntime:
                 result = np.maximum(result, candidate)
         return np.where(any_fired, result, 0.0)
 
+    def pain_graded_batch(self, states: np.ndarray,
+                          mask_table: Optional[List] = None):
+        """Grade the risk of each state: real threat vs controllable excess.
+
+        Over the short-window roots - the ones whose label window the
+        pending actions actually govern - the per-action risk reads are
+        reduced to two numbers per state: the *threat*, ``min over actions
+        of P(pain | root, action)``, which no plan through the state can
+        avoid and which is therefore charged in full; and the *excess*,
+        ``P(pain | root, acting) - threat``, the avoidable share a plan
+        takes by committing its own action - the part that counts as a
+        controllable risk rather than a real threat.  Roots with a
+        long-window horizon are excluded: their labels mix in continuations
+        the pending actions do not govern.  States under no root read
+        (0, 0).
+        """
+        states = np.asarray(states, dtype=float)
+        n = len(states)
+        if n == 0:
+            return np.zeros(0), np.zeros(0)
+        threat = np.full(n, -np.inf)
+        excess = np.zeros(n, dtype=float)
+        any_fired = np.zeros(n, dtype=bool)
+        if not self.feature_ids:
+            return np.zeros(n, dtype=float), np.zeros(n, dtype=float)
+        obs = states[:, :self.obs_dim]
+        if mask_table is None:
+            mask_table = self._feature_mask_table(obs)
+        acting = None
+        if states.shape[1] > self.obs_dim:
+            acting = np.rint(states[:, self.obs_dim]).astype(int)
+        if acting is None:
+            return np.zeros(n, dtype=float), np.zeros(n, dtype=float)
+        prior = self.feature_action_prior
+        for node_id in self.feature_ids:
+            node = self.graph.nodes.get(node_id)
+            if node is None or node.pain_horizon is not None:
+                # Long-window roots: their labels see beyond the pending
+                # window, so their per-action reads are not causal.
+                continue
+            root_feature = self._feature_objects.get(node_id)
+            if root_feature is None:
+                continue
+            root_mask = self._table_entry(
+                mask_table, node_id, root_feature, obs
+            )
+            if root_mask is None or not root_mask.any():
+                continue
+            base = float(node.value)
+            reads = {}
+            for action_key in self.action_space:
+                cell = self.feature_action_stats.get(node_id, {}).get(
+                    int(action_key)
+                )
+                if cell is not None and cell[0] > 0:
+                    count, hits = int(cell[0]), float(cell[1])
+                    reads[action_key] = (
+                        hits + prior * base
+                    ) / (count + prior)
+                else:
+                    reads[action_key] = base
+            threat_root = min(reads[action_key]
+                              for action_key in self.action_space)
+            for action_key in self.action_space:
+                selected = root_mask & (acting == int(action_key))
+                if not selected.any():
+                    continue
+                better = selected & (threat_root > threat)
+                threat[better] = threat_root
+                excess[better] = reads[action_key] - threat_root
+                any_fired |= better
+        return (
+            np.where(any_fired, threat, 0.0),
+            np.where(any_fired, excess, 0.0),
+        )
+
     def _record_prediction(self, root_ids, acting: int, actual: float,
                            state) -> None:
         """Record the pre-update readout against the actual outcome.
@@ -1881,14 +1966,23 @@ class NodeRuntime:
         return total
 
     def _update_feature_value(self, feature_ids, acting: int,
-                              return_dopamine: float) -> None:
-        """Accumulate E[discounted dopamine return | feature, acting]."""
-        value = float(return_dopamine)
+                              value: float,
+                              episode_id=None) -> None:
+        """Accumulate E[discounted dopamine return | feature, acting].
+
+        Each cell also tracks how many distinct episodes (world instances)
+        contributed to it - repetition inside one episode is not the same
+        evidence as coverage across episodes, and the trust readout uses
+        the distinct count.
+        """
+        value = float(value)
         for node_id in feature_ids:
             cells = self.feature_value_stats.setdefault(node_id, {})
-            cell = cells.setdefault(int(acting), [0, 0.0])
+            cell = cells.setdefault(int(acting), [0, 0.0, {}])
             cell[0] += 1
             cell[1] += value
+            if episode_id is not None:
+                cell[2][episode_id] = cell[2].get(episode_id, 0) + 1
         self.value_baseline += self.value_baseline_rate * (
             value - self.value_baseline
         )
@@ -1926,6 +2020,7 @@ class NodeRuntime:
         total = np.zeros(len(states), dtype=float)
         weight = np.zeros(len(states), dtype=float)
         count_sum = np.zeros(len(states), dtype=float)
+        diversity_sum = np.zeros(len(states), dtype=float)
         for node_id in roots:
             root_feature = self._feature_objects.get(node_id)
             if root_feature is None:
@@ -1952,11 +2047,15 @@ class NodeRuntime:
                 mask = mask if member_id == node_id else mask & root_mask
                 if not mask.any() or acting is None:
                     continue
-                for action_key, (count, total_return) in (
+                for action_key, cell in (
                     self.feature_value_stats.get(member_id, {}).items()
                 ):
+                    count, total_return = cell[0], cell[1]
                     if count <= 0:
                         continue
+                    diversity = (
+                        len(cell[2]) if len(cell) > 2 and cell[2] else count
+                    )
                     selected = (
                         mask & (acting == int(action_key))
                         & (count < best_count)
@@ -1964,6 +2063,7 @@ class NodeRuntime:
                     if selected.any():
                         best_count[selected] = count
                         count_sum[selected] += count
+                        diversity_sum[selected] += diversity
                         values[selected] = (
                             total_return + prior * baseline
                         ) / (count + prior)
@@ -1973,10 +2073,15 @@ class NodeRuntime:
                             baseline)
         if not return_support:
             return averaged
-        # Mean observation count of the cells behind each state's read:
-        # the evidence the value channel carries at that state.
-        support = np.where(weight > 0.0, count_sum / np.maximum(weight, 1e-9),
-                           0.0)
+        # Mean distinct-episode count behind each state's read: repetition
+        # inside one world is not diverse evidence, so the trust signal is
+        # the number of world instances that shaped the read (falling back
+        # to the raw count for cells that never saw an episode id).
+        support = np.where(
+            weight > 0.0,
+            diversity_sum / np.maximum(weight, 1e-9),
+            0.0,
+        )
         return averaged, support
 
     def prediction_report(self) -> dict:
