@@ -125,7 +125,9 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         rule_min_coverage: float = 0.0,
         rule_min_primitive_coverage: float = 0.0,
         rule_coverage_x=None, pairwise_features: bool = False,
-        branch_transitions: bool = False):
+        branch_transitions: bool = False,
+        action_edge_weight: float = 0.0,
+        action_edge_trust_samples: float = 50.0):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -184,6 +186,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         rule_min_primitive_coverage=rule_min_primitive_coverage,
         pairwise_features=pairwise_features,
         branch_transitions=branch_transitions,
+        action_edge_weight=action_edge_weight,
+        action_edge_trust_samples=action_edge_trust_samples,
     )
     episodes = {}
     for row in transitions:
@@ -638,7 +642,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         curiosity_weight=0.5, memory_credit=False,
         rule_min_coverage=0.0, rule_min_primitive_coverage=0.0,
         rule_validation_seed=0, rule_validation_frames=600,
-        pairwise_features=False, branch_transitions=False):
+        pairwise_features=False, branch_transitions=False,
+        action_edge_weight=0.0, action_edge_trust_samples=50.0):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -746,6 +751,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             # nothing beyond the calibration fit.
             contrast_objective=True,
             branch_transitions=branch_transitions,
+            action_edge_weight=action_edge_weight,
+            action_edge_trust_samples=action_edge_trust_samples,
         )
         propensities = []
         # Re-collect the whole stream with the guide instead of splicing
@@ -818,6 +825,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         rule_coverage_x=rule_validation_x,
         pairwise_features=pairwise_features,
         branch_transitions=branch_transitions,
+        action_edge_weight=action_edge_weight,
+        action_edge_trust_samples=action_edge_trust_samples,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -935,6 +944,10 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
     # a constant across plans, but it is evaluated so the term is exactly
     # the potential difference (PBRS identity), not a bare endpoint bonus.
     curiosity_weight = float(getattr(agent, "curiosity_weight", 0.0))
+    action_edge_weight = float(getattr(agent, "action_edge_weight", 0.0))
+    q_table = (
+        agent.action_edge_q_table() if action_edge_weight > 0.0 else None
+    )
     phi_start = 0.0
     if curiosity_weight > 0.0:
         pending_start = (
@@ -968,7 +981,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 stride_includes_lag and step == lag
             ):
                 return (
-                    np.zeros((len(states), 5)),
+                    np.zeros((len(states), 6)),
                     np.isfinite(states).all(axis=1),
                 )
             history = history_features(
@@ -977,10 +990,22 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             pending = history[:, :agent.lag][:, ::-1]
             encoded = np.concatenate([states, pending], axis=1) / agent.scales
             threat, excess = agent.pain_graded_batch(encoded)
-            cost = threat + agent.control_risk_weight * excess
+            q_cost = np.zeros(len(states))
+            if q_table is not None:
+                q_pain, q_count = agent.action_edge_q_batch(encoded, q_table)
+                trust = q_count / (
+                    q_count + agent.action_edge_trust_samples
+                )
+                q_cost = action_edge_weight * trust * (
+                    q_pain / (1.0 + np.abs(q_pain))
+                )
+            cost = threat + agent.control_risk_weight * excess + q_cost
             zeros = np.zeros(len(states))
             return (
-                np.column_stack([cost, zeros, cost, zeros, zeros]),
+                np.column_stack([
+                    cost, zeros, threat + agent.control_risk_weight * excess,
+                    zeros, zeros, q_cost,
+                ]),
                 np.isfinite(encoded).all(axis=1),
             )
 
@@ -1015,6 +1040,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 np.column_stack([
                     value_term + curiosity, -dopamine,
                     np.zeros(len(states)), value_term, curiosity,
+                    np.zeros(len(states)),
                 ]),
                 np.isfinite(encoded).all(axis=1),
             )
@@ -1028,7 +1054,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 stride_includes_lag and step == lag
             ):
                 return (
-                    np.zeros((len(states), 5)),
+                    np.zeros((len(states), 6)),
                     np.isfinite(states).all(axis=1),
                 )
             history = history_features(
@@ -1039,9 +1065,20 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 np.concatenate([states, pending], axis=1) / agent.scales
             )
             risk = agent.pain_signal_batch(encoded)
+            q_cost = np.zeros(len(states))
+            if q_table is not None:
+                q_pain, q_count = agent.action_edge_q_batch(encoded, q_table)
+                trust = q_count / (
+                    q_count + agent.action_edge_trust_samples
+                )
+                q_cost = action_edge_weight * trust * (
+                    q_pain / (1.0 + np.abs(q_pain))
+                )
             zeros = np.zeros(len(states))
             return (
-                np.column_stack([risk, zeros, risk, zeros, zeros]),
+                np.column_stack([
+                    risk + q_cost, zeros, risk, zeros, zeros, q_cost,
+                ]),
                 np.isfinite(encoded).all(axis=1),
             )
 
@@ -1095,6 +1132,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             return (
                 np.column_stack([
                     cost, -dopamine, risk, value_term, curiosity,
+                    np.zeros(len(states)),
                 ]),
                 np.isfinite(encoded).all(axis=1),
             )
@@ -1445,6 +1483,10 @@ def run_seed(task):
     rule_validation_frames = int(task.get("rule_validation_frames", 600))
     pairwise_features = bool(task.get("pairwise_features", False))
     branch_transitions = bool(task.get("branch_transitions", False))
+    action_edge_weight = float(task.get("action_edge_weight", 0.0))
+    action_edge_trust_samples = float(
+        task.get("action_edge_trust_samples", 50.0)
+    )
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
@@ -1510,6 +1552,8 @@ def run_seed(task):
         rule_validation_frames=rule_validation_frames,
         pairwise_features=pairwise_features,
         branch_transitions=branch_transitions,
+        action_edge_weight=action_edge_weight,
+        action_edge_trust_samples=action_edge_trust_samples,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1724,6 +1768,12 @@ def main():
                         help="add decayed recent branch sources to "
                              "action-edge evidence (structure-only: the "
                              "planner does not read action-edge Q yet)")
+    parser.add_argument("--action-edge-weight", type=float, default=0.0,
+                        help="weight of the normalized action-edge Q term "
+                             "in the planner cost (0 = the Q read is off)")
+    parser.add_argument("--action-edge-trust", type=float, default=50.0,
+                        help="evidence pseudo-count for trusting the "
+                             "action-edge Q read")
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
@@ -1950,6 +2000,8 @@ def main():
             rule_validation_frames=args.rule_validation_frames,
             pairwise_features=args.pairwise_features,
             branch_transitions=args.branch_transitions,
+            action_edge_weight=args.action_edge_weight,
+            action_edge_trust_samples=args.action_edge_trust,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,

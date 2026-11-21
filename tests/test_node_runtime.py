@@ -2159,9 +2159,9 @@ class PlanScoreTests(unittest.TestCase):
         score = result.score
         # P4: the score carries the objective's ledger - the scalarized
         # column is the sum of its hazard, value and curiosity shares.
-        self.assertEqual(len(score), 5)
+        self.assertEqual(len(score), 6)
         self.assertAlmostEqual(
-            score[0], score[2] + score[3] + score[4], places=6
+            score[0], score[2] + score[3] + score[4] + score[5], places=6
         )
         scores = [
             plan_score(
@@ -2184,9 +2184,9 @@ class PlanScoreTests(unittest.TestCase):
         prefix = np.zeros(3, dtype=float)
         result = policy_result(env, world, agent, prefix, horizon=3, lag=3)
         score = result.score
-        self.assertEqual(len(score), 5)
+        self.assertEqual(len(score), 6)
         self.assertAlmostEqual(
-            score[0], score[2] + score[3] + score[4], places=6
+            score[0], score[2] + score[3] + score[4] + score[5], places=6
         )
         scores = [
             plan_score(

@@ -189,5 +189,24 @@ class BranchTests(unittest.TestCase):
         self.assertAlmostEqual(edge.q_pain, 0.1 * 0.25 * 1.0)
 
 
+    def test_action_edge_q_read_follows_nearest_prototype(self):
+        import numpy as np
+        from node_runtime import NodeRuntime
+
+        runtime = NodeRuntime(
+            obs_dim=1, lag=1, scales=np.asarray([1.0, 1.0]),
+            birth_threshold=0.01, max_nodes=20, exploration=0.0,
+            alpha_v=0.5, alpha_q=0.1, gamma=0.9, lam=0.9,
+        )
+        first = runtime._create_node(np.asarray([0.0, 0.0]))
+        second = runtime._create_node(np.asarray([1.0, 0.0]))
+        runtime._update_action_edges([first], 0, second, 1.0, 0.0)
+        q, counts = runtime.action_edge_q_batch(
+            np.asarray([[0.0, 0.0]]), runtime.action_edge_q_table()
+        )
+        self.assertGreater(q[0], 0.0)
+        self.assertGreater(counts[0], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

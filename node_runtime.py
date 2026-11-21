@@ -311,6 +311,8 @@ class NodeRuntime:
         action_temperature: float = 0.1,
         action_uncertainty: float = 0.5,
         branch_transitions: bool = False,
+        action_edge_weight: float = 0.0,
+        action_edge_trust_samples: float = 50.0,
         seed: int = 0,
         scales: Optional[Sequence[float]] = None,
     ):
@@ -541,6 +543,10 @@ class NodeRuntime:
         # much of it reaches an earlier memory.
         self.memory_credit = bool(memory_credit)
         self.branch_transitions = bool(branch_transitions)
+        self.action_edge_weight = max(float(action_edge_weight), 0.0)
+        self.action_edge_trust_samples = max(
+            float(action_edge_trust_samples), 0.0
+        )
         self._memory_traces: Dict[str, float] = {}
         # Diagnostic counters: how many pain events corrected an earlier
         # memory, how much eligibility mass moved, and how many context
@@ -1741,6 +1747,68 @@ class NodeRuntime:
         node.dopamine += self.alpha_q * (
             target_dopamine - node.dopamine
         )
+
+    def action_edge_q_table(self):
+        """Mean q_pain per (nearest prototype, acting action).
+
+        Action edges are keyed by their target too; the planner only needs a
+        state-action value, so targets are averaged with count weights.
+        """
+        actions = [int(action) for action in self.action_space]
+        table = np.zeros((len(self._prototype_ids), len(actions)), dtype=float)
+        counts = np.zeros_like(table)
+        if not self._prototype_ids or not actions:
+            return table, counts
+        index = {
+            node_id: row for row, node_id in enumerate(self._prototype_ids)
+        }
+        action_index = {
+            action: column for column, action in enumerate(actions)
+        }
+        for (source, _target, action), edge in self.graph.action_edges.items():
+            row = index.get(source)
+            column = action_index.get(int(action))
+            if row is None or column is None:
+                continue
+            weight = float(edge.count)
+            if weight <= 0.0:
+                continue
+            table[row, column] += weight * float(edge.q_pain)
+            counts[row, column] += weight
+        table = np.where(
+            counts > 0.0, table / np.maximum(counts, 1e-9), 0.0
+        )
+        return table, counts
+
+    def action_edge_q_batch(self, states: np.ndarray, table=None):
+        """Q read for encoded states; the acting action is the oldest pending."""
+        states = np.asarray(states, dtype=float)
+        result = np.zeros(len(states), dtype=float)
+        counts = np.zeros(len(states), dtype=float)
+        if (
+            len(states) == 0 or states.shape[1] <= self.obs_dim
+            or not self._prototype_ids
+        ):
+            return result, counts
+        if table is None:
+            table = self.action_edge_q_table()
+        q_table, q_counts = table
+        indices, _weights, _nearest = self._soft_weights_batch(states)
+        if indices is None:
+            return result, counts
+        nearest = indices[:, 0].astype(int)
+        acting = np.rint(states[:, self.obs_dim]).astype(int)
+        columns = {
+            int(action): column
+            for column, action in enumerate(self.action_space)
+        }
+        for row in range(len(states)):
+            column = columns.get(int(acting[row]))
+            if column is None:
+                continue
+            result[row] = q_table[nearest[row], column]
+            counts[row] = q_counts[nearest[row], column]
+        return result, counts
 
     def _update_action_edges(self, sources: Iterable[str], action: int,
                              next_node: str, target_pain: float,
