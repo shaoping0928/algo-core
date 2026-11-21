@@ -458,6 +458,29 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
 双遍是 e2 崩塌的一部分（第一波方向），但特征回拟合本身在 6 种子下不
 带来生存收益——与“每条机制 A/B 在 6 种子下回归 null”的模式一致。
 
+**决策侧 score 逐列消融（2026-11-21，`score_column_probe.py`）**
+
+默认栈、H=8 oracle、每世界 4 个均匀点 + 尾部 12 点：
+
+| 种子 | 决策 | 可行集 miss | score misrank | oracle 被模型判死 | 被单列消融修复 |
+|---|---:|---:|---:|---:|---:|
+| 101 | 75 | 0 | 0 | 0 | — |
+| 102 | 75 | 8（11%） | 8 | 0 | **drop risk 4/8**；value/curiosity/Q 各 0 |
+
+读法：
+
+- seed 101 在 H=8 内**已经是 oracle-optimal**（列权重无关）；
+- seed 102 的 8 个 miss 全部是**可行集内的 score 排错**，其中一半由
+  “去掉 risk 列”修复 → **risk 列在部分状态过度惩罚**；
+- 但 H=8 会把“活满 8 步”的计划都记成 tie，真正长时域失败被截断；
+  全 episode 延续版探针尚未做。
+
+**风险列缩放 A/B（2026-11-21，已实现）**
+
+新增 `--risk-weight w`（只缩放 hazard 列；默认 1.0 逐位不变；286 测试，
+含 identity/risk_weight=0 回归）。A/B：`--risk-weight 0.5` × 3 种子进行中，
+对照基线 152.9；若正向，再测 0.75 并跑第二波 6 种子。
+
 **质量门**：阶段同质性（within-stage residual 显著低于跨阶段）；转移校准
 误差可控、applicability violation 低、support 不足 abstain；seed 101 的
 decision-relevant miss/regret 下降；seed 100/102 selected survives 不降、

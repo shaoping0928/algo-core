@@ -519,7 +519,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
 
 def collect_planner(seed, world, agent, episodes=2, cap=1200, horizon=10,
                     lag=LAG, step_stride=2, stride_includes_lag=False,
-                    offset=50000, max_frames=None):
+                    offset=50000, max_frames=None, risk_weight=1.0):
     """Record the trajectories the planner actually executes.
 
     These are real transitions with real world feedback, in the same schema
@@ -541,6 +541,7 @@ def collect_planner(seed, world, agent, episodes=2, cap=1200, horizon=10,
             stride_includes_lag=stride_includes_lag,
             env_seed=env_seed, record=True,
             episode=int(offset) + episode,
+            risk_weight=risk_weight,
         )
         transitions.extend(rows)
         frames.append(int(length))
@@ -706,6 +707,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         pairwise_features=False, branch_transitions=False,
         action_edge_weight=0.0, action_edge_trust_samples=50.0,
         feature_backfit=False,
+        risk_weight=1.0,
         death_rules=False, death_rule_compose=False,
         death_rule_max_thresholds=256, death_rule_max_rules=24,
         death_rule_max_literals=5, death_rule_boundary_margin=0.0,
@@ -928,6 +930,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             # into one list.
             offset=dagger_offset + _round * int(planner_episodes),
             max_frames=(int(dagger_frames) or None),
+            risk_weight=risk_weight,
         )
         if not planner:
             break
@@ -1011,12 +1014,13 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   step_stride=2, stride_includes_lag=False,
                   death_status_batch=None, unknown_penalty=0.0,
                   near_penalty=0.0, candidate_callback=None,
-                  inquiry_action=None):
+                  inquiry_action=None, risk_weight=1.0):
     initial = np.asarray(env.obs(), dtype=float)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
     action_dim = int(lag) + 1
     step_stride = max(int(step_stride), 1)
     lag = int(lag)
+    risk_weight = float(risk_weight)
     # Decision-side curiosity: the potential at the shared start state is
     # a constant across plans, but it is evaluated so the term is exactly
     # the potential difference (PBRS identity), not a bare endpoint bonus.
@@ -1188,7 +1192,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             previous_encoded = np.concatenate(
                 [previous, previous_pending], axis=1
             ) / agent.scales
-            risk = agent.pain_signal_batch(encoded)
+            risk = agent.pain_signal_batch(encoded) * risk_weight
             q_cost = np.zeros(len(states))
             if q_table is not None:
                 q_pain, q_count = agent.action_edge_transition_q_batch(
@@ -1226,11 +1230,13 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             if getattr(agent, "predicate_readouts", False):
                 # D3: the terminal hazard comes from the predicates only;
                 # the prototype valence no longer bounds it.
-                risk = agent.pain_signal_batch(encoded, mask_table)
+                risk = agent.pain_signal_batch(
+                    encoded, mask_table
+                ) * risk_weight
             else:
                 risk = np.maximum(
                     pain, agent.pain_signal_batch(encoded, mask_table)
-                )
+                ) * risk_weight
             # Scalarized objective: accumulated hazard minus the
             # sequence-level value of the endpoint, so a plan that accepts
             # local risk in exchange for a long-survival alignment can win.
@@ -1379,7 +1385,7 @@ def cell_q_action(env, world, agent, prefix, lag=LAG):
 
 def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                     step_stride=2, stride_includes_lag=False,
-                    decision="search", ledger_out=None):
+                    decision="search", ledger_out=None, risk_weight=1.0):
     """Dispatch one decision to the searched or the cell-Q-only policy.
 
     With `ledger_out` (a list) and the search decision, the winning
@@ -1395,6 +1401,7 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
             env, world, agent, prefix, horizon, lag=lag,
             step_stride=step_stride,
             stride_includes_lag=stride_includes_lag,
+            risk_weight=risk_weight,
         )
         if ledger_out is not None:
             score = result.score
@@ -1503,7 +1510,8 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
 
 def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
              step_stride=2, stride_includes_lag=False, env_seed=None,
-             record=False, episode=0, decision="search"):
+             record=False, episode=0, decision="search",
+             risk_weight=1.0):
     """Run one deterministic evaluation episode.
 
     ``env_seed`` selects the world instance; when omitted the historical
@@ -1534,6 +1542,7 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             step_stride=step_stride,
             stride_includes_lag=stride_includes_lag,
             decision=decision, ledger_out=ledger_out,
+            risk_weight=risk_weight,
         )
         history = np.asarray([float(action)] + recent[:lag], dtype=float)
         prediction_hook = getattr(agent, "prediction_branch", None) is not None
@@ -1640,6 +1649,7 @@ def run_seed(task):
         task.get("action_edge_trust_samples", 50.0)
     )
     death_rules = bool(task.get("death_rules", False))
+    risk_weight = float(task.get("risk_weight", 1.0))
     death_rule_compose = bool(task.get("death_rule_compose", False))
     death_rule_max_thresholds = int(
         task.get("death_rule_max_thresholds", 256)
@@ -1720,6 +1730,7 @@ def run_seed(task):
         pairwise_features=pairwise_features,
         branch_transitions=branch_transitions,
         feature_backfit=feature_backfit,
+        risk_weight=risk_weight,
         action_edge_weight=action_edge_weight,
         action_edge_trust_samples=action_edge_trust_samples,
         death_rules=death_rules,
@@ -1755,6 +1766,7 @@ def run_seed(task):
                     stride_includes_lag=stride_includes_lag,
                     env_seed=env_seed,
                     decision=decision,
+                    risk_weight=risk_weight,
                 )
                 rows.append(dict(
                     train_seed=seed,
@@ -1829,6 +1841,9 @@ def main():
     parser.add_argument("--feature-value-weight", type=float, default=0.02,
                         help="how much sequence-level value trades against "
                              "accumulated hazard in the search objective")
+    parser.add_argument("--risk-weight", type=float, default=1.0,
+                        help="scale on the accumulated hazard column "
+                             "(1.0 = current behaviour)")
     parser.add_argument("--eval-seeds", default="",
                         help="held-out seed spec, e.g. 120-139; empty keeps "
                              "the legacy self-evaluation")
@@ -2203,6 +2218,7 @@ def main():
             pairwise_features=args.pairwise_features,
             branch_transitions=args.branch_transitions,
             feature_backfit=args.feature_backfit,
+            risk_weight=args.risk_weight,
             action_edge_weight=args.action_edge_weight,
             action_edge_trust_samples=args.action_edge_trust,
             death_rules=args.death_rules,

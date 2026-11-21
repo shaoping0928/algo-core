@@ -2215,6 +2215,30 @@ class PlanScoreTests(unittest.TestCase):
         self.assertAlmostEqual(result.score[0], scores[best][0], places=6)
         self.assertAlmostEqual(result.score[1], scores[best][1], places=6)
 
+    def test_risk_weight_scales_only_the_hazard_column(self):
+        from latent_world import latent
+        from substrate_nodes import fit, policy_result
+
+        world, agent = fit(100, steps=300, epochs=1, max_nodes=200, lag=3)
+        env = latent[3](100)
+        prefix = np.zeros(3, dtype=float)
+        zero = policy_result(
+            env, world, agent, prefix, horizon=3, lag=3, risk_weight=0.0
+        )
+        self.assertAlmostEqual(zero.score[2], 0.0, places=9)
+        self.assertAlmostEqual(
+            zero.score[0],
+            zero.score[3] + zero.score[4] + zero.score[5],
+            places=9,
+        )
+        base = policy_result(env, world, agent, prefix, horizon=3, lag=3)
+        self.assertGreaterEqual(base.score[2], 0.0)
+        self.assertAlmostEqual(
+            base.score[0],
+            base.score[2] + base.score[3] + base.score[4] + base.score[5],
+            places=9,
+        )
+
     def test_plan_score_carries_the_curiosity_share(self):
         from latent_world import latent
         from substrate_nodes import fit, plan_score, policy_result

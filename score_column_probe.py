@@ -100,16 +100,30 @@ def run(args):
                     true_first < 0, args.horizon + 1, true_first
                 )
                 best = int(survival[feasible].max())
+                best_all = int(survival.max())
                 chosen = int(np.flatnonzero(feasible)[
                     np.argmin(scores[feasible, 0])
                 ])
+                oracle_all = np.flatnonzero(survival == best_all)
+                oracle_all_feasible = bool(
+                    feasible[oracle_all].any()
+                ) if len(oracle_all) else False
                 entry = dict(
                     eval_seed=int(eval_seed), point=int(point),
                     candidates=int(feasible.sum()), best_survival=best,
+                    best_all_survival=best_all,
+                    oracle_all_feasible=oracle_all_feasible,
                     chosen_survival=int(survival[chosen]),
                     miss=bool(int(survival[chosen]) < best),
+                    miss_vs_all=bool(
+                        int(survival[chosen]) < best_all
+                    ),
                 )
-                if entry["miss"]:
+                if entry["miss_vs_all"] and not oracle_all_feasible:
+                    entry["failure"] = "model_infeasible_oracle"
+                elif entry["miss"]:
+                    entry["failure"] = "score_misrank"
+                if entry.get("failure") == "score_misrank":
                     ablations = {}
                     for name, column in COLUMNS.items():
                         cost = scores[:, 0] - scores[:, column]
@@ -138,6 +152,11 @@ def run(args):
                     entry["ablations"] = ablations
                 rows.append(entry)
     misses = [row for row in rows if row["miss"]]
+    misranks = [row for row in rows if row.get("failure") == "score_misrank"]
+    infeasible = [
+        row for row in rows
+        if row.get("failure") == "model_infeasible_oracle"
+    ]
     counts = {key: 0 for key in list(COLUMNS) + ["value_curiosity", "only_risk"]}
     fixed = 0
     for row in misses:
@@ -158,6 +177,9 @@ def run(args):
         seed=int(args.seed),
         decisions=len(rows),
         misses=len(misses),
+        misranks=len(misranks),
+        model_infeasible_oracle=len(infeasible),
+        miss_vs_all=sum(1 for row in rows if row.get("miss_vs_all")),
         miss_rate=(float(len(misses)) / len(rows)) if rows else 0.0,
         oracle_fix_counts=counts,
         misses_fixed_by_any_ablation=fixed,
@@ -168,9 +190,11 @@ def run(args):
 def print_summary(report):
     print()
     print(
-        "== seed %d: %d decisions, %d decision-relevant misses (%.0f%%) =="
+        "== seed %d: %d decisions, %d feasible misses, %d score misranks, "
+        "%d model-infeasible oracle, %d misses vs all (%.0f%%) =="
         % (report["seed"], report["decisions"], report["misses"],
-           100.0 * report["miss_rate"])
+           report["misranks"], report["model_infeasible_oracle"],
+           report["miss_vs_all"], 100.0 * report["miss_rate"])
     )
     print("  misses fixed by dropping one column (landing on oracle-best):")
     for key in ("risk", "value", "curiosity", "q"):
