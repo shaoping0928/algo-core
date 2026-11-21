@@ -1090,6 +1090,50 @@ class NodeRuntime:
                 list(memories), created_memory, pain,
             )
 
+    def backfill_memory_features(self) -> int:
+        """Link event memories to the feature roots active at their members.
+
+        Memories are created before features exist (induction runs after the
+        first pass), so the feature-membership read path of the memory risk
+        channel is empty unless the links are added afterwards.  This walks
+        every memory's member prototypes and links it to the roots that fire
+        at those states.  Task-agnostic: only the induced features and the
+        prototype states are used.
+        """
+        if not self.feature_ids:
+            return 0
+        roots = [
+            (node_id, self._feature_objects[node_id])
+            for node_id in self.feature_ids
+            if node_id in self._feature_objects
+        ]
+        links = 0
+        for memory in list(self.graph.nodes.values()):
+            if memory.kind != MEMORY:
+                continue
+            members = [
+                key[1] for key in self.graph.outgoing.get(memory.id, [])
+                if key[2] == MEMBERSHIP
+            ]
+            for member in members:
+                node = self.graph.nodes.get(member)
+                if node is None or node.features is None:
+                    continue
+                state = np.asarray(node.features, dtype=float).reshape(
+                    1, -1
+                )[:, :self.obs_dim]
+                for root_id, feature in roots:
+                    if bool(feature.mask(state)[0]):
+                        edge = self.graph.add_membership(
+                            memory.id, root_id
+                        )
+                        # The link is definitional: the root fires at the
+                        # memory's own member state, so the strength starts
+                        # at one instead of the zero-weight default.
+                        edge.weight = max(float(edge.weight), 1.0)
+                        links += 1
+        return links
+
     def memories_for(self, node_ids: Iterable[str]) -> Dict[str, float]:
         """Find memory nodes through membership edges of active nodes."""
         result: Dict[str, float] = {}

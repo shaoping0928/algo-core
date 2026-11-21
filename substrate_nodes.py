@@ -133,6 +133,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         action_edge_weight: float = 0.0,
         feature_backfit: bool = False,
         risk_error_weight: bool = False,
+        memory_feature_backfill: bool = False,
         action_edge_trust_samples: float = 50.0,
         death_rules: bool = False,
         death_rule_compose: bool = False,
@@ -339,6 +340,10 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                         agent.install_feature_rules(
                             value_bank.rules, channel="value"
                         )
+            if memory_feature_backfill:
+                # Memories predate the induced features; link them so the
+                # memory risk channel has a feature-membership read path.
+                agent.backfill_memory_features()
         elif induce_features and iterative_induction and (
             1 <= epoch < epochs - 1
         ):
@@ -770,6 +775,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         risk_weight=1.0,
         risk_decay=1.0,
         risk_error_weight=False,
+        memory_feature_backfill=False,
         death_rules=False, death_rule_compose=False,
         death_rule_max_thresholds=256, death_rule_max_rules=24,
         death_rule_max_literals=5, death_rule_boundary_margin=0.0,
@@ -959,6 +965,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         action_edge_trust_samples=action_edge_trust_samples,
         feature_backfit=feature_backfit,
         risk_error_weight=risk_error_weight,
+        memory_feature_backfill=memory_feature_backfill,
         death_rules=death_rules,
         death_rule_compose=death_rule_compose,
         death_rule_max_thresholds=death_rule_max_thresholds,
@@ -1735,6 +1742,9 @@ def run_seed(task):
     risk_weight = float(task.get("risk_weight", 1.0))
     risk_decay = float(task.get("risk_decay", 1.0))
     risk_error_weight = bool(task.get("risk_error_weight", False))
+    memory_feature_backfill = bool(
+        task.get("memory_feature_backfill", False)
+    )
     death_rule_compose = bool(task.get("death_rule_compose", False))
     death_rule_max_thresholds = int(
         task.get("death_rule_max_thresholds", 256)
@@ -1818,6 +1828,7 @@ def run_seed(task):
         risk_weight=risk_weight,
         risk_decay=risk_decay,
         risk_error_weight=risk_error_weight,
+        memory_feature_backfill=memory_feature_backfill,
         action_edge_weight=action_edge_weight,
         action_edge_trust_samples=action_edge_trust_samples,
         death_rules=death_rules,
@@ -1939,6 +1950,11 @@ def main():
                         help="down-weight the hazard read at steps where "
                              "the world model's measured rollout error is "
                              "large (default off)")
+    parser.add_argument("--memory-feature-backfill", action="store_true",
+                        help="after induction, link event memories to the "
+                             "feature roots active at their members (the "
+                             "memory risk channel is otherwise empty under "
+                             "epochs=1)")
     parser.add_argument("--eval-seeds", default="",
                         help="held-out seed spec, e.g. 120-139; empty keeps "
                              "the legacy self-evaluation")
@@ -2316,6 +2332,7 @@ def main():
             risk_weight=args.risk_weight,
             risk_decay=args.risk_decay,
             risk_error_weight=args.risk_error_weight,
+            memory_feature_backfill=args.memory_feature_backfill,
             action_edge_weight=args.action_edge_weight,
             action_edge_trust_samples=args.action_edge_trust,
             death_rules=args.death_rules,

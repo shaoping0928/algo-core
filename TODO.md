@@ -624,6 +624,26 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
 - 下一步（第三步修法）：**记忆风险改从最近原型的 membership 读取**
   （或归纳后回填 memory→feature 边），再重拟合组合并检查 memory 权重。
 
+**第三步结果（2026-11-21，`--memory-feature-backfill`）**
+
+- 回填后 memory 通道：mean 0.0247、**rho 0.679**、nonzero 7%（之前恒 0）；
+  membership 权重 0.015 → **0.641**；
+- 但 NNLS 组合权重：**feature 0.905 / memory 0.000 / prototype 0.093**
+  → 记忆通道与特征通道**冗余**，即使接活也不被读取；
+- 附带发现：prototype 通道在同分布流上 rho ≈ **−0.02**（100% 非零但
+  无排序信号）；composed 读出的 0.97 实际由 **feature 通道**驱动。
+
+**判定：记忆风险通道关闭（冗余），不作为杠杆**；`--memory-feature-backfill`
+保留 opt-in。第三步结束。
+
+**接线审计的最终结论**
+
+- 决策路径 = **特征先验 hazard + 校准**（+ dopamine 平局项）；
+- 原型 MC 值、价值、好奇心、记忆都不进入有效决策；
+- 世界模型精确、风险分辨率充分；
+- 因此“快速适应”目前只能靠**归纳出的特征先验**，没有在线学习项参与
+  决策——这是机制层最根本的接线缺口。
+
 **质量门**：阶段同质性（within-stage residual 显著低于跨阶段）；转移校准
 误差可控、applicability violation 低、support 不足 abstain；seed 101 的
 decision-relevant miss/regret 下降；seed 100/102 selected survives 不降、

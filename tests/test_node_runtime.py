@@ -677,6 +677,32 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertTrue(bool(table[0][0]))
         self.assertFalse(bool(table[0][1]))
 
+    def test_memory_feature_backfill_links_the_memory_read(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            obs_dim=2, scales=np.asarray([1.0, 1.0]), lag=0, max_nodes=20
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, False, ">", 0.0), 10, 8.0, 0.8, 5, 4.0, 0.8, 0.8
+            )
+        ]
+        runtime.install_feature_rules()
+        prototype = runtime._assign(np.asarray([1.0, 0.0]))
+        memory = runtime._new_memory()
+        runtime.graph.add_membership(memory, prototype)
+        runtime.graph.nodes[memory].value = 1.0
+        runtime._association_stats[memory] = [1, 1.0]
+        self.assertEqual(runtime._feature_memory_risk_batch(
+            np.asarray([[1.0, 0.0]])
+        )[0], 0.0)
+        links = runtime.backfill_memory_features()
+        self.assertGreater(links, 0)
+        self.assertGreater(runtime._feature_memory_risk_batch(
+            np.asarray([[1.0, 0.0]])
+        )[0], 0.0)
+
     def test_replay_features_updates_cells_without_prototypes(self):
         from node_features import FeatureRule, Primitive
 

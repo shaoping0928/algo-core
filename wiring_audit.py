@@ -56,6 +56,7 @@ def run(args):
         curiosity_weight=args.curiosity_weight, memory_credit=False,
         dagger_rounds=0, feature_backfit=args.feature_backfit,
         feature_value_weight=args.feature_value_weight,
+        memory_feature_backfill=args.memory_feature_backfill,
     )
     rows, _counts = collect(
         args.seed, args.steps, coverage=0.1, lag=LAG
@@ -293,6 +294,7 @@ def main():
     parser.add_argument("--feature-backfit", action="store_true")
     parser.add_argument("--feature-value-weight", type=float, default=0.02)
     parser.add_argument("--curiosity-weight", type=float, default=0.5)
+    parser.add_argument("--memory-feature-backfill", action="store_true")
     parser.add_argument("--windows", type=int, default=40)
     parser.add_argument("--heldout-seed", type=int, default=120)
     parser.add_argument("--heldout-frames", type=int, default=600)
