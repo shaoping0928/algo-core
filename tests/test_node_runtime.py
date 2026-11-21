@@ -2239,6 +2239,25 @@ class PlanScoreTests(unittest.TestCase):
             places=9,
         )
 
+    def test_risk_decay_suppresses_later_steps(self):
+        from latent_world import latent
+        from substrate_nodes import fit, policy_result
+
+        world, agent = fit(100, steps=300, epochs=1, max_nodes=200, lag=3)
+        env = latent[3](100)
+        prefix = np.zeros(3, dtype=float)
+        base = policy_result(env, world, agent, prefix, horizon=3, lag=3)
+        decayed = policy_result(
+            env, world, agent, prefix, horizon=3, lag=3, risk_decay=0.0
+        )
+        self.assertLessEqual(decayed.score[2], base.score[2] + 1e-9)
+        self.assertAlmostEqual(
+            decayed.score[0],
+            decayed.score[2] + decayed.score[3] + decayed.score[4]
+            + decayed.score[5],
+            places=9,
+        )
+
     def test_plan_score_carries_the_curiosity_share(self):
         from latent_world import latent
         from substrate_nodes import fit, plan_score, policy_result

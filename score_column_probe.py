@@ -23,6 +23,7 @@ import numpy as np
 
 from latent_world import latent
 from planner_rollout_quality import flatten_batches, oracle_plan
+from substrate_generic import history_features
 from substrate_nodes import (
     LAG,
     _curiosity_off,
@@ -151,6 +152,76 @@ def run(args):
                 elif entry["miss"]:
                     entry["failure"] = "score_misrank"
                 if entry.get("failure") == "score_misrank":
+                    scale = agent.scales
+                    first_states = np.asarray(
+                        trace["first_states"], dtype=float
+                    )
+
+                    def risk_at(raw_state, sequence):
+                        history = history_features(
+                            sequence.reshape(1, -1), 1, prefix,
+                            action_dim=LAG + 1,
+                        )
+                        pending = history[:, :LAG][:, ::-1]
+                        encoded = np.concatenate(
+                            [np.asarray(raw_state, dtype=float).reshape(1, -1),
+                             pending], axis=1,
+                        ) / scale
+                        return float(agent.pain_signal_batch(encoded)[0])
+
+                    details = {}
+                    for label, index in (
+                        ("chosen", chosen), ("oracle", oracle_index)
+                    ):
+                        sequence = sequences[index]
+                        predicted = first_states[index]
+                        _death, actual, _dead = oracle_plan(
+                            env, sequence[:1]
+                        )
+                        details[label] = dict(
+                            risk_pred=risk_at(predicted, sequence),
+                            risk_actual=risk_at(actual, sequence),
+                            state_error=float(np.linalg.norm(
+                                (predicted - actual)
+                                / scale[:agent.obs_dim]
+                            )),
+                            true_death=int(true_first[index]),
+                        )
+
+                    def actual_risk_sum(sequence):
+                        child = latent[LAG](env_seed)
+                        for action in actions[:point]:
+                            if child.dead:
+                                return None
+                            child.step(int(action))
+                        total = 0.0
+                        for step in range(len(sequence)):
+                            history = history_features(
+                                np.asarray(sequence, dtype=float).reshape(
+                                    1, -1
+                                ),
+                                step + 1, prefix, action_dim=LAG + 1,
+                            )
+                            pending = history[:, :LAG][:, ::-1]
+                            encoded = np.concatenate(
+                                [child.obs().reshape(1, -1), pending],
+                                axis=1,
+                            ) / scale
+                            total += float(
+                                agent.pain_signal_batch(encoded)[0]
+                            )
+                            child.step(int(sequence[step]))
+                            if child.dead:
+                                break
+                        return total
+
+                    for label, index in (
+                        ("chosen", chosen), ("oracle", oracle_index)
+                    ):
+                        details[label]["actual_risk_sum"] = actual_risk_sum(
+                            sequences[index]
+                        )
+                    entry["risk_details"] = details
                     ablations = {}
                     for name, column in COLUMNS.items():
                         cost = scores[:, 0] - scores[:, column]
@@ -212,6 +283,24 @@ def run(args):
         )
         if chosen_pred > oracle_pred:
             model_safer += 1
+    read_correct = sum(
+        1 for row in misses
+        if row.get("risk_details")
+        and row["risk_details"]["chosen"]["risk_actual"]
+        > row["risk_details"]["oracle"]["risk_actual"]
+    )
+    actual_sum_correct = sum(
+        1 for row in misses
+        if row.get("risk_details")
+        and row["risk_details"]["chosen"]["actual_risk_sum"] is not None
+        and row["risk_details"]["oracle"]["actual_risk_sum"] is not None
+        and row["risk_details"]["chosen"]["actual_risk_sum"]
+        > row["risk_details"]["oracle"]["actual_risk_sum"]
+    )
+    state_errors = [
+        row["risk_details"]["chosen"]["state_error"]
+        for row in misses if row.get("risk_details")
+    ]
     return dict(
         seed=int(args.seed),
         decisions=len(rows),
@@ -221,6 +310,12 @@ def run(args):
         miss_vs_all=sum(1 for row in rows if row.get("miss_vs_all")),
         miss_rate=(float(len(misses)) / len(rows)) if rows else 0.0,
         misses_where_model_thought_chosen_safer=model_safer,
+        risk_read_correct_at_true_states=read_correct,
+        risk_read_wrong_at_true_states=len(state_errors) - read_correct,
+        actual_risk_sum_correct=actual_sum_correct,
+        mean_first_state_error=(
+            float(np.mean(state_errors)) if state_errors else 0.0
+        ),
         mean_tie_share=(
             float(np.mean([row["tie_share"] for row in rows]))
             if rows else 0.0
@@ -273,6 +368,17 @@ def print_summary(report):
         "  misses where the model thought the chosen plan was safer: %d / %d"
         % (report["misses_where_model_thought_chosen_safer"],
            report["misses"])
+    )
+    print(
+        "  risk read at TRUE states ranks chosen as worse: %d / %d "
+        "(wrong: %d, mean first-state error %.3f)"
+        % (report["risk_read_correct_at_true_states"],
+           report["misses"], report["risk_read_wrong_at_true_states"],
+           report["mean_first_state_error"])
+    )
+    print(
+        "  actual-trajectory risk sum ranks chosen as worse: %d / %d"
+        % (report["actual_risk_sum_correct"], report["misses"])
     )
     print()
 
