@@ -946,8 +946,24 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
     curiosity_weight = float(getattr(agent, "curiosity_weight", 0.0))
     action_edge_weight = float(getattr(agent, "action_edge_weight", 0.0))
     q_table = (
-        agent.action_edge_q_table() if action_edge_weight > 0.0 else None
+        agent.action_edge_transition_table()
+        if action_edge_weight > 0.0 else None
     )
+    previous_holder = {"states": None}
+
+    def previous_states_for(states, step):
+        if (
+            step == 0 or previous_holder["states"] is None
+            or len(previous_holder["states"]) != len(states)
+        ):
+            previous = np.broadcast_to(
+                initial, (len(states), len(initial))
+            ).copy()
+        else:
+            previous = previous_holder["states"]
+        previous_holder["states"] = np.asarray(states, dtype=float).copy()
+        return previous
+
     phi_start = 0.0
     if curiosity_weight > 0.0:
         pending_start = (
@@ -977,6 +993,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         # components can be regressed against its realized outcome without
         # a second pass (P4 objective learning).
         def evaluate_step(states, sequences, step):
+            previous = previous_states_for(states, step)
             if step % step_stride != 0 and not (
                 stride_includes_lag and step == lag
             ):
@@ -989,10 +1006,19 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             )
             pending = history[:, :agent.lag][:, ::-1]
             encoded = np.concatenate([states, pending], axis=1) / agent.scales
+            previous_history = history_features(
+                sequences, step, pending_prefix, action_dim=action_dim
+            )
+            previous_pending = previous_history[:, :agent.lag][:, ::-1]
+            previous_encoded = np.concatenate(
+                [previous, previous_pending], axis=1
+            ) / agent.scales
             threat, excess = agent.pain_graded_batch(encoded)
             q_cost = np.zeros(len(states))
             if q_table is not None:
-                q_pain, q_count = agent.action_edge_q_batch(encoded, q_table)
+                q_pain, q_count = agent.action_edge_transition_q_batch(
+                    previous_encoded, encoded, q_table
+                )
                 trust = q_count / (
                     q_count + agent.action_edge_trust_samples
                 )
@@ -1050,6 +1076,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             # from the plan rather than the pending prefix, so a plain
             # stride can step over the first point the plan can actually
             # influence.
+            previous = previous_states_for(states, step)
             if step % step_stride != 0 and not (
                 stride_includes_lag and step == lag
             ):
@@ -1064,10 +1091,19 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             encoded = (
                 np.concatenate([states, pending], axis=1) / agent.scales
             )
+            previous_history = history_features(
+                sequences, step, pending_prefix, action_dim=action_dim
+            )
+            previous_pending = previous_history[:, :agent.lag][:, ::-1]
+            previous_encoded = np.concatenate(
+                [previous, previous_pending], axis=1
+            ) / agent.scales
             risk = agent.pain_signal_batch(encoded)
             q_cost = np.zeros(len(states))
             if q_table is not None:
-                q_pain, q_count = agent.action_edge_q_batch(encoded, q_table)
+                q_pain, q_count = agent.action_edge_transition_q_batch(
+                    previous_encoded, encoded, q_table
+                )
                 trust = q_count / (
                     q_count + agent.action_edge_trust_samples
                 )

@@ -208,5 +208,30 @@ class BranchTests(unittest.TestCase):
         self.assertGreater(counts[0], 0.0)
 
 
+    def test_target_conditioned_q_read_uses_both_prototypes(self):
+        import numpy as np
+        from node_runtime import NodeRuntime
+
+        runtime = NodeRuntime(
+            obs_dim=1, lag=1, scales=np.asarray([1.0, 1.0]),
+            birth_threshold=0.01, max_nodes=20, exploration=0.0,
+            alpha_v=0.5, alpha_q=0.1, gamma=0.9, lam=0.9,
+        )
+        first = runtime._create_node(np.asarray([0.0, 0.0]))
+        second = runtime._create_node(np.asarray([1.0, 0.0]))
+        runtime._update_action_edges([first], 0, second, 1.0, 0.0)
+        table = runtime.action_edge_transition_table()
+        q, counts = runtime.action_edge_transition_q_batch(
+            np.asarray([[0.0, 0.0]]), np.asarray([[1.0, 0.0]]), table
+        )
+        self.assertGreater(q[0], 0.0)
+        self.assertGreater(counts[0], 0.0)
+        q_wrong, counts_wrong = runtime.action_edge_transition_q_batch(
+            np.asarray([[1.0, 0.0]]), np.asarray([[0.0, 0.0]]), table
+        )
+        self.assertEqual(q_wrong[0], 0.0)
+        self.assertEqual(counts_wrong[0], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

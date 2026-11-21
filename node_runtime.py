@@ -1810,6 +1810,55 @@ class NodeRuntime:
             counts[row] = q_counts[nearest[row], column]
         return result, counts
 
+    def action_edge_transition_table(self):
+        """Exact (previous prototype, next prototype, action) Q table."""
+        index = {
+            node_id: row for row, node_id in enumerate(self._prototype_ids)
+        }
+        table = {}
+        for (source, target, action), edge in self.graph.action_edges.items():
+            previous = index.get(source)
+            following = index.get(target)
+            if previous is None or following is None or edge.count <= 0.0:
+                continue
+            table[(previous, following, int(action))] = (
+                float(edge.q_pain), float(edge.count)
+            )
+        return table
+
+    def action_edge_transition_q_batch(self, previous_states,
+                                       next_states, table):
+        """Target-conditioned Q read for encoded consecutive states."""
+        previous_states = np.asarray(previous_states, dtype=float)
+        next_states = np.asarray(next_states, dtype=float)
+        result = np.zeros(len(next_states), dtype=float)
+        counts = np.zeros(len(next_states), dtype=float)
+        if (
+            table is None or len(table) == 0 or len(next_states) == 0
+            or next_states.shape[1] <= self.obs_dim
+            or not self._prototype_ids
+        ):
+            return result, counts
+        previous_indices, _pw, _pm = self._soft_weights_batch(
+            previous_states
+        )
+        next_indices, _nw, _nm = self._soft_weights_batch(next_states)
+        if previous_indices is None or next_indices is None:
+            return result, counts
+        previous_nearest = previous_indices[:, 0].astype(int)
+        next_nearest = next_indices[:, 0].astype(int)
+        acting = np.rint(next_states[:, self.obs_dim]).astype(int)
+        for row in range(len(next_states)):
+            entry = table.get((
+                int(previous_nearest[row]),
+                int(next_nearest[row]),
+                int(acting[row]),
+            ))
+            if entry is None:
+                continue
+            result[row], counts[row] = entry
+        return result, counts
+
     def _update_action_edges(self, sources: Iterable[str], action: int,
                              next_node: str, target_pain: float,
                              target_dopamine: float,
