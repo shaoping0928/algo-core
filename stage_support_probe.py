@@ -161,7 +161,11 @@ def analyse_stream(rows, radius=None, min_length=5, control="none",
              - np.asarray(row["obs"], dtype=float)) / scale
             for row in episode
         ])
-        actions = [int(row["history"][0]) for row in episode]
+        actions = [
+            int(row["history"][LAG])
+            if len(row["history"]) > LAG else int(row["history"][0])
+            for row in episode
+        ]
         if control == "shuffle_actions":
             actions = [int(value) for value in rng.permutation(actions)]
         if len(episode) < 2 * min_length:
