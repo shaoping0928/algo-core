@@ -598,15 +598,31 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
 本身不改变决策质量；“接线不良”是必要条件，不是充分条件。按顺序进入
 第二步（预测误差加权）。
 
-**第二步：按实测逐步误差给 risk 加权（2026-11-21，已实现）**
+**第二步：按实测逐步误差给 risk 加权（2026-11-21，已实现，已判死）**
 
 - `_rollout_error_curve`：在训练流上按已知动作序列滚动世界模型，测
-  每一步的误差（观测标准差单位）；`_train` 在 `risk_error_weight=True`
-  时把曲线存到 `agent.step_errors`；
-- `policy_result`：第 t 步 hazard × `1/(1+e_{t+1})`（默认关，逐位不变）；
-- CLI `--risk-error-weight`；289 测试（曲线形状、零误差逐位一致）。
-- A/B：`--risk-error-weight` × 3 种子进行中；目标是“少信 k≥4 的失效
-  rollout”，而不是全局 decay（后者 −19.3）。
+  每一步的误差（观测标准差单位）；
+- **修正（审计 bug）**：原审计按平坦行序跨 episode 取窗，制造了
+  “k≥4 漂移 0.52”的伪影。按 episode 分组重测后，训练世界与 held-out
+  120 的 8 步滚动误差都是 **0.0000**——世界模型是精确的。
+- 因此 `--risk-error-weight` 的曲线恒 0、A/B 逐位相同（必然）；
+  开关保留为诊断，默认关。
+
+**第三步诊断：危险通道的真实信号（2026-11-21，1500 帧）**
+
+| 通道 | 均值 | 与 pain 的 rank 相关 | 非零占比 |
+|---|---:|---:|---:|
+| prototype | 0.032 | **−0.020** | 100% |
+| feature | 0.058 | **0.688** | 7% |
+| **memory** | **0.000** | — | **0%** |
+
+- **memory 通道恒 0**：记忆风险通过“特征根 → 记忆”的 membership 读取，
+  而 `epochs=1` 下记忆创建时特征还没安装，之后也没有回填；backfit 的
+  `replay_features` 也不建立这条边 → 记忆风险读数是结构性死线。
+- prototype 通道在同分布流上 rank 相关 ≈ 0；composed 读出的 0.97
+  主要来自 feature 通道 + 同分布校准（in-sample）。
+- 下一步（第三步修法）：**记忆风险改从最近原型的 membership 读取**
+  （或归纳后回填 memory→feature 边），再重拟合组合并检查 memory 权重。
 
 **质量门**：阶段同质性（within-stage residual 显著低于跨阶段）；转移校准
 误差可控、applicability violation 低、support 不足 abstain；seed 101 的

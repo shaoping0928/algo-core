@@ -207,43 +207,60 @@ def run(args):
     add("planner columns", "ok" if len(active) > 1 else "single-signal",
         "active=%s, %s" % (active, json.dumps(columns, default=str)))
 
-    # L9 world model rollout error by step
+    # L9 world model rollout error by step (within episode, plus held-out)
     scale_obs = scale
-    errors = {1: [], 2: [], 4: [], 8: []}
-    windows = 0
-    index = 0
-    while index + 8 < len(rows) and windows < args.windows:
-        row = rows[index]
-        if bool(row["done"]):
-            index += 1
-            continue
-        state = np.asarray(row["obs"], dtype=float)
-        previous = state
-        for step in range(8):
-            history = np.asarray(
-                rows[index + step]["history"], dtype=float
-            ).reshape(1, -1)
-            predicted = world.predict(
-                previous.reshape(1, -1), history
-            )[0]
-            actual = np.asarray(
-                rows[index + step]["next_obs"], dtype=float
-            )
-            step_number = step + 1
-            if step_number in errors:
-                errors[step_number].append(float(np.linalg.norm(
-                    (predicted - actual) / scale_obs
-                )))
-            previous = predicted
-        windows += 1
-        index += 8
+
+    def rollout_errors(source_rows):
+        by_episode = defaultdict(list)
+        for row in source_rows:
+            by_episode[int(row["episode"])].append(row)
+        collected = {1: [], 2: [], 4: [], 8: []}
+        count = 0
+        for episode in by_episode.values():
+            for start in range(0, len(episode) - 8, 4):
+                chunk = episode[start:start + 8]
+                if any(bool(row["done"]) for row in chunk):
+                    continue
+                state = np.asarray(chunk[0]["obs"], dtype=float)
+                for step in range(8):
+                    history = np.asarray(
+                        chunk[step]["history"], dtype=float
+                    ).reshape(1, -1)
+                    predicted = world.predict(
+                        state.reshape(1, -1), history
+                    )[0]
+                    actual = np.asarray(
+                        chunk[step]["next_obs"], dtype=float
+                    )
+                    if step + 1 in collected:
+                        collected[step + 1].append(float(np.linalg.norm(
+                            (predicted - actual) / scale_obs
+                        )))
+                    state = predicted
+                count += 1
+                if count >= args.windows:
+                    break
+            if count >= args.windows:
+                break
+        return {
+            key: (float(np.mean(values)) if values else 0.0)
+            for key, values in collected.items()
+        }
+
+    train_errors = rollout_errors(rows)
+    heldout_rows, _ = collect(
+        args.heldout_seed, args.heldout_frames, coverage=0.1, lag=LAG
+    )
+    heldout_errors = rollout_errors(heldout_rows)
     add("world model", "drift" if (
-        errors[8] and errors[1]
-        and float(np.mean(errors[8])) > 3.0 * float(np.mean(errors[1]))
+        train_errors[8] > 0.1 or heldout_errors[8] > 1.0
     ) else "ok",
-        "rollout error " + ", ".join(
-            "k=%d %.4f" % (key, float(np.mean(value)))
-            for key, value in errors.items() if value
+        "train " + ", ".join(
+            "k=%d %.4f" % (key, value)
+            for key, value in train_errors.items()
+        ) + " | heldout %d " % args.heldout_seed + ", ".join(
+            "k=%d %.4f" % (key, value)
+            for key, value in heldout_errors.items()
         ))
 
     # L10 learning keying
@@ -277,6 +294,8 @@ def main():
     parser.add_argument("--feature-value-weight", type=float, default=0.02)
     parser.add_argument("--curiosity-weight", type=float, default=0.5)
     parser.add_argument("--windows", type=int, default=40)
+    parser.add_argument("--heldout-seed", type=int, default=120)
+    parser.add_argument("--heldout-frames", type=int, default=600)
     parser.add_argument("--report", default="")
     args = parser.parse_args()
     report = run(args)

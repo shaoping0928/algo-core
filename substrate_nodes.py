@@ -714,10 +714,11 @@ def _rollout_error_curve(transitions, world, lag, horizon=16,
     windows = 0
     for rows in episodes.values():
         start = 0
-        while start + horizon < len(rows) and windows < max_windows:
+        while (start + horizon < len(rows)
+               and windows < max_windows):
             chunk = rows[start:start + horizon]
             if any(bool(row["done"]) for row in chunk):
-                start += horizon
+                start += 1
                 continue
             state = np.asarray(chunk[0]["obs"], dtype=float)
             for step in range(horizon):
@@ -733,7 +734,7 @@ def _rollout_error_curve(transitions, world, lag, horizon=16,
                 )))
                 state = predicted
             windows += 1
-            start += horizon
+            start += 4
     return [
         float(np.mean(values)) if values else 0.0 for values in errors
     ]
