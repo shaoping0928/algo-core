@@ -26,7 +26,8 @@ import numpy as np
 import substrate_nodes as sn
 from death_rule_loop import refine_once
 from death_transition_quality import seed_spec
-from substrate_nodes import LAG, _curiosity_off, evaluate, fit
+from probe_cache import load_or_fit
+from substrate_nodes import LAG, _curiosity_off, evaluate
 
 CONFIG = dict(
     seed=100, steps=1500, epochs=1, max_nodes=1000,
@@ -105,12 +106,18 @@ def main():
     parser.add_argument("--cap", type=int, default=5000)
     parser.add_argument("--random-trials", type=int, default=2)
     parser.add_argument("--random-seed", type=int, default=20261121)
+    parser.add_argument("--cache", default="",
+                        help="reuse a fitted (world, agent) at this path")
+    parser.add_argument("--refit", action="store_true")
     parser.add_argument("--report", default="")
     args = parser.parse_args()
 
     config = dict(CONFIG)
     config["seed"] = args.seed
-    world, agent = fit(**config)
+    world, agent, _cached = load_or_fit(
+        config, args.cache or None, refit=bool(args.refit)
+    )
+    print("model cache: %s" % ("hit" if _cached else "fit"))
     agent.death_rule_hard = False
     base_rules = agent.death_rules
     if base_rules is None:

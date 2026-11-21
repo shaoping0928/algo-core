@@ -207,10 +207,13 @@ python math_memory_search.py
 | 候选计划质量探针（`planner_rollout_quality.py`） | ✓ | 85 决策/21760 计划 | — 诊断（precision 96.0%、recall 79.8%） |
 | 失败→规则（`death_rule_loop.py`） | ✓ | 合成（缺失第二模式） | ✗ 未接真实 planner 失败 |
 | 动作效应库（`action_effect.py`） | ✓ | 合成（Δdim/归一化） | ✗ 未接求知 |
+| 探针模型缓存（`probe_cache.py`） | ✓ | 单测（命中/失配/损坏） | — 探针侧，多 arm 复用 fit |
+| 单次搜索 baseline 重建（`best_candidate_index`） | ✓ | 单测逐位一致 | — 探针提速，不改搜索 |
 | 上下文分桶死亡规则（`contextual_rules.py`） | ✓ | 合成/稀疏桶回退 | ✗ 未接真实残差/planner |
 | 成对/归一化相对特征（死亡规则） | ✓ | 离线对比（`death_feature_probe.py`） | ✗ 当前观测冗余，默认关 |
 | 跨世界模式库（`pattern_library.py`） | ✓ | 合成/仿射帧 | ✗ dims 迁移中性，未接 |
 | 覆盖优先 + 边界余量 | ✓ | 合成/真实 | ✓ `--death-rule-margin`（默认 0） |
+| 模型误差包络（近死亡当死亡） | ✓ | H=6 候选计划筛选 | — `--death-rule-envelope`（默认关，需 margin>0） |
 | 嵌套表达式（AND/OR/XOR/NOT/数值项） | ✓ | 合成/组合搜索 | ✗ 预留能力 |
 | 动作边 Q（acting 键控） | ✓ | ✓ | ✓ `--action-edge-weight`（默认 0；目标平均/目标条件双负） |
 | 多分支强度（current/recent/prediction/value） | ✓ | ✓ | — 重构：决策逐位不变（不参与读出） |
@@ -1033,6 +1036,64 @@ held-out 世界的采样状态上运行两次真实 search（baseline 与死亡�
 - **判定：实际控制轨迹的失败太少且已被覆盖；failure→rule 的有效数据
   在候选计划的反事实终止（oracle 验证过的计划终点），不在实际 episode
   终止。** 下一步用候选计划失败做正例，仍然按 refine/test 世界分割。
+
+### 反事实失败：终止状态规则本身覆盖得比计划级读数好（2026-11-21）
+
+`counterfactual_failure_probe.py` 在 refine 世界运行真实 search，记录全部
+候选计划，对每个计划做 oracle 首死步，并直接分类其**真实终止状态**：
+
+- refine 120：3 个决策 / 96 个候选，真实终止状态 **0 missed / 1 covered**；
+- test 122：1 个实际终止 + 1 个反事实终止，源规则都漏掉；
+- failure 臂没有正例可加，random/all-terminal 臂也不改变 test。
+
+合起来看：**死亡规则在真实终止状态上的覆盖比在“预测计划”上的读数好得多。**
+候选计划探针的 2086 个 plan-level FN 里，很大一部分不是终止状态规则没覆盖，
+而是 `f` 把状态推到边界外/边界附近，规则在**预测状态**上静默。因此下一
+杠杆是模型误差包络（`classify_death(include_margin=True)`），而不是继续
+往规则里灌终止正例。
+
+### 模型误差包络：近死亡当死亡（2026-11-21）
+
+H=6 小样本筛选（35 决策/2240 候选）看起来很有希望：margin 0.01
+把 recall 从 0.875 推到 0.976、selected_missed 4→1，且 FP 为 0。
+但全量 H=8 暴露了精度-召回权衡：
+
+| 口径 | 决策/候选 | recall | FP rate | selected_missed | tri_later | 动作对比 |
+|---|---:|---:|---:|---:|---:|---:|
+| exact death | 85/21760 | 0.798 | **3.0%** | 12 | **8** | **6/7** |
+| margin 0.01 | 85/21760 | **0.884** | 9.6% | **7** | 4 | 4/7 |
+
+- 召回 +8.6pt，但假阳从 3.0% 升到 9.6%（约 3 倍），
+  selected_missed 12→7。
+- 净选择收益反而下降：tri_later 8→4，selected survives 50→48；
+  动作对比 6/7→4/7。
+- 首死步 exact 0.693→0.331，within-1 基本不变（0.81）。
+- H=6 的 0 FP 是小样本乐观偏差；全量结果才是裁决。
+- **判定：near-death 当硬死亡不采纳。** 精确死亡侧的高精度更有价值；
+  下一步把 near-death 当作**软风险/unknown**（不硬否决），或保持
+  exact 精度转向模型误差/求知。margin 0.03 不再全量跑。
+
+### 确认集与近死亡软风险：剩余 gap 是模型预测（2026-11-21）
+
+独立确认集 123–126（68 决策 / 17408 候选）：
+
+| 口径 | recall | FP rate | selected_missed | tri_later | selected survives |
+|---|---:|---:|---:|---:|---:|
+| exact death | 0.759 | **0.26%** | 10 | **10** | **45**（baseline 35） |
+| margin 0.01 | **0.905** | 7.7% | **4** | 8 | 43 |
+
+- 两个独立世界集（120–124、123–126）方向一致：margin 提高召回，
+  但假阳上升，**净选择收益反而低于 exact death**。
+- near-soft penalty（0.05/0.2/1.0）的选择指标与 exact **完全相同**；
+  被选计划的 near 步数只有 ~0.5。near 带不是失败点。
+- **漏检终止诊断**：确认集 10 个 selected miss 中，6 个真实终止状态
+  是 exact death、4 个是 near。也就是说，**规则本身覆盖了真实终止，
+  但 `f` 把预测状态推到了边界外/近边界之外**；planner 看到的是预测
+  状态，于是静默。
+- **判定：剩余 gap 是模型预测/状态访问问题，不是规则覆盖或阈值
+  精度问题。** 继续加终止正例、调 margin、near penalty 都不会有
+  稳定收益。下一杠杆是模型误差/支持度感知的信任（predicted state
+  的 OOD/残差 → unknown/soft risk/inquiry）。
 
 **归纳形式扩展（2026-11-20）：成对坐标差**。根稀疏的一个来源是绝对阈值
 贴在训练分布边缘。归纳文法新增纯代数坐标：

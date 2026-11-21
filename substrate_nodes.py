@@ -137,7 +137,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         death_rule_max_thresholds: int = 256,
         death_rule_max_rules: int = 24,
         death_rule_max_literals: int = 5,
-        death_rule_boundary_margin: float = 0.0):
+        death_rule_boundary_margin: float = 0.0,
+        death_rule_envelope: bool = False):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -488,6 +489,11 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         ).fit(entered_states, terminal_labels)
         agent.death_rules = rule_set
         agent.death_rule_hard = True
+        # Opt-in model-error envelope: the boundary margin that already
+        # keeps the safe side from claiming safety can also turn a
+        # near-boundary state into a death hit.  Exact death remains the
+        # default.
+        agent.death_rule_envelope = bool(death_rule_envelope)
         agent.death_rule_summary = dict(
             rules=[rule.text() for rule in rule_set.rules_],
             modes=[
@@ -695,7 +701,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         action_edge_weight=0.0, action_edge_trust_samples=50.0,
         death_rules=False, death_rule_compose=False,
         death_rule_max_thresholds=256, death_rule_max_rules=24,
-        death_rule_max_literals=5, death_rule_boundary_margin=0.0):
+        death_rule_max_literals=5, death_rule_boundary_margin=0.0,
+        death_rule_envelope=False):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -885,6 +892,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         death_rule_max_rules=death_rule_max_rules,
         death_rule_max_literals=death_rule_max_literals,
         death_rule_boundary_margin=death_rule_boundary_margin,
+        death_rule_envelope=death_rule_envelope,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -994,7 +1002,8 @@ def _curiosity_off(agent):
 def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   step_stride=2, stride_includes_lag=False,
                   death_status_batch=None, unknown_penalty=0.0,
-                  candidate_callback=None, inquiry_action=None):
+                  near_penalty=0.0, candidate_callback=None,
+                  inquiry_action=None):
     initial = np.asarray(env.obs(), dtype=float)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
     action_dim = int(lag) + 1
@@ -1014,9 +1023,13 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
     if death_status_batch is None and death_rules is not None and bool(
         getattr(agent, "death_rule_hard", False)
     ):
+        envelope = bool(getattr(agent, "death_rule_envelope", False))
+
         def death_batch(states, _sequences, step):
             observed = np.asarray(states, dtype=float)[:, :agent.obs_dim]
-            predicted = death_rules.classify_death(observed)
+            predicted = death_rules.classify_death(
+                observed, include_margin=envelope
+            )
             return np.where(predicted == 1, int(step), -1)
     previous_holder = {"states": None}
 
@@ -1259,6 +1272,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         evaluate_death=death_batch,
         evaluate_death_status=death_status_batch,
         unknown_penalty=unknown_penalty,
+        near_penalty=near_penalty,
         candidate_callback=(
             trace_callback if inquiry_action is not None
             else candidate_callback
@@ -1628,6 +1642,9 @@ def run_seed(task):
     death_rule_boundary_margin = float(
         task.get("death_rule_boundary_margin", 0.0)
     )
+    death_rule_envelope = bool(
+        task.get("death_rule_envelope", False)
+    )
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
@@ -1701,6 +1718,7 @@ def run_seed(task):
         death_rule_max_rules=death_rule_max_rules,
         death_rule_max_literals=death_rule_max_literals,
         death_rule_boundary_margin=death_rule_boundary_margin,
+        death_rule_envelope=death_rule_envelope,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1939,6 +1957,10 @@ def main():
                         help="boundary margin as a fraction of each "
                              "coordinate's observed range; states inside "
                              "the margin are UNKNOWN, not safe")
+    parser.add_argument("--death-rule-envelope", action="store_true",
+                        help="treat states inside the boundary margin as "
+                             "death for the planner's hard constraint "
+                             "(model-error-aware envelope); off by default")
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
@@ -2173,6 +2195,7 @@ def main():
             death_rule_max_rules=args.death_rule_max_rules,
             death_rule_max_literals=args.death_rule_max_literals,
             death_rule_boundary_margin=args.death_rule_margin,
+            death_rule_envelope=args.death_rule_envelope,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,

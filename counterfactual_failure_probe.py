@@ -33,7 +33,8 @@ from planner_rollout_quality import (
     oracle_plan,
     status_callback,
 )
-from substrate_nodes import LAG, _curiosity_off, evaluate, fit, policy_result
+from probe_cache import load_or_fit
+from substrate_nodes import LAG, _curiosity_off, evaluate, policy_result
 
 
 def sample_points(frames, branches, tail):
@@ -164,12 +165,18 @@ def main():
     parser.add_argument("--max-examples", type=int, default=48)
     parser.add_argument("--random-trials", type=int, default=2)
     parser.add_argument("--random-seed", type=int, default=20261121)
+    parser.add_argument("--cache", default="",
+                        help="reuse a fitted (world, agent) at this path")
+    parser.add_argument("--refit", action="store_true")
     parser.add_argument("--report", default="")
     args = parser.parse_args()
 
     config = dict(CONFIG)
     config["seed"] = args.seed
-    world, agent = fit(**config)
+    world, agent, _cached = load_or_fit(
+        config, args.cache or None, refit=bool(args.refit)
+    )
+    print("model cache: %s" % ("hit" if _cached else "fit"))
     agent.death_rule_hard = False
     base_rules = agent.death_rules
     if base_rules is None:

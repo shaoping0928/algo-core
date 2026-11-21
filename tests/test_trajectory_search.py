@@ -5,6 +5,7 @@ import numpy as np
 from trajectory_search import (
     SearchResult,
     beam_search,
+    best_candidate_index,
     exhaustive_search,
     merge_candidate_batches,
     override_first_action,
@@ -195,6 +196,7 @@ class TrajectorySearchTests(unittest.TestCase):
                 return np.where(first == 0, 0, -1)
             return np.where(first == 0, -1, 1)
 
+        batches = []
         result = exhaustive_search(
             initial_state=np.array([0.0]),
             action_space=(0, 1),
@@ -202,6 +204,7 @@ class TrajectorySearchTests(unittest.TestCase):
             transition_batch=self.add_action,
             evaluate_step=evaluate_step,
             evaluate_death_status=status,
+            candidate_callback=batches.append,
             batch_size=4,
         )
         self.assertTrue(result.feasible)
@@ -209,6 +212,80 @@ class TrajectorySearchTests(unittest.TestCase):
         self.assertEqual(result.first_unknown, 1)
         self.assertEqual(result.unknown_count, 1)
         self.assertEqual(result.safe_count, 1)
+        batch = batches[0]
+        dead = batch["sequences"][:, 0] == 1
+        self.assertTrue(batch["model_feasible"][dead].all())
+        self.assertFalse(batch["feasible"][dead].any())
+
+    def test_near_status_is_soft_and_tracked(self):
+        def evaluate_step(states, _actions, _step):
+            return np.zeros(len(states)), np.ones(len(states), dtype=bool)
+
+        def status(_states, sequences, step):
+            first = sequences[:, 0]
+            if step == 0:
+                return np.where(first == 0, 2, -1)
+            return np.where(first == 0, 0, 1)
+
+        batches = []
+        result = exhaustive_search(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=2,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            evaluate_death_status=status,
+            candidate_callback=batches.append,
+            batch_size=4,
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.first_death, -1)
+        self.assertEqual(result.first_near, 0)
+        self.assertEqual(result.near_count, 1)
+        self.assertEqual(result.safe_count, 1)
+        batch = batches[0]
+        dead = batch["sequences"][:, 0] == 1
+        self.assertTrue(batch["model_feasible"][dead].all())
+        self.assertFalse(batch["feasible"][dead].any())
+        self.assertTrue(batch["near_count"][~dead].all())
+
+    def test_near_penalty_breaks_ties_without_vetoing(self):
+        def evaluate_step(states, _sequences, _step):
+            return (
+                np.zeros(len(states)),
+                np.ones(len(states), dtype=bool),
+            )
+
+        def status(_states, sequences, _step):
+            return np.where(sequences[:, 0] == 0, 2, 0)
+
+        kwargs = dict(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=1,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            evaluate_death_status=status,
+        )
+        unpenned = exhaustive_search(**kwargs)
+        self.assertEqual(unpenned.actions[0], 0.0)
+        self.assertTrue(unpenned.feasible)
+        penalised = exhaustive_search(**kwargs, near_penalty=1.0)
+        self.assertEqual(penalised.actions[0], 1.0)
+        self.assertTrue(penalised.feasible)
+        self.assertEqual(penalised.near_count, 0)
+        with self.assertRaises(ValueError):
+            exhaustive_search(
+                initial_state=kwargs["initial_state"],
+                action_space=kwargs["action_space"],
+                horizon=1,
+                transition_batch=self.add_action,
+                evaluate_step=lambda states, sequences, step: (
+                    np.zeros(len(states)),
+                    np.ones(len(states), dtype=bool),
+                ),
+                near_penalty=1.0,
+            )
 
     def test_unknown_penalty_prefers_fewer_unknown_steps(self):
         def evaluate_step(_states, sequences, _step):
@@ -265,6 +342,7 @@ class TrajectorySearchTests(unittest.TestCase):
         self.assertEqual(batch["first_unknown"].shape, (4,))
         self.assertEqual(batch["unknown_count"].shape, (4,))
         self.assertEqual(batch["safe_count"].shape, (4,))
+        self.assertEqual(batch["model_feasible"].shape, (4,))
         np.testing.assert_allclose(traced.actions, plain.actions)
         np.testing.assert_allclose(traced.final_state, plain.final_state)
         self.assertEqual(traced.score, plain.score)
@@ -312,8 +390,60 @@ class TrajectorySearchTests(unittest.TestCase):
             first_unknown=np.zeros(count, dtype=int),
             unknown_count=np.full(count, 2, dtype=int),
             safe_count=np.zeros(count, dtype=int),
+            first_near=np.full(count, -1, dtype=int),
+            near_count=np.zeros(count, dtype=int),
             first_states=np.arange(8, dtype=float).reshape(4, 2),
             final_states=np.arange(8, dtype=float).reshape(4, 2) + 100.0,
+        )
+
+    def test_offline_baseline_matches_the_no_death_search(self):
+        def evaluate_step(states, sequences, step):
+            score = np.abs(states[:, 0] - 1.0) + 0.1 * sequences[:, 0]
+            return score, states[:, 0] < 3.0
+
+        def death_by_state(states, _sequences, step):
+            return np.where(states[:, 0] >= 1.5, step, -1)
+
+        kwargs = dict(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=3,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            batch_size=8,
+        )
+        baseline = exhaustive_search(**kwargs)
+        batches = []
+        _death_aware = exhaustive_search(
+            **kwargs, evaluate_death=death_by_state,
+            candidate_callback=batches.append,
+        )
+        merged = merge_candidate_batches(batches)
+        index = best_candidate_index(
+            merged["scores"], merged["model_feasible"]
+        )
+        np.testing.assert_allclose(
+            merged["sequences"][index], baseline.actions
+        )
+        self.assertAlmostEqual(
+            float(merged["scores"][index][0]),
+            float(baseline.score),
+        )
+
+    def test_best_candidate_index_matches_the_search_selection(self):
+        scores = np.asarray([[1.0, 5.0], [1.0, 4.0], [1.0, 9.0]])
+        feasible = np.asarray([True, True, True])
+        self.assertEqual(best_candidate_index(scores, feasible), 1)
+        self.assertEqual(
+            best_candidate_index(scores, np.asarray([True, False, False])),
+            0,
+        )
+        self.assertEqual(
+            best_candidate_index(scores, np.zeros(3, dtype=bool)), 1
+        )
+        with_nan = np.asarray([[np.nan], [2.0], [1.0]])
+        self.assertEqual(
+            best_candidate_index(with_nan, np.ones(3, dtype=bool)), 2
         )
 
     def test_merge_candidate_batches_concatenates_every_field(self):

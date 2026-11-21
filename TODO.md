@@ -877,8 +877,48 @@
     - [x] `action_effect.py`：按动作统计 signed/abs Δdim、归一化变化、
       首选动作；合成测试通过（5 条）。
     - [ ] 动作效应接求知/经验条目（action→Δdim 的消费者）。
-    - [ ] 反事实失败探针（`counterfactual_failure_probe.py`）：从候选
-      计划 oracle 终止状态取漏检正例，refine/test 世界分割。
+    - [x] `counterfactual_failure_probe.py` 冒烟：refine 120 的 3 个
+      决策/96 候选里 **0 missed / 1 covered** 反事实终止；test 122 的
+      1 个实际/反事实终止都被源规则漏掉；所有臂无变化（failure
+      无正例可加）。**判定：真实终止状态大多已被规则覆盖；plan-level
+      FN 主要来自预测状态漂移，不是终止状态规则覆盖不足。**
+    - [x] 模型误差包络 H=6 筛选（35 决策/2240 候选）：exact recall
+      0.875/FP 0/selected_missed 4；margin 0.01 recall 0.976/FP 0/
+      selected_missed 1；0.03 recall 1.000/FP 0/selected_missed 0，
+      但首死步 exact 0.25/within-1 0.60。小样本看起来很干净。
+    - [x] 模型误差包络**全量 H=8**（120–124，85 决策/21760 候选）：
+      exact death：recall 0.798、FP rate **3.0%**、selected_missed 12、
+      tri_later 8、selected survives 50；
+      `--margin-death` 0.01：recall **0.884**、FP rate **9.6%**、
+      selected_missed 7、tri_later 4、survives 48、动作对比 4/7
+      （exact 为 6/7）。**判定：近死亡当死亡提高召回，但假阳约 3 倍，
+      净选择收益反而低于 exact death；不采纳为默认，0.03 不再全量跑。
+      H=6 的 0 FP 是小样本乐观偏差。** 下一步：near-death 只作
+      软风险/unknown（不硬否决），或保持 exact 精度转向模型误差/求知。
+    - [x] `--death-rule-envelope` 接线：`agent.death_rule_envelope` →
+      `death_batch` 的 `include_margin`；默认关，`--death-rule-margin 0`
+      时无效果。**当前不启用。**
+    - [x] 确认集 123–126（baseline vs margin 0.01）：
+      exact death：recall 0.759、FP rate 0.26%、selected_missed 10、
+      tri_later 10、survives 45（baseline 35）、动作对比 7/8；
+      margin 0.01：recall 0.905、FP rate 7.7%、selected_missed 4、
+      tri_later 8、survives 43、动作对比 5/8。
+      **跨世界一致：margin 召回升但净选择收益降；exact 仍优。**
+    - [x] near-soft penalty（0.05/0.2/1.0，123–126）：
+      选择指标与 exact **完全相同**；selected near count ~0.5。
+      **近死亡软惩罚中性**——被选计划本来就不在 near 带里。
+    - [x] 漏检终止诊断：123–126 的 10 个 selected miss 中，
+      **6 个真实终止状态是 exact death、4 个是 near**。规则覆盖了
+      真实终止，但 `f` 的预测状态漂移出边界/近边界。**结论：剩余
+      gap 是模型预测，不是规则覆盖；继续加终止正例、调 margin 或
+      near penalty 都无效。**
+    - [ ] 下一步：模型误差/支持度感知的信任（predicted state 的
+      OOD/残差 → unknown/soft risk/inquiry），而不是继续调 margin。
+    - [x] 探针效率：`planner_rollout_quality` 只跑一次 search，
+      baseline 从 candidate trace 的 `scores`/`model_feasible` 重建
+      （单测与 no-death search 逐位一致）；`probe_cache.py` 缓存
+      `(world, agent)`，config 匹配才复用，损坏/不匹配自动重训。
+      多 arm 可并行进程跑，CPU 资源可用。
     - [ ] 候选计划探针在 seed 101/102 复跑，确认 tri_later>0 不是
       单一模型的偶然；近终止动作对比用 `--tail 20` 提高 comparable。
     - [ ] 归一化阈值先验旁支（k=5/10/20，覆盖升且 FP 不升才继续）。

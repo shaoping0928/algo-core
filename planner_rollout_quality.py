@@ -5,9 +5,10 @@ single transition was labelled correctly.  The planner, however, scores whole
 candidate action sequences and chooses one of them.  This probe therefore:
 
 - replays the deterministic control policy to sampled states;
-- runs the real ``policy_result`` search twice, once with the baseline
-  objective and once with the death-side tri-state callback;
-- records every candidate sequence through ``candidate_callback``;
+- runs the real ``policy_result`` search with the death-side tri-state
+  callback and records every candidate through ``candidate_callback``;
+- reconstructs the no-death baseline selection from the trace's scores and
+  model-feasibility mask, so the baseline is not searched twice;
 - evaluates each candidate in the real world as an oracle;
 - compares plan-level death prediction, first-death-step error, and whether
   the selected first action is the oracle-best action.
@@ -26,7 +27,9 @@ import numpy as np
 
 from death_transition_quality import seed_spec
 from latent_world import latent
-from substrate_nodes import LAG, _curiosity_off, evaluate, fit, policy_result
+from probe_cache import load_or_fit
+from substrate_nodes import LAG, _curiosity_off, evaluate, policy_result
+from trajectory_search import best_candidate_index
 
 CONFIG = dict(
     seed=100, steps=1500, epochs=1, max_nodes=1000,
@@ -52,6 +55,16 @@ def status_callback(rules, obs_dim, full=False, include_margin=False):
         return np.asarray(rules.classify_death(
             observed, include_margin=bool(include_margin)
         ), dtype=int)
+    return callback
+
+
+def near_status_callback(rules, obs_dim):
+    """Return exact death (1), near death (2), or unknown (-1)."""
+    def callback(states, _sequences, _step):
+        observed = np.asarray(states, dtype=float)[:, :int(obs_dim)]
+        return np.asarray(
+            rules.classify_death_status(observed), dtype=int
+        )
     return callback
 
 
@@ -146,22 +159,41 @@ def main():
     parser.add_argument("--margin-death", action="store_true",
                         help="treat states inside the fitted boundary margin "
                              "as death (model-error-aware envelope)")
+    parser.add_argument("--near-penalty", type=float, default=0.0,
+                        help="soft cost per near-death step; near states "
+                             "stay feasible and are not vetoed")
     parser.add_argument("--full-status", action="store_true",
                         help="use the safe side as a diagnostic tri-state; "
                              "the planner's hard constraint still reads only "
                              "the death side")
+    parser.add_argument("--cache", default="",
+                        help="reuse a fitted (world, agent) at this path")
+    parser.add_argument("--refit", action="store_true",
+                        help="ignore the cache and fit again")
     parser.add_argument("--report", default="")
     args = parser.parse_args()
 
     config = dict(CONFIG)
     config["death_rule_boundary_margin"] = args.margin
-    world, agent = fit(**config)
+    world, agent, _cached = load_or_fit(
+        config, args.cache or None, refit=bool(args.refit)
+    )
+    print("model cache: %s" % ("hit" if _cached else "fit"))
     rules = agent.death_rules
     agent.death_rule_hard = False
-    death_status = status_callback(
-        rules, agent.obs_dim, full=bool(args.full_status),
-        include_margin=bool(args.margin_death),
-    )
+    if args.near_penalty < 0.0:
+        raise SystemExit("--near-penalty must be non-negative")
+    if args.near_penalty > 0.0 and args.margin_death:
+        raise SystemExit(
+            "use --near-penalty or --margin-death, not both"
+        )
+    if args.near_penalty > 0.0:
+        death_status = near_status_callback(rules, agent.obs_dim)
+    else:
+        death_status = status_callback(
+            rules, agent.obs_dim, full=bool(args.full_status),
+            include_margin=bool(args.margin_death),
+        )
     seeds = seed_spec(args.eval_seeds)
 
     plan_rows = []
@@ -197,14 +229,11 @@ def main():
             prefix = np.zeros(LAG, dtype=float)
             prefix[:len(recent[:LAG])] = recent[:LAG]
 
-            baseline = policy_result(
-                env, world, agent, prefix, args.horizon, lag=LAG,
-                step_stride=2,
-            )
             tri_batches = []
             tri = policy_result(
                 env, world, agent, prefix, args.horizon, lag=LAG,
                 step_stride=2, death_status_batch=death_status,
+                near_penalty=args.near_penalty,
                 candidate_callback=tri_batches.append,
             )
             if not tri_batches:
@@ -216,7 +245,12 @@ def main():
             for index, sequence in enumerate(sequences):
                 true_first[index], _state, _dead = oracle_plan(env, sequence)
 
-            plan_rows.append(plan_death_counts(predicted_first, true_first))
+            plan_row = plan_death_counts(predicted_first, true_first)
+            plan_row["near_plans"] = int(np.sum(
+                np.asarray(trace["near_count"]) > 0
+            ))
+            plan_row["near_steps"] = int(np.sum(trace["near_count"]))
+            plan_rows.append(plan_row)
 
             best_true = action_best(sequences, true_first, args.horizon)
             best_pred = action_best(
@@ -228,7 +262,10 @@ def main():
                 feasible=trace["feasible"],
             )
             selected_action = int(tri.actions[0])
-            baseline_action = int(baseline.actions[0])
+            baseline_index = best_candidate_index(
+                trace["scores"], trace["model_feasible"]
+            )
+            baseline_action = int(sequences[baseline_index, 0])
             best_value = max(best_true.values())
             best_actions = {
                 action for action, value in best_true.items()
@@ -237,9 +274,7 @@ def main():
             selected_true, selected_state, _dead = oracle_plan(
                 env, tri.actions
             )
-            baseline_true, _baseline_state, _dead = oracle_plan(
-                env, baseline.actions
-            )
+            baseline_true = int(true_first[baseline_index])
             selected_oracle_best = selected_action in best_actions
             baseline_oracle_best = baseline_action in best_actions
             decisions += 1
@@ -247,12 +282,13 @@ def main():
                 tri_oracle_best=bool(selected_oracle_best),
                 baseline_oracle_best=bool(baseline_oracle_best),
                 tri_predicted_death=bool(tri.first_death >= 0),
-                baseline_predicted_death=bool(baseline.first_death >= 0),
                 selected_true_death=int(selected_true),
                 baseline_true_death=int(baseline_true),
                 selected_predicted_death=int(tri.first_death),
                 selected_unknown_count=int(tri.unknown_count),
                 selected_first_unknown=int(tri.first_unknown),
+                selected_near_count=int(tri.near_count),
+                selected_first_near=int(tri.first_near),
                 best_actions=sorted(int(action) for action in best_actions),
                 selected_action=selected_action,
                 baseline_action=baseline_action,
@@ -295,6 +331,8 @@ def main():
                     predicted_first_death=int(tri.first_death),
                     selected_true_first_death=int(selected_true),
                     selected_unknown_count=int(tri.unknown_count),
+                    selected_near_count=int(tri.near_count),
+                    selected_first_near=int(tri.first_near),
                     sequence=[int(value) for value in tri.actions],
                     terminal_state=[
                         float(value) for value in selected_state
@@ -344,6 +382,9 @@ def main():
         )),
         mean_selected_unknown_count=float(np.mean([
             row["selected_unknown_count"] for row in selected_rows
+        ])) if selected_rows else 0.0,
+        mean_selected_near_count=float(np.mean([
+            row["selected_near_count"] for row in selected_rows
         ])) if selected_rows else 0.0,
         tri_selected_survives=int(sum(
             row["selected_true_death"] < 0 for row in selected_rows

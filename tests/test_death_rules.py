@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from death_rules import UNKNOWN, DeathRuleSet
+from death_rules import NEAR, UNKNOWN, DeathRuleSet
 
 
 def _band_values(rng, n, low, high, outer=1.0):
@@ -190,6 +190,10 @@ class DeathRuleTests(unittest.TestCase):
         self.assertEqual(death_margin[0], 1)
         self.assertEqual(death_margin[1], UNKNOWN)
         self.assertEqual(death_margin[2], 1)
+        status = rules.classify_death_status(probe)
+        self.assertEqual(status[0], NEAR)
+        self.assertEqual(status[1], UNKNOWN)
+        self.assertEqual(status[2], 1)
         coverage = rules.coverage_report()
         self.assertGreater(coverage["safe_blocked_near_death"], 0)
         self.assertEqual(coverage["death_covered_negative"], 0)

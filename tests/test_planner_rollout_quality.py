@@ -6,6 +6,7 @@ import numpy as np
 from planner_rollout_quality import (
     action_best,
     action_rank,
+    near_status_callback,
     oracle_plan,
     plan_death_counts,
     status_callback,
@@ -33,6 +34,13 @@ class FakeRules:
 
     def classify(self, states):
         return np.where(states[:, 0] > 0.0, 1, 0)
+
+    def classify_death_status(self, states):
+        return np.where(
+            states[:, 0] > 0.0,
+            1,
+            np.where(states[:, 0] > -0.5, 2, -1),
+        )
 
 
 class PlannerRolloutQualityTests(unittest.TestCase):
@@ -83,6 +91,12 @@ class PlannerRolloutQualityTests(unittest.TestCase):
             margin_rules, 1, include_margin=True
         )(margin_states, None, 0)
         np.testing.assert_array_equal(envelope, [1, 1])
+
+    def test_near_status_callback_keeps_three_levels(self):
+        rules = FakeRules()
+        states = np.asarray([[-1.0], [-0.25], [0.25]])
+        status = near_status_callback(rules, 1)(states, None, 0)
+        np.testing.assert_array_equal(status, [-1, 2, 1])
 
     def test_oracle_plan_returns_first_death_and_final_state(self):
         env = FakeEnv()

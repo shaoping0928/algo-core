@@ -32,6 +32,11 @@ from node_features import Primitive
 from rule_expressions import ExpressionRule, search_compositions
 
 UNKNOWN = -1
+# A near-death status is a soft warning: the state is inside the fitted
+# boundary margin but no exact death rule fires.  It is deliberately
+# distinct from both death (1) and unknown (-1) so a planner can penalise
+# it without turning it into a hard veto.
+NEAR = 2
 
 
 def negate(primitive: Primitive) -> Primitive:
@@ -581,6 +586,28 @@ class DeathRuleSet:
         death, near = self._death_side(states)
         selected = near if include_margin else death
         return np.where(selected, 1, UNKNOWN)
+
+    def classify_death_status(self, states: np.ndarray) -> np.ndarray:
+        """Exact death (1), near death (2), or unknown (-1).
+
+        Near means the state is inside the fitted boundary margin but not
+        inside an exact death rule.  It is a soft risk signal: the planner
+        may penalise such states without vetoing the plan.  With no
+        boundary margin the near set is empty, so this reduces to
+        ``classify_death``.
+        """
+        if self.states_ is None:
+            raise RuntimeError(
+                "fit must be called before classify_death_status"
+            )
+        states = np.asarray(states, dtype=float)
+        if states.ndim == 1:
+            states = states.reshape(1, -1)
+        death, near = self._death_side(states)
+        result = np.full(len(states), UNKNOWN, dtype=int)
+        result[near & ~death] = NEAR
+        result[death] = 1
+        return result
 
     def verify(self, states: np.ndarray, labels: np.ndarray) -> dict:
         prediction = self.classify(states)
