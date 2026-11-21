@@ -50,6 +50,7 @@ memory_tree.py            有界扇出分层记忆：合并/分裂/关键词概�
 variable_registry.py      变量属性与关系：support/credibility/learning_rate
 hierarchical_memory.py    帧→事件→阶段→世界→根的分层记忆
 generative_expansion.py    关键词提示 → 节点策略 + 上下文动力学 rollout
+generated_prior_probe.py   生成先验 vs 在线 vs 零先验的存活配对
 dynamics_context_probe.py 跨世界动力学变化的通用上下文探针
 eval_protocol.py          held-out 种子解析、中位数/IQR、聚类 bootstrap 区间
 signal_bank.py            每节点信号源：差分、积分/泄漏、逆泄漏、均值
@@ -519,6 +520,32 @@ L0 帧窗（几帧） → L1 关键事件 → L2 阶段 → L3 世界 → L4 根
 **4/4 关键词 prompt 更接近目标世界的已存记忆，生成流全部有限。**
 限制：单步 cell 策略不是完整 planner；世界签名仍 noisy；越界即停；
 尚未用生成流初始化新世界的 planner/上下文先验，也还没有生存指标。
+
+### 生成先验的配对实验（2026-11-21）
+
+`generated_prior_probe.py` 把生成流变成**决策先验**：新世界先跑 10 帧
+固定 warmup，然后用相同动作分叉三臂：
+
+```text
+global     清空上下文，从零开始
+online     warmup 自己的上下文估计
+generated  用 warmup 动作对每个记忆候选做生成模拟，
+           选预测最匹配的 regime 作为 context prior
+```
+
+**通用置信度门控**：只有最佳候选相对第二名有明显优势
+（`(second-best)/second ≥ 0.05`）才采用生成先验；否则回退 `online`。
+
+| 对比 | 逐 episode Δ（生成−对照） | 均值 | 方向 |
+|---|---|---:|---|
+| vs global（零上下文） | +42 / +116 / +54 / +71 / +74 / +71 / +21 / +23 | **+59.0** | **8/8 正向** |
+| vs online（warmup 上下文） | +50 / +32 / +131 / +127 / 0 / +71 / +81 / +91 | **+72.9** | **7/8 正向，1 平** |
+
+无门控时 222 ep0 的生成先验 margin 0.012、错误先验造成 −53/−127；
+门控回退 `online` 后该例 200 帧，8/8 仍成立。逐 episode 的预测误差
+不总是更低（5/8 优于 global）——先验改善的是**决策/存活**，不是单纯
+一步误差。限制：4 世界 × 2 episode、单一节点 agent、未做 3 种子主基准；
+候选来自训练记忆的 31 个叶；生成模拟使用 warmup 动作。
 
 ### 记忆回溯修正（2026-11-20，已实现；A/B 进行中）
 

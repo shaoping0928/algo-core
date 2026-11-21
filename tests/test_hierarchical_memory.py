@@ -178,6 +178,19 @@ class HierarchicalMemoryTests(unittest.TestCase):
         self._feed(memory, 0, np.asarray([4.0, 0.0]), 20, done=True)
         self.assertGreaterEqual(len(memory.phases), 1)
 
+    def test_episode_leaf_and_world_reference_are_recorded(self):
+        memory = HierarchicalMemory(
+            context_dim=2, observation_dim=3, window=2,
+            salience_z=0.5, phase_split=1.0,
+        )
+        self._feed(memory, 0, np.asarray([0.0, 0.0]), 24)
+        self._feed(memory, 1, np.asarray([3.0, 0.0]), 24)
+        self.assertEqual(len(memory.episode_leaf), 2)
+        leaf = memory.episode_leaf[1]
+        reference = memory.world_reference_observations(leaf)
+        self.assertGreater(len(reference), 0)
+        self.assertEqual(reference.shape[1], 3)
+
     def test_phase_summary_expands_into_an_approximate_flow(self):
         memory = HierarchicalMemory(
             context_dim=2, observation_dim=3, window=2,

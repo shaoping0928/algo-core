@@ -214,6 +214,17 @@ class ContextualLinearModel:
                 self._prior_precision = max(float(prior_precision), 0.0)
         self._episode_sum = np.zeros_like(self.context)
 
+    def apply_prior(self, prior, precision: float = 1.0):
+        """Install a prior without discarding the observed warmup window."""
+        if self.basis is None:
+            return
+        prior = np.asarray(prior, dtype=float).reshape(-1)
+        if prior.shape[0] != self.context.shape[0]:
+            return
+        self.context = prior.copy()
+        self._prior = prior.copy()
+        self._prior_precision = max(float(precision), 0.0)
+
     def end_episode(self):
         """Return the episode's mean context and its length."""
         if self._episode_steps > 0:

@@ -137,6 +137,23 @@ class ContextModelTests(unittest.TestCase):
         self.assertGreaterEqual(model.basis.shape[0], 1)
         self.assertLessEqual(model.basis.shape[0], 3)
 
+    def test_apply_prior_keeps_the_observed_warmup_window(self):
+        rng = np.random.RandomState(43)
+        obs, act, target = _world_data(
+            np.asarray([0.4, -0.3]), self.basis, self.base, 8, rng
+        )
+        model = self._make_model()
+        model.begin_episode()
+        for step in range(5):
+            model.observe(obs[step], act[step], target[step])
+        buffered = len(model._buffer_x)
+        prior = np.asarray([0.5, -0.5])
+        model.apply_prior(prior, precision=1.0)
+        self.assertEqual(len(model._buffer_x), buffered)
+        np.testing.assert_allclose(model.context, prior)
+        model.observe(obs[5], act[5], target[5])
+        self.assertGreater(model.updates, 5)
+
 
 if __name__ == "__main__":
     unittest.main()
