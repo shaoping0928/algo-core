@@ -2258,6 +2258,31 @@ class PlanScoreTests(unittest.TestCase):
             places=9,
         )
 
+    def test_risk_error_weight_uses_the_measured_curve(self):
+        from latent_world import latent
+        from substrate_nodes import fit, policy_result
+
+        world, agent = fit(100, steps=300, epochs=1, max_nodes=200, lag=3)
+        env = latent[3](100)
+        prefix = np.zeros(3, dtype=float)
+        base = policy_result(env, world, agent, prefix, horizon=3, lag=3)
+        agent.risk_error_weight = True
+        agent.step_errors = [0.0] * 16
+        same = policy_result(env, world, agent, prefix, horizon=3, lag=3)
+        self.assertAlmostEqual(same.score[2], base.score[2], places=9)
+        agent.step_errors = [0.0] + [5.0] * 15
+        down = policy_result(env, world, agent, prefix, horizon=3, lag=3)
+        self.assertLessEqual(down.score[2], base.score[2] + 1e-9)
+
+    def test_rollout_error_curve_shape(self):
+        from substrate_nodes import _rollout_error_curve, collect, fit
+
+        world, agent = fit(100, steps=300, epochs=1, max_nodes=200, lag=3)
+        rows, _counts = collect(100, 300)
+        curve = _rollout_error_curve(rows, world, 3)
+        self.assertEqual(len(curve), 16)
+        self.assertTrue(all(value >= 0.0 for value in curve))
+
     def test_plan_score_carries_the_curiosity_share(self):
         from latent_world import latent
         from substrate_nodes import fit, plan_score, policy_result

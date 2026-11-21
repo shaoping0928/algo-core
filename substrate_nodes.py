@@ -132,6 +132,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         branch_transitions: bool = False,
         action_edge_weight: float = 0.0,
         feature_backfit: bool = False,
+        risk_error_weight: bool = False,
         action_edge_trust_samples: float = 50.0,
         death_rules: bool = False,
         death_rule_compose: bool = False,
@@ -205,6 +206,15 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
     for row in transitions:
         episodes.setdefault(row["episode"], []).append(row)
     ordered = [episodes[key] for key in sorted(episodes)]
+
+    if risk_error_weight:
+        # Data-driven per-step trust: the planner conditions on a known
+        # action sequence, so measure how far the fitted model drifts on
+        # the real stream and down-weight the hazard read accordingly.
+        agent.risk_error_weight = True
+        agent.step_errors = _rollout_error_curve(
+            transitions, world, lag
+        )
 
     # Rules are induced after the first pass, then materialized as feature
     # nodes.  With point-event labels (default) the predicate describes the
@@ -682,6 +692,53 @@ def ledger_survival_report(rows, weight: float,
     }
 
 
+def _rollout_error_curve(transitions, world, lag, horizon=16,
+                         max_windows=200):
+    """Per-step rollout error of the fitted world model on the real stream.
+
+    The planner conditions on a known action sequence, so the model is
+    rolled forward with the recorded actions and compared with the recorded
+    next observations at each step.  The curve is in observation-standard-
+    deviation units and is used to down-weight the hazard read at steps the
+    model cannot predict (discrete events, coordinate resets).
+    """
+    observations = np.asarray(
+        [row["obs"] for row in transitions], dtype=float
+    )
+    scale = observations.std(axis=0)
+    scale = np.where(scale > 1e-8, scale, 1.0)
+    episodes = {}
+    for row in transitions:
+        episodes.setdefault(row["episode"], []).append(row)
+    errors = [[] for _ in range(horizon)]
+    windows = 0
+    for rows in episodes.values():
+        start = 0
+        while start + horizon < len(rows) and windows < max_windows:
+            chunk = rows[start:start + horizon]
+            if any(bool(row["done"]) for row in chunk):
+                start += horizon
+                continue
+            state = np.asarray(chunk[0]["obs"], dtype=float)
+            for step in range(horizon):
+                history = np.asarray(
+                    chunk[step]["history"], dtype=float
+                ).reshape(1, -1)
+                predicted = world.predict(
+                    state.reshape(1, -1), history
+                )[0]
+                actual = np.asarray(chunk[step]["next_obs"], dtype=float)
+                errors[step].append(float(np.linalg.norm(
+                    (predicted - actual) / scale
+                )))
+                state = predicted
+            windows += 1
+            start += horizon
+    return [
+        float(np.mean(values)) if values else 0.0 for values in errors
+    ]
+
+
 def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         birth_threshold=0.45, epochs=5, lag=LAG,
         component_kinds=(), component_min_count=8,
@@ -711,6 +768,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         feature_backfit=False,
         risk_weight=1.0,
         risk_decay=1.0,
+        risk_error_weight=False,
         death_rules=False, death_rule_compose=False,
         death_rule_max_thresholds=256, death_rule_max_rules=24,
         death_rule_max_literals=5, death_rule_boundary_margin=0.0,
@@ -899,6 +957,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         action_edge_weight=action_edge_weight,
         action_edge_trust_samples=action_edge_trust_samples,
         feature_backfit=feature_backfit,
+        risk_error_weight=risk_error_weight,
         death_rules=death_rules,
         death_rule_compose=death_rule_compose,
         death_rule_max_thresholds=death_rule_max_thresholds,
@@ -1027,6 +1086,14 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
     lag = int(lag)
     risk_weight = float(risk_weight)
     risk_decay = float(risk_decay)
+    error_weight = bool(getattr(agent, "risk_error_weight", False))
+    step_errors = list(getattr(agent, "step_errors", ()) or ())
+
+    def error_factor(step_index):
+        if not error_weight or not step_errors:
+            return 1.0
+        index = min(int(step_index), len(step_errors) - 1)
+        return 1.0 / (1.0 + float(step_errors[index]))
     # Decision-side curiosity: the potential at the shared start state is
     # a constant across plans, but it is evaluated so the term is exactly
     # the potential difference (PBRS identity), not a bare endpoint bonus.
@@ -1200,7 +1267,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             ) / agent.scales
             risk = agent.pain_signal_batch(encoded) * risk_weight * (
                 risk_decay ** step
-            )
+            ) * error_factor(step)
             q_cost = np.zeros(len(states))
             if q_table is not None:
                 q_pain, q_count = agent.action_edge_transition_q_batch(
@@ -1240,11 +1307,15 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 # the prototype valence no longer bounds it.
                 risk = agent.pain_signal_batch(
                     encoded, mask_table
-                ) * risk_weight * (risk_decay ** horizon)
+                ) * risk_weight * (risk_decay ** horizon) * error_factor(
+                    horizon - 1
+                )
             else:
                 risk = np.maximum(
                     pain, agent.pain_signal_batch(encoded, mask_table)
-                ) * risk_weight * (risk_decay ** horizon)
+                ) * risk_weight * (risk_decay ** horizon) * error_factor(
+                    horizon - 1
+                )
             # Scalarized objective: accumulated hazard minus the
             # sequence-level value of the endpoint, so a plan that accepts
             # local risk in exchange for a long-survival alignment can win.
@@ -1662,6 +1733,7 @@ def run_seed(task):
     death_rules = bool(task.get("death_rules", False))
     risk_weight = float(task.get("risk_weight", 1.0))
     risk_decay = float(task.get("risk_decay", 1.0))
+    risk_error_weight = bool(task.get("risk_error_weight", False))
     death_rule_compose = bool(task.get("death_rule_compose", False))
     death_rule_max_thresholds = int(
         task.get("death_rule_max_thresholds", 256)
@@ -1744,6 +1816,7 @@ def run_seed(task):
         feature_backfit=feature_backfit,
         risk_weight=risk_weight,
         risk_decay=risk_decay,
+        risk_error_weight=risk_error_weight,
         action_edge_weight=action_edge_weight,
         action_edge_trust_samples=action_edge_trust_samples,
         death_rules=death_rules,
@@ -1861,6 +1934,10 @@ def main():
     parser.add_argument("--risk-decay", type=float, default=1.0,
                         help="per-step decay on the hazard column: later "
                              "predicted steps count less (1.0 = off)")
+    parser.add_argument("--risk-error-weight", action="store_true",
+                        help="down-weight the hazard read at steps where "
+                             "the world model's measured rollout error is "
+                             "large (default off)")
     parser.add_argument("--eval-seeds", default="",
                         help="held-out seed spec, e.g. 120-139; empty keeps "
                              "the legacy self-evaluation")
@@ -2237,6 +2314,7 @@ def main():
             feature_backfit=args.feature_backfit,
             risk_weight=args.risk_weight,
             risk_decay=args.risk_decay,
+            risk_error_weight=args.risk_error_weight,
             action_edge_weight=args.action_edge_weight,
             action_edge_trust_samples=args.action_edge_trust,
             death_rules=args.death_rules,

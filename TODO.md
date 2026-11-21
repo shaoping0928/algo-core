@@ -586,6 +586,28 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
 → **三个 dead 环节已接活**；A/B（3 种子）验证“特征格改进 hazard 读出”
 是否转成生存收益。
 
+**第一步 A/B（2026-11-21，backfit + value_weight=0 + curiosity=0）**
+
+| 臂 | 100 | 101 | 102 | 均值 | 中位 |
+|---|---:|---:|---:|---:|---:|
+| 基线 | 191.8 | 178.4 | 88.4 | **152.9** | 152 |
+| backfit + vw0 + cw0 | 148.0 | 126.0 | 104.6 | **126.2** | 124 |
+| paired | −43.8 | −52.4 | +16.2 | **−26.7** | 1/3 |
+
+**判定：接线修好但没有转成收益 → 保留 opt-in。** 特征格接进 hazard 读出
+本身不改变决策质量；“接线不良”是必要条件，不是充分条件。按顺序进入
+第二步（预测误差加权）。
+
+**第二步：按实测逐步误差给 risk 加权（2026-11-21，已实现）**
+
+- `_rollout_error_curve`：在训练流上按已知动作序列滚动世界模型，测
+  每一步的误差（观测标准差单位）；`_train` 在 `risk_error_weight=True`
+  时把曲线存到 `agent.step_errors`；
+- `policy_result`：第 t 步 hazard × `1/(1+e_{t+1})`（默认关，逐位不变）；
+- CLI `--risk-error-weight`；289 测试（曲线形状、零误差逐位一致）。
+- A/B：`--risk-error-weight` × 3 种子进行中；目标是“少信 k≥4 的失效
+  rollout”，而不是全局 decay（后者 −19.3）。
+
 **质量门**：阶段同质性（within-stage residual 显著低于跨阶段）；转移校准
 误差可控、applicability violation 低、support 不足 abstain；seed 101 的
 decision-relevant miss/regret 下降；seed 100/102 selected survives 不降、
