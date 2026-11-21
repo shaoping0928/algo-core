@@ -21,9 +21,14 @@ import json
 import numpy as np
 
 from context_model import ContextualLinearModel
+from generative_expansion import (
+    GenerativeExpander,
+    nearest_reference_distance,
+)
 from hierarchical_memory import HierarchicalMemory
 from latent_world import latent
 from substrate_generic import LayerPair, LinearObservationModel
+from substrate_nodes import _train
 
 LAG = 3
 OBS_DIM = 7
@@ -92,7 +97,8 @@ def collect_world(seed, gravity, flap, drag, speed, steps=1200, lag=LAG):
                 signals=np.asarray(
                     [feedback["dopamine"], feedback["pain"]], dtype=float
                 ),
-                done=bool(env.dead), episode=episode, world=seed,
+                done=bool(env.dead), episode=seed * 100000 + episode,
+                world=seed,
             ))
             recent = [action] + recent[:-1]
         episode += 1
@@ -216,6 +222,35 @@ def run(seed=0, train_steps=1200, episodes=4, max_frames=60,
         int(context_model.basis.shape[0])
         if context_model.basis is not None else 0
     )
+    all_rows = [row for stream in streams for row in stream]
+    _agent_world, node_agent = _train(
+        all_rows, seed=200, epochs=2, lag=LAG, max_nodes=800,
+        birth_threshold=0.45, component_kinds=(), component_min_count=8,
+        max_components=0, component_weight=0.5, component_gating=False,
+        memory_weight=0.1, association_rate=0.0, induce_features=True,
+        precursor_labels=False, pain_horizon=None, voi_target=3,
+        feature_value_weight=0.05,
+    )
+
+    def node_policy(observation, history):
+        pending = np.asarray(history[1:1 + LAG], dtype=float)
+        if len(pending) < LAG - 1:
+            pending = np.concatenate([
+                pending, np.zeros(LAG - 1 - len(pending))
+            ])
+        scores = {}
+        for action in (0, 1):
+            columns = np.concatenate([
+                [float(action)], pending[:LAG - 1]
+            ])
+            encoded = np.concatenate([
+                np.asarray(observation, dtype=float), columns
+            ]).reshape(1, -1) / node_agent.scales
+            risk = float(node_agent.feature_risk_batch(encoded)[0])
+            value = float(node_agent.feature_value_batch(encoded)[0])
+            scores[action] = risk - node_agent.feature_value_weight * value
+        return int(min(scores, key=lambda key: (scores[key], key)))
+
     arm_memory = {
         "global": None, "context": None,
         "context+mem": HierarchicalMemory(
@@ -297,6 +332,10 @@ def run(seed=0, train_steps=1200, episodes=4, max_frames=60,
             )
         results[world_seed] = arm_rows
     memory = arm_memory["context+mem"]
+    expander = GenerativeExpander(
+        context_model, memory=memory, policy=node_policy,
+        horizon=18, phase_len=6,
+    )
     world_summaries = []
     for node_id, node in memory.world_tree.nodes.items():
         if node.leaf or node.keywords is None:
@@ -325,6 +364,43 @@ def run(seed=0, train_steps=1200, episodes=4, max_frames=60,
                 item["error"] for item in expansion["events"]
             ])) if expansion["events"] else 0.0,
         ))
+    world_generation = []
+    if context_dim > 0:
+        for node_id, node in memory.world_tree.nodes.items():
+            if node.leaf or node.keywords is None:
+                continue
+            context = node.mean[:context_dim]
+            start = expander.pick_start(context)
+            keyword_flow = expander.expand(context, start_obs=start)
+            global_flow = expander.expand(
+                np.zeros(context_dim), start_obs=start
+            )
+            reference = memory.world_reference_observations(node_id)
+            if not keyword_flow or len(reference) == 0:
+                continue
+            keyword_observations = np.stack([
+                row["observation"] for row in keyword_flow
+            ])
+            global_observations = np.stack([
+                row["observation"] for row in global_flow
+            ])
+            keyword_distance = nearest_reference_distance(
+                keyword_observations, reference
+            )
+            global_distance = nearest_reference_distance(
+                global_observations, reference
+            )
+            world_generation.append(dict(
+                node=node_id, level=int(node.level),
+                keywords=int(node.keywords.shape[0]),
+                steps=len(keyword_flow),
+                phases=len(expander.summarize(keyword_flow)),
+                keyword_distance=keyword_distance,
+                global_distance=global_distance,
+                improvement=float(global_distance - keyword_distance),
+                reference_frames=len(reference),
+                finite=bool(np.isfinite(keyword_observations).all()),
+            ))
     directions = []
     for index in range(context_dim):
         unit = np.zeros(context_dim)
@@ -380,6 +456,7 @@ def run(seed=0, train_steps=1200, episodes=4, max_frames=60,
         world_variables=worlds_report,
         world_summaries=world_summaries,
         phase_summaries=phase_summaries,
+        world_generation=world_generation,
         directions=directions,
         hidden_correlations=correlations,
     )

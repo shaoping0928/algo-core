@@ -1469,6 +1469,7 @@ class NodeRuntimeTests(unittest.TestCase):
         for name in (
             "context_model.py", "memory_tree.py",
             "variable_registry.py", "hierarchical_memory.py",
+            "generative_expansion.py",
         ):
             text = (root / name).read_text(encoding="utf-8")
             for token in (

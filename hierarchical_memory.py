@@ -128,6 +128,7 @@ class HierarchicalMemory:
         self._episode_start = 0
         self._episode_event_start = 0
         self._episode_phase_start = 0
+        self.episode_leaf: Dict[int, int] = {}
         self._frame_buffer = []
         self._episode_contexts = []
         self._episode_feedback = []
@@ -304,6 +305,7 @@ class HierarchicalMemory:
         leaf_id = self.world_tree.insert(signature, weight=float(len(
             self._episode_contexts
         )))
+        self.episode_leaf[int(episode.episode)] = int(leaf_id)
         self._update_registry(episode, leaf_id)
         self._episode = -1
         return episode
@@ -382,6 +384,32 @@ class HierarchicalMemory:
         return self.world_tree.keyword_persistence(node_id)
 
     # ---- queries ----------------------------------------------------------
+    def _subtree_leaves(self, node_id: int) -> set:
+        node = self.world_tree.nodes.get(node_id)
+        if node is None:
+            return set()
+        if node.leaf:
+            return {node_id}
+        result = set()
+        for child in node.children:
+            result |= self._subtree_leaves(child)
+        return result
+
+    def world_reference_observations(self, node_id: int) -> np.ndarray:
+        """Stored frame observations belonging to a world node's episodes."""
+        leaves = self._subtree_leaves(node_id)
+        episodes = {
+            episode.episode for episode in self.episodes
+            if self.episode_leaf.get(episode.episode) in leaves
+        }
+        rows = [
+            frame.observation for frame in self.frames
+            if frame.episode in episodes
+        ]
+        if not rows:
+            return np.zeros((0, self.observation_dim), dtype=float)
+        return np.stack(rows)
+
     def query_world(self, context_or_signature, max_distance=None):
         signature = np.asarray(context_or_signature, dtype=float)
         if signature.shape[-1] != self.signature_dim:
