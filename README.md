@@ -50,6 +50,7 @@ memory_tree.py            有界扇出分层记忆：合并/分裂/关键词概�
 variable_registry.py      变量属性与关系：support/credibility/learning_rate
 hierarchical_memory.py    帧→事件→阶段→世界→根的分层记忆
 generative_expansion.py    关键词提示 → 节点策略 + 上下文动力学 rollout
+branches.py                共享图上的多角色稀疏强度：current/recent/prediction/value
 generated_prior_probe.py   生成先验 vs 在线 vs 零先验的存活配对
 dynamics_context_probe.py 跨世界动力学变化的通用上下文探针
 eval_protocol.py          held-out 种子解析、中位数/IQR、聚类 bootstrap 区间
@@ -553,6 +554,27 @@ vs online **+72.9（7/8 正向，1 平）**。但 **3 个行为流种子
 **保留的已验证部分**：上下文层对未见动力学的预测误差 2–3× 改善
 （无 world 标签）；分层概括/生成式展开的匹配机制。
 **不再宣称**：生成先验提高存活。
+
+### 多分支节点系统（2026-11-21，第一片）
+
+同一张 `NodeGraph`，每个角色拥有自己的稀疏强度字典：
+
+```text
+CurrentBranch      瞬时现状（覆盖上一帧）
+RecentBranch       指数衰减近期痕迹
+PredictionBranch   rollout 的预期激活，compare(current) 逐节点误差
+ValueBranch        慢速价值（固定率或 1/n）
+BranchBank         transition_pairs / prediction_error / snapshot
+```
+
+`BranchBank.transition_pairs(action)` 用 `recent × current` 生成
+`(old, action, new)` 的加权证据，供动作边学习；`prediction_error()`
+把预测分支与现状分支逐节点比较，供预测可信度/学习率使用。
+
+**只读接入**：`NodeRuntime._interact` 每步更新 `current`/`recent`，
+决策路径仍读原有图字段。同一 fast 配置的 80 帧评估与接入前**逐位
+相同**；测试 188 → 196（+8 branch）。下一步：转移边学习、
+prediction 分支、记忆树分支关键词、value/risk 分支接入。
 
 ### 记忆回溯修正（2026-11-20，已实现；A/B 进行中）
 

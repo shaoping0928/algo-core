@@ -466,6 +466,24 @@
   下一步（若要继续）：(a) warmup 20–30 帧 + 更多训练世界/数据；
   (b) 用生成流初始化 planner 候选/动作偏置，而不是只改上下文；
   (c) 指标从噪声大的存活改为适应误差 + 多环境配对。
+- **多分支节点系统（2026-11-21，用户设计，第一片已落地）**：
+  `branches.py`：**共享同一张 NodeGraph**，每个分支只拥有一个稀疏的
+  `node_id -> strength` 字典；`NodeBranch` 基类提供
+  `activate / step / read / top / compare / snapshot`。实例：
+  - `CurrentBranch`：瞬时现状，每次激活覆盖上一帧；
+  - `RecentBranch`：指数衰减的近期痕迹（decay=0.8，上限 1）；
+  - `PredictionBranch`：rollout 的预期激活，`compare(current)` 给出
+    逐节点误差、重叠与余弦；
+  - `ValueBranch`：慢速价值（固定学习率或 1/n）。
+  `BranchBank` 提供 `transition_pairs(action)`（recent × current，
+  用于 `(old, action, new)` 边学习）、`prediction_error()`、`snapshot()`。
+  **只读接入**：`NodeRuntime._interact` 每步更新 `current`/`recent`
+  分支；决策路径仍读原有图字段，不改变任何读出。验证：同一 fast
+  配置的 80 帧评估与接入前**逐位相同**；测试 188 → **196**。
+  下一步：(a) 用 `transition_pairs` 驱动动作边学习（先 A/B 不劣化）；
+  (b) planner rollout 写 `prediction` 分支，真实 step 后逐节点比较，
+  更新预测可信度/学习率；(c) 记忆树事件快照带分支关键词；
+  (d) value/risk 分支接入 D4 信任与 P4 账本。
 - **标签口径裁定（2026-11-20，用户）：点事件 pain 为默认**：世界只在
   撞边界/管道时给 pain；正常飞行没有任何问题、不能给 pain。据此撤销
   两样东西：前兆标签 `P(pain within k)`（把死亡前 k 帧的正常状态标成

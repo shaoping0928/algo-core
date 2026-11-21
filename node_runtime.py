@@ -26,6 +26,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from branches import BranchBank, CurrentBranch, RecentBranch
 from node_components import ComponentBank
 from node_features import (
     FeatureRuleBank,
@@ -566,6 +567,13 @@ class NodeRuntime:
         self.scales = scales
 
         self.graph = NodeGraph()
+        # Read-only branch record: the same graph, separate strength states
+        # for the current state and the recent trace.  Decision paths still
+        # read the graph fields; branches are available for the transition,
+        # prediction and memory layers without changing behaviour.
+        self.branches = BranchBank(self.graph)
+        self.branches.add(CurrentBranch(graph=self.graph))
+        self.branches.add(RecentBranch(graph=self.graph, decay=0.8))
         self.components = ComponentBank(
             self.graph,
             threshold=self.component_threshold,
@@ -982,6 +990,15 @@ class NodeRuntime:
         dopamine = float(dopamine)
         current_features = list(dict.fromkeys(current_features))
         next_features = list(dict.fromkeys(next_features))
+        self.branches.get("recent").step()
+        self.branches.activate(
+            "current", [current] + current_features,
+            [1.0] * (1 + len(current_features)),
+        )
+        self.branches.activate(
+            "recent", [next_node] + next_features,
+            [1.0] * (1 + len(next_features)),
+        )
         if current == next_node:
             # A self-loop is still a visit: the per-node valence rate must
             # see every transition through the node, even the ones that
