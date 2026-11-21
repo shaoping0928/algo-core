@@ -422,6 +422,24 @@ class DeathRuleSet:
         result[death] = 1
         return result
 
+    def classify_death(self, states: np.ndarray) -> np.ndarray:
+        """Only the death side: 1 when a death rule fires, else UNKNOWN.
+
+        The planner's hard constraint only needs this side.  Not claiming
+        safety from a finite rule set keeps a missed death visible as
+        uncertainty instead of silently becoming a false negative.
+        """
+        if self.states_ is None:
+            raise RuntimeError("fit must be called before classify_death")
+        states = np.asarray(states, dtype=float)
+        if states.ndim == 1:
+            states = states.reshape(1, -1)
+        death = np.zeros(len(states), dtype=bool)
+        for rule in self.rules_:
+            if rule.label == 1:
+                death |= rule.mask(states)
+        return np.where(death, 1, UNKNOWN)
+
     def verify(self, states: np.ndarray, labels: np.ndarray) -> dict:
         prediction = self.classify(states)
         truth = (np.asarray(labels, dtype=float).reshape(-1) > 0.5).astype(int)

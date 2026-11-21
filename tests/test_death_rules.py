@@ -41,6 +41,9 @@ class DeathRuleTests(unittest.TestCase):
             "f0" in rule.text() and "f1" in rule.text()
             for rule in rules.rules_for(1)
         ))
+        death_only = rules.classify_death(states[cut:])
+        self.assertTrue(np.all((death_only == 1) | (death_only == UNKNOWN)))
+        self.assertTrue(np.all(death_only[labels[cut:] == 1] == 1))
 
     def test_recovers_a_disjunction_as_separate_rules(self):
         # A deterministic 2-D grid keeps both branches represented in the

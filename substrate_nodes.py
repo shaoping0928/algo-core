@@ -1005,7 +1005,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
     ):
         def death_batch(states, _sequences, step):
             observed = np.asarray(states, dtype=float)[:, :agent.obs_dim]
-            predicted = death_rules.classify(observed)
+            predicted = death_rules.classify_death(observed)
             return np.where(predicted == 1, int(step), -1)
     previous_holder = {"states": None}
 
