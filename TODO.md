@@ -97,9 +97,11 @@ held-out 世界 120–124；基线 129.1 / 147（3 种子）。
 
 **分片与验收（默认关，逐片 A/B）**
 
-- [ ] **片 1**：`stage_graph.py` schema（纯数据类）+ 离线分段器
+- [x] **片 1**：`stage_graph.py` schema（纯数据类）+ 离线分段器
       （split/merge，合并用 next-outcome 分布 ΔBIC + 期望计数门，
       从 1 阶段起步）+ 合成切换动力学测试；不接 planner。
+      **结果见下“片 1 实测”**：分段器跑通，但真实流上几乎不产生
+      action-relevant 边界，片 2 保持关闭。
 - [ ] **片 2**：阶段转移图 + 预测契约 + 离线 router 探针
       （fine-only / coarse-only / coarse-to-fine）。
 - [ ] **片 3**：粗到细搜索 + 吸引力列（`--stage-graph` opt-in；
@@ -301,6 +303,34 @@ tie-break / 只在粗层阶段评分中使用。
       输出 cross3（跨≥3 episode 的 informative 边）计数；
 - [ ] 合成测试：分段切换、常数流、动作打乱对照；
 - [ ] **不接 planner、不写入 MemoryTree、不改默认路径**。
+
+**片 1 实测（2026-11-21，`stage_graph.py`，纯数据层）**
+
+实现：`Stage` / `StageTransition` / `StageGraph` schema；离线分段器
+（k=1、acting 对齐、状态+动作 ridge 残差、BIC 型惩罚）；拟合门 =
+逐折标准化 + alpha=1.0 + 丢零方差维的 pooled OOF R²（<0 则 abstain，
+每 episode 单阶段）；阶段身份 = 动作效应向量单链路聚类（半径 = 正距离
+中位数的 0.5）；输出 `cross_episode_informative`（非自环非 END、
+frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
+
+真实流结果（缓存流，seed 100）：
+
+| 流 | 门 R² | 阶段数 | 簇 | 转移 | cross3 | 打乱对照 cross3 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1500 帧 / 38 ep | 0.751 | 38（1/ep） | 3 | 5 | **0** | 0 |
+| 6536 帧 / 101 ep | 0.609 | 108（1.07/ep） | 12 | 35 | **12** | **21** |
+
+判定：
+
+1. **1500 帧无 BIC 支持的 action-relevant 边界**：状态+动作模型解释了
+   大部分方差（70 个参数的 BIC 惩罚 ≈ 260/episode），残差里没有可分
+   结构 → 每 episode 单阶段，cross3=0；
+2. **6536 帧的 12 条 cross3 过不了打乱对照**（21 条）——打乱标签让动作
+   效应向量更分散、簇更多（19 vs 12），cross3 反而上升。**cross3 不能
+   单独作开闸数**，必须用“真实 − 打乱”的净值或按簇数归一化；
+3. **片 2 保持关闭**：现有数据上没有可检测的 action-relevant 阶段边界，
+   转移图无法提供方向。下一步三选一：更多 DAgger 轮次（提高跨 episode
+   复发）、粗层改为结果导向（dead-end/存活段）、或回到证据通道 A/B。
 
 **质量门**：阶段同质性（within-stage residual 显著低于跨阶段）；转移校准
 误差可控、applicability violation 低、support 不足 abstain；seed 101 的
