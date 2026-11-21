@@ -315,7 +315,7 @@ def _rank_literals(literals: Sequence[Primitive], states: np.ndarray,
         covered_negatives = int((mask & negatives).sum())
         if positives == 0:
             continue
-        scored.append((positives - covered_negatives, positives, literal))
+        scored.append((positives, -covered_negatives, literal))
     scored.sort(key=lambda item: (-item[0], -item[1]))
     return [item[2] for item in scored[:limit]]
 
@@ -357,6 +357,14 @@ def search_compositions(states: np.ndarray, target: np.ndarray,
     base_literals = _rank_literals(
         literals, states, target, negatives, max_base
     )
+    # A zero cut is a universal reference and is often the only split that
+    # separates a conditional XOR; keep it available even when the
+    # positive-coverage ranking is crowded by broad near-duplicates.
+    zero_literals = [
+        literal for literal in literals
+        if abs(float(literal.threshold)) <= 1e-12
+    ]
+    base_literals = list(dict.fromkeys(zero_literals + base_literals))
     if not base_literals:
         return []
     base = [Literal(literal) for literal in base_literals]
