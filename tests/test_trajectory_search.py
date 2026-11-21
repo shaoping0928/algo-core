@@ -2,7 +2,13 @@ import unittest
 
 import numpy as np
 
-from trajectory_search import beam_search, exhaustive_search
+from trajectory_search import (
+    SearchResult,
+    beam_search,
+    exhaustive_search,
+    merge_candidate_batches,
+    override_first_action,
+)
 
 
 class TrajectorySearchTests(unittest.TestCase):
@@ -291,6 +297,61 @@ class TrajectorySearchTests(unittest.TestCase):
         self.assertEqual(status.feasible_count, legacy.feasible_count)
         self.assertEqual(status.first_death, legacy.first_death)
         self.assertEqual(status.score, legacy.score)
+
+    @staticmethod
+    def candidate_batch():
+        count = 4
+        return dict(
+            sequences=np.asarray([[0, 0], [0, 1], [1, 0], [1, 1]],
+                                 dtype=float),
+            scores=np.asarray([[1.0], [2.0], [3.0], [4.0]]),
+            ranking_scores=np.asarray([[1.0], [2.0], [3.0], [4.0]]),
+            feasible=np.asarray([True, False, True, True]),
+            finite=np.ones(count, dtype=bool),
+            first_death=np.asarray([-1, -1, -1, -1]),
+            first_unknown=np.zeros(count, dtype=int),
+            unknown_count=np.full(count, 2, dtype=int),
+            safe_count=np.zeros(count, dtype=int),
+            first_states=np.arange(8, dtype=float).reshape(4, 2),
+            final_states=np.arange(8, dtype=float).reshape(4, 2) + 100.0,
+        )
+
+    def test_merge_candidate_batches_concatenates_every_field(self):
+        merged = merge_candidate_batches([
+            self.candidate_batch(), self.candidate_batch()
+        ])
+        self.assertEqual(len(merged["sequences"]), 8)
+        self.assertEqual(merged["first_death"].shape, (8,))
+        self.assertEqual(merged["final_states"].shape, (8, 2))
+
+    def test_override_first_action_picks_best_feasible_suffix(self):
+        result = SearchResult(
+            actions=np.asarray([0.0, 0.0]), score=1.0, feasible=True,
+            feasible_count=3, candidate_count=4,
+            first_state=np.zeros(1), final_state=np.zeros(1),
+        )
+        overridden = override_first_action(
+            result, [self.candidate_batch()], 1
+        )
+        np.testing.assert_array_equal(overridden.actions, [1.0, 0.0])
+        self.assertEqual(overridden.score, 3.0)
+        self.assertTrue(overridden.feasible)
+        self.assertEqual(overridden.feasible_count, 3)
+        self.assertEqual(overridden.candidate_count, 4)
+        self.assertEqual(overridden.unknown_count, 2)
+
+    def test_override_first_action_falls_back_when_nothing_is_feasible(self):
+        result = SearchResult(
+            actions=np.asarray([1.0, 0.0]), score=3.0, feasible=True,
+            feasible_count=3, candidate_count=4,
+            first_state=np.zeros(1), final_state=np.zeros(1),
+        )
+        batch = self.candidate_batch()
+        batch["feasible"] = np.asarray([True, True, False, False])
+        unchanged = override_first_action(result, [batch], 1)
+        self.assertIs(unchanged, result)
+        missing = override_first_action(result, [batch], 7)
+        self.assertIs(missing, result)
 
 
 if __name__ == "__main__":

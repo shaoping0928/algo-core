@@ -37,7 +37,11 @@ from substrate_generic import (
     collect,
     history_features,
 )
-from trajectory_search import exhaustive_search
+from trajectory_search import (
+    exhaustive_search,
+    merge_candidate_batches,
+    override_first_action,
+)
 
 LAG = 3
 DEFAULT_JOBS = min(8, os.cpu_count() or 1)
@@ -990,7 +994,7 @@ def _curiosity_off(agent):
 def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   step_stride=2, stride_includes_lag=False,
                   death_status_batch=None, unknown_penalty=0.0,
-                  candidate_callback=None):
+                  candidate_callback=None, inquiry_action=None):
     initial = np.asarray(env.obs(), dtype=float)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
     action_dim = int(lag) + 1
@@ -1238,6 +1242,13 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 np.isfinite(encoded).all(axis=1),
             )
 
+    inquiry_batches = []
+
+    def trace_callback(batch):
+        inquiry_batches.append(batch)
+        if candidate_callback is not None:
+            candidate_callback(batch)
+
     result = exhaustive_search(
         initial_state=initial,
         action_space=(0, 1),
@@ -1248,13 +1259,26 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         evaluate_death=death_batch,
         evaluate_death_status=death_status_batch,
         unknown_penalty=unknown_penalty,
-        candidate_callback=candidate_callback,
+        candidate_callback=(
+            trace_callback if inquiry_action is not None
+            else candidate_callback
+        ),
         batch_size=2 ** horizon,
         # "sum" expands to one mode per objective column, so the ledger
         # columns (hazard and value shares) sum alongside the scalarized
         # cost and the dopamine tie-break without changing their contract.
         score_combine="sum",
     )
+    if inquiry_action is not None and inquiry_batches:
+        merged = merge_candidate_batches(inquiry_batches)
+        # Inquiry is only for the all-unknown case: if any candidate has a
+        # death hit, the search already has a preference to act on.
+        if np.all(np.asarray(merged["first_death"]) < 0):
+            action = inquiry_action(initial, merged)
+            if action is not None:
+                result = override_first_action(
+                    result, inquiry_batches, int(action)
+                )
     return result
 
 

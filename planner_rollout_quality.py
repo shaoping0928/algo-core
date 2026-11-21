@@ -37,18 +37,21 @@ CONFIG = dict(
 )
 
 
-def status_callback(rules, obs_dim, full=False):
+def status_callback(rules, obs_dim, full=False, include_margin=False):
     """Return 1/0/-1 status per candidate and step.
 
     ``full=False`` is the death side the planner reads: 1 or unknown.  The
     full classifier is a diagnostic comparator and is never used for the
-    planner's hard constraint.
+    planner's hard constraint.  ``include_margin=True`` treats states inside
+    the fitted boundary margin as death (the model-error-aware envelope).
     """
     def callback(states, _sequences, _step):
         observed = np.asarray(states, dtype=float)[:, :int(obs_dim)]
         if full:
             return np.asarray(rules.classify(observed), dtype=int)
-        return np.asarray(rules.classify_death(observed), dtype=int)
+        return np.asarray(rules.classify_death(
+            observed, include_margin=bool(include_margin)
+        ), dtype=int)
     return callback
 
 
@@ -140,6 +143,9 @@ def main():
                         help="also sample the last N frames of each episode")
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--margin", type=float, default=0.01)
+    parser.add_argument("--margin-death", action="store_true",
+                        help="treat states inside the fitted boundary margin "
+                             "as death (model-error-aware envelope)")
     parser.add_argument("--full-status", action="store_true",
                         help="use the safe side as a diagnostic tri-state; "
                              "the planner's hard constraint still reads only "
@@ -153,7 +159,8 @@ def main():
     rules = agent.death_rules
     agent.death_rule_hard = False
     death_status = status_callback(
-        rules, agent.obs_dim, full=bool(args.full_status)
+        rules, agent.obs_dim, full=bool(args.full_status),
+        include_margin=bool(args.margin_death),
     )
     seeds = seed_spec(args.eval_seeds)
 

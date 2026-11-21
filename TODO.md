@@ -863,14 +863,31 @@
       oracle 首死步/动作选择；结果见上。
     - [x] `death_rule_loop.py`：漏检终止→正例、误报→反例，
       `refine_once`/`run_loop`；合成缺失第二模式测试通过。
-    - [ ] 失败→规则接真实 planner 失败，并按 refine/test 世界分割
-      测 held-out 终止覆盖率/FP（避免同世界泄漏）。
-    - [ ] UNKNOWN→求知 tie-break（全部候选未知/hazard 无区分时）。
-    - [ ] 动作效应模板（action→Δdim）与经验条目扩展。
+    - [x] `death_failure_probe.py`：实际 planner 轨迹按 refine/test
+      世界分割。refine 120–121 **624 状态/2 终止**，源规则已覆盖
+      2/2；test 122–124 **335 状态/3 终止**，源规则 2/3；failure
+      无新增（0），random 0，all-terminal 加 2 个终止但 test 仍 2/3。
+      **判定：实际控制轨迹的失败太少且已被覆盖；failure→rule 的
+      有效数据在候选计划的反事实终止，不在实际 episode 终止。**
+      下一步改为反事实失败（oracle 验证的候选计划终止状态）。
+    - [x] `trajectory_search.override_first_action` + `merge_candidate_batches`：
+      全部候选未知时可把结果替换为指定首动作的最佳可行候选；默认不启用。
+    - [ ] UNKNOWN→求知 tie-break 接 `policy_result`（全部候选未知时用
+      动作效应选动作）。
+    - [x] `action_effect.py`：按动作统计 signed/abs Δdim、归一化变化、
+      首选动作；合成测试通过（5 条）。
+    - [ ] 动作效应接求知/经验条目（action→Δdim 的消费者）。
+    - [ ] 反事实失败探针（`counterfactual_failure_probe.py`）：从候选
+      计划 oracle 终止状态取漏检正例，refine/test 世界分割。
+    - [ ] 候选计划探针在 seed 101/102 复跑，确认 tri_later>0 不是
+      单一模型的偶然；近终止动作对比用 `--tail 20` 提高 comparable。
     - [ ] 归一化阈值先验旁支（k=5/10/20，覆盖升且 FP 不升才继续）。
   - **当前总判定（2026-11-21）**：默认栈不变；`--death-rules` 仍是
-    opt-in（3 种子配对均值 −13.2，2/3 正向）；**235 测试**全过。
-    死亡判断**精度好、覆盖率/召回是主瓶颈**；边界余量只修“误判安全”。
+    opt-in（3 种子配对均值 −13.2，2/3 正向；**注意该 A/B 用的是
+    Batch 2 规则，早于覆盖优先/少数模式支持/边界余量；当前规则的
+    候选计划探针方向为正，但仍需新质量门后的 A/B 复核**）；
+    **235 测试**全过。死亡判断**精度好、覆盖率/召回是主瓶颈**；
+    边界余量只修“误判安全”。
     当前观测已含相对量，成对特征冗余；模式库只迁移关系维度，阈值仍需
     本地校准，样本效率提升中性。候选计划探针显示硬否决方向为正
     （8 改进/0 退化），但 12/85 选中死亡计划未被标出。下一步优先级：

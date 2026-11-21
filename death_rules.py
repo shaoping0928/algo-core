@@ -559,20 +559,28 @@ class DeathRuleSet:
         result[death] = 1
         return result
 
-    def classify_death(self, states: np.ndarray) -> np.ndarray:
+    def classify_death(self, states: np.ndarray,
+                       include_margin: bool = False) -> np.ndarray:
         """Only the death side: 1 when a death rule fires, else UNKNOWN.
 
         The planner's hard constraint only needs this side.  Not claiming
         safety from a finite rule set keeps a missed death visible as
         uncertainty instead of silently becoming a false negative.
+
+        With ``include_margin=True``, states inside the fitted boundary
+        margin are also reported as death.  This is the model-error-aware
+        envelope: a predicted state that lands just outside a death rule is
+        treated as risky instead of silently unknown.  The default keeps
+        the exact death side, so callers that do not opt in are unchanged.
         """
         if self.states_ is None:
             raise RuntimeError("fit must be called before classify_death")
         states = np.asarray(states, dtype=float)
         if states.ndim == 1:
             states = states.reshape(1, -1)
-        death, _near = self._death_side(states)
-        return np.where(death, 1, UNKNOWN)
+        death, near = self._death_side(states)
+        selected = near if include_margin else death
+        return np.where(selected, 1, UNKNOWN)
 
     def verify(self, states: np.ndarray, labels: np.ndarray) -> dict:
         prediction = self.classify(states)

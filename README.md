@@ -202,10 +202,11 @@ python math_memory_search.py
 | 事件记忆（风险通道读活体率；终端混合仍读冻结值 ✗） | ✓ | ✓ | ✓ 风险通道 |
 | NNLS 堆叠组合 + isotonic 后置校准 | ✓ | 训练末拟合 | ✓ `pain_signal_batch` |
 | 分级校准（逐（根，acting）读出配对，逐代刷新） | ✓ | ✓ | ✓ 分级目标 |
-| 0/1 死亡条件规则（`death_rules.py`） | ✓ | 离线/反例细化 | ✓ `--death-rules`（硬约束，默认 0；3 种子配对均值 −13.2，2/3 正） |
+| 0/1 死亡条件规则（`death_rules.py`） | ✓ | 离线/反例细化 | ✓ `--death-rules`（硬约束，默认 0；Batch 2 旧规则 3 种子配对均值 −13.2，2/3 正；Batch 3 规则待新 A/B） |
 | 三态搜索信息（`first_unknown`/`unknown_count`/candidate 回调） | ✓ | 单测 | — 默认关；关闭时逐位不变 |
 | 候选计划质量探针（`planner_rollout_quality.py`） | ✓ | 85 决策/21760 计划 | — 诊断（precision 96.0%、recall 79.8%） |
 | 失败→规则（`death_rule_loop.py`） | ✓ | 合成（缺失第二模式） | ✗ 未接真实 planner 失败 |
+| 动作效应库（`action_effect.py`） | ✓ | 合成（Δdim/归一化） | ✗ 未接求知 |
 | 上下文分桶死亡规则（`contextual_rules.py`） | ✓ | 合成/稀疏桶回退 | ✗ 未接真实残差/planner |
 | 成对/归一化相对特征（死亡规则） | ✓ | 离线对比（`death_feature_probe.py`） | ✗ 当前观测冗余，默认关 |
 | 跨世界模式库（`pattern_library.py`） | ✓ | 合成/仿射帧 | ✗ dims 迁移中性，未接 |
@@ -1014,6 +1015,24 @@ held-out 世界的采样状态上运行两次真实 search（baseline 与死亡�
   主目标。** `unknown_penalty` 在 death-only 状态下不可用：每个非死亡
   步都是 unknown，按 unknown 步数加罚会偏好“早死”；它只适合
   full-status 诊断或求知循环。
+
+### 实际失败流：几乎没有可学的失败（2026-11-21）
+
+`death_failure_probe.py` 在 refine 世界 120–121 上收集真实控制轨迹，
+把漏检终止作正例、误报作反例，再在 122–124 上测：
+
+| 口径 | refine 状态/终止 | test 状态/终止 | test 覆盖 | 新增 |
+|---|---|---|---|---|
+| 源规则 | 624 / 2 | 335 / 3 | **2/3** | — |
+| failure 精炼 | 624 / 2 | 335 / 3 | **2/3** | 0 |
+| random 精炼 | 624 / 2 | 335 / 3 | **2/3** | 0 |
+| all-terminal | 624 / 2 | 335 / 3 | **2/3** | 2 |
+
+- refine 世界的 2 个真实终止**源规则已经全中**；没有漏检正例。
+- 加入 refine 的全部终止也不改善 test 的第 3 个终止。
+- **判定：实际控制轨迹的失败太少且已被覆盖；failure→rule 的有效数据
+  在候选计划的反事实终止（oracle 验证过的计划终点），不在实际 episode
+  终止。** 下一步用候选计划失败做正例，仍然按 refine/test 世界分割。
 
 **归纳形式扩展（2026-11-20）：成对坐标差**。根稀疏的一个来源是绝对阈值
 贴在训练分布边缘。归纳文法新增纯代数坐标：

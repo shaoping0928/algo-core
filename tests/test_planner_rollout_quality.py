@@ -27,8 +27,9 @@ class FakeEnv:
 
 
 class FakeRules:
-    def classify_death(self, states):
-        return np.where(states[:, 0] > 0.0, 1, -1)
+    def classify_death(self, states, include_margin=False):
+        threshold = -0.5 if include_margin else 0.0
+        return np.where(states[:, 0] > threshold, 1, -1)
 
     def classify(self, states):
         return np.where(states[:, 0] > 0.0, 1, 0)
@@ -76,6 +77,12 @@ class PlannerRolloutQualityTests(unittest.TestCase):
         np.testing.assert_array_equal(death_side, [-1, 1])
         full = status_callback(rules, 1, full=True)(states, None, 0)
         np.testing.assert_array_equal(full, [0, 1])
+        margin_rules = FakeRules()
+        margin_states = np.asarray([[-0.25], [0.25]])
+        envelope = status_callback(
+            margin_rules, 1, include_margin=True
+        )(margin_states, None, 0)
+        np.testing.assert_array_equal(envelope, [1, 1])
 
     def test_oracle_plan_returns_first_death_and_final_state(self):
         env = FakeEnv()

@@ -388,6 +388,61 @@ def exhaustive_search(
     )
 
 
+def merge_candidate_batches(batches) -> dict:
+    """Concatenate the per-batch dictionaries from `candidate_callback`."""
+    batches = list(batches)
+    if not batches:
+        raise ValueError("at least one candidate batch is required")
+    keys = batches[0].keys()
+    return {
+        key: np.concatenate([batch[key] for batch in batches], axis=0)
+        for key in keys
+    }
+
+
+def override_first_action(result: SearchResult, batches,
+                          action: int) -> SearchResult:
+    """Replace a search result with the best feasible plan starting with `action`.
+
+    This is the inquiry hook: when the death side leaves every candidate
+    unknown, the caller may prefer an action that changes the rule's
+    relation dimensions.  The override only chooses among candidates the
+    search already marked feasible; it never turns a predicted death into
+    an accepted plan.  If the action has no feasible candidate, the
+    original result is returned unchanged.
+    """
+    merged = merge_candidate_batches(batches)
+    sequences = np.asarray(merged["sequences"], dtype=float)
+    first = np.asarray(sequences[:, 0], dtype=int)
+    mask = first == int(action)
+    if not mask.any():
+        return result
+    feasible = np.asarray(merged["feasible"], dtype=bool).reshape(-1)
+    finite = np.asarray(
+        merged.get("finite", np.ones(len(mask), dtype=bool)), dtype=bool
+    ).reshape(-1)
+    usable = mask & feasible & finite
+    if not usable.any():
+        return result
+    ranking = np.asarray(merged["ranking_scores"], dtype=float)
+    index = _lexicographic_argmin(ranking, usable)
+    scores = np.asarray(merged["scores"], dtype=float)
+    score = tuple(float(value) for value in scores[index])
+    return SearchResult(
+        actions=sequences[index].copy(),
+        score=score[0] if len(score) == 1 else score,
+        feasible=True,
+        feasible_count=result.feasible_count,
+        candidate_count=result.candidate_count,
+        first_state=np.asarray(merged["first_states"][index]).copy(),
+        final_state=np.asarray(merged["final_states"][index]).copy(),
+        first_death=int(merged["first_death"][index]),
+        first_unknown=int(merged["first_unknown"][index]),
+        unknown_count=int(merged["unknown_count"][index]),
+        safe_count=int(merged["safe_count"][index]),
+    )
+
+
 def beam_search(
     initial_state: np.ndarray,
     action_space: Iterable,
