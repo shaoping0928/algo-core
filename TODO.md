@@ -572,6 +572,20 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
 3. **记忆检索 6%**：membership 权重 0.015，检索只走最近原型一跳；
    需要“检索半径/多跳”或让记忆按特征激活检索。
 
+**接线验证结果（2026-11-21，`--feature-backfit --feature-value-weight 0
+--curiosity-weight 0`，1500 帧审计）**
+
+| 环节 | 之前 | backfit 后 |
+|---|---|---|
+| 特征动作格 | 0 | **85 cells / 10,474 obs** |
+| 价值格 | 0 | **25 cells，read 26.2，support 13.2，rho 0.46** |
+| 好奇心 | Φ≡1 | **evidence 117.95，Φ mean 0.591，54 distinct** |
+| 危险组合 | composed_mae 0.005 | composed_mae **0.0**，rate=label |
+| 规划器列 | 仅 risk | 仍仅 risk（本次 value/curiosity 权重为 0） |
+
+→ **三个 dead 环节已接活**；A/B（3 种子）验证“特征格改进 hazard 读出”
+是否转成生存收益。
+
 **质量门**：阶段同质性（within-stage residual 显著低于跨阶段）；转移校准
 误差可控、applicability violation 低、support 不足 abstain；seed 101 的
 decision-relevant miss/regret 下降；seed 100/102 selected survives 不降、
