@@ -124,7 +124,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         dagger_frames: int = 0, memory_credit: bool = False,
         rule_min_coverage: float = 0.0,
         rule_min_primitive_coverage: float = 0.0,
-        rule_coverage_x=None, pairwise_features: bool = False):
+        rule_coverage_x=None, pairwise_features: bool = False,
+        branch_transitions: bool = False):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -182,6 +183,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         rule_min_coverage=rule_min_coverage,
         rule_min_primitive_coverage=rule_min_primitive_coverage,
         pairwise_features=pairwise_features,
+        branch_transitions=branch_transitions,
     )
     episodes = {}
     for row in transitions:
@@ -636,7 +638,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         curiosity_weight=0.5, memory_credit=False,
         rule_min_coverage=0.0, rule_min_primitive_coverage=0.0,
         rule_validation_seed=0, rule_validation_frames=600,
-        pairwise_features=False):
+        pairwise_features=False, branch_transitions=False):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -743,6 +745,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             # and the bootstrap agent never plans, so the flag costs
             # nothing beyond the calibration fit.
             contrast_objective=True,
+            branch_transitions=branch_transitions,
         )
         propensities = []
         # Re-collect the whole stream with the guide instead of splicing
@@ -814,6 +817,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         rule_min_primitive_coverage=rule_min_primitive_coverage,
         rule_coverage_x=rule_validation_x,
         pairwise_features=pairwise_features,
+        branch_transitions=branch_transitions,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -1440,6 +1444,7 @@ def run_seed(task):
     rule_validation_seed = int(task.get("rule_validation_seed", 0))
     rule_validation_frames = int(task.get("rule_validation_frames", 600))
     pairwise_features = bool(task.get("pairwise_features", False))
+    branch_transitions = bool(task.get("branch_transitions", False))
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
@@ -1504,6 +1509,7 @@ def run_seed(task):
         rule_validation_seed=rule_validation_seed,
         rule_validation_frames=rule_validation_frames,
         pairwise_features=pairwise_features,
+        branch_transitions=branch_transitions,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1714,6 +1720,10 @@ def main():
                         help="deprecated alias; pairwise differences are "
                              "off by default")
     parser.set_defaults(pairwise_features=False)
+    parser.add_argument("--branch-transitions", action="store_true",
+                        help="add decayed recent branch sources to "
+                             "action-edge evidence (structure-only: the "
+                             "planner does not read action-edge Q yet)")
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
@@ -1939,6 +1949,7 @@ def main():
             rule_validation_seed=args.rule_validation_seed,
             rule_validation_frames=args.rule_validation_frames,
             pairwise_features=args.pairwise_features,
+            branch_transitions=args.branch_transitions,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,

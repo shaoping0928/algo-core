@@ -310,6 +310,7 @@ class NodeRuntime:
         obs_trust: float = 1.0,
         action_temperature: float = 0.1,
         action_uncertainty: float = 0.5,
+        branch_transitions: bool = False,
         seed: int = 0,
         scales: Optional[Sequence[float]] = None,
     ):
@@ -539,6 +540,7 @@ class NodeRuntime:
         # (gamma*lambda, the same constants as the TD path) decides how
         # much of it reaches an earlier memory.
         self.memory_credit = bool(memory_credit)
+        self.branch_transitions = bool(branch_transitions)
         self._memory_traces: Dict[str, float] = {}
         # Diagnostic counters: how many pain events corrected an earlier
         # memory, how much eligibility mass moved, and how many context
@@ -1004,12 +1006,15 @@ class NodeRuntime:
         current_features = list(dict.fromkeys(current_features))
         next_features = list(dict.fromkeys(next_features))
         self.branches.get("recent").step()
+        # `recent` holds the state being left (plus older decaying trace);
+        # `current` holds the state the transition entered.  transition_pairs
+        # therefore reads old -> new when it multiplies recent by current.
         self.branches.activate(
-            "current", [current] + current_features,
+            "recent", [current] + current_features,
             [1.0] * (1 + len(current_features)),
         )
         self.branches.activate(
-            "recent", [next_node] + next_features,
+            "current", [next_node] + next_features,
             [1.0] * (1 + len(next_features)),
         )
         if current == next_node:
@@ -1739,14 +1744,24 @@ class NodeRuntime:
 
     def _update_action_edges(self, sources: Iterable[str], action: int,
                              next_node: str, target_pain: float,
-                             target_dopamine: float) -> None:
+                             target_dopamine: float,
+                             weights: Optional[Dict[str, float]] = None,
+                             scale: float = 1.0) -> None:
         for source in dict.fromkeys(sources):
+            weight = float(scale)
+            if weights is not None:
+                weight *= float(weights.get(source, 1.0))
+            if weight <= 0.0:
+                continue
             edge = self.graph.add_action_edge(source, action, next_node)
             edge.prediction_error = target_pain - edge.q_pain
-            edge.count += 1
-            edge.q_pain += self.alpha_q * (target_pain - edge.q_pain)
+            edge.count += weight
+            edge.q_pain += (
+                self.alpha_q * weight * (target_pain - edge.q_pain)
+            )
             edge.q_dopamine += (
-                self.alpha_q * (target_dopamine - edge.q_dopamine)
+                self.alpha_q * weight
+                * (target_dopamine - edge.q_dopamine)
             )
 
     def _update(self, current: str, action: int, next_node: str,
@@ -2139,10 +2154,16 @@ class NodeRuntime:
                         if node_id in active_set
                     )
                 value_roots = list(dict.fromkeys(value_roots))
+            branch_action = acting if acting is not None else action
+            branch_pairs = (
+                self.branches.transition_pairs(
+                    action=branch_action, top=16
+                ) if self.branch_transitions else ()
+            )
             steps.append((
                 current, action, next_node, float(signals[1]),
                 float(signals[0]), done, sources, signature,
-                acting, value_roots, row_weight,
+                acting, value_roots, row_weight, branch_pairs,
             ))
             if done:
                 self.reset()
@@ -2175,7 +2196,7 @@ class NodeRuntime:
         for position in range(len(steps) - 1, -1, -1):
             (current, action, next_node, pain, dopamine,
              terminal, sources, signature, acting,
-             value_roots, row_weight) = steps[position]
+             value_roots, row_weight, branch_pairs) = steps[position]
             return_pain = pain + (
                 0.0 if terminal else self.gamma * running_pain
             )
@@ -2198,6 +2219,24 @@ class NodeRuntime:
                 acting if acting is not None else action,
                 next_node, return_pain, return_dopamine,
             )
+            if self.branch_transitions and branch_pairs:
+                effective = acting if acting is not None else action
+                weights = {}
+                extra = []
+                for old, new, act, weight in branch_pairs:
+                    if new == next_node and act == effective:
+                        weights[old] = weight
+                        if old not in sources:
+                            extra.append(old)
+                if extra:
+                    # Decayed recent sources add transition evidence with a
+                    # smaller weight; the current sources are already
+                    # updated by the unweighted call above.
+                    self._update_action_edges(
+                        extra, effective, next_node,
+                        return_pain, return_dopamine,
+                        weights=weights, scale=0.25,
+                    )
             self._update_transition_value(
                 current, next_node, return_pain, return_dopamine
             )

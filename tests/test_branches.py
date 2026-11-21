@@ -99,18 +99,18 @@ class BranchTests(unittest.TestCase):
         second = runtime._create_node(np.asarray([1.0]))
         third = runtime._create_node(np.asarray([2.0]))
         runtime._interact(first, second)
-        self.assertEqual(runtime.branches.get("current").read(first), 1.0)
+        self.assertEqual(runtime.branches.get("current").read(second), 1.0)
         self.assertAlmostEqual(
-            runtime.branches.get("recent").read(second), 1.0
+            runtime.branches.get("recent").read(first), 1.0
         )
         runtime._interact(second, third)
-        self.assertEqual(runtime.branches.get("current").read(second), 1.0)
+        self.assertEqual(runtime.branches.get("current").read(third), 1.0)
         self.assertEqual(runtime.branches.get("current").read(first), 0.0)
         self.assertLess(
-            runtime.branches.get("recent").read(second), 1.0
+            runtime.branches.get("recent").read(first), 1.0
         )
         self.assertAlmostEqual(
-            runtime.branches.get("recent").read(third), 1.0
+            runtime.branches.get("recent").read(second), 1.0
         )
 
 
@@ -167,6 +167,26 @@ class BranchTests(unittest.TestCase):
         runtime.set_prediction(np.asarray([1.0]))
         miss = runtime.observe_prediction(np.asarray([0.0]))
         self.assertEqual(miss["hits"], 0)
+
+
+    def test_weighted_action_edges_scale_count_and_q(self):
+        import numpy as np
+        from node_runtime import NodeRuntime
+
+        runtime = NodeRuntime(
+            obs_dim=1, lag=0, scales=np.asarray([1.0]),
+            birth_threshold=0.01, max_nodes=20, exploration=0.0,
+            alpha_v=0.5, alpha_q=0.1, gamma=0.9, lam=0.9,
+        )
+        first = runtime._create_node(np.asarray([0.0]))
+        second = runtime._create_node(np.asarray([1.0]))
+        runtime._update_action_edges(
+            [first], 0, second, 1.0, 0.0,
+            weights={first: 0.5}, scale=0.5,
+        )
+        edge = runtime.graph.action_edges[(first, second, 0)]
+        self.assertAlmostEqual(edge.count, 0.25)
+        self.assertAlmostEqual(edge.q_pain, 0.1 * 0.25 * 1.0)
 
 
 if __name__ == "__main__":
