@@ -56,7 +56,9 @@ def main():
         leads = []
         for episode in sorted(by_episode):
             indices = by_episode[episode]
-            obs = np.asarray([rows[index]["obs"] for index in indices])
+            obs = np.asarray(
+                [rows[index]["obs"] for index in indices], dtype=float
+            ) / agent.scales[:agent.obs_dim]
             columns = [
                 np.asarray(
                     agent._feature_objects[node_id].mask(obs), dtype=bool
