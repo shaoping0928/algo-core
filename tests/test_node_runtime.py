@@ -1464,6 +1464,20 @@ class NodeRuntimeTests(unittest.TestCase):
             "crossing", "TerminalRiskHead",
         ):
             self.assertNotIn(token, adapter, "%s in substrate_nodes.py" % token)
+        # The generic context and memory modules must not privilege any
+        # benchmark parameter either: they only see transitions.
+        for name in (
+            "context_model.py", "memory_tree.py",
+            "variable_registry.py", "hierarchical_memory.py",
+        ):
+            text = (root / name).read_text(encoding="utf-8")
+            for token in (
+                "gravity", "flap", "BIRD_X", "pipes",
+                "target_gap", "near_pipe", "collision",
+            ):
+                self.assertNotIn(
+                    token, text, "%s in %s" % (token, name)
+                )
 
     def test_offline_pending_matches_the_runtime_encoding(self):
         from substrate_nodes import _encoded_pending

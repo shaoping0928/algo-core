@@ -49,10 +49,11 @@ class ContextModelTests(unittest.TestCase):
             obs_dim=2, action_dim=1, context_dim=2,
             context_ridge=1e-2, window=32,
             change_detection=change_detection, change_factor=4.0,
+            discovery="segment",
         )
         rng = np.random.RandomState(11)
         obs, act, target, worlds = self._training_stream(rng)
-        model.fit(obs, act, target, worlds=worlds)
+        model.fit(obs, act, target, segments=worlds)
         return model
 
     def test_context_adapts_to_an_unseen_regime(self):
@@ -123,6 +124,18 @@ class ContextModelTests(unittest.TestCase):
         for step in range(len(obs)):
             model.observe(obs[step], act[step], target[step])
         self.assertEqual(model.changes, 0)
+
+    def test_basis_is_discovered_without_any_group_labels(self):
+        rng = np.random.RandomState(31)
+        model = ContextualLinearModel(
+            obs_dim=2, action_dim=1, context_dim=3,
+            context_ridge=1e-2, window=32, segment_size=48,
+        )
+        obs, act, target, _worlds = self._training_stream(rng)
+        model.fit(obs, act, target)
+        self.assertIsNotNone(model.basis)
+        self.assertGreaterEqual(model.basis.shape[0], 1)
+        self.assertLessEqual(model.basis.shape[0], 3)
 
 
 if __name__ == "__main__":

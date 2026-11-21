@@ -44,7 +44,8 @@ SEED = 21
 
 
 class Flappy:
-    def __init__(self, seed, max_t=None, gravity=None, flap=None):
+    def __init__(self, seed, max_t=None, gravity=None, flap=None,
+                 drag=None, speed=None):
         self.rng = np.random.RandomState(seed)
         self.max_t = MAXT if max_t is None else int(max_t)
         if self.max_t < 1:
@@ -54,6 +55,8 @@ class Flappy:
         # dynamics differ.  The learner never sees these values.
         self.gravity = GRAVITY if gravity is None else float(gravity)
         self.flap = FLAP if flap is None else float(flap)
+        self.drag = DRAG if drag is None else float(drag)
+        self.speed = SPEED if speed is None else float(speed)
         self.reset()
 
     def reset(self):
@@ -80,10 +83,10 @@ class Flappy:
         if flap and V0 > 0.0 and self.vy < 0.0:
             imp *= float(np.exp(self.vy / V0))
         self.vy += -self.gravity * (1.0 + KY * (self.y - 0.5) ** 2) \
-            - DRAG * self.vy * abs(self.vy) + (imp if flap else 0.0)
+            - self.drag * self.vy * abs(self.vy) + (imp if flap else 0.0)
         self.y += self.vy
         for p in self.pipes:
-            p[0] -= SPEED
+            p[0] -= self.speed
         if self.pipes[0][0] < -0.2:
             self.pipes.pop(0)
             self.pipes.append([self.pipes[-1][0] + SPACING, self._gap()])

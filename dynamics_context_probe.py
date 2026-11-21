@@ -28,16 +28,25 @@ from substrate_generic import LayerPair, LinearObservationModel
 LAG = 3
 OBS_DIM = 7
 
-# World-side parameter grid.  The learner never sees these values.
+# World-side parameter grid.  These values are never shown to the learner;
+# they are the hidden factors the probe varies.  Several unrelated factors
+# move at once so a context dimension cannot be attributed to one of them by
+# construction.
 TRAIN_WORLDS = [
-    (200, 0.0011, 0.017), (201, 0.0013, 0.019),
-    (202, 0.0015, 0.021), (203, 0.0017, 0.023),
-    (204, 0.0019, 0.017), (205, 0.0021, 0.019),
-    (206, 0.0012, 0.022), (207, 0.0018, 0.018),
+    (200, 0.0011, 0.017, 0.0, 0.0100),
+    (201, 0.0013, 0.019, 1.5, 0.0085),
+    (202, 0.0015, 0.021, 3.0, 0.0115),
+    (203, 0.0017, 0.023, 0.0, 0.0085),
+    (204, 0.0019, 0.017, 1.5, 0.0115),
+    (205, 0.0021, 0.019, 3.0, 0.0100),
+    (206, 0.0012, 0.022, 3.0, 0.0110),
+    (207, 0.0018, 0.018, 1.5, 0.0090),
 ]
 HELDOUT_WORLDS = [
-    (220, 0.0012, 0.020), (221, 0.0016, 0.018),
-    (222, 0.0020, 0.022), (223, 0.0014, 0.024),
+    (220, 0.0012, 0.020, 0.7, 0.0095),
+    (221, 0.0016, 0.018, 2.2, 0.0105),
+    (222, 0.0020, 0.022, 0.4, 0.0112),
+    (223, 0.0014, 0.024, 2.7, 0.0088),
 ]
 
 
@@ -57,13 +66,14 @@ def _behavior_action(env, layer_pair, rng):
     return int(rng.rand() < probability)
 
 
-def collect_world(seed, gravity, flap, steps=1200, lag=LAG):
+def collect_world(seed, gravity, flap, drag, speed, steps=1200, lag=LAG):
     rng = np.random.RandomState(seed)
     rows = []
     episode = 0
     while len(rows) < steps:
         env = latent[lag](
-            seed * 10000 + episode, gravity=gravity, flap=flap
+            seed * 10000 + episode, gravity=gravity, flap=flap,
+            drag=drag, speed=speed,
         )
         layer_pair = LayerPair(k_max=8)
         layer_pair.hist = [0.0] * 8
@@ -129,9 +139,11 @@ def _run_episode(env, model, memory, global_model, episode_id,
     model.begin_episode(prior=prior, prior_precision=prior_precision)
     while not env.dead and steps < max_frames:
         if switch_after is not None and steps == switch_after:
-            gravity, flap = switch_to
+            gravity, flap, drag, speed = switch_to
             env.gravity = gravity
             env.flap = flap
+            env.drag = drag
+            env.speed = speed
         obs = np.asarray(env.obs(), dtype=float)
         action = _behavior_action(env, layer_pair, rng)
         history = np.asarray([action] + recent[:LAG], dtype=float)
@@ -185,20 +197,21 @@ def _recovery_step(errors, start, baseline):
 
 
 def run(seed=0, train_steps=1200, episodes=4, max_frames=60,
-        switch_after=12, world_radius=0.1):
+        switch_after=12, world_radius=0.1, segment_size=800):
     del seed
     streams = [
-        collect_world(world_seed, gravity, flap, steps=train_steps)
-        for world_seed, gravity, flap in TRAIN_WORLDS
+        collect_world(world_seed, gravity, flap, drag, speed,
+                      steps=train_steps)
+        for world_seed, gravity, flap, drag, speed in TRAIN_WORLDS
     ]
-    observations, histories, targets, worlds = _flatten(streams)
+    observations, histories, targets, _worlds = _flatten(streams)
     global_model = LinearObservationModel(OBS_DIM, LAG + 1).fit(
         observations, histories, targets
     )
     context_model = ContextualLinearModel(
         OBS_DIM, LAG + 1, context_dim=4, context_ridge=1e-2,
-        window=48, change_factor=1.0,
-    ).fit(observations, histories, targets, worlds=worlds)
+        window=48, change_factor=1.0, segment_size=segment_size,
+    ).fit(observations, histories, targets)
     context_dim = (
         int(context_model.basis.shape[0])
         if context_model.basis is not None else 0
@@ -218,7 +231,7 @@ def run(seed=0, train_steps=1200, episodes=4, max_frames=60,
     }
     results = {}
     hidden_vs_context = []
-    for world_index, (world_seed, gravity, flap) in enumerate(
+    for world_index, (world_seed, gravity, flap, drag, speed) in enumerate(
         HELDOUT_WORLDS
     ):
         next_index = (world_index + 1) % len(HELDOUT_WORLDS)
@@ -233,7 +246,7 @@ def run(seed=0, train_steps=1200, episodes=4, max_frames=60,
             for episode in range(episodes):
                 env = latent[LAG](
                     world_seed * 10000 + episode,
-                    gravity=gravity, flap=flap,
+                    gravity=gravity, flap=flap, drag=drag, speed=speed,
                 )
                 switch = switch_to if episode == 0 else None
                 outcome = _run_episode(
@@ -248,7 +261,7 @@ def run(seed=0, train_steps=1200, episodes=4, max_frames=60,
                 errors_context.extend(outcome["errors_context"])
                 if arm == "context+mem" and outcome["steps"] > 0:
                     hidden_vs_context.append(dict(
-                        gravity=gravity, flap=flap,
+                        gravity=gravity, flap=flap, drag=drag, speed=speed,
                         context=[float(value) for value in (
                             outcome["mean_context"]
                         )],
@@ -335,22 +348,30 @@ def run(seed=0, train_steps=1200, episodes=4, max_frames=60,
         matrix = np.asarray([
             row["context"] for row in hidden_vs_context
         ])
-        gravity = np.asarray([row["gravity"] for row in hidden_vs_context])
-        flap = np.asarray([row["flap"] for row in hidden_vs_context])
+        hidden = {
+            "gravity": np.asarray([
+                row["gravity"] for row in hidden_vs_context
+            ]),
+            "flap": np.asarray([row["flap"] for row in hidden_vs_context]),
+            "drag": np.asarray([row["drag"] for row in hidden_vs_context]),
+            "speed": np.asarray([row["speed"] for row in hidden_vs_context]),
+        }
         for index in range(context_dim):
             column = matrix[:, index]
-            if float(np.std(column)) > 1e-9:
-                correlations["z%d_gravity" % index] = float(
-                    np.corrcoef(column, gravity)[0, 1]
-                )
-                correlations["z%d_flap" % index] = float(
-                    np.corrcoef(column, flap)[0, 1]
+            if float(np.std(column)) <= 1e-9:
+                continue
+            for name, values in hidden.items():
+                if float(np.std(values)) <= 1e-9:
+                    continue
+                correlations["z%d_%s" % (index, name)] = float(
+                    np.corrcoef(column, values)[0, 1]
                 )
     return dict(
         training=dict(
             transitions=int(len(observations)),
             worlds=len(TRAIN_WORLDS),
             context_dim=context_dim,
+            discovered_groups=int(context_model.discovered_groups),
             threshold=float(context_model.change_threshold or 0.0),
         ),
         results=results,
@@ -372,12 +393,14 @@ def main():
     parser.add_argument("--max-frames", type=int, default=60)
     parser.add_argument("--switch-after", type=int, default=12)
     parser.add_argument("--world-radius", type=float, default=0.1)
+    parser.add_argument("--segment-size", type=int, default=800)
     parser.add_argument("--report", default="")
     args = parser.parse_args()
     report = run(
         seed=args.seed, train_steps=args.train_steps,
         episodes=args.episodes, max_frames=args.max_frames,
         switch_after=args.switch_after, world_radius=args.world_radius,
+        segment_size=args.segment_size,
     )
     print(json.dumps(report, indent=2, default=str))
     if args.report:

@@ -2,8 +2,8 @@
 
 The model assumes the world can be in one of several dynamical regimes that
 share structure but differ in some latent parameters.  Nothing here names a
-parameter (gravity, drag, flap strength, ...); the only inputs are the same
-raw transitions every other learner consumes:
+physical parameter; the only inputs are the same raw transitions every other
+learner consumes:
 
     observation, action history, next observation
 
@@ -29,7 +29,8 @@ class ContextualLinearModel:
     def __init__(self, obs_dim, action_dim, ridge=1e-8,
                  context_dim=4, context_ridge=1e-2, window=64,
                  change_detection=True, change_patience=3,
-                 change_factor=3.0, warmup=4):
+                 change_factor=3.0, warmup=4, segment_size=128,
+                 discovery="cluster", merge_threshold=0.5):
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
         self.ridge = float(ridge)
@@ -40,6 +41,12 @@ class ContextualLinearModel:
         self.change_patience = max(int(change_patience), 1)
         self.change_factor = float(change_factor)
         self.warmup = max(int(warmup), 0)
+        self.segment_size = max(int(segment_size), 1)
+        if discovery not in ("segment", "cluster"):
+            raise ValueError("discovery must be 'segment' or 'cluster'")
+        self.discovery = discovery
+        self.merge_threshold = float(merge_threshold)
+        self.discovered_groups = 0
         if self.change_factor <= 0.0:
             raise ValueError("change_factor must be positive")
         self.weights = None
@@ -73,13 +80,16 @@ class ContextualLinearModel:
         )
 
     def fit(self, observations, histories, next_observations,
-            worlds=None):
-        """Fit the shared map and, with multiple worlds, the context basis.
+            segments=None, segment_size=None):
+        """Fit the shared map and discover the context basis.
 
-        `worlds` is a per-transition group id used only to estimate the
-        per-regime residual corrections.  It is training-time supervision
-        of the *grouping*, not of any physical quantity; at runtime the
-        context is inferred without it.
+        `segments` are observable segment ids (for example episode
+        boundaries).  When omitted, the model uses fixed contiguous windows
+        of `segment_size` transitions.  Neither is a hidden label: the
+        model never learns which parameters a segment has, only which
+        transitions the stream says belong together.  The basis comes from
+        the spectrum of the per-segment residual corrections, and the
+        number of kept directions is selected from that spectrum too.
         """
         x = self._features(observations, histories)
         y = np.asarray(next_observations, dtype=float)
@@ -91,37 +101,82 @@ class ContextualLinearModel:
         self.basis = None
         self.context = np.zeros(self.context_dim)
         noise_norms = np.linalg.norm(residuals, axis=1)
-        if worlds is not None and self.context_dim > 0:
-            groups = np.asarray(worlds)
-            unique = np.unique(groups)
-            if len(unique) >= 2:
-                corrections = []
+        if segments is None:
+            window = (
+                self.segment_size if segment_size is None
+                else max(int(segment_size), 1)
+            )
+            groups = np.arange(len(x)) // window
+        else:
+            groups = np.asarray(segments)
+        if len(np.unique(groups)) >= 2 and self.context_dim > 0:
+            segment_x = []
+            segment_r = []
+            corrections = []
+            within = []
+            for group in np.unique(groups):
+                mask = groups == group
+                xg = x[mask]
+                rg = residuals[mask]
+                gram_g = xg.T @ xg + self.context_ridge * np.eye(
+                    x.shape[1]
+                )
+                correction = np.linalg.solve(gram_g, xg.T @ rg)
+                corrections.append(correction.T)          # (obs, feature)
+                segment_x.append(xg)
+                segment_r.append(rg)
+                after = rg - xg @ correction
+                within.extend(np.linalg.norm(after, axis=1))
+            stacked = np.stack(corrections)               # (groups, obs, feat)
+            if self.discovery == "cluster" and len(stacked) >= 2:
+                # Discover regimes from the corrections themselves: merge
+                # the segments whose residual corrections are closer than
+                # a fraction of the median pairwise distance.  No world
+                # label and no contiguity assumption enter this step.
+                flat_all = stacked.reshape(len(stacked), -1)
+                centroids, assignments = _cluster_corrections(
+                    flat_all, self.merge_threshold
+                )
+                self.discovered_groups = len(centroids)
+                stacked = centroids.reshape(
+                    len(centroids), self.obs_dim, -1
+                )
                 within = []
-                for group in unique:
-                    mask = groups == group
-                    xg = x[mask]
-                    rg = residuals[mask]
-                    gram_g = xg.T @ xg + self.context_ridge * np.eye(
-                        x.shape[1]
+                for index, (xg, rg) in enumerate(
+                    zip(segment_x, segment_r)
+                ):
+                    correction = centroids[assignments[index]].reshape(
+                        self.obs_dim, -1
                     )
-                    correction = np.linalg.solve(gram_g, xg.T @ rg)
-                    corrections.append(correction.T)      # (obs, feature)
-                    after = rg - xg @ correction
+                    after = rg - xg @ correction.T
                     within.extend(np.linalg.norm(after, axis=1))
-                stacked = np.stack(corrections)           # (worlds, obs, feat)
+            else:
+                self.discovered_groups = len(stacked)
+            if len(stacked) >= 2:
                 stacked = stacked - stacked.mean(axis=0, keepdims=True)
-                flat = stacked.reshape(len(unique), -1)
+                flat = stacked.reshape(len(stacked), -1)
                 _u, singular, vt = np.linalg.svd(
                     flat, full_matrices=False
                 )
                 if len(singular) and singular[0] > 1e-12:
-                    keep = min(self.context_dim, vt.shape[0])
-                    basis = vt[:keep].reshape(
-                        keep, self.obs_dim, x.shape[1]
+                    # Keep directions that carry a non-negligible share of
+                    # the between-regime variation; the number is
+                    # discovered from the residual spectrum.
+                    limit = min(
+                        self.context_dim, vt.shape[0], len(singular)
                     )
-                    self.basis = basis
-                    self.context = np.zeros(keep)
-                    noise_norms = np.asarray(within, dtype=float)
+                    significant = int(np.sum(
+                        singular[:limit] >= 0.1 * singular[0]
+                    ))
+                    keep = max(1, significant) if limit > 0 else 0
+                    keep = min(keep, limit)
+                    if keep > 0:
+                        basis = vt[:keep].reshape(
+                            keep, self.obs_dim, x.shape[1]
+                        )
+                        self.basis = basis
+                        self.context = np.zeros(keep)
+                        noise_norms = np.asarray(within, dtype=float)
         # The change threshold reflects the within-regime noise, not the
         # spread between regimes: a new regime should look surprising even
         # though the pooled residual is large by construction.
@@ -256,3 +311,46 @@ class ContextualLinearModel:
             "nf,kdf,k->nd", x, self.basis, self.context
         )
         return base + correction
+
+def _cluster_corrections(vectors, fraction: float = 0.5):
+    """Agglomerate residual corrections closer than a median-distance cut.
+
+    The number of regimes is whatever survives the cut; the caller never
+    supplies a world id or a regime count.  Returns centroids and the
+    nearest-centroid assignment of every input segment.
+    """
+    vectors = np.asarray(vectors, dtype=float)
+    count = len(vectors)
+    if count < 2:
+        return vectors.copy(), np.zeros(count, dtype=int)
+    differences = vectors[:, None, :] - vectors[None, :, :]
+    distances = np.sqrt((differences ** 2).sum(axis=2))
+    upper = np.triu_indices(count, 1)
+    median = float(np.median(distances[upper])) if len(upper[0]) else 0.0
+    threshold = max(0.0, float(fraction) * median)
+    clusters = [[index] for index in range(count)]
+    centroids = [vectors[index].copy() for index in range(count)]
+    counts = [1] * count
+    while len(clusters) > 1:
+        centers = np.stack(centroids)
+        deltas = centers[:, None, :] - centers[None, :, :]
+        pair = np.sqrt((deltas ** 2).sum(axis=2))
+        np.fill_diagonal(pair, np.inf)
+        flat_index = int(np.argmin(pair))
+        first, second = divmod(flat_index, len(centers))
+        if pair[first, second] > threshold:
+            break
+        total = counts[first] + counts[second]
+        centroids[first] = (
+            centroids[first] * counts[first]
+            + centroids[second] * counts[second]
+        ) / total
+        counts[first] = total
+        clusters[first].extend(clusters[second])
+        del clusters[second]
+        del centroids[second]
+        del counts[second]
+    centers = np.stack(centroids)
+    deltas = vectors[:, None, :] - centers[None, :, :]
+    assignments = np.argmin((deltas ** 2).sum(axis=2), axis=1)
+    return centers, assignments
