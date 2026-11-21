@@ -1340,7 +1340,8 @@ class NodeRuntime:
         return learned
 
     def _hazard_channels(self, states: np.ndarray,
-                         mask_table: Optional[List] = None
+                         mask_table: Optional[List] = None,
+                         include: Optional[Iterable[str]] = None
                          ) -> Dict[str, np.ndarray]:
         """The individual hazard readouts the signal composes.
 
@@ -1349,13 +1350,30 @@ class NodeRuntime:
         when the stacked composition is fitted, takes the learned
         non-negative weighted sum.  Keeping the channels in one place
         guarantees the fit and the consumers always see the same columns.
+
+        `include` names the channels a consumer actually reads.  The
+        stacked composition zeroes channels that duplicate an already
+        covered member, and computing a zero-weight channel would be pure
+        cost - it is read out but multiplied by zero.  When omitted every
+        channel is computed, which is what the composition fit needs.
         """
         states = np.asarray(states, dtype=float)
         channels: Dict[str, np.ndarray] = {}
-        if not self.predicate_readouts:
+        want = None if include is None else set(include)
+        if not self.predicate_readouts and (
+            want is None or "prototype" in want
+        ):
             indices, weights, nearest_min = self._soft_weights_batch(states)
             prototype = np.zeros(len(states), dtype=float)
             if indices is not None:
+                # The association rate is constant over one readout, so
+                # read every prototype once per batch instead of once per
+                # neighbour slot, and reuse memory rates the same way.
+                associations = np.asarray([
+                    self._pain_association(node_id)
+                    for node_id in self._prototype_ids
+                ], dtype=float)
+                memory_rates: Dict[str, float] = {}
                 for row in range(len(states)):
                     total = 0.0
                     weighted = 0.0
@@ -1365,36 +1383,45 @@ class NodeRuntime:
                         node_weight = float(weights[row, column])
                         node_ids.append(node_id)
                         total += node_weight
-                        weighted += node_weight * self._pain_association(
-                            node_id
-                        )
+                        weighted += node_weight * associations[int(index)]
                     for memory_id, strength in self.memories_for(
                         node_ids
                     ).items():
+                        rate = memory_rates.get(memory_id)
+                        if rate is None:
+                            rate = self._pain_association(memory_id)
+                            memory_rates[memory_id] = rate
                         total += float(strength)
-                        weighted += float(strength) * self._pain_association(
-                            memory_id
-                        )
+                        weighted += float(strength) * rate
                     prototype[row] = weighted / total if total > 0.0 else 0.0
-                prototype = self._shrink_to_baseline(
-                    prototype, nearest_min,
-                    baseline=self.prototype_pain_baseline(),
-                )
+                if self.ood_trust_scale > 0.0:
+                    # The shrink target is only read when trust scaling is
+                    # on; with the default zero scale the baseline sweep
+                    # over every prototype was pure cost.
+                    prototype = self._shrink_to_baseline(
+                        prototype, nearest_min,
+                        baseline=float(associations.mean())
+                        if len(associations) else 0.0,
+                    )
                 prototype = prototype * self.obs_trust
             channels["prototype"] = prototype
         if self.feature_ids:
-            if mask_table is None:
-                mask_table = self._feature_mask_table(
-                    states[:, :self.obs_dim]
+            if want is None or "feature" in want or "memory" in want:
+                if mask_table is None:
+                    mask_table = self._feature_mask_table(
+                        states[:, :self.obs_dim]
+                    )
+            if want is None or "feature" in want:
+                channels["feature"] = self._feature_risk_batch(
+                    states, mask_table
                 )
-            channels["feature"] = self._feature_risk_batch(
-                states, mask_table
-            )
-            if self.event_memory_risk:
+            if self.event_memory_risk and (
+                want is None or "memory" in want
+            ):
                 channels["memory"] = self._feature_memory_risk_batch(
                     states, mask_table
                 )
-        elif self.rules.rules:
+        elif self.rules.rules and (want is None or "rules" in want):
             channels["rules"] = self.rules.activate(
                 states[:, :self.obs_dim]
             )
@@ -1405,8 +1432,20 @@ class NodeRuntime:
         states = np.asarray(states, dtype=float)
         if len(states) == 0:
             return np.zeros(0)
-        channels = self._hazard_channels(states, mask_table)
         composition = self.hazard_composition
+        if composition:
+            # Only the channels with positive learned weight are read; a
+            # zeroed channel contributes exactly nothing to the stacked
+            # composition, so computing it would be pure cost.
+            needed = [
+                name for name, weight in composition.items()
+                if float(weight) > 0.0
+            ]
+            channels = self._hazard_channels(
+                states, mask_table, include=needed
+            )
+        else:
+            channels = self._hazard_channels(states, mask_table)
         if composition:
             # P2 stacked composition: the non-negative least-squares
             # weights were fitted to the precursor labels, so the read is
@@ -3197,23 +3236,25 @@ class NodeRuntime:
         # row; the merge below reproduces its exact order (per root: the
         # node's own membership memories, then its one-hop association
         # reach, merged by max), so the reads are bit-identical.
-        root_memories = {}
-        for node_id in self.feature_ids:
-            if mask_table is None:
-                feature = self._feature_objects.get(node_id)
-                if feature is None:
-                    continue
-                entry = feature.mask(obs)
-            else:
-                entry = mask_table[self._feature_all.index(node_id)]
-            if entry is not None and entry.any():
-                root_memories[node_id] = self.memories_for([node_id])
+        root_set = set(self.feature_ids)
+        root_columns = []
+        for node_id, entry in zip(self._feature_all, table):
+            if node_id not in root_set or entry is None:
+                continue
+            if entry.any():
+                root_columns.append((node_id, entry))
+        root_memories = {
+            node_id: self.memories_for([node_id])
+            for node_id, _entry in root_columns
+        }
+        # Live rates are constant over one readout; one read per memory
+        # instead of one per (row, root) hit.
+        rate_cache: Dict[str, float] = {}
         for row in range(len(states)):
             feature_ids = [
                 node_id
-                for node_id, mask in zip(self._feature_all, table)
-                if mask is not None and bool(mask[row])
-                and node_id in self.feature_ids
+                for node_id, mask in root_columns
+                if bool(mask[row])
             ]
             if not feature_ids:
                 continue
@@ -3237,9 +3278,11 @@ class NodeRuntime:
                 # not the creation-time snapshot, which would report a
                 # single event's pain forever no matter what later
                 # transitions through the same region showed.
-                weighted += float(strength) * self._pain_association(
-                    memory_id
-                )
+                rate = rate_cache.get(memory_id)
+                if rate is None:
+                    rate = self._pain_association(memory_id)
+                    rate_cache[memory_id] = rate
+                weighted += float(strength) * rate
             if total > 0.0:
                 result[row] = weighted / total
         return result
@@ -3317,16 +3360,20 @@ class NodeRuntime:
         weights = weights / np.where(total > 0.0, total, 1.0)
         return indices, weights, nearest_min
 
-    def _memory_values_batch(self, indices, weights, attribute: str):
+    def _memory_values_batch(self, indices, weights, attribute: str,
+                             cache: Optional[Dict[str, Dict[str, float]]] = None):
         count = len(indices)
         sums = np.zeros(count, dtype=float)
         mass = np.zeros(count, dtype=float)
+        cache = {} if cache is None else cache
         for row in range(count):
             for column, index in enumerate(indices[row]):
                 node_id = self._prototype_ids[int(index)]
-                for memory_id, strength in self.memories_for(
-                    [node_id]
-                ).items():
+                memories = cache.get(node_id)
+                if memories is None:
+                    memories = self.memories_for([node_id])
+                    cache[node_id] = memories
+                for memory_id, strength in memories.items():
                     memory = self.graph.nodes.get(memory_id)
                     if memory is None or memory.kind != MEMORY:
                         continue
@@ -3358,11 +3405,15 @@ class NodeRuntime:
         ]).reshape(indices.shape)
         pain = (weights * pain_values).sum(axis=1)
         dopamine = (weights * dopamine_values).sum(axis=1)
+        # Both valence channels read the same memory neighbourhoods; one
+        # retrieval pass per prototype serves both instead of rescanning
+        # the membership/association graph for each attribute.
+        memory_cache: Dict[str, Dict[str, float]] = {}
         for attribute, values in (
             ("value", pain), ("dopamine", dopamine)
         ):
             memory_sums, memory_mass = self._memory_values_batch(
-                indices, weights, attribute
+                indices, weights, attribute, cache=memory_cache
             )
             present = memory_mass > 0.0
             if present.any():

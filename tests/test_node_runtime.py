@@ -1725,7 +1725,7 @@ class NodeRuntimeTests(unittest.TestCase):
         }
         labels = np.asarray([1.0, 0.0, 0.0, 0.0])
         runtime._hazard_channels = (
-            lambda states, mask_table=None: readings
+            lambda states, mask_table=None, include=None: readings
         )
         report = runtime.fit_hazard_composition(
             np.zeros((4, 1)), np.zeros((4, 0)), labels
