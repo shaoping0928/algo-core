@@ -124,7 +124,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         dagger_frames: int = 0, memory_credit: bool = False,
         rule_min_coverage: float = 0.0,
         rule_min_primitive_coverage: float = 0.0,
-        rule_coverage_x=None, pairwise_features: bool = True):
+        rule_coverage_x=None, pairwise_features: bool = False):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -636,7 +636,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         curiosity_weight=0.5, memory_credit=False,
         rule_min_coverage=0.0, rule_min_primitive_coverage=0.0,
         rule_validation_seed=0, rule_validation_frames=600,
-        pairwise_features=True):
+        pairwise_features=False):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -1431,7 +1431,7 @@ def run_seed(task):
     )
     rule_validation_seed = int(task.get("rule_validation_seed", 0))
     rule_validation_frames = int(task.get("rule_validation_frames", 600))
-    pairwise_features = bool(task.get("pairwise_features", True))
+    pairwise_features = bool(task.get("pairwise_features", False))
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
@@ -1695,10 +1695,16 @@ def main():
                              "coverage gates; 0 = use the training split")
     parser.add_argument("--rule-validation-frames", type=int, default=600,
                         help="frames collected from --rule-validation-seed")
+    parser.add_argument("--pairwise-features", dest="pairwise_features",
+                        action="store_true",
+                        help="add generic pairwise coordinate differences "
+                             "to the induction grammar (six-seed A/B null; "
+                             "opt-in)")
     parser.add_argument("--no-pairwise-features", dest="pairwise_features",
                         action="store_false",
-                        help="disable the generic pairwise coordinate "
-                             "differences in the induction grammar")
+                        help="deprecated alias; pairwise differences are "
+                             "off by default")
+    parser.set_defaults(pairwise_features=False)
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
