@@ -41,7 +41,7 @@ def run(args):
             )
             if frames >= args.cap or frames < 3:
                 continue
-            for lag_back in range(1, args.max_lag + 1):
+            for lag_back in range(args.min_lag, args.max_lag + 1):
                 point = frames - lag_back
                 if point < 1:
                     continue
@@ -122,6 +122,7 @@ def main():
     parser.add_argument("--eval-seeds", default="120-124")
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--max-lag", type=int, default=12)
+    parser.add_argument("--min-lag", type=int, default=1)
     parser.add_argument("--cap", type=int, default=5000)
     parser.add_argument("--report", default="")
     args = parser.parse_args()
