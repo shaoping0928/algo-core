@@ -944,23 +944,26 @@
       decision-relevant 仍 10、selected survives 54→52；seed 102
       selected survives 50→45、regret_nonzero 5。**envelope 提高标签
       recall，但不修 score misrank，且会 veto 安全计划。**
-    - [ ] 新瓶颈：候选集/时域/探索。到这些晚期状态，H=8 内所有候选
-      都死；再好的死亡分类也救不了。需要更早行动/更长时域/更好的
-      候选生成，而不是继续提高 death recall。
+    - [ ] 候选集/时域/探索瓶颈（seed 100/102）：到这些晚期状态，
+      H=8 内所有候选都死；再好的死亡分类也救不了。需要更早行动/
+      更长时域/更好的候选生成。**seed 101 是例外：score misrank，
+      见下方 oracle-best 归因；两条瓶颈并存，按验证集区分。**
     - [x] **修复探针 seed 配置 bug**：`planner_rollout_quality` 的 fit
       config 之前漏了 `config["seed"] = args.seed`，导致 seed 101/102
       实际复用了 seed 100 的 cache；已提取 `probe_config(args)` 并加
       回归测试。**此前那轮“101/102 确认”作废，重跑中。**
-    - [ ] 用同一 margin 诊断在 seed 101/102 复跑，确认
-      decision_relevant_misses=0 不是单一模型；之后再决定是否进
-      early-warning/horizon 实验。
+    - [x] 用同一 margin 诊断在 seed 101/102 复跑（修正 cache 后）：
+      **seed 101 decision-relevant 10、seed 102 0**；结论是
+      seed-dependent，不再追求“全 seed 0”。下一步按验证集区分
+      score misrank 与候选集/时域瓶颈。
     - [x] 探针效率：`planner_rollout_quality` 只跑一次 search，
       baseline 从 candidate trace 的 `scores`/`model_feasible` 重建
       （单测与 no-death search 逐位一致）；`probe_cache.py` 缓存
       `(world, agent)`，config 匹配才复用，损坏/不匹配自动重训。
       多 arm 可并行进程跑，CPU 资源可用。
-    - [ ] 候选计划探针在 seed 101/102 复跑，确认 tri_later>0 不是
-      单一模型的偶然；近终止动作对比用 `--tail 20` 提高 comparable。
+    - [x] 候选计划探针在 seed 101/102 复跑：tri_later 11 / 6，
+      tri_earlier 0 / 0；硬否决方向为正。近终止动作对比仍需
+      `--tail 20` 提高 comparable 样本。
     - [ ] 归一化阈值先验旁支（k=5/10/20，覆盖升且 FP 不升才继续）。
   - **当前总判定（2026-11-21）**：默认栈不变；`--death-rules` 仍是
     opt-in（3 种子配对均值 −13.2，2/3 正向；该 A/B 用的是 Batch 2
@@ -983,7 +986,123 @@
     (a) score component 诊断（risk/value/curiosity 哪一列把存活计划
     排后）；(b) score calibration / conservative lower bound；
     (c) early-warning/horizon/候选集（seed 100/102 的晚期状态）。
-    不做任务定制，不在任务几何/专用阈值上继续硬调。
+    **Batch 5 设计（阶段/事件驱动的多尺度预测）已记录在下方：
+    先把记忆树升级成“阶段图 + 局部转移统计 + 预测契约”，
+    离线验证 coarse-to-fine 能否修 seed 101 的 score misrank；
+    未过质量门前不接默认 planner。** 不做任务定制，不在任务几何/
+    专用阈值上继续硬调。
+- **Batch 5 设计：阶段/事件驱动的多尺度预测（2026-11-21）**：
+  - **动机**：当前 planner 只有一条一步 `f` + 固定 H 的 roll-out。
+    seed 101 的 10 个 decision-relevant miss 中，oracle-best 计划
+    10/10 feasible、10/10 被 score 排后，说明问题不只是死亡规则/
+    时域；score 在阶段级判断上缺少可靠的粗预测。现有
+    `HierarchicalMemory` 已有 frame/event/phase/world 层级，但只存
+    context/feedback 汇总，没有阶段转移边；`MemoryTree` 按 context
+    距离合并，不按转移模型等价合并。→ 需要“阶段图 + 多层级转移
+    预测 + 预测契约”的设计。
+  - **核心定义（不是时间档位）**：
+    - **阶段** = 一段可以用同一个局部转移模型解释的连续状态转移；
+      分界是**关键事件**，不是固定时长。
+    - **事件层级** = 发生显著参数/结果变化的**最粗模型层级**：
+      L1 局部动力学（接触/碰撞/速度突变）；L2 阶段/子目标/结果；
+      L3 世界/回合 regime。
+    - 持续时间是阶段的**观测结果**，不是阶段的定义。
+  - **现有代码映射与缺口**：
+    - `hierarchical_memory.py`：L0 frame/L1 event/L2 phase/L3 world
+      骨架正确；缺每阶段的 `θ_i`（动作-转移统计）、residual、
+      support，以及阶段间转移边。
+    - `memory_tree.py`：合并准则应加入**转移结果一致性/预测误差**，
+      不能只看 context 距离；否则会把“像但动力学不同”的段合并。
+    - `predict_layer.py`：单层 AR 预测，不是多尺度转移模型；可作为
+      within-stage 的对照，不是阶段图。
+    - planner：没有 `PredictionRequest`/`PredictionRecord`/
+      applicability；所有预测同权进入 score。
+  - **Schema（先离线，不改 planner）**：
+    ```text
+    Stage:
+      id, level, start/end, entry_condition
+      local_model θ（动作-转移/结果统计）
+      residual, support, last_validated
+      exit_event
+
+    Event:
+      id, time, type, level
+      affected_model_components
+      before_stage / after_stage
+      salience/surprise, support
+
+    StageTransition:
+      source_stage, action/option, entry_condition
+      target_stage/outcome, exit_condition
+      duration_distribution, probability, support, error
+
+    PredictionRequest:
+      target (next state / stage outcome / dead-end / return)
+      concept_level (within-stage / stage-transition / world)
+      required_resolution, required_confidence
+      current_stage, decision_type
+
+    PredictionRecord:
+      source_stage, conditions, target, duration
+      uncertainty, support, calibration_error, validity
+    ```
+  - **学习准则**：
+    - Split：单模型误差 - 左右两模型误差 > 复杂度惩罚，且边界有
+      support/salience；事件层级 = 误差下降最显著的模型层。
+    - Merge：相邻阶段 `θ_A`/`θ_B` 在置信区间内不可区分、结果分布
+      一致 → 合并；避免过分割。
+    - 在线用局部 sufficient statistics + residual monitor；离线用
+      DP/自底向上合并 + MDL/BIC 惩罚。
+    - 阶段/事件定义必须**任务无关**：只用转移、反馈、预测误差、
+      支持度；不写任务词/几何。
+  - **预测路由与仲裁**：
+    - within-stage 细预测：只在该阶段入口条件内有效，用于即时动作。
+    - stage-transition 粗预测：用于阶段结果/早期预警/剪枝；不能
+      覆盖 within-stage 的即时判断。
+    - event 预测：边界类型/层级/时间，用于模式切换、保守、求知。
+    - 仲裁：入口条件不满足 → abstain/UNKNOWN；粗预测区间很宽时，
+      只有下界仍优于替代上界才改变排序；决策边际小 → 保守/求知。
+  - **与当前证据的关系**：
+    - seed 101：阶段级 dead-end 预测可能在不依赖精确状态的情况下
+      提供早期风险，修正 score misrank；这是该设计的首要验证案例。
+    - seed 100/102：fine 已经 oracle-best；coarse 只能做先验/剪枝，
+      不能破坏 fine；默认路由应选 fine。
+    - 死亡规则保留为阶段内细粒度 0/1 条件；阶段转移是互补的粗信号。
+  - **实施顺序（checklist）**：
+    - [ ] 定义 `Stage`/`Event`/`StageTransition`/
+      `PredictionRequest`/`PredictionRecord` schema + 单测
+      （纯数据类，无行为）。
+    - [ ] 在 `HierarchicalMemory` 节点上累积局部转移统计 `θ_i`、
+      residual、support；保持现有 context 汇总兼容。
+    - [ ] 离线阶段分割器：用 split/merge 准则在日志上分段；与现有
+      frame/event/phase 对照；输出阶段同质性/事件层级统计。
+    - [ ] 构建阶段图：`(stage, action/option) → (next stage/outcome,
+      duration)`；只在 refine 世界上学习，test 世界验证。
+    - [ ] 离线 router 探针：fine-only / coarse-only /
+      coarse-to-fine；指标为 next-stage/outcome 准确率、
+      dead-end 召回、decision regret、FP、applicability violation；
+      不是状态 MSE。
+    - [ ] seed 101 关键案例：coarse 阶段预测能否降低
+      decision-relevant miss/regret；seed 100/102 是否不退化。
+    - [ ] 质量门通过后才接 planner（opt-in，默认 fine-only）。
+  - **质量门（建议）**：
+    - 阶段同质性：within-stage residual 显著低于跨阶段；事件层级
+      与真实 regime 变化一致（人工/离线对照）。
+    - 阶段转移：next-stage/outcome 校准误差可控；applicability
+      violation 低；小样本 support 不足时 abstain。
+    - 决策：seed 101 的 decision-relevant miss/regret 下降；
+      seed 100/102 的 selected survives 不下降；FP 不升。
+    - 不达标不接默认；不用任务专用阶段名/几何。
+  - **反模式/非目标**：
+    - 固定时间窗切阶段；按 context 距离合并；用 salience 大小直接
+      当事件层级；粗预测覆盖细预测；全局 confidence 混合所有尺度；
+      没有入口条件/support 就采纳阶段转移；为 benchmark 写阶段词。
+  - **开放问题**：
+    - 局部模型用线性/局部线性/统计表？复杂度惩罚怎么定？
+    - 事件层级在小 support 下如何稳健判定？是否需要滞后/回滞？
+    - 阶段定义跨世界如何迁移：存条件+结果统计，还是存关系签名？
+    - 阶段转移的持续时间分布如何校准（少样本）？
+    - coarse 预测与 fine 预测冲突时的仲裁阈值如何从数据学？
 - **死亡归因探针（2026-11-20，临时脚本 death_abstraction_probe.py，seed 101/3000 步）**：
   判别"抽象不足 vs 决策不足"：死亡前 5 决策的账本危险份额 **3.09** vs
   平稳段 1.08；死亡行分级威胁读出 **0.77** vs 平稳段中位 0.00——
