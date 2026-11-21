@@ -67,15 +67,21 @@ class _SequencePolicy:
         return int(action)
 
 
-def _collect_streams(steps):
+def _collect_streams(steps, data_seed=None):
     return [
-        collect_world(seed, gravity, flap, drag, speed, steps=steps)
+        collect_world(
+            seed, gravity, flap, drag, speed, steps=steps,
+            behavior_seed=(
+                None if data_seed is None
+                else int(data_seed) * 1000000 + seed
+            ),
+        )
         for seed, gravity, flap, drag, speed in TRAIN_WORLDS
     ]
 
 
-def _build(steps=1200):
-    streams = _collect_streams(steps)
+def _build(steps=1200, model_seed=200, data_seed=None):
+    streams = _collect_streams(steps, data_seed=data_seed)
     observations, histories, targets, _worlds = _flatten(streams)
     context_model = ContextualLinearModel(
         OBS_DIM, LAG + 1, context_dim=4, context_ridge=1e-2,
@@ -87,7 +93,7 @@ def _build(steps=1200):
     )
     rows = [row for stream in streams for row in stream]
     _world, agent = _train(
-        rows, seed=200, epochs=2, lag=LAG, max_nodes=800,
+        rows, seed=model_seed, epochs=2, lag=LAG, max_nodes=800,
         birth_threshold=0.45, component_kinds=(), component_min_count=8,
         max_components=0, component_weight=0.5, component_gating=False,
         memory_weight=0.1, association_rate=0.0, induce_features=True,
@@ -219,8 +225,10 @@ def _plan(env, model, agent, recent, max_frames, horizon=8):
 
 
 def run(train_steps=1200, warmup=10, max_frames=120, episodes=2,
-        horizon=8):
-    context_model, context_dim, agent, memory = _build(train_steps)
+        horizon=8, model_seed=200, data_seed=None):
+    context_model, context_dim, agent, memory = _build(
+        train_steps, model_seed=model_seed, data_seed=data_seed
+    )
     expander = GenerativeExpander(
         context_model, memory=memory, policy=_node_policy(agent),
         horizon=warmup, phase_len=4,
@@ -294,6 +302,7 @@ def run(train_steps=1200, warmup=10, max_frames=120, episodes=2,
         results[world_seed] = rows
     return dict(
         context_dim=int(context_dim),
+        model_seed=int(model_seed),
         warmup=int(warmup),
         candidates=len(candidates),
         results=results,
@@ -307,12 +316,15 @@ def main():
     parser.add_argument("--max-frames", type=int, default=120)
     parser.add_argument("--episodes", type=int, default=2)
     parser.add_argument("--horizon", type=int, default=8)
+    parser.add_argument("--model-seed", type=int, default=200)
+    parser.add_argument("--data-seed", type=int, default=0)
     parser.add_argument("--report", default="")
     args = parser.parse_args()
     report = run(
         train_steps=args.train_steps, warmup=args.warmup,
         max_frames=args.max_frames, episodes=args.episodes,
-        horizon=args.horizon,
+        horizon=args.horizon, model_seed=args.model_seed,
+        data_seed=(args.data_seed if args.data_seed > 0 else None),
     )
     print(json.dumps(report, indent=2, default=str))
     if args.report:

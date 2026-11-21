@@ -71,8 +71,11 @@ def _behavior_action(env, layer_pair, rng):
     return int(rng.rand() < probability)
 
 
-def collect_world(seed, gravity, flap, drag, speed, steps=1200, lag=LAG):
-    rng = np.random.RandomState(seed)
+def collect_world(seed, gravity, flap, drag, speed, steps=1200, lag=LAG,
+                  behavior_seed=None):
+    rng = np.random.RandomState(
+        seed if behavior_seed is None else int(behavior_seed)
+    )
     rows = []
     episode = 0
     while len(rows) < steps:
