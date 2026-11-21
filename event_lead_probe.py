@@ -24,6 +24,8 @@ def main():
     parser.add_argument("--eval-seeds", default="120-122")
     parser.add_argument("--cap", type=int, default=5000)
     parser.add_argument("--penalty", type=float, default=1.0)
+    parser.add_argument("--events", choices=("stage", "feature"),
+                        default="stage")
     args = parser.parse_args()
     from eval_protocol import parse_seed_spec
     eval_seeds = parse_seed_spec(args.eval_seeds)
@@ -46,6 +48,43 @@ def main():
                 row = dict(row)
                 row["episode"] = int(eval_seed)
                 rows.append(row)
+    if args.events == "feature":
+        by_episode = {}
+        for index, row in enumerate(rows):
+            by_episode.setdefault(int(row["episode"]), []).append(index)
+        print("  episode  frames  changes  last-event-lead  median-gap")
+        leads = []
+        for episode in sorted(by_episode):
+            indices = by_episode[episode]
+            obs = np.asarray([rows[index]["obs"] for index in indices])
+            columns = [
+                np.asarray(
+                    agent._feature_objects[node_id].mask(obs), dtype=bool
+                )
+                for node_id in agent.feature_ids
+                if node_id in agent._feature_objects
+            ]
+            if not columns:
+                print("  no feature roots")
+                return
+            active = np.stack(columns, axis=1)
+            changes = np.flatnonzero(
+                np.any(active[1:] != active[:-1], axis=1)
+            ) + 1
+            lead = int(len(indices) - 1 - changes[-1]) if len(changes) else -1
+            gaps = np.diff(changes) if len(changes) > 1 else np.asarray([])
+            leads.append(lead)
+            print("  %7d  %6d  %7d  %15d  %10s" % (
+                episode, len(indices), len(changes), lead,
+                "%.1f" % np.median(gaps) if len(gaps) else "-",
+            ))
+        if leads:
+            print("  last-event lead: median %.1f  mean %.1f  min %d  max %d" % (
+                float(np.median(leads)), float(np.mean(leads)),
+                int(np.min(leads)), int(np.max(leads)),
+            ))
+        return
+
     graph = build_stage_graph(rows, lag=LAG, penalty=args.penalty)
     summary = graph.summary()
     print("== events: seed %d, %d episodes, %d frames ==" % (
