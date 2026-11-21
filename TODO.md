@@ -332,6 +332,27 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
    转移图无法提供方向。下一步三选一：更多 DAgger 轮次（提高跨 episode
    复发）、粗层改为结果导向（dead-end/存活段）、或回到证据通道 A/B。
 
+**结果导向粗层探针（2026-11-21，`outcome_coarse_probe.py`，只读）**
+
+定义：粗状态 = time-to-terminal 桶（0 终端 / 1: 1–5 帧 / 2: 6–15 /
+3: 16+），只用 episode boundary；对照 = 动作打乱、随机桶。
+
+6536 帧结果：
+
+| 臂 | (bucket,action) 格 ≥5 | 转移 | informative | cross3 |
+|---|---:|---:|---:|---:|
+| 真实 | 8/8 | 14 | 6 | 6 |
+| 动作打乱 | 8/8 | 14 | 6 | **6（完全相同）** |
+| 随机桶 | 8/8 | 37 | 24 | 20 |
+
+桶内动作判别：bucket 1（最后 5 帧）a1 比 a0 多 **+0.47 帧**；bucket 2
++0.32；bucket 3（16+）**−2.37 帧**（受状态混杂：拍翅多发生在危险时）。
+
+判定：**时间/结果桶可估但不可判别动作**（打乱后完全不变）——它是时钟，
+不是状态抽象；随机桶对照的 cross3 更高，再次说明 cross3 不能单独作门槛。
+结果导向粗层的有效部分退化为现有 hazard / death-side 机制，不构成新的
+方向。
+
 **质量门**：阶段同质性（within-stage residual 显著低于跨阶段）；转移校准
 误差可控、applicability violation 低、support 不足 abstain；seed 101 的
 decision-relevant miss/regret 下降；seed 100/102 selected survives 不降、
