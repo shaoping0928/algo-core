@@ -915,17 +915,42 @@
     - [x] 决策相关不确定性诊断（`planner_rollout_quality` 新增
       `margin_analysis`）：selected miss 按 top1/top2 动作分数差分桶，
       同时记录 `one_action_only`、regret、oracle-best survival。
-      **结果（120–124 / 123–126）**：
-      selected miss 12/10 个，**decision_relevant_misses = 0**，
-      **unavoidable_misses = 12/10**，**regret_nonzero = 0**，
-      selected survives = oracle-best survives（**50/50、45/45**）。
+      **seed 100 结果（120–124 / 123–126）**：
+      selected miss 12/10 个，decision_relevant_misses = 0，
+      unavoidable_misses = 12/10，regret_nonzero = 0，
+      selected survives = oracle-best survives（50/50、45/45）。
       miss 集中在大 margin 桶（8/14、7/12），不是小 margin。
-      **判定：全局 death recall 是标签质量指标，不是决策质量指标；
-      规划器不是“不确定”，而是自信地选了当前候选集里最好的。
-      exact death 的决策相关 miss 已为 0。**
+      但**修正 seed 缓存 bug 后，多 seed 结果并不一致**：
+      seed 101：selected miss 15，**decision_relevant_misses = 10**，
+      unavoidable 5，regret_nonzero 10（max 6，mean 0.55），
+      **selected survives 54 vs oracle 64**；miss margin 横跨小/中/大桶
+      （4/5/5），高 margin 桶 regret 更大（1.125）。
+      seed 102：selected miss 0，decision_relevant 0，
+      selected survives 50/50；plan recall **1.000**、FP 7.2%
+      （种子 101 为 recall 0.756、FP 1.2%；种子 100 为 0.798/3.0%）。
+      **判定：death recall 是否决策相关是 seed-dependent。**
+      100/102 的 gap 是标签噪声；101 的 gap 是真实决策损失。
+      全局 death recall 不能一概当标签指标；也不能用固定 margin
+      统一修。
+    - [x] oracle-best 归因（seed 101）：10 个 decision-relevant miss 中，
+      **oracle-best 计划 10/10 是 feasible**（death veto **0**），
+      **10/10 被 score 排在致命计划后面**（score misrank **10**），
+      mean score gap 0.053；seed 102 的 oracle-best ranked-first
+      **47/47**。**判定：seed 101 不是死亡规则 veto 错，也不是规则
+      覆盖不足，而是 hazard/value score 把存活计划排在致命计划后面。**
+      下一步是 score component 诊断（risk/value/curiosity 哪一列
+      误导），不是继续加 death recall/margin/state depth。
+    - [x] 固定 margin envelope 在多 seed 上被否决：seed 101 envelope
+      decision-relevant 仍 10、selected survives 54→52；seed 102
+      selected survives 50→45、regret_nonzero 5。**envelope 提高标签
+      recall，但不修 score misrank，且会 veto 安全计划。**
     - [ ] 新瓶颈：候选集/时域/探索。到这些晚期状态，H=8 内所有候选
       都死；再好的死亡分类也救不了。需要更早行动/更长时域/更好的
       候选生成，而不是继续提高 death recall。
+    - [x] **修复探针 seed 配置 bug**：`planner_rollout_quality` 的 fit
+      config 之前漏了 `config["seed"] = args.seed`，导致 seed 101/102
+      实际复用了 seed 100 的 cache；已提取 `probe_config(args)` 并加
+      回归测试。**此前那轮“101/102 确认”作废，重跑中。**
     - [ ] 用同一 margin 诊断在 seed 101/102 复跑，确认
       decision_relevant_misses=0 不是单一模型；之后再决定是否进
       early-warning/horizon 实验。
@@ -940,19 +965,25 @@
   - **当前总判定（2026-11-21）**：默认栈不变；`--death-rules` 仍是
     opt-in（3 种子配对均值 −13.2，2/3 正向；该 A/B 用的是 Batch 2
     规则，早于覆盖优先/少数模式支持/边界余量）。**262 测试**全过。
-    死亡判断**精度高**；全局 plan recall 76–80% 是**标签质量指标**，
-    不是决策质量指标。决策相关诊断（120–124/123–126）显示：
-    **decision_relevant_misses = 0、regret = 0、selected survives =
-    oracle-best survives（50/50、45/45）**；剩余 selected miss 全部是
-    unavoidable（晚期状态 H=8 内所有候选都死）或 one-action-only。
-    **当前瓶颈已从“死亡规则召回”转移到“候选集/时域/探索”**：到晚期
-    状态再好的死亡分类也无法凭空造出存活计划；需要更早行动/更长时域/
-    更好的候选生成。当前观测已含相对量，成对特征冗余；模式库只迁移
-    关系维度，阈值仍需本地校准，样本效率中性。下一步优先级：
-    (a) seed 101/102 复跑 margin 诊断，确认 decision-relevant 0；
-    (b) early-warning/horizon/候选集实验；(c) 若 regret 出现，再校准
-    hazard/value 分数。阈值先验、失败→规则、UNKNOWN→求知降为旁支，
-    不再先做。不做任务定制，不在任务几何/专用阈值上继续硬调。
+    死亡判断**精度高**，但**决策相关性是 seed-dependent**：
+    seed 100/102 的 decision_relevant_misses = 0、regret = 0、
+    selected survives = oracle-best（50/50、50/50），剩余 miss 是
+    unavoidable 或 one-action-only；**seed 101 则是反例**：
+    decision_relevant_misses = 10、regret 最高 6、
+    selected survives 54 vs oracle 64。种子 101 的 plan recall 0.756、
+    FP 1.2%；种子 102 为 recall 1.000、FP 7.2%；固定阈值/固定 margin
+    无法同时覆盖。**当前瓶颈是 per-model 的死亡边界校准**：
+    既不是单纯“标签问题”，也不是单纯“候选集/时域”；要先在模型
+    验证集上测 decision-relevant recall/regret，再决定是否加 envelope。
+    当前观测已含相对量，成对特征冗余；模式库只迁移关系维度，阈值仍需
+    本地校准，样本效率中性。**seed 101 的 oracle-best 归因显示：
+    10/10 decision-relevant miss 的 oracle-best 计划是 feasible，
+    10/10 被 score 排在后面；death veto 0。** 所以主瓶颈不是死亡规则
+    召回，而是 hazard/value score 的排序/校准。下一步优先级：
+    (a) score component 诊断（risk/value/curiosity 哪一列把存活计划
+    排后）；(b) score calibration / conservative lower bound；
+    (c) early-warning/horizon/候选集（seed 100/102 的晚期状态）。
+    不做任务定制，不在任务几何/专用阈值上继续硬调。
 - **死亡归因探针（2026-11-20，临时脚本 death_abstraction_probe.py，seed 101/3000 步）**：
   判别"抽象不足 vs 决策不足"：死亡前 5 决策的账本危险份额 **3.09** vs
   平稳段 1.08；死亡行分级威胁读出 **0.77** vs 平稳段中位 0.00——

@@ -195,6 +195,44 @@ def plan_score_gap(trace):
     return float(scores[top2, 0] - scores[top1, 0])
 
 
+def oracle_best_details(trace, sequences, true_first, horizon,
+                        selected_score):
+    """Best true plan and whether the score/feasibility hid it.
+
+    ``score_gap > 0`` means the oracle-best plan has a worse predicted score
+    than the selected plan, so the ranking (not death feasibility) hid it.
+    ``feasible=False`` means its predicted death vetoed it.
+    """
+    true_values = np.where(
+        np.asarray(true_first, dtype=int) < 0,
+        int(horizon) + 1,
+        np.asarray(true_first, dtype=int),
+    )
+    best_value = int(true_values.max())
+    mask = true_values == best_value
+    index = best_candidate_index(trace["scores"], mask)
+    feasible_mask = (
+        np.asarray(trace["feasible"], dtype=bool)
+        & np.asarray(trace["finite"], dtype=bool)
+    )
+    feasible = bool(feasible_mask[index])
+    score = float(np.asarray(trace["scores"], dtype=float)[index, 0])
+    pool = feasible_mask if feasible_mask.any() else np.asarray(
+        trace["finite"], dtype=bool
+    )
+    pool_scores = np.asarray(trace["scores"], dtype=float)[pool, 0]
+    rank = int(np.sum(pool_scores < score))
+    return dict(
+        oracle_best_value=int(best_value),
+        oracle_best_index=int(index),
+        oracle_best_feasible=feasible,
+        oracle_best_score=score,
+        oracle_best_score_gap=score - float(selected_score),
+        oracle_best_rank=rank,
+        oracle_best_action=int(sequences[index, 0]),
+    )
+
+
 def summarize_margins(rows):
     """Stratify selected misses by the decision margin.
 
@@ -214,8 +252,18 @@ def summarize_margins(rows):
     all_oracle = np.asarray([
         row["oracle_best_value"] for row in rows
     ], dtype=float)
+    all_feasible = np.asarray([
+        row["oracle_best_feasible"] for row in rows
+    ], dtype=bool)
+    all_score_gap = np.asarray([
+        row["oracle_best_score_gap"] for row in rows
+    ], dtype=float)
+    all_rank = np.asarray([
+        row["oracle_best_rank"] for row in rows
+    ], dtype=float)
     decision_relevant = int(np.sum(all_miss & (all_regret > 0)))
     unavoidable = int(np.sum(all_miss & (all_regret <= 0)))
+    relevant_mask = all_miss & (all_regret > 0)
     base = dict(
         decisions=len(rows),
         usable=int(len(usable)),
@@ -232,6 +280,28 @@ def summarize_margins(rows):
             int(np.sum([
                 row["selected_value"] > horizon for row in rows
             ])) if len(rows) else 0
+        ),
+        oracle_best_feasible=int(np.sum(all_feasible)) if len(rows) else 0,
+        oracle_best_ranked_first=(
+            int(np.sum(all_feasible & (all_rank == 0)))
+            if len(rows) else 0
+        ),
+        decision_relevant_oracle_feasible=(
+            int(np.sum(relevant_mask & all_feasible))
+            if len(rows) else 0
+        ),
+        decision_relevant_score_misrank=(
+            int(np.sum(
+                relevant_mask & all_feasible & (all_score_gap > 0)
+            )) if len(rows) else 0
+        ),
+        decision_relevant_death_veto=(
+            int(np.sum(relevant_mask & ~all_feasible))
+            if len(rows) else 0
+        ),
+        mean_score_gap_decision_relevant=(
+            float(np.mean(all_score_gap[relevant_mask]))
+            if relevant_mask.any() else 0.0
         ),
     )
     if not usable:
@@ -283,8 +353,26 @@ def summarize_margins(rows):
             float(np.median(ok_margins)) if len(ok_margins) else 0.0
         ),
         mean_regret=float(np.mean(regret)),
+        decision_relevant_usable=int(np.sum(
+            is_miss & (regret > 0)
+        )),
+        decision_relevant_one_action_only=int(
+            decision_relevant - np.sum(is_miss & (regret > 0))
+        ),
         buckets=buckets,
     )
+
+
+def probe_config(args):
+    """Build the fit configuration from the probe CLI.
+
+    The seed must be part of the cache key; reusing a seed-100 model under
+    a different --seed would silently make every run identical.
+    """
+    config = dict(CONFIG)
+    config["seed"] = int(args.seed)
+    config["death_rule_boundary_margin"] = float(args.margin)
+    return config
 
 
 def main():
@@ -313,8 +401,7 @@ def main():
     parser.add_argument("--report", default="")
     args = parser.parse_args()
 
-    config = dict(CONFIG)
-    config["death_rule_boundary_margin"] = args.margin
+    config = probe_config(args)
     world, agent, _cached = load_or_fit(
         config, args.cache or None, refit=bool(args.refit)
     )
@@ -463,18 +550,25 @@ def main():
             action_margin, best_action_scores = action_score_gap(
                 trace, sequences
             )
+            selected_score = (
+                tri.score[0] if isinstance(tri.score, tuple) else tri.score
+            )
+            oracle_details = oracle_best_details(
+                trace, sequences, true_first, args.horizon,
+                selected_score,
+            )
             margin_rows.append(dict(
                 action_margin=action_margin,
                 plan_margin=plan_score_gap(trace),
                 best_action_scores=best_action_scores,
                 selected_miss=selected_missed,
                 selected_value=int(selected_value),
-                oracle_best_value=int(best_value),
                 regret=int(best_value - selected_value),
                 selected_true=int(selected_true),
                 selected_action=selected_action,
                 predicted_death=bool(tri.first_death >= 0),
                 horizon=int(args.horizon),
+                **oracle_details,
             ))
             if len(examples) < 12 and (
                 selected_missed or not selected_oracle_best
@@ -494,6 +588,11 @@ def main():
                     selected_unknown_count=int(tri.unknown_count),
                     selected_near_count=int(tri.near_count),
                     selected_first_near=int(tri.first_near),
+                    action_margin=action_margin,
+                    plan_margin=plan_score_gap(trace),
+                    regret=int(best_value - selected_value),
+                    selected_value=int(selected_value),
+                    oracle_best_value=int(best_value),
                     sequence=[int(value) for value in tri.actions],
                     terminal_state=[
                         float(value) for value in selected_state
@@ -595,6 +694,7 @@ def main():
         selection=selection,
         action_contrast=contrast,
         margin_analysis=summarize_margins(margin_rows),
+        margin_rows=margin_rows,
         examples=examples,
     )
     print(json.dumps(summary, indent=2))

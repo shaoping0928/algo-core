@@ -1,5 +1,6 @@
 """Generic metric helpers for the candidate-plan quality probe."""
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -11,6 +12,7 @@ from planner_rollout_quality import (
     oracle_plan,
     plan_death_counts,
     plan_score_gap,
+    probe_config,
     status_callback,
     summarize_margins,
 )
@@ -47,6 +49,14 @@ class FakeRules:
 
 
 class PlannerRolloutQualityTests(unittest.TestCase):
+    def test_probe_config_keeps_seed_and_margin(self):
+        config = probe_config(SimpleNamespace(seed=101, margin=0.03))
+        self.assertEqual(config["seed"], 101)
+        self.assertAlmostEqual(
+            config["death_rule_boundary_margin"], 0.03
+        )
+        self.assertEqual(config["steps"], 1500)
+
     def test_plan_death_counts(self):
         counts = plan_death_counts(
             predicted=[2, -1, 1, -1], truth=[0, 2, 1, -1]
@@ -127,15 +137,25 @@ class PlannerRolloutQualityTests(unittest.TestCase):
     def test_summarize_margins_stratifies_selected_misses(self):
         rows = [
             dict(action_margin=0.05, selected_miss=True, regret=3.0,
-                 selected_value=2.0, oracle_best_value=5.0, horizon=8),
+                 selected_value=2.0, oracle_best_value=5.0, horizon=8,
+                 oracle_best_feasible=True, oracle_best_score_gap=0.5,
+                 oracle_best_rank=3),
             dict(action_margin=0.10, selected_miss=True, regret=2.0,
-                 selected_value=3.0, oracle_best_value=5.0, horizon=8),
+                 selected_value=3.0, oracle_best_value=5.0, horizon=8,
+                 oracle_best_feasible=True, oracle_best_score_gap=0.5,
+                 oracle_best_rank=3),
             dict(action_margin=0.20, selected_miss=False, regret=0.0,
-                 selected_value=5.0, oracle_best_value=5.0, horizon=8),
+                 selected_value=5.0, oracle_best_value=5.0, horizon=8,
+                 oracle_best_feasible=True, oracle_best_score_gap=0.0,
+                 oracle_best_rank=0),
             dict(action_margin=0.50, selected_miss=False, regret=0.0,
-                 selected_value=5.0, oracle_best_value=5.0, horizon=8),
+                 selected_value=5.0, oracle_best_value=5.0, horizon=8,
+                 oracle_best_feasible=True, oracle_best_score_gap=0.0,
+                 oracle_best_rank=0),
             dict(action_margin=None, selected_miss=False, regret=0.0,
-                 selected_value=1.0, oracle_best_value=5.0, horizon=8),
+                 selected_value=1.0, oracle_best_value=5.0, horizon=8,
+                 oracle_best_feasible=True, oracle_best_score_gap=0.0,
+                 oracle_best_rank=0),
         ]
         summary = summarize_margins(rows)
         self.assertEqual(summary["decisions"], 5)
@@ -148,6 +168,14 @@ class PlannerRolloutQualityTests(unittest.TestCase):
         self.assertAlmostEqual(summary["regret_max"], 3.0)
         self.assertEqual(summary["oracle_best_survives"], 0)
         self.assertEqual(summary["selected_survives"], 0)
+        self.assertEqual(summary["decision_relevant_oracle_feasible"], 2)
+        self.assertEqual(summary["decision_relevant_score_misrank"], 2)
+        self.assertEqual(summary["decision_relevant_death_veto"], 0)
+        self.assertAlmostEqual(
+            summary["mean_score_gap_decision_relevant"], 0.5
+        )
+        self.assertEqual(summary["oracle_best_feasible"], 5)
+        self.assertEqual(summary["oracle_best_ranked_first"], 3)
         self.assertAlmostEqual(summary["miss_margin_mean"], 0.075)
         self.assertAlmostEqual(summary["ok_margin_mean"], 0.35)
         self.assertEqual(len(summary["buckets"]), 4)

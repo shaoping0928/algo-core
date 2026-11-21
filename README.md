@@ -1100,23 +1100,37 @@ H=6 小样本筛选（35 决策/2240 候选）看起来很有希望：margin 0.0
 
 `planner_rollout_quality` 新增 `margin_analysis`：按 top1/top2 动作
 分数差分桶，并记录 regret（选中计划真实存活 vs oracle-best）与
-one-action-only。两个世界集：
+one-action-only。**修正 seed 缓存 bug 后，多 seed 结果并不一致：**
 
-| 世界集 | selected miss | decision-relevant | unavoidable | regret>0 | selected / oracle survives |
-|---|---:|---:|---:|---:|---:|
-| 120–124 | 12 | **0** | 12 | **0** | **50 / 50** |
-| 123–126 | 10 | **0** | 10 | **0** | **45 / 45** |
+| seed | selected miss | decision-relevant | regret max | selected / oracle survives | plan recall | FP rate |
+|---|---:|---:|---:|---:|---:|---:|
+| 100 (120–124) | 12 | **0** | 0 | **50 / 50** | 0.798 | 3.0% |
+| 100 (123–126) | 10 | **0** | 0 | **45 / 45** | 0.759 | 0.26% |
+| 101 (120–124) | 15 | **10** | **6** | **54 / 64** | 0.756 | 1.2% |
+| 102 (120–124) | 0 | **0** | 0 | **50 / 50** | **1.000** | 7.2% |
 
-- miss 集中在**最大 margin 桶**（8/14、7/12），不是小 margin；
-  miss margin 均值 0.164/0.386，ok margin 0.041/0.025。
-- 也就是说，planner 不是“不确定”，而是**自信地选了当前候选集里
-  最好的那个**；死亡侧没标出来，但没有更好的选择，regret 为 0。
-- **判定：全局 death recall 是标签质量指标，不是决策质量指标。**
-  当前 exact death 的决策相关 miss 在本模型种子上已经是 **0**；
-  继续加召回/调 margin 不会提高决策质量。
-- **新瓶颈：候选集/时域/探索。** 到这些晚期状态，H=8 内所有候选
-  都死；再好的死亡分类也无法凭空造出存活计划。需要更早行动/更长
-  时域/更好的候选生成，而不是继续提高 death recall。
+- seed 100/102：planner 已经选了 oracle-best；剩余 miss 是
+  unavoidable（H=8 内所有候选都死）或 one-action-only，regret=0。
+- **seed 101 是反例**：10 个 decision-relevant miss，选中存活比
+  oracle 少 10；miss margin 横跨小/中/大桶（4/5/5），高 margin 桶
+  的 regret 更大（mean 1.125）。这些 miss 的真实终止状态都是
+  exact death，规则覆盖了真实终止，但预测状态漂移，且存在存活
+  替代计划。
+- **seed 101 的 oracle-best 归因**：10 个 decision-relevant miss 中，
+  **oracle-best 计划 10/10 是 feasible**（death veto **0**），
+  **10/10 被 score 排在致命计划后面**（score misrank **10**），
+  mean score gap 0.053；seed 102 的 oracle-best ranked-first 47/47。
+  也就是说，seed 101 不是死亡规则 veto 错，也不是规则覆盖不足，
+  而是 **hazard/value score 把存活计划排在致命计划后面**。
+- **固定 margin envelope 被多 seed 否决**：seed 101 envelope 的
+  decision-relevant 仍为 10、selected survives 54→52；seed 102
+  selected survives 50→45、regret_nonzero 5。envelope 提高标签
+  recall，但不修 score misrank，还会 veto 安全计划。
+- **判定：seed 101 的主瓶颈是 score 排序/校准，不是 death recall，
+  也不是 state prediction depth。** 下一步做 score component 诊断
+  （risk/value/curiosity 哪一列把存活计划排后），再做 calibration
+  或 conservative lower bound；seed 100/102 的晚期状态仍指向候选集/
+  时域/探索。两条瓶颈并存，谁是主瓶颈取决于模型。
 
 **归纳形式扩展（2026-11-20）：成对坐标差**。根稀疏的一个来源是绝对阈值
 贴在训练分布边缘。归纳文法新增纯代数坐标：
