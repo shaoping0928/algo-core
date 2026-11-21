@@ -178,6 +178,120 @@ class TrajectorySearchTests(unittest.TestCase):
         np.testing.assert_allclose(beam.actions, exhaustive.actions)
         self.assertAlmostEqual(beam.final_state[0], exhaustive.final_state[0])
 
+    def test_death_status_tracks_unknown_and_safe_steps(self):
+        def evaluate_step(states, _actions, _step):
+            return np.zeros(len(states)), np.ones(len(states), dtype=bool)
+
+        def status(_states, sequences, step):
+            # Action 0 is safe then unknown; action 1 is unknown then dead.
+            first = sequences[:, 0]
+            if step == 0:
+                return np.where(first == 0, 0, -1)
+            return np.where(first == 0, -1, 1)
+
+        result = exhaustive_search(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=2,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            evaluate_death_status=status,
+            batch_size=4,
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.first_death, -1)
+        self.assertEqual(result.first_unknown, 1)
+        self.assertEqual(result.unknown_count, 1)
+        self.assertEqual(result.safe_count, 1)
+
+    def test_unknown_penalty_prefers_fewer_unknown_steps(self):
+        def evaluate_step(_states, sequences, _step):
+            score = np.where(sequences[:, 0] == 1, -1.0, 0.0)
+            return score, np.ones(len(score), dtype=bool)
+
+        def status(_states, sequences, _step):
+            return np.where(sequences[:, 0] == 1, -1, 0)
+
+        kwargs = dict(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=1,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            evaluate_death_status=status,
+        )
+        unpenalised = exhaustive_search(**kwargs)
+        self.assertEqual(unpenalised.actions[0], 1.0)
+        self.assertEqual(unpenalised.unknown_count, 1)
+
+        mild = exhaustive_search(**kwargs, unknown_penalty=0.5)
+        self.assertEqual(mild.actions[0], 1.0)
+        self.assertEqual(mild.score, -1.0)
+        self.assertEqual(mild.unknown_count, 1)
+
+        strict = exhaustive_search(**kwargs, unknown_penalty=2.0)
+        self.assertEqual(strict.actions[0], 0.0)
+        self.assertEqual(strict.score, 0.0)
+        self.assertEqual(strict.unknown_count, 0)
+        self.assertEqual(strict.safe_count, 1)
+
+    def test_candidate_callback_sees_all_candidates_and_keeps_selection(self):
+        def evaluate_step(states, _actions, _step):
+            return np.abs(states[:, 0] - 1.0), np.ones(len(states), dtype=bool)
+
+        kwargs = dict(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=2,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            batch_size=4,
+        )
+        batches = []
+        traced = exhaustive_search(
+            **kwargs, candidate_callback=batches.append
+        )
+        plain = exhaustive_search(**kwargs)
+        self.assertEqual(len(batches), 1)
+        batch = batches[0]
+        self.assertEqual(len(batch["sequences"]), 4)
+        self.assertEqual(batch["first_death"].shape, (4,))
+        self.assertEqual(batch["first_unknown"].shape, (4,))
+        self.assertEqual(batch["unknown_count"].shape, (4,))
+        self.assertEqual(batch["safe_count"].shape, (4,))
+        np.testing.assert_allclose(traced.actions, plain.actions)
+        np.testing.assert_allclose(traced.final_state, plain.final_state)
+        self.assertEqual(traced.score, plain.score)
+
+    def test_status_callback_matches_legacy_death_callback(self):
+        def evaluate_step(states, _actions, _step):
+            return -states[:, 0], np.ones(len(states), dtype=bool)
+
+        def death_by_state(states, _sequences, step):
+            return np.where(states[:, 0] >= 1.5, step, -1)
+
+        def status_by_state(states, _sequences, _step):
+            return np.where(states[:, 0] >= 1.5, 1, -1)
+
+        kwargs = dict(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=2,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            batch_size=4,
+        )
+        legacy = exhaustive_search(**kwargs, evaluate_death=death_by_state)
+        status = exhaustive_search(
+            **kwargs, evaluate_death_status=status_by_state
+        )
+        np.testing.assert_allclose(status.actions, legacy.actions)
+        np.testing.assert_allclose(status.final_state, legacy.final_state)
+        self.assertEqual(status.feasible, legacy.feasible)
+        self.assertEqual(status.feasible_count, legacy.feasible_count)
+        self.assertEqual(status.first_death, legacy.first_death)
+        self.assertEqual(status.score, legacy.score)
+
 
 if __name__ == "__main__":
     unittest.main()

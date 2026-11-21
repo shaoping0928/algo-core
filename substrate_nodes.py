@@ -988,7 +988,9 @@ def _curiosity_off(agent):
 
 
 def policy_result(env, world, agent, prefix, horizon, lag=LAG,
-                  step_stride=2, stride_includes_lag=False):
+                  step_stride=2, stride_includes_lag=False,
+                  death_status_batch=None, unknown_penalty=0.0,
+                  candidate_callback=None):
     initial = np.asarray(env.obs(), dtype=float)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
     action_dim = int(lag) + 1
@@ -1005,7 +1007,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
     )
     death_rules = getattr(agent, "death_rules", None)
     death_batch = None
-    if death_rules is not None and bool(
+    if death_status_batch is None and death_rules is not None and bool(
         getattr(agent, "death_rule_hard", False)
     ):
         def death_batch(states, _sequences, step):
@@ -1244,6 +1246,9 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         evaluate_step=evaluate_step,
         evaluate_terminal=evaluate_terminal,
         evaluate_death=death_batch,
+        evaluate_death_status=death_status_batch,
+        unknown_penalty=unknown_penalty,
+        candidate_callback=candidate_callback,
         batch_size=2 ** horizon,
         # "sum" expands to one mode per objective column, so the ledger
         # columns (hazard and value shares) sum alongside the scalarized

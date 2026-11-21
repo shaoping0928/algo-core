@@ -228,7 +228,9 @@ NodeRuntime(obs_dim, action_space=(0,1), lag=0, gamma=0.99, lam=0.9,
 ```python
 exhaustive_search(initial_state, action_space, horizon,
                   transition_batch, evaluate_step, batch_size=4096,
-                  evaluate_terminal=None, score_combine="sum") -> SearchResult
+                  evaluate_terminal=None, score_combine="sum",
+                  evaluate_death=None, evaluate_death_status=None,
+                  unknown_penalty=0.0, candidate_callback=None) -> SearchResult
 beam_search(initial_state, action_space, horizon,
             transition_batch, evaluate_step, evaluate_terminal=None,
             beam_width=256, score_combine="sum") -> SearchResult
@@ -236,8 +238,10 @@ beam_search(initial_state, action_space, horizon,
 
 - `transition_batch(states, sequences, step)`：批量一步预测；**完整候选序列可见**（供延迟动作读前缀）。
 - `evaluate_step(states, sequences, step) -> (score_increment, feasible)`：增量可为标量或向量（向量按字典序最小化）；`score_combine ∈ {"sum","max"}`。
-- `SearchResult(actions, score, feasible, feasible_count, candidate_count, first_state, final_state)`。
-- 无可行解 → 返回最低分候选 + `feasible=False`；核心不保存完整轨迹（只留 current/first/final）。
+- `SearchResult(actions, score, feasible, feasible_count, candidate_count, first_state, final_state, first_death, first_unknown, unknown_count, safe_count)`：后四个字段默认 `-1/0/0`，只有提供三态回调时才有意义。
+- `evaluate_death_status(states, sequences, step) -> 1/0/-1`：`1`=死亡、`0`=安全、`-1`=未知；与 `evaluate_death` 互斥。未知不单独否决计划，`unknown_penalty` 只给主目标按未知步数加罚（返回的 `score` 仍是未加罚目标）。
+- `candidate_callback(batch)`：诊断/探针钩子，接收每批候选的序列、分数、可行性、首死/首未知/未知步数与预测状态；搜索本身不依赖它。
+- 无可行解 → 返回最低分候选 + `feasible=False`；核心不保存完整轨迹（只留 current/first/final）。`evaluate_death=None` 且 `unknown_penalty=0` 时选择路径逐位不变。
 
 ---
 

@@ -25,6 +25,13 @@ class SearchResult:
     first_state: np.ndarray
     final_state: np.ndarray
     first_death: int = -1
+    # Tri-state bookkeeping for the selected plan.  These stay at their
+    # defaults when the caller only supplies the legacy death callback:
+    # there is no way to distinguish "safe" from "unknown" without a
+    # status callback, and inventing one would silently change meaning.
+    first_unknown: int = -1
+    unknown_count: int = 0
+    safe_count: int = 0
 
 
 def _sequence_batches(
@@ -110,6 +117,11 @@ def exhaustive_search(
     evaluate_death: Optional[Callable[
         [np.ndarray, np.ndarray, int], np.ndarray
     ]] = None,
+    evaluate_death_status: Optional[Callable[
+        [np.ndarray, np.ndarray, int], np.ndarray
+    ]] = None,
+    unknown_penalty: float = 0.0,
+    candidate_callback: Optional[Callable[[dict], None]] = None,
     score_combine: Union[str, Sequence[str]] = "sum",
 ) -> SearchResult:
     """Enumerate action sequences and select plans using supplied model/evaluator callbacks.
@@ -122,6 +134,20 @@ def exhaustive_search(
     An optional `evaluate_death(states, sequences, step)` returns the death step for each
     candidate (-1 = alive). A death marks the plan infeasible; if no candidate survives the
     whole horizon, the candidate with the latest first death wins, then the score.
+    An optional `evaluate_death_status(states, sequences, step)` returns one status per
+    candidate and step: ``1`` = death, ``0`` = safe, ``-1`` = unknown.  It is mutually
+    exclusive with `evaluate_death`; the richer callback supplies the death step as well as
+    the first-unknown step and the number of unknown/safe steps before the first death.
+    Unknown is never treated as safe: it does not veto a plan by itself, but
+    `unknown_penalty` can add a cost per unknown step to the primary objective for
+    selection (the returned score stays the unpenalised objective).  The default
+    `unknown_penalty=0` keeps the old selection path.  A positive penalty is
+    only meaningful when the status callback can return ``0`` for a known-safe
+    step; with a death-only callback (``1``/``-1``) every non-death step is
+    unknown, so penalising unknowns would prefer an early death.
+    An optional `candidate_callback(batch)` receives the per-batch sequences, scores,
+    feasibility, death/unknown bookkeeping and predicted states; it is for probes and
+    diagnostics and is never required by the search itself.
     Lower scores are better. Only current, first, and final states are retained; the core does
     not store every candidate's full trajectory.
 
@@ -138,6 +164,16 @@ def exhaustive_search(
         raise ValueError("horizon must be a positive integer")
     if batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
+    if evaluate_death is not None and evaluate_death_status is not None:
+        raise ValueError(
+            "supply evaluate_death or evaluate_death_status, not both"
+        )
+    if float(unknown_penalty) < 0.0:
+        raise ValueError("unknown_penalty must be non-negative")
+    if float(unknown_penalty) > 0.0 and evaluate_death_status is None:
+        raise ValueError(
+            "unknown_penalty needs evaluate_death_status to count unknowns"
+        )
 
     best_feasible = None
     best_any = None
@@ -151,6 +187,9 @@ def exhaustive_search(
         scores = None
         feasible = np.ones(count, dtype=bool)
         first_death = np.full(count, -1, dtype=int)
+        first_unknown = np.full(count, -1, dtype=int)
+        unknown_count = np.zeros(count, dtype=int)
+        safe_count = np.zeros(count, dtype=int)
         first_states = None
 
         for step in range(horizon):
@@ -179,7 +218,33 @@ def exhaustive_search(
             else:
                 scores = _combine_scores(scores, increments, modes)
             feasible &= step_feasible
-            if evaluate_death is not None:
+            if evaluate_death_status is not None:
+                status = np.asarray(
+                    evaluate_death_status(states, sequences, step)
+                ).reshape(-1)
+                if status.shape != (count,):
+                    raise ValueError(
+                        "evaluate_death_status must return one status per plan"
+                    )
+                if not np.isin(status, (-1, 0, 1)).all():
+                    raise ValueError(
+                        "evaluate_death_status values must be -1, 0 or 1"
+                    )
+                status = status.astype(int)
+                # Only the prefix before the first death is meaningful:
+                # once a plan is dead, later unknowns cannot make it safe.
+                active = first_death < 0
+                death_now = active & (status == 1)
+                unknown_now = active & (status == -1)
+                safe_now = active & (status == 0)
+                first_death = np.where(death_now, step, first_death)
+                first_unknown = np.where(
+                    unknown_now & (first_unknown < 0), step, first_unknown
+                )
+                unknown_count += unknown_now.astype(int)
+                safe_count += safe_now.astype(int)
+                feasible &= ~death_now
+            elif evaluate_death is not None:
                 death = np.asarray(
                     evaluate_death(states, sequences, step)
                 ).reshape(-1)
@@ -211,6 +276,26 @@ def exhaustive_search(
         if scores is None:
             raise ValueError("at least one evaluator must provide a score")
         finite = np.isfinite(scores).all(axis=1)
+        ranking_scores = scores
+        if unknown_penalty > 0.0:
+            ranking_scores = scores.copy()
+            ranking_scores[:, 0] += float(unknown_penalty) * unknown_count
+
+        if candidate_callback is not None:
+            candidate_callback(dict(
+                sequences=sequences.copy(),
+                scores=scores.copy(),
+                ranking_scores=np.asarray(ranking_scores).copy(),
+                feasible=feasible.copy(),
+                finite=finite.copy(),
+                first_death=first_death.copy(),
+                first_unknown=first_unknown.copy(),
+                unknown_count=unknown_count.copy(),
+                safe_count=safe_count.copy(),
+                first_states=first_states.copy(),
+                final_states=states.copy(),
+            ))
+
         if not finite.any():
             candidate_count += count
             continue
@@ -219,51 +304,52 @@ def exhaustive_search(
         feasible_count += int(feasible.sum())
         candidate_count += count
 
-        any_index = _lexicographic_argmin(scores, finite)
-        any_candidate = (
-            int(first_death[any_index]),
-            tuple(float(value) for value in scores[any_index]),
-            sequences[any_index].copy(),
-            first_states[any_index].copy(),
-            states[any_index].copy(),
-        )
-        if best_any is None or any_candidate[1] < best_any[1]:
+        def candidate(index, death_value):
+            # The layout keeps the legacy comparison keys at the front:
+            # [0] first death, [4] selection score.  The original score at
+            # [5] is what the caller sees; the ranking score may carry the
+            # optional unknown penalty.
+            return (
+                int(death_value),
+                int(first_unknown[index]),
+                int(unknown_count[index]),
+                int(safe_count[index]),
+                tuple(float(value) for value in ranking_scores[index]),
+                tuple(float(value) for value in scores[index]),
+                sequences[index].copy(),
+                first_states[index].copy(),
+                states[index].copy(),
+            )
+
+        any_index = _lexicographic_argmin(ranking_scores, finite)
+        any_candidate = candidate(any_index, first_death[any_index])
+        if best_any is None or any_candidate[4] < best_any[4]:
             best_any = any_candidate
 
         if feasible.any():
-            feasible_index = _lexicographic_argmin(scores, feasible)
-            feasible_candidate = (
-                -1,
-                tuple(float(value) for value in scores[feasible_index]),
-                sequences[feasible_index].copy(),
-                first_states[feasible_index].copy(),
-                states[feasible_index].copy(),
-            )
+            feasible_index = _lexicographic_argmin(ranking_scores, feasible)
+            feasible_candidate = candidate(feasible_index, -1)
             if best_feasible is None or (
-                feasible_candidate[1] < best_feasible[1]
+                feasible_candidate[4] < best_feasible[4]
             ):
                 best_feasible = feasible_candidate
 
-        if evaluate_death is not None:
+        if evaluate_death is not None or evaluate_death_status is not None:
             # When every candidate dies, keep the one whose first death is
             # latest; the ordinary objective is only the tie-break.
             late = finite & (first_death >= 0)
             if late.any():
                 latest = int(first_death[late].max())
                 late_indices = late & (first_death == latest)
-                late_index = _lexicographic_argmin(scores, late_indices)
-                late_candidate = (
-                    latest,
-                    tuple(float(value) for value in scores[late_index]),
-                    sequences[late_index].copy(),
-                    first_states[late_index].copy(),
-                    states[late_index].copy(),
+                late_index = _lexicographic_argmin(
+                    ranking_scores, late_indices
                 )
+                late_candidate = candidate(late_index, latest)
                 if best_late is None or (
                     late_candidate[0] > best_late[0]
                     or (
                         late_candidate[0] == best_late[0]
-                        and late_candidate[1] < best_late[1]
+                        and late_candidate[4] < best_late[4]
                     )
                 ):
                     best_late = late_candidate
@@ -275,7 +361,17 @@ def exhaustive_search(
         selected = best_any
     if selected is None:
         raise ValueError("evaluators returned no finite score for any candidate")
-    death, score, sequence, first_state, final_state = selected
+    (
+        death,
+        selected_first_unknown,
+        selected_unknown_count,
+        selected_safe_count,
+        _rank,
+        score,
+        sequence,
+        first_state,
+        final_state,
+    ) = selected
     score = score[0] if len(score) == 1 else score
     return SearchResult(
         actions=sequence,
@@ -286,6 +382,9 @@ def exhaustive_search(
         first_state=first_state,
         final_state=final_state,
         first_death=int(death),
+        first_unknown=int(selected_first_unknown),
+        unknown_count=int(selected_unknown_count),
+        safe_count=int(selected_safe_count),
     )
 
 

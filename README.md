@@ -203,6 +203,9 @@ python math_memory_search.py
 | NNLS 堆叠组合 + isotonic 后置校准 | ✓ | 训练末拟合 | ✓ `pain_signal_batch` |
 | 分级校准（逐（根，acting）读出配对，逐代刷新） | ✓ | ✓ | ✓ 分级目标 |
 | 0/1 死亡条件规则（`death_rules.py`） | ✓ | 离线/反例细化 | ✓ `--death-rules`（硬约束，默认 0；3 种子配对均值 −13.2，2/3 正） |
+| 三态搜索信息（`first_unknown`/`unknown_count`/candidate 回调） | ✓ | 单测 | — 默认关；关闭时逐位不变 |
+| 候选计划质量探针（`planner_rollout_quality.py`） | ✓ | 85 决策/21760 计划 | — 诊断（precision 96.0%、recall 79.8%） |
+| 失败→规则（`death_rule_loop.py`） | ✓ | 合成（缺失第二模式） | ✗ 未接真实 planner 失败 |
 | 上下文分桶死亡规则（`contextual_rules.py`） | ✓ | 合成/稀疏桶回退 | ✗ 未接真实残差/planner |
 | 成对/归一化相对特征（死亡规则） | ✓ | 离线对比（`death_feature_probe.py`） | ✗ 当前观测冗余，默认关 |
 | 跨世界模式库（`pattern_library.py`） | ✓ | 合成/仿射帧 | ✗ dims 迁移中性，未接 |
@@ -988,6 +991,29 @@ control `191.8 / 178.4 / 88.4`，均值 **152.9**，中位 152；
   不在模式检索。
 
 默认栈不变；`pattern_library.py` 与探针保留为通用实验工具。
+
+### 候选计划质量：死亡侧在 planner 真正评估的计划上（2026-11-21）
+
+`planner_rollout_quality.py` 不再只看控制策略的单步分支，而是在 5 个
+held-out 世界的采样状态上运行两次真实 search（baseline 与死亡侧三态），
+记录全部候选计划，并用真实世界做 oracle 首死步/动作对比。85 个决策、
+**21760 个候选计划**（H=8）：
+
+| 口径 | TP | FP | FN | precision | recall | FP rate |
+|---|---:|---:|---:|---:|---:|---:|
+| 候选计划死亡预测 | 8226 | 344 | 2086 | **96.0%** | **79.8%** | **3.0%** |
+
+- 首死步：exact **69.3%**、within-1 **81.0%**。
+- 选择层：tri **85/85** oracle-best vs baseline 84/85；选中计划真实存活
+  **50 vs 44**；**tri_later 8、tri_earlier 0、tie 77**；
+  `selected_missed` **12/85**（选中的真实死亡计划中 34% 未被死亡侧标出）。
+- 动作对比样本小：comparable 7，death 6/7、score 6/7，
+  selected_saving 7/7、baseline 6/7。
+- **判定：死亡侧在候选计划上精度高，召回/首死步仍是瓶颈；硬否决方向
+  为正（8 改进、0 退化），但 12 个 selected miss 是失败→规则/求知的
+  主目标。** `unknown_penalty` 在 death-only 状态下不可用：每个非死亡
+  步都是 unknown，按 unknown 步数加罚会偏好“早死”；它只适合
+  full-status 诊断或求知循环。
 
 **归纳形式扩展（2026-11-20）：成对坐标差**。根稀疏的一个来源是绝对阈值
 贴在训练分布边缘。归纳文法新增纯代数坐标：
