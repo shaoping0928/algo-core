@@ -57,8 +57,12 @@ def segment_cost(deltas, actions, start, end):
     )
 
 
-def segment_episode(deltas, actions, min_length=5):
-    """Greedy BIC splitting; returns [(start, end), ...]."""
+def segment_episode(deltas, actions, min_length=5, gains=None):
+    """Greedy BIC splitting; returns [(start, end), ...].
+
+    When `gains` is a list, every accepted split appends ``(cut, gain)`` so
+    the caller can inspect how decisive each boundary was.
+    """
     length = len(deltas)
     if length < 2 * min_length:
         return [(0, length)]
@@ -81,6 +85,8 @@ def segment_episode(deltas, actions, min_length=5):
                 best_cut = cut
         if best_cut is not None:
             boundaries.append(best_cut)
+            if gains is not None:
+                gains.append((best_cut, best_gain))
             stack.append((start, best_cut))
             stack.append((best_cut, end))
     boundaries = sorted(set(boundaries))
@@ -130,6 +136,8 @@ def analyse_stream(rows, radius=None, min_length=5):
 
     segments = []          # (episode, start, end, mean delta vector)
     episode_report = []
+    split_gains = []
+    short_episodes = 0
     for episode_id in sorted(episodes):
         episode = episodes[episode_id]
         deltas = np.asarray([
@@ -138,7 +146,11 @@ def analyse_stream(rows, radius=None, min_length=5):
             for row in episode
         ])
         actions = [int(row["history"][0]) for row in episode]
-        found = segment_episode(deltas, actions, min_length=min_length)
+        if len(episode) < 2 * min_length:
+            short_episodes += 1
+        found = segment_episode(
+            deltas, actions, min_length=min_length, gains=split_gains
+        )
         episode_report.append(dict(
             episode=episode_id,
             frames=len(episode),
@@ -199,18 +211,34 @@ def analyse_stream(rows, radius=None, min_length=5):
         count for key, count in edge_frames.items()
         if edge_frames[key] < 2
     )
+    edge_total = sum(edge_frames.values())
+    top_edges = sorted(
+        edge_frames.items(), key=lambda item: -item[1]
+    )[:6]
+    gains = np.asarray([gain for _cut, gain in split_gains], dtype=float)
+    lengths = np.asarray(
+        [end - start for start, end in
+         [(segment["start"], segment["end"]) for segment in segments]],
+        dtype=float,
+    )
 
     return dict(
         frames=len(rows),
         episodes=len(episodes),
+        short_episodes=short_episodes,
         segments=len(segments),
         clusters=clusters,
         cluster_radius=radius,
         episode_frames=[item["frames"] for item in episode_report],
         stages_per_episode=[item["stages"] for item in episode_report],
-        stage_lengths=[end - start for start, end in
-                       [(segment["start"], segment["end"])
-                        for segment in segments]],
+        stage_lengths=lengths.tolist(),
+        stage_length_p50=float(np.percentile(lengths, 50)) if len(lengths) else 0.0,
+        stage_length_p90=float(np.percentile(lengths, 90)) if len(lengths) else 0.0,
+        stage_length_max=float(lengths.max()) if len(lengths) else 0.0,
+        split_gains=[float(gain) for gain in gains],
+        split_gain_p50=float(np.percentile(gains, 50)) if len(gains) else 0.0,
+        split_gain_p90=float(np.percentile(gains, 90)) if len(gains) else 0.0,
+        split_gain_min=float(gains.min()) if len(gains) else 0.0,
         multi_stage_episodes=sum(
             1 for item in episode_report if item["stages"] > 1
         ),
@@ -219,6 +247,10 @@ def analyse_stream(rows, radius=None, min_length=5):
         cell_support_p90=float(np.percentile(cell_supports, 90)),
         cell_support_ge2=sum(1 for value in cell_frames.values() if value >= 2),
         cell_support_ge5=sum(1 for value in cell_frames.values() if value >= 5),
+        cell_top1_share=(
+            float(max(cell_frames.values())) / float(total_frames)
+            if total_frames else 0.0
+        ),
         cell_action_coverage=float(np.mean([
             sum(1 for action in (0, 1) if (stage, action) in cell_frames)
             / 2.0
@@ -232,6 +264,16 @@ def analyse_stream(rows, radius=None, min_length=5):
         edge_support_median=float(np.median(edge_supports)),
         edge_support_ge2=sum(1 for value in edge_frames.values() if value >= 2),
         edge_support_ge5=sum(1 for value in edge_frames.values() if value >= 5),
+        edge_top4_share=(
+            float(sum(count for _key, count in top_edges[:4]))
+            / float(edge_total)
+            if edge_total else 0.0
+        ),
+        top_edges=[
+            dict(stage=int(stage), action=int(action),
+                 next_stage=int(next_stage), frames=int(count))
+            for (stage, action, next_stage), count in top_edges
+        ],
         edge_frame_abstain_rate=(
             float(uncovered_edges) / float(total_frames)
             if total_frames else 0.0
@@ -283,17 +325,23 @@ def print_summary(report):
         )
         print(
             "  stages: %d segments, %d clusters (radius %.3f), "
-            "multi-stage episodes %d/%d"
+            "multi-stage episodes %d/%d, short %d"
             % (stream["segments"], stream["clusters"],
                stream["cluster_radius"], stream["multi_stage_episodes"],
-               stream["episodes"])
+               stream["episodes"], stream["short_episodes"])
+        )
+        print(
+            "  split gains: n=%d  p50 %.2f  p90 %.2f  min %.3f"
+            % (len(stream["split_gains"]), stream["split_gain_p50"],
+               stream["split_gain_p90"], stream["split_gain_min"])
         )
         print(
             "  per-episode stages: mean %.2f  max %d  "
-            "stage length median %.0f"
+            "stage length p50 %.0f p90 %.0f max %.0f"
             % (np.mean(stream["stages_per_episode"]),
                max(stream["stages_per_episode"]),
-               float(np.median(stream["stage_lengths"])))
+               stream["stage_length_p50"], stream["stage_length_p90"],
+               stream["stage_length_max"])
         )
         print(
             "  (stage, action) cells: %d  support median %.0f p90 %.0f  "
@@ -307,11 +355,18 @@ def print_summary(report):
         )
         print(
             "  (stage, action, next) edges: %d  support median %.0f  "
-            ">=2: %d  >=5: %d  frame abstain %.0f%%"
+            ">=2: %d  >=5: %d  top4 share %.0f%%  frame abstain %.0f%%"
             % (stream["edges"], stream["edge_support_median"],
                stream["edge_support_ge2"], stream["edge_support_ge5"],
+               100.0 * stream["edge_top4_share"],
                100.0 * stream["edge_frame_abstain_rate"])
         )
+        for edge in stream["top_edges"][:4]:
+            print(
+                "    top edge s%d a%d -> s%d  frames %d"
+                % (edge["stage"], edge["action"], edge["next_stage"],
+                   edge["frames"])
+            )
     print()
 
 
