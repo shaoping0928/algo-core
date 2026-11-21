@@ -4,9 +4,11 @@ import unittest
 import numpy as np
 
 from stage_graph import (
+    _kmeans,
     build_stage_graph,
     evaluate_stream,
     shuffle_actions,
+    sweep_vocabulary,
 )
 
 
@@ -98,6 +100,23 @@ class StageGraphTest(unittest.TestCase):
         self.assertGreater(
             result["real"]["stages"], result["shuffle_actions"]["stages"] - 1
         )
+
+    def test_kmeans_separates_two_action_effects(self):
+        vectors = np.asarray([[1.0, 0.0]] * 5 + [[-1.0, 0.0]] * 5)
+        labels = _kmeans(vectors, 2)
+        self.assertEqual(len(set(labels[:5])), 1)
+        self.assertEqual(len(set(labels[5:])), 1)
+        self.assertNotEqual(labels[0], labels[5])
+
+    def test_sweep_vocabulary_reports_each_k(self):
+        rows = make_rows(switch=10)
+        result = sweep_vocabulary(rows, [2, 3])
+        self.assertEqual([item["k"] for item in result], [2, 3])
+        for item in result:
+            self.assertIn("real_cross3", item)
+            self.assertIn("shuffle_cross3", item)
+        # K=2 recovers the two-regime structure on the real stream.
+        self.assertGreater(result[0]["real_cross3"], 0)
 
 
 if __name__ == "__main__":

@@ -294,10 +294,34 @@ def _single_link(vectors, radius):
     return [mapping[label] for label in labels]
 
 
-def build_stage_graph(rows, lag=3, min_length=MIN_LENGTH,
-                      penalty=1.0, radius=None,
-                      gate_min_r2=0.0) -> StageGraph:
-    """Segment one real stream into stages and build the transition table."""
+def _kmeans(vectors, count, seed=0, iterations=60):
+    """Deterministic k-means on the action-effect vectors."""
+    vectors = np.asarray(vectors, dtype=float)
+    total = len(vectors)
+    if total == 0:
+        return []
+    count = max(1, min(int(count), total))
+    rng = np.random.RandomState(seed)
+    centers = vectors[rng.choice(total, count, replace=False)].copy()
+    labels = np.zeros(total, dtype=int)
+    for _ in range(iterations):
+        distances = (
+            (vectors[:, None, :] - centers[None, :, :]) ** 2
+        ).sum(axis=2)
+        new_labels = distances.argmin(axis=1)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        for index in range(count):
+            members = vectors[labels == index]
+            if len(members):
+                centers[index] = members.mean(axis=0)
+    return [int(label) for label in labels]
+
+
+def _segment_stream(rows, lag=3, min_length=MIN_LENGTH, penalty=1.0,
+                    gate_min_r2=0.0):
+    """Per-episode segmentation; returns (stages, gate_r2, episode_count)."""
     episodes, state_scale, keep = _standardise(rows, lag)
     states = []
     targets = []
@@ -353,9 +377,17 @@ def build_stage_graph(rows, lag=3, min_length=MIN_LENGTH,
                     for action in (0, 1)
                 },
             ))
+    return stages, float(gate_r2), len(episodes)
 
+
+def _label_stages(stages, radius=None, clusters=None):
+    """Stage identity: fixed-K k-means or single link on action effects."""
+    if not stages:
+        return [], 0.0
     effects = np.asarray([stage.action_effect for stage in stages],
                          dtype=float)
+    if clusters is not None:
+        return _kmeans(effects, clusters), 0.0
     if len(effects) > 1:
         pairwise = np.linalg.norm(
             effects[:, None, :] - effects[None, :, :], axis=2
@@ -371,9 +403,10 @@ def build_stage_graph(rows, lag=3, min_length=MIN_LENGTH,
             )
     else:
         radius = 0.0
-    labels = _single_link(effects, radius) if len(effects) else []
-    clusters = len(set(labels))
+    return _single_link(effects, radius), float(radius)
 
+
+def _build_graph(stages, labels, radius, gate_r2, rows, episode_count):
     edge_frames = Counter()
     edge_episodes = defaultdict(set)
     stage_by_episode = defaultdict(list)
@@ -403,10 +436,60 @@ def build_stage_graph(rows, lag=3, min_length=MIN_LENGTH,
         transitions=transitions,
         cluster_radius=float(radius),
         gate_r2=float(gate_r2),
-        clusters=clusters,
+        clusters=len(set(labels)),
         stream_frames=len(rows),
-        episodes=len(episodes),
+        episodes=episode_count,
     )
+
+
+def build_stage_graph(rows, lag=3, min_length=MIN_LENGTH,
+                      penalty=1.0, radius=None,
+                      gate_min_r2=0.0, clusters=None) -> StageGraph:
+    """Segment one real stream into stages and build the transition table."""
+    stages, gate_r2, episode_count = _segment_stream(
+        rows, lag=lag, min_length=min_length, penalty=penalty,
+        gate_min_r2=gate_min_r2,
+    )
+    labels, radius = _label_stages(
+        stages, radius=radius, clusters=clusters
+    )
+    return _build_graph(
+        stages, labels, radius, gate_r2, rows, episode_count
+    )
+
+
+def sweep_vocabulary(rows, ks, lag=3, min_length=MIN_LENGTH, penalty=1.0):
+    """Fixed-K vocabulary sweep: real vs action-shuffled cross3 per K."""
+    real_stages, real_gate, episodes = _segment_stream(
+        rows, lag=lag, min_length=min_length, penalty=penalty
+    )
+    shuffled_stages, shuffle_gate, _episodes = _segment_stream(
+        shuffle_actions(rows, lag=lag), lag=lag,
+        min_length=min_length, penalty=penalty,
+    )
+    result = []
+    for k in ks:
+        real_labels, real_radius = _label_stages(
+            real_stages, clusters=k
+        )
+        shuffled_labels, _radius = _label_stages(
+            shuffled_stages, clusters=k
+        )
+        real = _build_graph(
+            real_stages, real_labels, real_radius, real_gate, rows, episodes
+        )
+        shuffled = _build_graph(
+            shuffled_stages, shuffled_labels, 0.0, shuffle_gate, rows,
+            episodes,
+        )
+        result.append(dict(
+            k=int(k),
+            real_cross3=real.cross_episode_informative(),
+            shuffle_cross3=shuffled.cross_episode_informative(),
+            real_transitions=len(real.transitions),
+            shuffle_transitions=len(shuffled.transitions),
+        ))
+    return result
 
 
 def shuffle_actions(rows, lag=3, seed=12345):
@@ -453,12 +536,39 @@ def evaluate_stream(rows, lag=3, min_length=MIN_LENGTH, penalty=1.0):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--streams", default="")
+    parser.add_argument("--sweep-k", default="",
+                        help="comma-separated fixed vocabulary sizes; "
+                             "runs real vs action-shuffled cross3 per K")
     parser.add_argument("--report", default="")
     args = parser.parse_args()
     if not args.streams:
         raise SystemExit("--streams is required")
     from stage_support_probe import load_streams
     streams = load_streams(args.streams)
+    if args.sweep_k:
+        ks = [int(value) for value in args.sweep_k.split(",") if value.strip()]
+        payload = dict(phases=[])
+        print()
+        for index, rows in enumerate(streams):
+            results = sweep_vocabulary(rows, ks)
+            payload["phases"].append(dict(
+                phase=index + 1, frames=len(rows), sweep=results,
+            ))
+            print("== phase %d: %d frames ==" % (index + 1, len(rows)))
+            print("    K  real cross3  shuffle cross3  "
+                  "real transitions  shuffle transitions")
+            for item in results:
+                print(
+                    "  %3d  %10d  %13d  %16d  %19d"
+                    % (item["k"], item["real_cross3"],
+                       item["shuffle_cross3"], item["real_transitions"],
+                       item["shuffle_transitions"])
+                )
+        print()
+        if args.report:
+            with open(args.report, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, default=str)
+        return
     report = dict(phases=[
         dict(phase=index + 1, **evaluate_stream(stream))
         for index, stream in enumerate(streams)
