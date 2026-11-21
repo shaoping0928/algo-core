@@ -538,6 +538,40 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
 目标下缩放是单调变换）。该开关保留为诊断（只有在价值/好奇/Q 激活时
 才有意义）。
 
+**链路接线审计（2026-11-21，`wiring_audit.py`，1500 帧短训，只读）**
+
+| 环节 | 状态 | 证据 |
+|---|---|---|
+| 观测/尺度 | ok | 7 维，无常量维，尺度 0.169–16.9 |
+| 原型覆盖 | ok | 734 个，最近距离 p50=0.000、p90=0.315，>birth 0% |
+| 特征归纳 | ok | 8 根、43 节点，训练流 any-root **2.9%** |
+| **特征动作/价值格** | **dead** | action cells=0、value cells=0、ledger=0（`epochs=1` 归纳在唯一一遍之后） |
+| 危险组合 | ok | composed_mae 0.005 vs maximum 0.026；composed_rate 0.0264 ≈ label_rate 0.0247 |
+| 危险读出 | ok | mean 0.026、饱和 2%、**spearman 0.97**（同分布内） |
+| **价值通道** | **dead** | cells=0，read 0.000，support 0 |
+| 记忆 | sparse | 21 条，**检索 6%**，membership 权重均值 0.015 |
+| **好奇心** | **inert** | evidence 0、Φ 恒 1.000 |
+| **规划器列** | **single-signal** | 仅 risk 与 −dopamine 非零；value/curiosity/q 全 0 |
+| **世界模型** | **drift** | 滚动误差 k=1 **0.0000**、k=2 **0.0000**、k=4 **0.5204**、k=8 **0.7322** |
+| 学习标签 | ok | 37 个痛事件/1500 行（24.7‰），acting=history[3] |
+
+**接线结论**：决策路径实际只接通了 **“原型 hazard + dopamine 平局项”**。
+特征格、价值、好奇心、记忆（6% 检索）几乎不参与；世界模型在 k≥4 处
+失效（离散事件/管口重置未被建模），而规划器用的是 H=8——**rollout 的
+后半段基本是外推噪声**。
+
+**修复优先级（按“接线不良”程度）**
+
+1. **特征格 / 价值 / 好奇心的时序**：`--feature-backfit`（已实现）可让
+   格子训练而原型保持单遍；先用 `--feature-backfit --feature-value-weight 0
+   --curiosity-weight 0` 验证“特征格接进决策但不引入价值/好奇项”；
+   检查点：cells>0、composition 权重变化、规划器列出现 risk+特征分量。
+2. **世界模型的 k≥4 失效**：k≤2 精确、k=4 起爆（0.52）说明离散事件
+   （管口通过/坐标重置）未被建模；先在 planner 里用**逐步预测误差**
+   给后段 risk 加权（而不是全局 decay），或做事件感知的转移模型。
+3. **记忆检索 6%**：membership 权重 0.015，检索只走最近原型一跳；
+   需要“检索半径/多跳”或让记忆按特征激活检索。
+
 **质量门**：阶段同质性（within-stage residual 显著低于跨阶段）；转移校准
 误差可控、applicability violation 低、support 不足 abstain；seed 101 的
 decision-relevant miss/regret 下降；seed 100/102 selected survives 不降、
