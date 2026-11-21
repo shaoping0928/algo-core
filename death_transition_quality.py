@@ -40,7 +40,7 @@ CONFIG = dict(
     birth_threshold=0.45, dagger_rounds=1, dagger_frames=5000,
     dagger_cap=5000, dagger_horizon=8, step_stride=2,
     curiosity_weight=0.5, death_rules=True,
-    death_rule_max_thresholds=256,
+    death_rule_max_thresholds=256, death_rule_boundary_margin=0.01,
 )
 
 
@@ -154,10 +154,14 @@ def main():
     parser.add_argument("--eval-seeds", default="120-124")
     parser.add_argument("--branches", type=int, default=10)
     parser.add_argument("--horizon", type=int, default=8)
+    parser.add_argument("--margin", type=float, default=0.01,
+                        help="death-rule boundary margin fraction")
     parser.add_argument("--report", default="")
     args = parser.parse_args()
     seeds = seed_spec(args.eval_seeds)
-    world, agent = fit(**CONFIG)
+    config = dict(CONFIG)
+    config["death_rule_boundary_margin"] = args.margin
+    world, agent = fit(**config)
     rules = agent.death_rules
     agent.death_rule_hard = False
 
@@ -177,6 +181,8 @@ def main():
     first_true = {name: [] for name, _ in policies}
     first_pred = {name: [] for name, _ in policies}
     contrast = {name: dict(total=0, correct=0, ties=0) for name, _ in policies}
+    unknown_terminal = []
+    terminal_examples = []
     rng = np.random.RandomState(args.seed + 12345)
 
     for eval_seed in seeds:
@@ -240,6 +246,23 @@ def main():
                 rule_pred_death.append(
                     int(rules.classify_death(predicted_next[None])[0])
                 )
+                if immediate:
+                    example = dict(
+                        eval_seed=int(eval_seed),
+                        point=int(point),
+                        action=int(action),
+                        true_state=[float(v) for v in true_next],
+                        predicted_state=[float(v) for v in predicted_next],
+                        hazard_true=float(hazard_true[-1]),
+                        hazard_pred=float(hazard_pred[-1]),
+                        rule_true=int(rule_true[-1]),
+                        rule_pred=int(rule_pred[-1]),
+                        rule_true_death=int(rule_true_death[-1]),
+                        rule_pred_death=int(rule_pred_death[-1]),
+                    )
+                    terminal_examples.append(example)
+                    if rule_true_death[-1] == -1:
+                        unknown_terminal.append(example)
                 # Multi-step first death for each fixed continuation.
                 for name, policy in policies:
                     true_step, _ = true_rollout(
@@ -315,6 +338,8 @@ def main():
         ),
         first_death={},
         action_contrast={},
+        terminal_examples=terminal_examples,
+        unknown_terminal=unknown_terminal,
     )
     for name, _ in policies:
         true = np.asarray(first_true[name], dtype=int)

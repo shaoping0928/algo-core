@@ -63,6 +63,26 @@ class DeathRule:
             result &= literal.mask(states)
         return result
 
+    def mask_margin(self, states: np.ndarray,
+                    margins: np.ndarray) -> np.ndarray:
+        """Expand every threshold outward by the per-coordinate margin."""
+        states = np.asarray(states, dtype=float)
+        if states.ndim == 1:
+            states = states.reshape(1, -1)
+        margins = np.asarray(margins, dtype=float)
+        result = np.ones(len(states), dtype=bool)
+        for literal in self.literals:
+            values = (
+                np.abs(states[:, literal.dim])
+                if literal.magnitude else states[:, literal.dim]
+            )
+            margin = float(margins[literal.dim])
+            if literal.op == "<":
+                result &= values < literal.threshold + margin
+            else:
+                result &= values > literal.threshold - margin
+        return result
+
     def text(self) -> str:
         if not self.literals:
             body = "TRUE"
@@ -96,6 +116,8 @@ class DeathRuleSet:
     def __init__(self, max_rules: int = 24, max_literals: int = 4,
                  min_support: int = 2, max_thresholds: int = 48,
                  max_attempts: int = 96, compose: bool = False,
+                 coverage_first: bool = False,
+                 boundary_margin: float = 0.0,
                  compose_max_base: int = 24, compose_max_pairs: int = 256,
                  compose_rules: int = 8, compose_complexity: int = 8):
         if max_rules < 1:
@@ -112,6 +134,9 @@ class DeathRuleSet:
         self.max_thresholds = int(max_thresholds)
         self.max_attempts = int(max_attempts)
         self.compose = bool(compose)
+        self.coverage_first = bool(coverage_first)
+        self.boundary_margin = max(float(boundary_margin), 0.0)
+        self.margins_: Optional[np.ndarray] = None
         self.compose_max_base = int(compose_max_base)
         self.compose_max_pairs = int(compose_max_pairs)
         self.compose_rules = int(compose_rules)
@@ -121,6 +146,7 @@ class DeathRuleSet:
         self.literals_: List[Primitive] = []
         self._masks: Optional[np.ndarray] = None
         self.rules_: list = []
+        self.coverage_: Optional[dict] = None
         self.refinement_log: List[dict] = []
 
     # ---- thresholds -------------------------------------------------------
@@ -175,6 +201,12 @@ class DeathRuleSet:
                 if value not in keep:
                     keep.append(value)
             candidates = keep
+        # Zero is a universal reference cut (not a task constant).  Without
+        # it a conditional boundary that sits at zero can be skipped by
+        # the rank-spread sample.  Append after the budget cut so it is
+        # never crowded out.
+        if unique_values[0] < 0.0 < unique_values[-1]:
+            candidates.append(0.0)
         quantiles = np.unique(np.quantile(
             unique_values, np.linspace(0.02, 0.98, 32)
         ))
@@ -214,7 +246,8 @@ class DeathRuleSet:
 
     # ---- AQ rule growth ---------------------------------------------------
     def _grow_rule(self, target: np.ndarray, seed: int,
-                   remaining: Optional[np.ndarray] = None):
+                   remaining: Optional[np.ndarray] = None,
+                   max_literals: Optional[int] = None):
         """Grow one pure conjunction from a positive seed.
 
         ``remaining`` marks the positives not yet covered by earlier
@@ -233,7 +266,8 @@ class DeathRuleSet:
             return (), current
         selected: List[Primitive] = []
         min_support = max(1, self.min_support)
-        for _ in range(self.max_literals):
+        limit = self.max_literals if max_literals is None else int(max_literals)
+        for _ in range(limit):
             candidates = np.flatnonzero(self._masks[:, seed])
             if len(candidates) == 0:
                 return None
@@ -309,10 +343,18 @@ class DeathRuleSet:
                 break
         return selected, mask
 
-    def _induce_class(self, target: np.ndarray, label: int) -> List[DeathRule]:
+    def _induce_class(self, target: np.ndarray, label: int,
+                      remaining_mask: Optional[np.ndarray] = None,
+                      max_literals: Optional[int] = None) -> List[DeathRule]:
         positives = np.flatnonzero(target)
-        remaining = set(int(index) for index in positives)
-        remaining_mask = target.copy()
+        remaining = set(int(index) for index in (
+            positives if remaining_mask is None
+            else np.flatnonzero(remaining_mask)
+        ))
+        remaining_mask = (
+            target.copy() if remaining_mask is None
+            else np.asarray(remaining_mask, dtype=bool).copy()
+        )
         rules: List[DeathRule] = []
         attempts = 0
         while remaining and len(rules) < self.max_rules:
@@ -320,7 +362,9 @@ class DeathRuleSet:
                 break
             attempts += 1
             seed = min(remaining)
-            grown = self._grow_rule(target, seed, remaining_mask)
+            grown = self._grow_rule(
+                target, seed, remaining_mask, max_literals=max_literals
+            )
             if grown is None:
                 remaining.discard(seed)
                 continue
@@ -357,6 +401,11 @@ class DeathRuleSet:
             raise ValueError("need at least one state")
         self.states_ = states.copy()
         self.labels_ = (labels > 0.5).astype(int)
+        span = (
+            np.max(self.states_, axis=0) - np.min(self.states_, axis=0)
+        )
+        span = np.where(np.isfinite(span) & (span > 0.0), span, 0.0)
+        self.margins_ = self.boundary_margin * span
         self.literals_ = self._candidate_literals(
             self.states_, self.labels_
         )
@@ -371,13 +420,25 @@ class DeathRuleSet:
         safe_target = self.labels_ == 0
         death_rules = self._induce_class(death_target, 1)
         safe_rules = self._induce_class(safe_target, 0)
-        if self.compose:
-            def covered(rules):
-                result = np.zeros(len(states), dtype=bool)
-                for rule in rules:
-                    result |= rule.mask(self.states_)
-                return result
 
+        def covered(rules):
+            result = np.zeros(len(states), dtype=bool)
+            for rule in rules:
+                result |= rule.mask(self.states_)
+            return result
+
+        if self.coverage_first:
+            # A pure rule that does not cover every observed death is a
+            # coverage gap, not a safe state.  Spend a larger conjunction
+            # budget on the uncovered positives before giving them up.
+            remaining_death = death_target & ~covered(death_rules)
+            if remaining_death.any():
+                death_rules.extend(self._induce_class(
+                    death_target, 1,
+                    remaining_mask=remaining_death,
+                    max_literals=max(self.max_literals, 8),
+                ))
+        if self.compose or self.coverage_first:
             remaining_death = death_target & ~covered(death_rules)
             if remaining_death.any():
                 death_rules.extend(search_compositions(
@@ -389,6 +450,7 @@ class DeathRuleSet:
                     min_support=self.min_support,
                     max_complexity=self.compose_complexity,
                 ))
+        if self.compose:
             remaining_safe = safe_target & ~covered(safe_rules)
             if remaining_safe.any():
                 safe_rules.extend(search_compositions(
@@ -401,7 +463,64 @@ class DeathRuleSet:
                     max_complexity=self.compose_complexity,
                 ))
         self.rules_ = death_rules + safe_rules
+        self.coverage_ = self.coverage_report()
         return self
+
+    def coverage_report(self, states: Optional[np.ndarray] = None,
+                        labels: Optional[np.ndarray] = None) -> dict:
+        """Coverage of the death side, with the safe side reported apart."""
+        if states is None:
+            states = self.states_
+            truth = self.labels_
+        else:
+            if labels is None:
+                raise ValueError("labels are required with external states")
+            states = np.asarray(states, dtype=float)
+            truth = (np.asarray(labels, dtype=float).reshape(-1) > 0.5).astype(int)
+        death, near = self._death_side(states)
+        safe = np.zeros(len(states), dtype=bool)
+        for rule in self.rules_:
+            if rule.label == 0:
+                safe |= rule.mask(states)
+        positives = truth == 1
+        negatives = truth == 0
+        covered_positive = int(np.sum(death & positives))
+        safe_answered = safe & ~near
+        return dict(
+            total=int(len(truth)),
+            positive=int(positives.sum()),
+            negative=int(negatives.sum()),
+            death_covered_positive=covered_positive,
+            death_uncovered_positive=int(positives.sum()) - covered_positive,
+            death_coverage=(
+                float(covered_positive) / float(positives.sum())
+                if positives.any() else 0.0
+            ),
+            death_near_positive=int(np.sum(near & positives)),
+            death_covered_negative=int(np.sum(death & negatives)),
+            death_near_negative=int(np.sum(near & negatives)),
+            safe_covered_negative=int(np.sum(safe_answered & negatives)),
+            safe_blocked_near_death=int(np.sum(
+                safe & near & ~death
+            )),
+            unknown=int(np.sum(~(death | safe_answered))),
+            unknown_positive=int(np.sum(
+                ~(death | safe_answered) & positives
+            )),
+        )
+
+    def _death_side(self, states: np.ndarray):
+        exact = np.zeros(len(states), dtype=bool)
+        near = np.zeros(len(states), dtype=bool)
+        for rule in self.rules_:
+            if rule.label != 1:
+                continue
+            exact |= rule.mask(states)
+            if self.margins_ is not None and hasattr(rule, "mask_margin"):
+                near |= rule.mask_margin(states, self.margins_)
+            else:
+                near |= rule.mask(states)
+        return exact, near
 
     def classify(self, states: np.ndarray) -> np.ndarray:
         if self.states_ is None:
@@ -409,16 +528,13 @@ class DeathRuleSet:
         states = np.asarray(states, dtype=float)
         if states.ndim == 1:
             states = states.reshape(1, -1)
-        death = np.zeros(len(states), dtype=bool)
+        death, near = self._death_side(states)
         safe = np.zeros(len(states), dtype=bool)
         for rule in self.rules_:
-            hit = rule.mask(states)
-            if rule.label == 1:
-                death |= hit
-            else:
-                safe |= hit
+            if rule.label == 0:
+                safe |= rule.mask(states)
         result = np.full(len(states), UNKNOWN, dtype=int)
-        result[safe] = 0
+        result[safe & ~near] = 0
         result[death] = 1
         return result
 
@@ -434,10 +550,7 @@ class DeathRuleSet:
         states = np.asarray(states, dtype=float)
         if states.ndim == 1:
             states = states.reshape(1, -1)
-        death = np.zeros(len(states), dtype=bool)
-        for rule in self.rules_:
-            if rule.label == 1:
-                death |= rule.mask(states)
+        death, _near = self._death_side(states)
         return np.where(death, 1, UNKNOWN)
 
     def verify(self, states: np.ndarray, labels: np.ndarray) -> dict:

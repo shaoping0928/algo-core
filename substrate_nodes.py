@@ -132,7 +132,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         death_rule_compose: bool = False,
         death_rule_max_thresholds: int = 256,
         death_rule_max_rules: int = 24,
-        death_rule_max_literals: int = 5):
+        death_rule_max_literals: int = 5,
+        death_rule_boundary_margin: float = 0.0):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -478,6 +479,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
             min_support=2,
             max_thresholds=int(death_rule_max_thresholds),
             compose=bool(death_rule_compose),
+            coverage_first=True,
+            boundary_margin=float(death_rule_boundary_margin),
         ).fit(entered_states, terminal_labels)
         agent.death_rules = rule_set
         agent.death_rule_hard = True
@@ -493,6 +496,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
             verification=rule_set.verify(
                 entered_states, terminal_labels
             ),
+            coverage=rule_set.coverage_,
         )
     return world, agent
 
@@ -687,7 +691,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         action_edge_weight=0.0, action_edge_trust_samples=50.0,
         death_rules=False, death_rule_compose=False,
         death_rule_max_thresholds=256, death_rule_max_rules=24,
-        death_rule_max_literals=5):
+        death_rule_max_literals=5, death_rule_boundary_margin=0.0):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -876,6 +880,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         death_rule_max_thresholds=death_rule_max_thresholds,
         death_rule_max_rules=death_rule_max_rules,
         death_rule_max_literals=death_rule_max_literals,
+        death_rule_boundary_margin=death_rule_boundary_margin,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -1591,6 +1596,9 @@ def run_seed(task):
     death_rule_max_literals = int(
         task.get("death_rule_max_literals", 5)
     )
+    death_rule_boundary_margin = float(
+        task.get("death_rule_boundary_margin", 0.0)
+    )
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
@@ -1663,6 +1671,7 @@ def run_seed(task):
         death_rule_max_thresholds=death_rule_max_thresholds,
         death_rule_max_rules=death_rule_max_rules,
         death_rule_max_literals=death_rule_max_literals,
+        death_rule_boundary_margin=death_rule_boundary_margin,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1897,6 +1906,10 @@ def main():
                         help="maximum death/safe rules per class")
     parser.add_argument("--death-rule-max-literals", type=int, default=5,
                         help="maximum literals in one conjunctive rule")
+    parser.add_argument("--death-rule-margin", type=float, default=0.0,
+                        help="boundary margin as a fraction of each "
+                             "coordinate's observed range; states inside "
+                             "the margin are UNKNOWN, not safe")
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
@@ -2130,6 +2143,7 @@ def main():
             death_rule_max_thresholds=args.death_rule_thresholds,
             death_rule_max_rules=args.death_rule_max_rules,
             death_rule_max_literals=args.death_rule_max_literals,
+            death_rule_boundary_margin=args.death_rule_margin,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,

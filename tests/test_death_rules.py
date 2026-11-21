@@ -122,6 +122,74 @@ class DeathRuleTests(unittest.TestCase):
         self.assertEqual(len(rules.refinement_log), 48)
         self.assertEqual(rules.refinement_log[-1]["after"], 0)
 
+    def test_coverage_first_grows_a_three_literal_rule(self):
+        rng = np.random.RandomState(7)
+        n = 1600
+        states = rng.uniform(-1.0, 1.0, (n, 3))
+        labels = (
+            (states[:, 0] > 0.0)
+            & (states[:, 1] > 0.0)
+            & (states[:, 2] > 0.0)
+        ).astype(int)
+        rules = DeathRuleSet(
+            max_literals=2, min_support=2, max_thresholds=32,
+            coverage_first=True,
+        ).fit(states, labels)
+        coverage = rules.coverage_report()
+        self.assertEqual(coverage["death_uncovered_positive"], 0)
+        self.assertEqual(coverage["death_coverage"], 1.0)
+        self.assertEqual(coverage["death_covered_negative"], 0)
+        self.assertTrue(any(
+            len(rule.literals) >= 3 for rule in rules.rules_for(1)
+        ))
+
+    def test_coverage_first_falls_back_to_xor_composition(self):
+        rng = np.random.RandomState(8)
+        n = 1200
+        states = rng.uniform(-1.0, 1.0, (n, 2))
+        labels = (
+            (states[:, 0] > 0.0) ^ (states[:, 1] > 0.0)
+        ).astype(int)
+        rules = DeathRuleSet(
+            max_literals=1, min_support=2, max_thresholds=32,
+            coverage_first=True, compose_max_base=16,
+            compose_max_pairs=64,
+        ).fit(states, labels)
+        coverage = rules.coverage_report()
+        self.assertEqual(coverage["death_uncovered_positive"], 0)
+        self.assertEqual(coverage["death_covered_negative"], 0)
+        self.assertTrue(any(
+            "XOR" in rule.text() for rule in rules.rules_for(1)
+        ))
+
+    def test_boundary_margin_returns_unknown_not_safe(self):
+        rng = np.random.RandomState(9)
+        n = 1200
+        states = np.column_stack([
+            rng.uniform(-1.0, 1.0, n),
+            rng.uniform(-1.0, 1.0, n),
+        ])
+        labels = (states[:, 0] > 0.5).astype(int)
+        rules = DeathRuleSet(
+            max_literals=3, min_support=2, max_thresholds=48,
+            boundary_margin=0.02,
+        ).fit(states, labels)
+        probe = np.asarray([
+            [0.499, 0.0],
+            [-0.5, 0.0],
+            [0.8, 0.0],
+        ])
+        prediction = rules.classify(probe)
+        self.assertEqual(prediction[0], UNKNOWN)
+        self.assertEqual(prediction[1], 0)
+        self.assertEqual(prediction[2], 1)
+        death_only = rules.classify_death(probe)
+        self.assertEqual(death_only[0], UNKNOWN)
+        self.assertEqual(death_only[2], 1)
+        coverage = rules.coverage_report()
+        self.assertGreater(coverage["safe_blocked_near_death"], 0)
+        self.assertEqual(coverage["death_covered_negative"], 0)
+
     def test_redundant_literal_is_removed(self):
         rng = np.random.RandomState(6)
         n = 1200

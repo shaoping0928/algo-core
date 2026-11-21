@@ -1470,7 +1470,7 @@ class NodeRuntimeTests(unittest.TestCase):
             "context_model.py", "memory_tree.py",
             "variable_registry.py", "hierarchical_memory.py",
             "generative_expansion.py", "branches.py", "death_rules.py",
-            "rule_expressions.py",
+            "rule_expressions.py", "contextual_rules.py",
         ):
             text = (root / name).read_text(encoding="utf-8")
             for token in (
