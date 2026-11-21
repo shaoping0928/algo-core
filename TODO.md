@@ -105,6 +105,45 @@ held-out 世界 120–124；基线 129.1 / 147（3 种子）。
       关闭时逐位不变）。
 - [ ] **片 4**：质量门通过后接 `policy_result`，真实基准 3 种子配对 A/B。
 
+**门槛 0 探针读数（2026-11-21，`stage_support_probe.py`，只读）**
+
+数据：真实 `fit` 路径捕获的两条流——1500 帧 / 38 episodes，6536 帧 /
+101 episodes（含 5000 帧 DAgger 实际执行行）。分段 = episode 内贪心 BIC
+（每段每动作一个 mean-Δ 模型，min_length=5）；阶段簇 = 段均值向量的
+单链路聚类（半径 = 中位两两距离）。
+
+| 指标 | 1500 帧 | 6536 帧 |
+|---|---:|---:|
+| 段数 / 每 episode 阶段数（均值, max） | 125 / 3.29, 6 | 315 / 3.12, 8 |
+| 阶段长度中位 | 7 帧 | 7 帧 |
+| 多阶段 episode | 35/38 | 86/101 |
+| 阶段簇数（单链路中位距离） | 2 | 8 |
+| (stage, action) 格 / support 中位 / ≥5 | 4 / 84 / 2 | 16 / 4 / 5 |
+| 两动作覆盖 | 100% | 100% |
+| (stage, action, next) 边 / 中位 / ≥5 | 8 / 10 / 4 | 31 / 1 / 4 |
+| 帧级 abstain | 0% | 0% |
+
+读法：
+
+1. **阶段数可估**：~3 阶段/episode、中位 7 帧，BIC 不会退化为单阶段；
+2. **阶段词表未收敛**：簇数 2→8 随数据增长 → 阶段身份不能只按 Δ 均值
+   距离，必须用设计里的**转移等价合并**（结果分布/预测误差一致）；
+3. **support 高度偏斜**：1500 帧仅 2/4 格 ≥5；6536 帧 5/16 格、4/31 边
+   ≥5；帧级 abstain 0% 只是因为少数大格子/大边覆盖多数帧 →
+   **主路径可估，长尾必须 `UNKNOWN`/abstain**；
+4. 两动作都出现但 support 偏斜，与已知的 a=1 格子饥荒一致。
+
+局限：探针判据（episode 内贪心 BIC + Δ 均值单链路）只是门槛 0，不是
+最终设计；簇数随数据增长本身就是“需要转移等价合并”的证据。
+
+**接口约束（已核实）**：`policy_result` 的 score 被测试钉死为 6 列且
+`score[0] == score[2]+score[3]+score[4]+score[5]`
+（`tests/test_node_runtime.py:2163-2165`, `2188-2190`），另有硬编码
+`np.zeros((len(states), 6))`（`substrate_nodes.py:1083`, `1166`）；
+账本只读 `score[2]/score[3]`（`:1391-1395`）。→ 吸引力**不能直接加第
+7 列**；候选落法：折进 cost（需同步账本恒等式与测试）/ 搜索后独立
+tie-break / 只在粗层阶段评分中使用。
+
 **质量门**：阶段同质性（within-stage residual 显著低于跨阶段）；转移校准
 误差可控、applicability violation 低、support 不足 abstain；seed 101 的
 decision-relevant miss/regret 下降；seed 100/102 selected survives 不降、
