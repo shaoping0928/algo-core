@@ -104,6 +104,14 @@ def run(args):
                 chosen = int(np.flatnonzero(feasible)[
                     np.argmin(scores[feasible, 0])
                 ])
+                feasible_costs = scores[feasible, 0]
+                best_cost = float(feasible_costs.min())
+                ties = int(np.sum(
+                    np.abs(feasible_costs - best_cost) <= 1e-9
+                ))
+                near_ties = int(np.sum(
+                    np.abs(feasible_costs - best_cost) <= 0.01
+                ))
                 oracle_all = np.flatnonzero(survival == best_all)
                 oracle_all_feasible = bool(
                     feasible[oracle_all].any()
@@ -118,6 +126,15 @@ def run(args):
                     miss_vs_all=bool(
                         int(survival[chosen]) < best_all
                     ),
+                    cost_spread=float(
+                        feasible_costs.max() - best_cost
+                    ),
+                    exact_ties=ties,
+                    near_ties=near_ties,
+                    tie_share=float(ties) / float(len(feasible_costs)),
+                    distinct_costs=int(len(np.unique(
+                        np.round(feasible_costs, 9)
+                    ))),
                 )
                 if entry["miss_vs_all"] and not oracle_all_feasible:
                     entry["failure"] = "model_infeasible_oracle"
@@ -181,6 +198,21 @@ def run(args):
         model_infeasible_oracle=len(infeasible),
         miss_vs_all=sum(1 for row in rows if row.get("miss_vs_all")),
         miss_rate=(float(len(misses)) / len(rows)) if rows else 0.0,
+        mean_tie_share=(
+            float(np.mean([row["tie_share"] for row in rows]))
+            if rows else 0.0
+        ),
+        decisions_with_over_half_ties=sum(
+            1 for row in rows if row["tie_share"] > 0.5
+        ),
+        mean_cost_spread=(
+            float(np.mean([row["cost_spread"] for row in rows]))
+            if rows else 0.0
+        ),
+        mean_distinct_costs=(
+            float(np.mean([row["distinct_costs"] for row in rows]))
+            if rows else 0.0
+        ),
         oracle_fix_counts=counts,
         misses_fixed_by_any_ablation=fixed,
         rows=rows,
@@ -205,6 +237,15 @@ def print_summary(report):
           % report["oracle_fix_counts"]["only_risk"])
     print("  any ablation fixes: %d / %d"
           % (report["misses_fixed_by_any_ablation"], report["misses"]))
+    print(
+        "  risk resolution: mean tie share %.2f  decisions >50%% ties %d / %d"
+        % (report["mean_tie_share"],
+           report["decisions_with_over_half_ties"], report["decisions"])
+    )
+    print(
+        "  cost spread mean %.3f  distinct costs/decision %.2f"
+        % (report["mean_cost_spread"], report["mean_distinct_costs"])
+    )
     print()
 
 

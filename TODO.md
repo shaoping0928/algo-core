@@ -475,11 +475,28 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
 - 但 H=8 会把“活满 8 步”的计划都记成 tie，真正长时域失败被截断；
   全 episode 延续版探针尚未做。
 
+**失败（2026-11-21）：`--risk-weight 0.5` 与基线逐位相同**
+
+原因：现役口径（epochs=1）下目标是**纯 risk**（value=0、curiosity=0、Q=0），
+缩放 risk 是单调变换，argmin 不变 → risk-weight 结构性无效。也意味着
+探针里“去掉 risk 修复 4/8”是**把 cost 变成全 0 后按枚举顺序乱选**，
+不是“risk 过度惩罚”的证据。正确的问题变成 **risk 的分辨率/饱和**：
+若大量决策的最优 cost 并列，规划器实际上是在按枚举顺序选。
+
+**风险分辨率探针（2026-11-21，进行中）**
+
+`score_column_probe` 新增每个决策的 tie 统计：`tie_share`（与最优 cost
+相差 ≤1e-9 的可行候选占比）、`near_ties`（≤0.01）、`cost_spread`、
+`distinct_costs`。seed 102 重跑中；若 tie_share 高，修法是提高 risk
+分辨率/拉开饱和，而不是改权重。
+
 **风险列缩放 A/B（2026-11-21，已实现）**
 
 新增 `--risk-weight w`（只缩放 hazard 列；默认 1.0 逐位不变；286 测试，
-含 identity/risk_weight=0 回归）。A/B：`--risk-weight 0.5` × 3 种子进行中，
-对照基线 152.9；若正向，再测 0.75 并跑第二波 6 种子。
+含 identity/risk_weight=0 回归）。A/B `--risk-weight 0.5` × 3 种子：
+**191.8 / 178.4 / 88.4，与基线逐位相同**——见上条“失败”分析（纯 risk
+目标下缩放是单调变换）。该开关保留为诊断（只有在价值/好奇/Q 激活时
+才有意义）。
 
 **质量门**：阶段同质性（within-stage residual 显著低于跨阶段）；转移校准
 误差可控、applicability violation 低、support 不足 abstain；seed 101 的
