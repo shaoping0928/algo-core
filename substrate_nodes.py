@@ -127,7 +127,12 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         rule_coverage_x=None, pairwise_features: bool = False,
         branch_transitions: bool = False,
         action_edge_weight: float = 0.0,
-        action_edge_trust_samples: float = 50.0):
+        action_edge_trust_samples: float = 50.0,
+        death_rules: bool = False,
+        death_rule_compose: bool = False,
+        death_rule_max_thresholds: int = 256,
+        death_rule_max_rules: int = 24,
+        death_rule_max_literals: int = 5):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -453,6 +458,42 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
             loss_without=loss_without,
             rolled_back=bool(rolled_back),
         ))
+    if death_rules:
+        # The 0/1 death condition is trained on the entered states.  It
+        # stays a pure rule set: no probability enters the planner.
+        from death_rules import DeathRuleSet
+        entered_states = np.asarray(
+            [row["next_obs"] for row in transitions], dtype=float
+        )
+        terminal_labels = np.asarray(
+            [
+                1 if float(row["signals"][1]) > 0.5 else 0
+                for row in transitions
+            ],
+            dtype=int,
+        )
+        rule_set = DeathRuleSet(
+            max_rules=int(death_rule_max_rules),
+            max_literals=int(death_rule_max_literals),
+            min_support=2,
+            max_thresholds=int(death_rule_max_thresholds),
+            compose=bool(death_rule_compose),
+        ).fit(entered_states, terminal_labels)
+        agent.death_rules = rule_set
+        agent.death_rule_hard = True
+        agent.death_rule_summary = dict(
+            rules=[rule.text() for rule in rule_set.rules_],
+            modes=[
+                dict(
+                    signature=list(mode["signature"]),
+                    rules=[rule.text() for rule in mode["rules"]],
+                )
+                for mode in rule_set.modes(1)
+            ],
+            verification=rule_set.verify(
+                entered_states, terminal_labels
+            ),
+        )
     return world, agent
 
 
@@ -643,7 +684,10 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         rule_min_coverage=0.0, rule_min_primitive_coverage=0.0,
         rule_validation_seed=0, rule_validation_frames=600,
         pairwise_features=False, branch_transitions=False,
-        action_edge_weight=0.0, action_edge_trust_samples=50.0):
+        action_edge_weight=0.0, action_edge_trust_samples=50.0,
+        death_rules=False, death_rule_compose=False,
+        death_rule_max_thresholds=256, death_rule_max_rules=24,
+        death_rule_max_literals=5):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -827,6 +871,11 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         branch_transitions=branch_transitions,
         action_edge_weight=action_edge_weight,
         action_edge_trust_samples=action_edge_trust_samples,
+        death_rules=death_rules,
+        death_rule_compose=death_rule_compose,
+        death_rule_max_thresholds=death_rule_max_thresholds,
+        death_rule_max_rules=death_rule_max_rules,
+        death_rule_max_literals=death_rule_max_literals,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -949,6 +998,15 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         agent.action_edge_transition_table()
         if action_edge_weight > 0.0 else None
     )
+    death_rules = getattr(agent, "death_rules", None)
+    death_batch = None
+    if death_rules is not None and bool(
+        getattr(agent, "death_rule_hard", False)
+    ):
+        def death_batch(states, _sequences, step):
+            observed = np.asarray(states, dtype=float)[:, :agent.obs_dim]
+            predicted = death_rules.classify(observed)
+            return np.where(predicted == 1, int(step), -1)
     previous_holder = {"states": None}
 
     def previous_states_for(states, step):
@@ -1180,6 +1238,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         transition_batch=predict_batch,
         evaluate_step=evaluate_step,
         evaluate_terminal=evaluate_terminal,
+        evaluate_death=death_batch,
         batch_size=2 ** horizon,
         # "sum" expands to one mode per objective column, so the ledger
         # columns (hazard and value shares) sum alongside the scalarized
@@ -1523,6 +1582,15 @@ def run_seed(task):
     action_edge_trust_samples = float(
         task.get("action_edge_trust_samples", 50.0)
     )
+    death_rules = bool(task.get("death_rules", False))
+    death_rule_compose = bool(task.get("death_rule_compose", False))
+    death_rule_max_thresholds = int(
+        task.get("death_rule_max_thresholds", 256)
+    )
+    death_rule_max_rules = int(task.get("death_rule_max_rules", 24))
+    death_rule_max_literals = int(
+        task.get("death_rule_max_literals", 5)
+    )
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
     eval_seeds = list(task.get("eval_seeds", ()))
@@ -1590,6 +1658,11 @@ def run_seed(task):
         branch_transitions=branch_transitions,
         action_edge_weight=action_edge_weight,
         action_edge_trust_samples=action_edge_trust_samples,
+        death_rules=death_rules,
+        death_rule_compose=death_rule_compose,
+        death_rule_max_thresholds=death_rule_max_thresholds,
+        death_rule_max_rules=death_rule_max_rules,
+        death_rule_max_literals=death_rule_max_literals,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1635,6 +1708,7 @@ def run_seed(task):
         graph=agent.snapshot(),
         prediction=agent.prediction_summary(),
         dagger=getattr(agent, "dagger_log", []),
+        death_rules=getattr(agent, "death_rule_summary", None),
         top_nodes=agent.top_nodes(5),
         top_edges=agent.top_edges(5),
     )
@@ -1810,6 +1884,19 @@ def main():
     parser.add_argument("--action-edge-trust", type=float, default=50.0,
                         help="evidence pseudo-count for trusting the "
                              "action-edge Q read")
+    parser.add_argument("--death-rules", action="store_true",
+                        help="train a 0/1 death-condition rule set and use "
+                             "it as a hard planner constraint; off by "
+                             "default")
+    parser.add_argument("--death-rule-compose", action="store_true",
+                        help="allow nested AND/OR/XOR/NOT composition in "
+                             "the death-rule learner")
+    parser.add_argument("--death-rule-thresholds", type=int, default=256,
+                        help="candidate threshold budget per coordinate")
+    parser.add_argument("--death-rule-max-rules", type=int, default=24,
+                        help="maximum death/safe rules per class")
+    parser.add_argument("--death-rule-max-literals", type=int, default=5,
+                        help="maximum literals in one conjunctive rule")
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
@@ -2038,6 +2125,11 @@ def main():
             branch_transitions=args.branch_transitions,
             action_edge_weight=args.action_edge_weight,
             action_edge_trust_samples=args.action_edge_trust,
+            death_rules=args.death_rules,
+            death_rule_compose=args.death_rule_compose,
+            death_rule_max_thresholds=args.death_rule_thresholds,
+            death_rule_max_rules=args.death_rule_max_rules,
+            death_rule_max_literals=args.death_rule_max_literals,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,

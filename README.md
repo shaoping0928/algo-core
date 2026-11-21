@@ -202,7 +202,7 @@ python math_memory_search.py
 | 事件记忆（风险通道读活体率；终端混合仍读冻结值 ✗） | ✓ | ✓ | ✓ 风险通道 |
 | NNLS 堆叠组合 + isotonic 后置校准 | ✓ | 训练末拟合 | ✓ `pain_signal_batch` |
 | 分级校准（逐（根，acting）读出配对，逐代刷新） | ✓ | ✓ | ✓ 分级目标 |
-| 0/1 死亡条件规则（`death_rules.py`） | ✓ | 离线/反例细化 | ✗ 尚未接控制器（Batch 2） |
+| 0/1 死亡条件规则（`death_rules.py`） | ✓ | 离线/反例细化 | ✓ `--death-rules`（硬约束，默认关；A/B 待判） |
 | 嵌套表达式（AND/OR/XOR/NOT/数值项） | ✓ | 合成/组合搜索 | ✗ 预留能力 |
 | 动作边 Q（acting 键控） | ✓ | ✓ | ✓ `--action-edge-weight`（默认 0；目标平均/目标条件双负） |
 | 多分支强度（current/recent/prediction/value） | ✓ | ✓ | — 重构：决策逐位不变（不参与读出） |
@@ -880,6 +880,17 @@ separate-and-conquer/AQ：每条规则从正例种子出发，选择“保留最
   被规则捕获，0 safe / 0 unknown。
 - 这仍是离线验证，没有接决策；Batch 2 才做 planner 的硬约束
   （每步检查、首次死亡时间排序）与真实基准 3 种子 A/B。
+
+### 0/1 死亡条件硬约束（2026-11-21，Batch 2）
+
+`--death-rules` 在 `_train` 末尾用 entered state 的 0/1 终止标签训练
+`DeathRuleSet`，挂到 `agent.death_rules`。`exhaustive_search` 新增
+`evaluate_death`：每个预测步检查规则，命中即计划不可行（不改 stride、
+不改账本列）；若所有计划都不可行，按**首次死亡步最晚**选择，再按原
+目标排序。`UNKNOWN` 不当作死亡，回退到原 hazard 目标。默认关闭；
+`evaluate_death=None` 时搜索路径逐位不变（214 测试）。
+
+真实基准两臂 × 3 种子正在跑；结果与裁决补在这里，未出数前不改默认。
 
 **归纳形式扩展（2026-11-20）：成对坐标差**。根稀疏的一个来源是绝对阈值
 贴在训练分布边缘。归纳文法新增纯代数坐标：

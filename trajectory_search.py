@@ -24,6 +24,7 @@ class SearchResult:
     candidate_count: int
     first_state: np.ndarray
     final_state: np.ndarray
+    first_death: int = -1
 
 
 def _sequence_batches(
@@ -106,6 +107,9 @@ def exhaustive_search(
     evaluate_terminal: Optional[Callable[
         [np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]
     ]] = None,
+    evaluate_death: Optional[Callable[
+        [np.ndarray, np.ndarray, int], np.ndarray
+    ]] = None,
     score_combine: Union[str, Sequence[str]] = "sum",
 ) -> SearchResult:
     """Enumerate action sequences and select plans using supplied model/evaluator callbacks.
@@ -115,11 +119,14 @@ def exhaustive_search(
     `evaluate_step(states, sequences, step)` returns (score_increment, feasible). Scores may be
     scalar or multi-objective; vector scores are minimized lexicographically. An optional
     `evaluate_terminal(final_states, sequences)` adds a terminal score and feasibility check.
+    An optional `evaluate_death(states, sequences, step)` returns the death step for each
+    candidate (-1 = alive). A death marks the plan infeasible; if no candidate survives the
+    whole horizon, the candidate with the latest first death wins, then the score.
     Lower scores are better. Only current, first, and final states are retained; the core does
     not store every candidate's full trajectory.
 
-    If no candidate is feasible, the lowest-score candidate is returned with `feasible=False`,
-    allowing the task adapter to detect and handle that case.
+    If no candidate is feasible and no death callback is supplied, the lowest-score candidate is
+    returned with `feasible=False`, allowing the task adapter to detect and handle that case.
     """
     state0 = np.asarray(initial_state, dtype=float)
     if state0.ndim == 0:
@@ -134,6 +141,7 @@ def exhaustive_search(
 
     best_feasible = None
     best_any = None
+    best_late = None
     feasible_count = 0
     candidate_count = 0
 
@@ -142,6 +150,7 @@ def exhaustive_search(
         states = np.broadcast_to(state0, (count,) + state0.shape).copy()
         scores = None
         feasible = np.ones(count, dtype=bool)
+        first_death = np.full(count, -1, dtype=int)
         first_states = None
 
         for step in range(horizon):
@@ -170,6 +179,19 @@ def exhaustive_search(
             else:
                 scores = _combine_scores(scores, increments, modes)
             feasible &= step_feasible
+            if evaluate_death is not None:
+                death = np.asarray(
+                    evaluate_death(states, sequences, step)
+                ).reshape(-1)
+                if death.shape != (count,):
+                    raise ValueError(
+                        "evaluate_death must return one step per plan"
+                    )
+                death = death.astype(int)
+                first_death = np.where(
+                    (first_death < 0) & (death >= 0), death, first_death
+                )
+                feasible &= death < 0
 
         if evaluate_terminal is not None:
             increments, terminal_feasible = evaluate_terminal(states, sequences)
@@ -199,29 +221,61 @@ def exhaustive_search(
 
         any_index = _lexicographic_argmin(scores, finite)
         any_candidate = (
+            int(first_death[any_index]),
             tuple(float(value) for value in scores[any_index]),
             sequences[any_index].copy(),
             first_states[any_index].copy(),
             states[any_index].copy(),
         )
-        if best_any is None or any_candidate[0] < best_any[0]:
+        if best_any is None or any_candidate[1] < best_any[1]:
             best_any = any_candidate
 
         if feasible.any():
             feasible_index = _lexicographic_argmin(scores, feasible)
             feasible_candidate = (
+                -1,
                 tuple(float(value) for value in scores[feasible_index]),
                 sequences[feasible_index].copy(),
                 first_states[feasible_index].copy(),
                 states[feasible_index].copy(),
             )
-            if best_feasible is None or feasible_candidate[0] < best_feasible[0]:
+            if best_feasible is None or (
+                feasible_candidate[1] < best_feasible[1]
+            ):
                 best_feasible = feasible_candidate
 
-    selected = best_feasible if best_feasible is not None else best_any
+        if evaluate_death is not None:
+            # When every candidate dies, keep the one whose first death is
+            # latest; the ordinary objective is only the tie-break.
+            late = finite & (first_death >= 0)
+            if late.any():
+                latest = int(first_death[late].max())
+                late_indices = late & (first_death == latest)
+                late_index = _lexicographic_argmin(scores, late_indices)
+                late_candidate = (
+                    latest,
+                    tuple(float(value) for value in scores[late_index]),
+                    sequences[late_index].copy(),
+                    first_states[late_index].copy(),
+                    states[late_index].copy(),
+                )
+                if best_late is None or (
+                    late_candidate[0] > best_late[0]
+                    or (
+                        late_candidate[0] == best_late[0]
+                        and late_candidate[1] < best_late[1]
+                    )
+                ):
+                    best_late = late_candidate
+
+    selected = best_feasible
+    if selected is None and best_late is not None:
+        selected = best_late
+    if selected is None:
+        selected = best_any
     if selected is None:
         raise ValueError("evaluators returned no finite score for any candidate")
-    score, sequence, first_state, final_state = selected
+    death, score, sequence, first_state, final_state = selected
     score = score[0] if len(score) == 1 else score
     return SearchResult(
         actions=sequence,
@@ -231,6 +285,7 @@ def exhaustive_search(
         candidate_count=candidate_count,
         first_state=first_state,
         final_state=final_state,
+        first_death=int(death),
     )
 
 

@@ -736,6 +736,15 @@
     状态全部捕获（0 safe/unknown）。
   - 仍是离线验证；Batch 2 才接 planner（每步检查、首次死亡时间排序）
     并走真实 3 种子 A/B。当前默认栈不变。
+- **0/1 死亡条件硬约束（2026-11-21，Batch 2）**：
+  - `--death-rules`：`_train` 末尾用 entered state 的 0/1 终止标签训练
+    `DeathRuleSet`，挂到 `agent.death_rules`；默认关闭。
+  - `trajectory_search.exhaustive_search` 新增可选 `evaluate_death`：
+    每步检查，命中即计划不可行；全部不可行时按首次死亡步最晚选择，
+    再按原目标；`SearchResult.first_death` 记录该步。`UNKNOWN` 不当作
+    死亡，回退原 hazard。`evaluate_death=None` 时逐位不变。
+  - 新增回归：死亡计划否决、全死时选最晚死、默认路径不变（214 测试）。
+  - 真实基准两臂 × 3 种子运行中；结果出来前默认栈不变。
 - **死亡归因探针（2026-11-20，临时脚本 death_abstraction_probe.py，seed 101/3000 步）**：
   判别"抽象不足 vs 决策不足"：死亡前 5 决策的账本危险份额 **3.09** vs
   平稳段 1.08；死亡行分级威胁读出 **0.77** vs 平稳段中位 0.00——

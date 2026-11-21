@@ -64,6 +64,46 @@ class TrajectorySearchTests(unittest.TestCase):
         self.assertFalse(fallback.feasible)
         self.assertEqual(fallback.actions[0], 0.0)
 
+    def test_death_callback_vetoes_dead_plans_and_keeps_latest_death(self):
+        def evaluate_step(states, _actions, _step):
+            # Prefer the largest state; without the death callback this
+            # would choose the plan that reaches 2.
+            return -states[:, 0], np.ones(len(states), dtype=bool)
+
+        def death_by_state(states, _sequences, step):
+            return np.where(states[:, 0] >= 1.5, step, -1)
+
+        result = exhaustive_search(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=2,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            evaluate_death=death_by_state,
+            batch_size=2,
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.first_death, -1)
+        self.assertLess(result.final_state[0], 1.5)
+
+        def death_by_first_action(_states, sequences, step):
+            # The first action decides whether death happens at step 0
+            # or step 1; the latest death must win.
+            return np.where(sequences[:, 0] == 1, 0, 1)
+
+        doomed = exhaustive_search(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=2,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            evaluate_death=death_by_first_action,
+            batch_size=2,
+        )
+        self.assertFalse(doomed.feasible)
+        self.assertEqual(doomed.first_death, 1)
+        self.assertEqual(doomed.actions[0], 0.0)
+
     def test_multiobjective_scores_prioritize_first_objective(self):
         def evaluate_step(_states, sequences, _step):
             action = sequences[:, 0]
