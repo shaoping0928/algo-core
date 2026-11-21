@@ -96,6 +96,9 @@ def run(args):
                     true_first[index], _state, _dead = oracle_plan(
                         env, sequence
                     )
+                predicted_first = np.asarray(
+                    trace["first_death"], dtype=int
+                )
                 survival = np.where(
                     true_first < 0, args.horizon + 1, true_first
                 )
@@ -116,12 +119,19 @@ def run(args):
                 oracle_all_feasible = bool(
                     feasible[oracle_all].any()
                 ) if len(oracle_all) else False
+                oracle_index = int(oracle_all[0]) if len(oracle_all) else 0
                 entry = dict(
                     eval_seed=int(eval_seed), point=int(point),
                     candidates=int(feasible.sum()), best_survival=best,
                     best_all_survival=best_all,
                     oracle_all_feasible=oracle_all_feasible,
                     chosen_survival=int(survival[chosen]),
+                    chosen_predicted_death=int(predicted_first[chosen]),
+                    oracle_predicted_death=int(
+                        predicted_first[oracle_index]
+                    ),
+                    chosen_true_death=int(true_first[chosen]),
+                    oracle_true_death=int(true_first[oracle_index]),
                     miss=bool(int(survival[chosen]) < best),
                     miss_vs_all=bool(
                         int(survival[chosen]) < best_all
@@ -190,6 +200,18 @@ def run(args):
             any_fix = True
         if any_fix:
             fixed += 1
+    model_safer = 0
+    for row in misses:
+        chosen_pred = (
+            args.horizon + 1 if row["chosen_predicted_death"] < 0
+            else row["chosen_predicted_death"]
+        )
+        oracle_pred = (
+            args.horizon + 1 if row["oracle_predicted_death"] < 0
+            else row["oracle_predicted_death"]
+        )
+        if chosen_pred > oracle_pred:
+            model_safer += 1
     return dict(
         seed=int(args.seed),
         decisions=len(rows),
@@ -198,6 +220,7 @@ def run(args):
         model_infeasible_oracle=len(infeasible),
         miss_vs_all=sum(1 for row in rows if row.get("miss_vs_all")),
         miss_rate=(float(len(misses)) / len(rows)) if rows else 0.0,
+        misses_where_model_thought_chosen_safer=model_safer,
         mean_tie_share=(
             float(np.mean([row["tie_share"] for row in rows]))
             if rows else 0.0
@@ -245,6 +268,11 @@ def print_summary(report):
     print(
         "  cost spread mean %.3f  distinct costs/decision %.2f"
         % (report["mean_cost_spread"], report["mean_distinct_costs"])
+    )
+    print(
+        "  misses where the model thought the chosen plan was safer: %d / %d"
+        % (report["misses_where_model_thought_chosen_safer"],
+           report["misses"])
     )
     print()
 

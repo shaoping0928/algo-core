@@ -483,12 +483,21 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
 不是“risk 过度惩罚”的证据。正确的问题变成 **risk 的分辨率/饱和**：
 若大量决策的最优 cost 并列，规划器实际上是在按枚举顺序选。
 
-**风险分辨率探针（2026-11-21，进行中）**
+**风险分辨率探针（2026-11-21，seed 102）**
 
 `score_column_probe` 新增每个决策的 tie 统计：`tie_share`（与最优 cost
 相差 ≤1e-9 的可行候选占比）、`near_ties`（≤0.01）、`cost_spread`、
-`distinct_costs`。seed 102 重跑中；若 tie_share 高，修法是提高 risk
-分辨率/拉开饱和，而不是改权重。
+`distinct_costs`。
+
+结果：**mean tie_share 0.01；0/75 决策有大面积并列；cost spread 0.856；
+256 个候选里平均 186 个不同 cost**。→ **不是分辨率/并列问题**，规划器
+没有按枚举顺序乱选。
+
+因此 seed 102 的 8 次排错是**真实的 risk 排序错误**。最后一个待测点是
+“模型是否把被选计划读成更安全”：已给探针加 `chosen_predicted_death` vs
+`oracle_predicted_death`，重跑 seed 102；若多数 miss 满足
+`chosen_pred > oracle_pred`，则结论是**预测状态上的 risk 读出错误**
+（世界模型/预测问题），不是分数权重。
 
 **风险列缩放 A/B（2026-11-21，已实现）**
 
