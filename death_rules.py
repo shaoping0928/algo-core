@@ -118,6 +118,8 @@ class DeathRuleSet:
                  max_attempts: int = 96, compose: bool = False,
                  coverage_first: bool = False,
                  boundary_margin: float = 0.0,
+                 feature_dims: Optional[Sequence[int]] = None,
+                 pure_support_fraction: float = 0.05,
                  compose_max_base: int = 24, compose_max_pairs: int = 256,
                  compose_rules: int = 8, compose_complexity: int = 8):
         if max_rules < 1:
@@ -137,6 +139,13 @@ class DeathRuleSet:
         self.coverage_first = bool(coverage_first)
         self.boundary_margin = max(float(boundary_margin), 0.0)
         self.margins_: Optional[np.ndarray] = None
+        self.feature_dims = (
+            None if feature_dims is None
+            else tuple(sorted({int(dim) for dim in feature_dims}))
+        )
+        self.pure_support_fraction = max(
+            float(pure_support_fraction), 0.0
+        )
         self.compose_max_base = int(compose_max_base)
         self.compose_max_pairs = int(compose_max_pairs)
         self.compose_rules = int(compose_rules)
@@ -229,7 +238,13 @@ class DeathRuleSet:
     def _candidate_literals(self, states: np.ndarray,
                             labels: np.ndarray) -> List[Primitive]:
         literals: List[Primitive] = []
-        for dim in range(states.shape[1]):
+        dims = (
+            range(states.shape[1])
+            if self.feature_dims is None else self.feature_dims
+        )
+        for dim in dims:
+            if dim < 0 or dim >= states.shape[1]:
+                raise ValueError("feature dim out of range: %d" % dim)
             for magnitude in (False, True):
                 values = (
                     np.abs(states[:, dim]) if magnitude else states[:, dim]
@@ -287,10 +302,16 @@ class DeathRuleSet:
             # alone picks tiny slices; width alone can pick a literal that
             # never reaches purity within the budget.
             max_positives = int(new_positives[valid_indices].max())
+            support_floor = max(
+                min_support,
+                int(np.ceil(
+                    self.pure_support_fraction * float(max_positives)
+                )),
+            )
             pure = (
                 valid
                 & (new_negatives == 0)
-                & (new_positives * 2 >= max_positives)
+                & (new_positives >= support_floor)
             )
             if pure.any():
                 pure_indices = np.flatnonzero(pure)
