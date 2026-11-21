@@ -147,6 +147,146 @@ def action_rank(sequences, ranking_scores, actions, feasible=None):
     return ranked
 
 
+def action_score_gap(trace, sequences):
+    """Gap between the best feasible score of each first action.
+
+    This is the decision margin the planner actually faces: only the first
+    action is executed, and each action may have a different best suffix.
+    Returns ``(gap, best_by_action)``; ``gap`` is None when one action has
+    no feasible plan.
+    """
+    first = np.asarray(sequences[:, 0], dtype=int)
+    scores = np.asarray(
+        trace.get("ranking_scores", trace["scores"]), dtype=float
+    )
+    feasible = (
+        np.asarray(trace["feasible"], dtype=bool)
+        & np.asarray(trace["finite"], dtype=bool)
+    )
+    best = {}
+    for action in sorted(set(first.tolist())):
+        mask = (first == action) & feasible
+        if not mask.any():
+            continue
+        index = best_candidate_index(scores, mask)
+        best[action] = float(scores[index, 0])
+    if 0 not in best or 1 not in best:
+        return None, best
+    return abs(best[0] - best[1]), best
+
+
+def plan_score_gap(trace):
+    """First-objective gap between the top two feasible full plans."""
+    scores = np.asarray(trace["scores"], dtype=float)
+    feasible = (
+        np.asarray(trace["feasible"], dtype=bool)
+        & np.asarray(trace["finite"], dtype=bool)
+    )
+    indices = np.flatnonzero(feasible)
+    if len(indices) < 2:
+        return None
+    keys = tuple(
+        scores[indices, column]
+        for column in reversed(range(scores.shape[1]))
+    )
+    order = np.lexsort(keys)
+    top1 = indices[order[0]]
+    top2 = indices[order[1]]
+    return float(scores[top2, 0] - scores[top1, 0])
+
+
+def summarize_margins(rows):
+    """Stratify selected misses by the decision margin.
+
+    The question is whether the planner is uncertain (small top1/top2 gap)
+    or confidently wrong (large gap).  Margins are first-objective score
+    gaps; rows without two feasible actions are reported separately.
+    """
+    usable = [row for row in rows if row["action_margin"] is not None]
+    missing = len(rows) - len(usable)
+    horizon = int(rows[0].get("horizon", 8)) if rows else 8
+    all_miss = np.asarray([
+        row["selected_miss"] for row in rows
+    ], dtype=bool)
+    all_regret = np.asarray([
+        row["regret"] for row in rows
+    ], dtype=float)
+    all_oracle = np.asarray([
+        row["oracle_best_value"] for row in rows
+    ], dtype=float)
+    decision_relevant = int(np.sum(all_miss & (all_regret > 0)))
+    unavoidable = int(np.sum(all_miss & (all_regret <= 0)))
+    base = dict(
+        decisions=len(rows),
+        usable=int(len(usable)),
+        one_action_only=int(missing),
+        selected_misses=int(all_miss.sum()) if len(rows) else 0,
+        decision_relevant_misses=decision_relevant,
+        unavoidable_misses=unavoidable,
+        regret_nonzero=int(np.sum(all_regret > 0)) if len(rows) else 0,
+        regret_max=float(np.max(all_regret)) if len(rows) else 0.0,
+        oracle_best_survives=(
+            int(np.sum(all_oracle > horizon)) if len(rows) else 0
+        ),
+        selected_survives=(
+            int(np.sum([
+                row["selected_value"] > horizon for row in rows
+            ])) if len(rows) else 0
+        ),
+    )
+    if not usable:
+        return base
+    margins = np.asarray([
+        row["action_margin"] for row in usable
+    ], dtype=float)
+    is_miss = np.asarray([
+        row["selected_miss"] for row in usable
+    ], dtype=bool)
+    regret = np.asarray([
+        row["regret"] for row in usable
+    ], dtype=float)
+    miss_margins = margins[is_miss]
+    ok_margins = margins[~is_miss]
+    quantiles = np.quantile(margins, [0.25, 0.5, 0.75])
+    cuts = [0.0] + [float(value) for value in quantiles] + [np.inf]
+    buckets = []
+    for low, high in zip(cuts[:-1], cuts[1:]):
+        if np.isinf(high):
+            mask = margins > low
+        else:
+            mask = (margins > low) & (margins <= high)
+        count = int(mask.sum())
+        bucket_miss = int(is_miss[mask].sum())
+        buckets.append(dict(
+            low=float(low), high=None if np.isinf(high) else float(high),
+            decisions=count,
+            misses=bucket_miss,
+            miss_rate=(
+                float(bucket_miss) / float(count) if count else 0.0
+            ),
+            mean_regret=(
+                float(np.mean(regret[mask])) if count else 0.0
+            ),
+        ))
+    return dict(
+        base,
+        miss_margin_mean=(
+            float(np.mean(miss_margins)) if len(miss_margins) else 0.0
+        ),
+        miss_margin_median=(
+            float(np.median(miss_margins)) if len(miss_margins) else 0.0
+        ),
+        ok_margin_mean=(
+            float(np.mean(ok_margins)) if len(ok_margins) else 0.0
+        ),
+        ok_margin_median=(
+            float(np.median(ok_margins)) if len(ok_margins) else 0.0
+        ),
+        mean_regret=float(np.mean(regret)),
+        buckets=buckets,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=100)
@@ -199,6 +339,7 @@ def main():
     plan_rows = []
     selected_rows = []
     contrast_rows = []
+    margin_rows = []
     examples = []
     decisions = 0
 
@@ -315,6 +456,26 @@ def main():
             selected_missed = bool(
                 selected_true >= 0 and tri.first_death < 0
             )
+            selected_value = (
+                args.horizon + 1 if selected_true < 0
+                else int(selected_true)
+            )
+            action_margin, best_action_scores = action_score_gap(
+                trace, sequences
+            )
+            margin_rows.append(dict(
+                action_margin=action_margin,
+                plan_margin=plan_score_gap(trace),
+                best_action_scores=best_action_scores,
+                selected_miss=selected_missed,
+                selected_value=int(selected_value),
+                oracle_best_value=int(best_value),
+                regret=int(best_value - selected_value),
+                selected_true=int(selected_true),
+                selected_action=selected_action,
+                predicted_death=bool(tri.first_death >= 0),
+                horizon=int(args.horizon),
+            ))
             if len(examples) < 12 and (
                 selected_missed or not selected_oracle_best
             ):
@@ -433,6 +594,7 @@ def main():
         plan_death=plan_total,
         selection=selection,
         action_contrast=contrast,
+        margin_analysis=summarize_margins(margin_rows),
         examples=examples,
     )
     print(json.dumps(summary, indent=2))

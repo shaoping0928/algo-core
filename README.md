@@ -205,6 +205,7 @@ python math_memory_search.py
 | 0/1 死亡条件规则（`death_rules.py`） | ✓ | 离线/反例细化 | ✓ `--death-rules`（硬约束，默认 0；Batch 2 旧规则 3 种子配对均值 −13.2，2/3 正；Batch 3 规则待新 A/B） |
 | 三态搜索信息（`first_unknown`/`unknown_count`/candidate 回调） | ✓ | 单测 | — 默认关；关闭时逐位不变 |
 | 候选计划质量探针（`planner_rollout_quality.py`） | ✓ | 85 决策/21760 计划 | — 诊断（precision 96.0%、recall 79.8%） |
+| 决策相关不确定性（`margin_analysis`） | ✓ | 120–124/123–126 | — decision-relevant miss **0**、regret **0** |
 | 失败→规则（`death_rule_loop.py`） | ✓ | 合成（缺失第二模式） | ✗ 未接真实 planner 失败 |
 | 动作效应库（`action_effect.py`） | ✓ | 合成（Δdim/归一化） | ✗ 未接求知 |
 | 探针模型缓存（`probe_cache.py`） | ✓ | 单测（命中/失配/损坏） | — 探针侧，多 arm 复用 fit |
@@ -1094,6 +1095,28 @@ H=6 小样本筛选（35 决策/2240 候选）看起来很有希望：margin 0.0
   精度问题。** 继续加终止正例、调 margin、near penalty 都不会有
   稳定收益。下一杠杆是模型误差/支持度感知的信任（predicted state
   的 OOD/残差 → unknown/soft risk/inquiry）。
+
+### 决策相关不确定性：0 个 decision-relevant miss（2026-11-21）
+
+`planner_rollout_quality` 新增 `margin_analysis`：按 top1/top2 动作
+分数差分桶，并记录 regret（选中计划真实存活 vs oracle-best）与
+one-action-only。两个世界集：
+
+| 世界集 | selected miss | decision-relevant | unavoidable | regret>0 | selected / oracle survives |
+|---|---:|---:|---:|---:|---:|
+| 120–124 | 12 | **0** | 12 | **0** | **50 / 50** |
+| 123–126 | 10 | **0** | 10 | **0** | **45 / 45** |
+
+- miss 集中在**最大 margin 桶**（8/14、7/12），不是小 margin；
+  miss margin 均值 0.164/0.386，ok margin 0.041/0.025。
+- 也就是说，planner 不是“不确定”，而是**自信地选了当前候选集里
+  最好的那个**；死亡侧没标出来，但没有更好的选择，regret 为 0。
+- **判定：全局 death recall 是标签质量指标，不是决策质量指标。**
+  当前 exact death 的决策相关 miss 在本模型种子上已经是 **0**；
+  继续加召回/调 margin 不会提高决策质量。
+- **新瓶颈：候选集/时域/探索。** 到这些晚期状态，H=8 内所有候选
+  都死；再好的死亡分类也无法凭空造出存活计划。需要更早行动/更长
+  时域/更好的候选生成，而不是继续提高 death recall。
 
 **归纳形式扩展（2026-11-20）：成对坐标差**。根稀疏的一个来源是绝对阈值
 贴在训练分布边缘。归纳文法新增纯代数坐标：

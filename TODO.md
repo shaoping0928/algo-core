@@ -912,8 +912,23 @@
       真实终止，但 `f` 的预测状态漂移出边界/近边界。**结论：剩余
       gap 是模型预测，不是规则覆盖；继续加终止正例、调 margin 或
       near penalty 都无效。**
-    - [ ] 下一步：模型误差/支持度感知的信任（predicted state 的
-      OOD/残差 → unknown/soft risk/inquiry），而不是继续调 margin。
+    - [x] 决策相关不确定性诊断（`planner_rollout_quality` 新增
+      `margin_analysis`）：selected miss 按 top1/top2 动作分数差分桶，
+      同时记录 `one_action_only`、regret、oracle-best survival。
+      **结果（120–124 / 123–126）**：
+      selected miss 12/10 个，**decision_relevant_misses = 0**，
+      **unavoidable_misses = 12/10**，**regret_nonzero = 0**，
+      selected survives = oracle-best survives（**50/50、45/45**）。
+      miss 集中在大 margin 桶（8/14、7/12），不是小 margin。
+      **判定：全局 death recall 是标签质量指标，不是决策质量指标；
+      规划器不是“不确定”，而是自信地选了当前候选集里最好的。
+      exact death 的决策相关 miss 已为 0。**
+    - [ ] 新瓶颈：候选集/时域/探索。到这些晚期状态，H=8 内所有候选
+      都死；再好的死亡分类也救不了。需要更早行动/更长时域/更好的
+      候选生成，而不是继续提高 death recall。
+    - [ ] 用同一 margin 诊断在 seed 101/102 复跑，确认
+      decision_relevant_misses=0 不是单一模型；之后再决定是否进
+      early-warning/horizon 实验。
     - [x] 探针效率：`planner_rollout_quality` 只跑一次 search，
       baseline 从 candidate trace 的 `scores`/`model_feasible` 重建
       （单测与 no-death search 逐位一致）；`probe_cache.py` 缓存
@@ -923,17 +938,21 @@
       单一模型的偶然；近终止动作对比用 `--tail 20` 提高 comparable。
     - [ ] 归一化阈值先验旁支（k=5/10/20，覆盖升且 FP 不升才继续）。
   - **当前总判定（2026-11-21）**：默认栈不变；`--death-rules` 仍是
-    opt-in（3 种子配对均值 −13.2，2/3 正向；**注意该 A/B 用的是
-    Batch 2 规则，早于覆盖优先/少数模式支持/边界余量；当前规则的
-    候选计划探针方向为正，但仍需新质量门后的 A/B 复核**）；
-    **235 测试**全过。死亡判断**精度好、覆盖率/召回是主瓶颈**；
-    边界余量只修“误判安全”。
-    当前观测已含相对量，成对特征冗余；模式库只迁移关系维度，阈值仍需
-    本地校准，样本效率提升中性。候选计划探针显示硬否决方向为正
-    （8 改进/0 退化），但 12/85 选中死亡计划未被标出。下一步优先级：
-    (a) 失败→规则（真实 planner 失败、refine/test 分割）；(b) UNKNOWN→
-    求知；(c) 动作效应模板；阈值先验作为旁支，不再先做。不做任务定制，
-    不在任务几何/专用阈值上继续硬调。
+    opt-in（3 种子配对均值 −13.2，2/3 正向；该 A/B 用的是 Batch 2
+    规则，早于覆盖优先/少数模式支持/边界余量）。**262 测试**全过。
+    死亡判断**精度高**；全局 plan recall 76–80% 是**标签质量指标**，
+    不是决策质量指标。决策相关诊断（120–124/123–126）显示：
+    **decision_relevant_misses = 0、regret = 0、selected survives =
+    oracle-best survives（50/50、45/45）**；剩余 selected miss 全部是
+    unavoidable（晚期状态 H=8 内所有候选都死）或 one-action-only。
+    **当前瓶颈已从“死亡规则召回”转移到“候选集/时域/探索”**：到晚期
+    状态再好的死亡分类也无法凭空造出存活计划；需要更早行动/更长时域/
+    更好的候选生成。当前观测已含相对量，成对特征冗余；模式库只迁移
+    关系维度，阈值仍需本地校准，样本效率中性。下一步优先级：
+    (a) seed 101/102 复跑 margin 诊断，确认 decision-relevant 0；
+    (b) early-warning/horizon/候选集实验；(c) 若 regret 出现，再校准
+    hazard/value 分数。阈值先验、失败→规则、UNKNOWN→求知降为旁支，
+    不再先做。不做任务定制，不在任务几何/专用阈值上继续硬调。
 - **死亡归因探针（2026-11-20，临时脚本 death_abstraction_probe.py，seed 101/3000 步）**：
   判别"抽象不足 vs 决策不足"：死亡前 5 决策的账本危险份额 **3.09** vs
   平稳段 1.08；死亡行分级威胁读出 **0.77** vs 平稳段中位 0.00——

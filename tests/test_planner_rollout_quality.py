@@ -6,10 +6,13 @@ import numpy as np
 from planner_rollout_quality import (
     action_best,
     action_rank,
+    action_score_gap,
     near_status_callback,
     oracle_plan,
     plan_death_counts,
+    plan_score_gap,
     status_callback,
+    summarize_margins,
 )
 
 
@@ -91,6 +94,67 @@ class PlannerRolloutQualityTests(unittest.TestCase):
             margin_rules, 1, include_margin=True
         )(margin_states, None, 0)
         np.testing.assert_array_equal(envelope, [1, 1])
+
+    @staticmethod
+    def margin_trace():
+        return dict(
+            scores=np.asarray([[1.0], [3.0], [2.0], [4.0]]),
+            feasible=np.asarray([True, True, True, True]),
+            finite=np.ones(4, dtype=bool),
+        )
+
+    def test_action_score_gap_compares_best_plan_per_action(self):
+        trace = self.margin_trace()
+        sequences = np.asarray([[0], [0], [1], [1]])
+        gap, best = action_score_gap(trace, sequences)
+        self.assertAlmostEqual(gap, 1.0)
+        self.assertEqual(best, {0: 1.0, 1: 2.0})
+        trace["feasible"] = np.asarray([True, True, False, False])
+        gap, best = action_score_gap(trace, sequences)
+        self.assertIsNone(gap)
+        self.assertEqual(best, {0: 1.0})
+
+    def test_plan_score_gap_uses_the_lexicographic_top_two(self):
+        trace = dict(
+            scores=np.asarray([[2.0, 9.0], [1.0, 5.0], [1.0, 3.0]]),
+            feasible=np.ones(3, dtype=bool),
+            finite=np.ones(3, dtype=bool),
+        )
+        self.assertAlmostEqual(plan_score_gap(trace), 0.0)
+        trace["scores"] = np.asarray([[2.0], [1.0], [3.0]])
+        self.assertAlmostEqual(plan_score_gap(trace), 1.0)
+
+    def test_summarize_margins_stratifies_selected_misses(self):
+        rows = [
+            dict(action_margin=0.05, selected_miss=True, regret=3.0,
+                 selected_value=2.0, oracle_best_value=5.0, horizon=8),
+            dict(action_margin=0.10, selected_miss=True, regret=2.0,
+                 selected_value=3.0, oracle_best_value=5.0, horizon=8),
+            dict(action_margin=0.20, selected_miss=False, regret=0.0,
+                 selected_value=5.0, oracle_best_value=5.0, horizon=8),
+            dict(action_margin=0.50, selected_miss=False, regret=0.0,
+                 selected_value=5.0, oracle_best_value=5.0, horizon=8),
+            dict(action_margin=None, selected_miss=False, regret=0.0,
+                 selected_value=1.0, oracle_best_value=5.0, horizon=8),
+        ]
+        summary = summarize_margins(rows)
+        self.assertEqual(summary["decisions"], 5)
+        self.assertEqual(summary["usable"], 4)
+        self.assertEqual(summary["one_action_only"], 1)
+        self.assertEqual(summary["selected_misses"], 2)
+        self.assertEqual(summary["decision_relevant_misses"], 2)
+        self.assertEqual(summary["unavoidable_misses"], 0)
+        self.assertEqual(summary["regret_nonzero"], 2)
+        self.assertAlmostEqual(summary["regret_max"], 3.0)
+        self.assertEqual(summary["oracle_best_survives"], 0)
+        self.assertEqual(summary["selected_survives"], 0)
+        self.assertAlmostEqual(summary["miss_margin_mean"], 0.075)
+        self.assertAlmostEqual(summary["ok_margin_mean"], 0.35)
+        self.assertEqual(len(summary["buckets"]), 4)
+        self.assertEqual(
+            sum(bucket["misses"] for bucket in summary["buckets"]), 2
+        )
+        self.assertEqual(summary["buckets"][0]["miss_rate"], 1.0)
 
     def test_near_status_callback_keeps_three_levels(self):
         rules = FakeRules()
