@@ -114,5 +114,40 @@ class BranchTests(unittest.TestCase):
         )
 
 
+    def test_runtime_prediction_credibility_tracks_hits(self):
+        import numpy as np
+        from node_features import FeatureRule, Primitive
+        from node_runtime import NodeRuntime
+
+        runtime = NodeRuntime(
+            obs_dim=1, lag=1, scales=np.asarray([1.0, 1.0]),
+            birth_threshold=0.01, max_nodes=40, exploration=0.0,
+            alpha_v=0.5, alpha_q=0.5, gamma=0.9, lam=0.9,
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, True, "<", 2.0), 5, 4, 0.8, 2, 2, 1.0, 0.75
+            )
+        ]
+        runtime.install_feature_rules()
+        feature_id = runtime.feature_ids[0]
+        runtime.set_prediction(np.asarray([0.0]))
+        hit = runtime.observe_prediction(np.asarray([0.0]))
+        self.assertEqual(hit["hits"], 1)
+        first = runtime.prediction_credibility(feature_id)
+        self.assertGreater(first, 0.5)
+        runtime.set_prediction(np.asarray([0.0]))
+        miss = runtime.observe_prediction(np.asarray([3.0]))
+        self.assertEqual(miss["hits"], 0)
+        second = runtime.prediction_credibility(feature_id)
+        self.assertLess(second, first)
+        summary = runtime.prediction_summary()
+        self.assertEqual(summary["nodes"], 1)
+        self.assertEqual(summary["count"], 2.0)
+        self.assertAlmostEqual(
+            runtime.prediction_learning_rate(feature_id), 0.25
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

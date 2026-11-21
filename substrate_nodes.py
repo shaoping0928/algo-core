@@ -1343,9 +1343,17 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             decision=decision, ledger_out=ledger_out,
         )
         history = np.asarray([float(action)] + recent[:lag], dtype=float)
+        prediction_hook = getattr(agent, "prediction_branch", None) is not None
+        if prediction_hook:
+            predicted = world.predict(
+                obs.reshape(1, -1), history.reshape(1, -1)
+            )[0]
+            agent.set_prediction(predicted)
         actions.append(action)
         prefix = np.concatenate([[float(action)], prefix[:-1]])
         env.step(action)
+        if prediction_hook:
+            agent.observe_prediction(np.asarray(env.obs(), dtype=float))
         if record:
             feedback = env.feedback()
             transitions.append(dict(
@@ -1539,6 +1547,7 @@ def run_seed(task):
         action_rate=rows[0]["action_rate"],
         evals=rows,
         graph=agent.snapshot(),
+        prediction=agent.prediction_summary(),
         dagger=getattr(agent, "dagger_log", []),
         top_nodes=agent.top_nodes(5),
         top_edges=agent.top_edges(5),

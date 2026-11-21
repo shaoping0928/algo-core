@@ -26,7 +26,12 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from branches import BranchBank, CurrentBranch, RecentBranch
+from branches import (
+    BranchBank,
+    CurrentBranch,
+    PredictionBranch,
+    RecentBranch,
+)
 from node_components import ComponentBank
 from node_features import (
     FeatureRuleBank,
@@ -574,6 +579,14 @@ class NodeRuntime:
         self.branches = BranchBank(self.graph)
         self.branches.add(CurrentBranch(graph=self.graph))
         self.branches.add(RecentBranch(graph=self.graph, decay=0.8))
+        self.prediction_branch = self.branches.add(
+            PredictionBranch(graph=self.graph)
+        )
+        # Per-node precision of the planner's one-step prediction: when a
+        # root was predicted active, how often was it actually active after
+        # the real transition?  Used as the prediction-credibility channel.
+        self.prediction_stats: Dict[str, List[float]] = {}
+        self._last_prediction: set = set()
         self.components = ComponentBank(
             self.graph,
             threshold=self.component_threshold,
@@ -2374,6 +2387,82 @@ class NodeRuntime:
         if mask_table is None:
             return feature.mask(obs)
         return mask_table[self._feature_all.index(node_id)]
+
+    # ---- prediction branch -------------------------------------------------
+    def _branch_active_features(self, observation) -> List[str]:
+        """Feature roots active at an observation, for branch comparisons."""
+        obs = np.asarray(observation, dtype=float).reshape(-1)
+        if obs.shape[0] < self.obs_dim:
+            return []
+        encoded = obs[:self.obs_dim] / self.scales[:self.obs_dim]
+        active = self._active_feature_ids(encoded)
+        return [node_id for node_id in active if node_id in self.feature_ids]
+
+    def set_prediction(self, observation) -> List[str]:
+        """Record the roots the planner expects at the next state."""
+        node_ids = self._branch_active_features(observation)
+        self.prediction_branch.activate(
+            node_ids, [1.0] * len(node_ids)
+        )
+        self._last_prediction = set(node_ids)
+        return node_ids
+
+    def observe_prediction(self, observation) -> dict:
+        """Compare the recorded prediction with the actually entered state."""
+        actual = set(self._branch_active_features(observation))
+        predicted = set(self._last_prediction)
+        for node_id in predicted:
+            stats = self.prediction_stats.setdefault(
+                node_id, [0.0, 0.0]
+            )
+            stats[1] += 1.0
+            if node_id in actual:
+                stats[0] += 1.0
+        hits = len(predicted & actual)
+        self.prediction_branch.reset()
+        self._last_prediction = set()
+        return dict(
+            predicted=len(predicted), actual=len(actual), hits=hits,
+        )
+
+    def prediction_credibility(self, node_id: str,
+                               prior: float = 2.0,
+                               base: float = 0.5) -> float:
+        hits, count = self.prediction_stats.get(
+            node_id, [0.0, 0.0]
+        )
+        return float((hits + prior * base) / (count + prior))
+
+    def prediction_learning_rate(self, node_id: str,
+                                 prior: float = 2.0) -> float:
+        """How fast this node's prediction estimate should still move."""
+        _hits, count = self.prediction_stats.get(
+            node_id, [0.0, 0.0]
+        )
+        return float(1.0 / (count + prior))
+
+    def prediction_summary(self) -> dict:
+        if not self.prediction_stats:
+            return dict(
+                nodes=0, mean_credibility=0.0, mean_learning_rate=0.0,
+                hits=0.0, count=0.0,
+            )
+        hits = sum(stat[0] for stat in self.prediction_stats.values())
+        count = sum(stat[1] for stat in self.prediction_stats.values())
+        credibility = [
+            self.prediction_credibility(node_id)
+            for node_id in self.prediction_stats
+        ]
+        learning = [
+            self.prediction_learning_rate(node_id)
+            for node_id in self.prediction_stats
+        ]
+        return dict(
+            nodes=len(self.prediction_stats),
+            mean_credibility=float(np.mean(credibility)),
+            mean_learning_rate=float(np.mean(learning)),
+            hits=float(hits), count=float(count),
+        )
 
     def _feature_mask_table(self, obs: np.ndarray) -> List:
         """Every node's activation over a batch of raw observations.

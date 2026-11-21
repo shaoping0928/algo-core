@@ -576,6 +576,13 @@ BranchBank         transition_pairs / prediction_error / snapshot
 相同**；测试 188 → 196（+8 branch）。下一步：转移边学习、
 prediction 分支、记忆树分支关键词、value/risk 分支接入。
 
+**预测分支（第二片）**：`evaluate` 在 `env.step` 前用 `world.predict`
+记录下一状态的根激活，step 后与真实下一状态比较；每个预测根维护
+`precision = (hits + prior*base)/(count + prior)` 与
+`learning_rate = 1/(count + prior)`，`run_seed` 输出 prediction summary。
+80 帧评估仍与接入前逐位相同；测试 **197**。下一步：用逐节点
+credibility 门控生成先验/预测读取，做 3 种子 A/B。
+
 ### 记忆回溯修正（2026-11-20，已实现；A/B 进行中）
 
 用户裁定：pain **不是**“给前面的状态贴标签”的理由，但它**可以修正前面的记忆**。

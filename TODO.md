@@ -484,6 +484,13 @@
   (b) planner rollout 写 `prediction` 分支，真实 step 后逐节点比较，
   更新预测可信度/学习率；(c) 记忆树事件快照带分支关键词；
   (d) value/risk 分支接入 D4 信任与 P4 账本。
+  **预测分支第二片（2026-11-21）**：`NodeRuntime.prediction_branch` +
+  `prediction_stats`；`evaluate` 在 `env.step` 前用 `world.predict` 记录
+  下一状态的根激活，step 后与真实下一状态比较；逐节点
+  `precision = (hits + prior*base)/(count + prior)`，
+  `learning_rate = 1/(count + prior)`；`run_seed` 输出 prediction summary。
+  验证：80 帧评估与接入前**逐位相同**；测试 196 → **197**。
+  下一步：用逐节点 credibility 门控生成先验/预测读取，做 3 种子 A/B。
 - **标签口径裁定（2026-11-20，用户）：点事件 pain 为默认**：世界只在
   撞边界/管道时给 pain；正常飞行没有任何问题、不能给 pain。据此撤销
   两样东西：前兆标签 `P(pain within k)`（把死亡前 k 帧的正常状态标成
