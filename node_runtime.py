@@ -306,6 +306,7 @@ class NodeRuntime:
         curiosity_weight: float = 0.0,
         value_bank_only: bool = False,
         value_horizon: Optional[int] = None,
+        pain_gamma: Optional[float] = None,
         ood_trust_scale: float = 0.0,
         obs_trust: float = 1.0,
         action_temperature: float = 0.1,
@@ -406,6 +407,16 @@ class NodeRuntime:
         self.action_space = actions
         self.lag = int(lag)
         self.gamma = float(gamma)
+        # The pain value's own discount.  The shared gamma is a dopamine
+        # (long survival) horizon; the pain channel needs a discount that
+        # matches how far ahead a death is actually predictable, otherwise
+        # the return-to-go is nearly flat across the window the planner
+        # searches.  None keeps the historical behaviour.
+        self.pain_gamma = (
+            float(pain_gamma) if pain_gamma is not None else float(gamma)
+        )
+        if not 0.0 < self.pain_gamma <= 1.0:
+            raise ValueError("pain_gamma must be in (0, 1]")
         self.lam = float(lam)
         self.alpha_v = float(alpha_v)
         self.alpha_q = float(alpha_q)
@@ -2015,7 +2026,7 @@ class NodeRuntime:
         pain = float(valence[1])
         dopamine = float(valence[0])
         next_value = self.graph.nodes[next_node]
-        target_pain = pain + (0.0 if done else self.gamma * next_value.value)
+        target_pain = pain + (0.0 if done else self.pain_gamma * next_value.value)
         target_dopamine = dopamine + (
             0.0 if done else self.gamma * next_value.dopamine
         )
@@ -2096,7 +2107,7 @@ class NodeRuntime:
         pain = float(valence[1])
         dopamine = float(valence[0])
         next_value = self.graph.nodes[next_node]
-        target_pain = pain + (0.0 if done else self.gamma * next_value.value)
+        target_pain = pain + (0.0 if done else self.pain_gamma * next_value.value)
         target_dopamine = dopamine + (
             0.0 if done else self.gamma * next_value.dopamine
         )
@@ -2359,7 +2370,7 @@ class NodeRuntime:
              terminal, sources, signature, acting,
              value_roots, row_weight, branch_pairs) = steps[position]
             return_pain = pain + (
-                0.0 if terminal else self.gamma * running_pain
+                0.0 if terminal else self.pain_gamma * running_pain
             )
             return_dopamine = dopamine + (
                 0.0 if terminal else self.gamma * running_dopamine

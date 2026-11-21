@@ -759,6 +759,30 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
 若 oracle@8 显著长于 policy@8，则缺口是**选择/价值**；若持平，则缺口
 是**视界/状态抽象**。
 
+**oracle@8 结果（seed 100，120-122）**：policy 与 oracle **逐 episode
+完全相同**（472/472、152/152、183/183）。→ 8 帧候选集里**本来就没有
+更好的方案**，完美选择也救不了。**视界是硬约束，排序不是**（在 8 帧
+内）。
+
+**但 horizon 12 不可行**：一次 horizon-12 搜索约 **10 分钟**
+（4096 候选 × 12 步 × 每步 hazard 读出），全 episode 需要 ~25 小时。
+→ “加深搜索”在算力上不成立。必须用**廉价的视界外推**：端点价值
+（8 步端点上的 `pain` 值，若其有效视界 ≈10 帧，就等价于看到 8–18 帧）。
+这正是 `pain_gamma` 的动机。
+
+**pain_gamma（新增，默认 = gamma，行为不变）**
+
+- 痛回报原来用 `gamma=0.99` → 有效视界 ≈100 帧，在 10 帧窗口内基本
+  是常数（实测 0.41–0.43 平直）；
+- `--pain-gamma` 只改痛通道的折扣（dopamine 仍用 gamma），给痛价值
+  一个与因果视界匹配的折扣；
+- 代码：`NodeRuntime.pain_gamma`（默认 = gamma）、`fit(pain_gamma=None)`、
+  `learn_episode`/`observe`/`learn_transition` 的痛目标；单测
+  `test_pain_gamma_sets_the_pain_value_horizon`（gamma 0.9 vs 0.99 的
+  两帧前读数）。
+- 探针：`warning_lead_probe.py --pain-gamma 0.9` 检查提前量是否从 2 帧
+  扩到 8–10 帧；若是，再跑 3 种子 A/B。
+
 **警告提前量（`warning_lead_probe.py`，seed 100，5 个死亡 episode）**
 
 | k（死亡前帧） | composed | prototype | value | mc |

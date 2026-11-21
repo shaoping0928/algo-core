@@ -130,6 +130,41 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertGreater(snapshot["transitions"], 0)
         self.assertGreater(snapshot["memories"], 0)
 
+    def test_pain_gamma_sets_the_pain_value_horizon(self):
+        rows = [
+            dict(
+                obs=np.asarray([0.0]), next_obs=np.asarray([1.0]),
+                history=np.asarray([0.0, 0.0, 0.0, 0.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([1.0]), next_obs=np.asarray([2.0]),
+                history=np.asarray([0.0, 0.0, 0.0, 0.0]),
+                signals=np.asarray([1.0, 0.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([2.0]), next_obs=np.asarray([3.0]),
+                history=np.asarray([0.0, 0.0, 0.0, 0.0]),
+                signals=np.asarray([0.0, 1.0]), done=True, episode=0,
+            ),
+        ]
+        short = self.make_runtime(
+            gamma=0.99, pain_gamma=0.9, max_nodes=40
+        )
+        long = self.make_runtime(gamma=0.99, max_nodes=40)
+        self.assertAlmostEqual(long.pain_gamma, 0.99)
+        for _ in range(60):
+            short.learn_episode(rows)
+            long.learn_episode(rows)
+        # The pain return decays with the pain discount alone: two steps
+        # before the terminal reads 0.81 instead of 0.98.
+        self.assertLess(
+            short.node_value(np.asarray([0.0])),
+            long.node_value(np.asarray([0.0])),
+        )
+        with self.assertRaises(ValueError):
+            self.make_runtime(pain_gamma=0.0)
+
     def test_novel_observations_birth_nodes(self):
         runtime = self.make_runtime(birth_threshold=0.1)
         runtime.reset()
