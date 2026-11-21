@@ -35,11 +35,23 @@ from latent_world import latent
 from substrate_generic import history_features
 from substrate_nodes import LAG, _curiosity_off, evaluate, fit, policy_result
 
-MACROS = {
-    "still": lambda k: [0] * k,
-    "flap": lambda k: [1] * k,
-    "flap_first": lambda k: [1] + [0] * (k - 1),
-    "flap_last": lambda k: [0] * (k - 1) + [1],
+MACRO_SETS = {
+    4: {
+        "still": lambda k: [0] * k,
+        "flap": lambda k: [1] * k,
+        "flap_first": lambda k: [1] + [0] * (k - 1),
+        "flap_last": lambda k: [0] * (k - 1) + [1],
+    },
+    8: {
+        "still": lambda k: [0] * k,
+        "flap": lambda k: [1] * k,
+        "flap_first": lambda k: [1] + [0] * (k - 1),
+        "flap_last": lambda k: [0] * (k - 1) + [1],
+        "flap_second": lambda k: [0, 1] + [0] * (k - 2),
+        "flap_third": lambda k: [0, 0, 1] + [0] * (k - 3),
+        "flap_two_first": lambda k: [1, 1] + [0] * (k - 2),
+        "flap_two_last": lambda k: [0] * (k - 2) + [1, 1],
+    },
 }
 
 
@@ -67,14 +79,15 @@ def spearman(left, right):
     return float((a * b).sum() / denominator) if denominator else 0.0
 
 
-def coarse_plans(k, steps):
-    names = list(MACROS)
+def coarse_plans(k, steps, macro_count=4):
+    macros = MACRO_SETS[int(macro_count)]
+    names = list(macros)
     plans = []
     labels = []
     for combination in itertools.product(names, repeat=steps):
         plan = []
         for name in combination:
-            plan.extend(MACROS[name](k))
+            plan.extend(macros[name](k))
         plans.append(np.asarray(plan, dtype=float))
         labels.append("+".join(combination))
     return np.asarray(plans), labels
@@ -104,7 +117,9 @@ def run(args):
         dagger_rounds=1, dagger_episodes=2, dagger_cap=5000,
         dagger_frames=5000, dagger_horizon=args.horizon, step_stride=2,
     )
-    plans, labels = coarse_plans(args.macro_frames, args.macro_steps)
+    plans, labels = coarse_plans(
+        args.macro_frames, args.macro_steps, args.macro_count
+    )
     span = args.macro_frames * args.macro_steps
     rows = []
     with _curiosity_off(agent):
@@ -143,6 +158,23 @@ def run(args):
                         span + 1 if death < 0 else int(death)
                     )
                 cheapest = int(np.argmin(cost))
+                control = None
+                if args.control_plans:
+                    rng = np.random.RandomState(args.seed * 1000 + point)
+                    controls = (
+                        rng.rand(args.control_plans, span) < 0.5
+                    ).astype(float)
+                    control_survival = np.empty(len(controls), dtype=int)
+                    for index, plan in enumerate(controls):
+                        death, _state, _dead = oracle_plan(env, plan)
+                        control_survival[index] = (
+                            span + 1 if death < 0 else int(death)
+                        )
+                    control = dict(
+                        best=int(control_survival.max()),
+                        mean=float(control_survival.mean()),
+                        share=float(np.mean(control_survival > span)),
+                    )
                 # The fine layer's own choice at the same state, for the
                 # head-to-head: the plan the 8-frame search executes.
                 batches = []
@@ -174,8 +206,12 @@ def run(args):
                     best_survival=int(survival[cheapest]),
                     ceiling=int(survival.max()),
                     fine_survival=fine,
+                    actual_survival=int(lag_back - 1),
                     best_label=labels[cheapest],
                     plans=int(len(plans)),
+                    macro_share=float(np.mean(survival > span)),
+                    macro_mean=float(survival.mean()),
+                    control=control,
                 ))
     return rows
 
@@ -185,8 +221,10 @@ def summarize(rows):
     for lag_back in sorted(set(row["lag_back"] for row in rows)):
         block = [row for row in rows if row["lag_back"] == lag_back]
         gains = [
-            row["best_survival"] - row["fine_survival"]
-            for row in block if row["fine_survival"] is not None
+            row["best_survival"] - row["actual_survival"] for row in block
+        ]
+        ceiling_gains = [
+            row["ceiling"] - row["actual_survival"] for row in block
         ]
         out.append(dict(
             lag_back=int(lag_back),
@@ -195,9 +233,18 @@ def summarize(rows):
             share_ranked=float(np.mean([row["rho"] <= -0.2 for row in block])),
             mean_best=float(np.mean([row["best_survival"] for row in block])),
             mean_ceiling=float(np.mean([row["ceiling"] for row in block])),
-            mean_gain=float(np.mean(gains)) if gains else float("nan"),
-            share_gain=float(np.mean([gain > 0 for gain in gains]))
-            if gains else float("nan"),
+            mean_gain=float(np.mean(gains)),
+            share_gain=float(np.mean([gain > 0 for gain in gains])),
+            mean_ceiling_gain=float(np.mean(ceiling_gains)),
+            share_ceiling_gain=float(np.mean(
+                [gain > 0 for gain in ceiling_gains]
+            )),
+            macro_share=float(np.mean([row["macro_share"] for row in block])),
+            control_share=float(np.mean([
+                row["control"]["share"] for row in block
+                if row["control"] is not None
+            ])) if any(row["control"] is not None for row in block)
+            else float("nan"),
         ))
     return out
 
@@ -209,6 +256,8 @@ def main():
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--macro-frames", type=int, default=4)
     parser.add_argument("--macro-steps", type=int, default=3)
+    parser.add_argument("--macro-count", type=int, choices=(4, 8), default=4)
+    parser.add_argument("--control-plans", type=int, default=0)
     parser.add_argument("--min-lag", type=int, default=8)
     parser.add_argument("--max-lag", type=int, default=14)
     parser.add_argument("--cap", type=int, default=5000)
@@ -219,21 +268,29 @@ def main():
 
     rows = run(args)
     summary = summarize(rows)
-    print("== coarse pass: seed %d, %dx%d macro frames, %d leaves ==" % (
-        args.seed, args.macro_frames, args.macro_steps,
-        rows[0]["plans"] if rows else 0,
-    ))
-    print("  k  states  rho(cost,true)  coarse-best  ceiling  gain-vs-fine")
+    print("== coarse pass: seed %d, %d macros x %d steps x %d frames, "
+          "%d leaves ==" % (
+              args.seed, args.macro_count, args.macro_steps,
+              args.macro_frames, rows[0]["plans"] if rows else 0,
+          ))
+    print("  k  states  rho  coarse-best  ceiling  gain-vs-actual  "
+          "ceiling-gain  macro-survive  random-survive")
     for block in summary:
-        print("  %2d  %6d  %13.3f  %11.2f  %7.2f  %12.2f" % (
-            block["lag_back"], block["states"], block["mean_rho"],
-            block["mean_best"], block["mean_ceiling"], block["mean_gain"],
-        ))
+        print("  %2d  %6d  %5.2f  %11.2f  %7.2f  %14.2f  %12.2f  "
+              "%13.0f%%  %14.0f%%" % (
+                  block["lag_back"], block["states"], block["mean_rho"],
+                  block["mean_best"], block["mean_ceiling"],
+                  block["mean_gain"], block["mean_ceiling_gain"],
+                  100.0 * block["macro_share"],
+                  100.0 * block["control_share"],
+              ))
     if summary:
-        print("  rho correct (<=-0.2): %.0f%% | coarse beats fine: %.0f%%" % (
-            100.0 * np.mean([block["share_ranked"] for block in summary]),
-            100.0 * np.mean([block["share_gain"] for block in summary]),
-        ))
+        print("  rho correct (<=-0.2): %.0f%% | coarse beats actual: %.0f%% "
+              "| ceiling beats actual: %.0f%%" % (
+                  100.0 * np.mean([b["share_ranked"] for b in summary]),
+                  100.0 * np.mean([b["share_gain"] for b in summary]),
+                  100.0 * np.mean([b["share_ceiling_gain"] for b in summary]),
+              ))
     if args.report:
         with open(args.report, "w", encoding="utf-8") as handle:
             json.dump(dict(summary=summary, rows=rows), handle,
