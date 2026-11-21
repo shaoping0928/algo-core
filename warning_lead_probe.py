@@ -49,6 +49,7 @@ def run(args):
         dagger_rounds=1, dagger_episodes=2, dagger_cap=5000,
         dagger_frames=5000, dagger_horizon=args.horizon, step_stride=2,
         feature_backfit=args.feature_backfit,
+        pain_gamma=args.pain_gamma,
     )
     buckets = {}
     with _curiosity_off(agent):
@@ -98,6 +99,7 @@ def main():
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--feature-backfit", action="store_true")
+    parser.add_argument("--pain-gamma", type=float, default=None)
     parser.add_argument("--max-lead", type=int, default=20)
     parser.add_argument("--cap", type=int, default=5000)
     parser.add_argument("--report", default="")
