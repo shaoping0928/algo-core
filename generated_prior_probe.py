@@ -169,7 +169,7 @@ def _candidates(memory, context_dim):
     return result
 
 
-def _generated_choice(expander, candidates, actions, observations):
+def _generated_choice(expander, candidates, actions, observations, agent):
     target = np.asarray(observations[1:], dtype=float)
     if not candidates or not target.size:
         return None
@@ -188,15 +188,37 @@ def _generated_choice(expander, candidates, actions, observations):
         distance = float(np.mean(np.linalg.norm(
             predictions - target, axis=1
         )))
-        ranked.append((distance, node_id, context, count))
+        # Per-node prediction ability inside this candidate's simulation:
+        # a candidate whose predicted roots rarely match the observed
+        # roots is less trustworthy even if its numeric distance is small.
+        hits = {}
+        counts = {}
+        for predicted, actual in zip(predictions, target):
+            predicted_roots = set(agent.prediction_nodes(predicted))
+            actual_roots = set(agent.prediction_nodes(actual))
+            for root in predicted_roots:
+                counts[root] = counts.get(root, 0) + 1
+                if root in actual_roots:
+                    hits[root] = hits.get(root, 0) + 1
+        if counts:
+            credibility = float(np.mean([
+                (hits.get(root, 0) + 1.0) / (counts[root] + 2.0)
+                for root in counts
+            ]))
+        else:
+            credibility = 0.5
+        adjusted = distance * (1.0 + (1.0 - credibility))
+        ranked.append((
+            adjusted, distance, credibility, node_id, context, count
+        ))
     if not ranked:
         return None
     ranked.sort(key=lambda item: item[0])
     best = ranked[0]
     second = ranked[1][0] if len(ranked) > 1 else best[0]
     return dict(
-        distance=best[0], node=best[1], context=best[2],
-        support=best[3], second=second,
+        distance=best[0], raw_distance=best[1], credibility=best[2],
+        node=best[3], context=best[4], support=best[5], second=second,
         margin=(second - best[0]) / second if second > 0.0 else 0.0,
     )
 
@@ -204,6 +226,7 @@ def _generated_choice(expander, candidates, actions, observations):
 def _plan(env, model, agent, recent, max_frames, horizon=8):
     prefix = np.asarray(recent[:LAG], dtype=float)
     errors = []
+    agent.reset_prediction_stats()
     while not env.dead and env.t < max_frames:
         observation = np.asarray(env.obs(), dtype=float)
         action = decision_action(
@@ -213,15 +236,17 @@ def _plan(env, model, agent, recent, max_frames, horizon=8):
         prediction = model.predict(
             observation.reshape(1, -1), history.reshape(1, -1)
         )[0]
+        agent.set_prediction(prediction)
         env.step(action)
         next_observation = np.asarray(env.obs(), dtype=float)
+        agent.observe_prediction(next_observation)
         errors.append(float(np.linalg.norm(
             next_observation - prediction
         )))
         model.observe(observation, history, next_observation)
         prefix = np.concatenate([[float(action)], prefix[:-1]])
         recent = [float(action)] + recent[:-1]
-    return env.t, errors
+    return env.t, errors, agent.prediction_summary()
 
 
 def run(train_steps=1200, warmup=10, max_frames=120, episodes=2,
@@ -256,13 +281,18 @@ def run(train_steps=1200, warmup=10, max_frames=120, episodes=2,
                     model.reset_context()
                 elif arm == "generated":
                     choice = _generated_choice(
-                        expander, candidates, actions, observations
+                        expander, candidates, actions, observations, agent
                     )
                     if choice is not None:
                         # Use the generated regime only when the simulation
-                        # distinguishes it from the runner-up; an ambiguous
-                        # match falls back to the warmup's own context.
-                        if choice["margin"] >= 0.05:
+                        # both distinguishes it from the runner-up and its
+                        # predicted roots are credible; otherwise fall back
+                        # to the warmup's own context.
+                        accepted = bool(
+                            choice["margin"] >= 0.05
+                            and choice["credibility"] >= 0.4
+                        )
+                        if accepted:
                             model.apply_prior(
                                 choice["context"],
                                 precision=min(
@@ -272,6 +302,8 @@ def run(train_steps=1200, warmup=10, max_frames=120, episodes=2,
                             prior_info = dict(
                                 node=int(choice["node"]),
                                 distance=float(choice["distance"]),
+                                raw_distance=float(choice["raw_distance"]),
+                                credibility=float(choice["credibility"]),
                                 support=float(choice["support"]),
                                 margin=float(choice["margin"]),
                                 accepted=True,
@@ -280,12 +312,18 @@ def run(train_steps=1200, warmup=10, max_frames=120, episodes=2,
                             prior_info = dict(
                                 node=int(choice["node"]),
                                 distance=float(choice["distance"]),
+                                raw_distance=float(choice["raw_distance"]),
+                                credibility=float(choice["credibility"]),
                                 support=float(choice["support"]),
                                 margin=float(choice["margin"]),
                                 accepted=False,
-                                fallback="ambiguous",
+                                fallback=(
+                                    "ambiguous"
+                                    if choice["margin"] < 0.05
+                                    else "low_credibility"
+                                ),
                             )
-                frames, errors = _plan(
+                frames, errors, prediction = _plan(
                     env, model, agent, recent, max_frames,
                     horizon=horizon,
                 )
@@ -297,6 +335,7 @@ def run(train_steps=1200, warmup=10, max_frames=120, episodes=2,
                     if errors else 0.0,
                     error_all=float(np.mean(errors)) if errors else 0.0,
                     prior=prior_info,
+                    prediction=prediction,
                 )
             rows[episode] = arms
         results[world_seed] = rows

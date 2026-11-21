@@ -2400,16 +2400,48 @@ class NodeRuntime:
 
     def set_prediction(self, observation) -> List[str]:
         """Record the roots the planner expects at the next state."""
-        node_ids = self._branch_active_features(observation)
+        node_ids = self.prediction_nodes(observation)
         self.prediction_branch.activate(
             node_ids, [1.0] * len(node_ids)
         )
         self._last_prediction = set(node_ids)
         return node_ids
 
+    def active_feature_roots(self, observation) -> List[str]:
+        """Public read of the roots active at an observation."""
+        return self._branch_active_features(observation)
+
+    def nearest_prototype(self, observation):
+        """Nearest prototype to an observation with zero pending actions."""
+        obs = np.asarray(observation, dtype=float).reshape(-1)
+        if obs.shape[0] < self.obs_dim or not self._prototype_ids:
+            return None, float("inf")
+        state = np.concatenate([
+            obs[:self.obs_dim], np.zeros(self.lag, dtype=float)
+        ]) / self.scales
+        return self._nearest(state)
+
+    def prediction_nodes(self, observation) -> List[str]:
+        """Nodes whose prediction ability is tracked at this observation.
+
+        Feature roots are the preferred granularity.  When a world's roots
+        do not fire (a known held-out failure mode), fall back to the
+        nearest prototype so the prediction channel still has an anchor.
+        """
+        roots = self.active_feature_roots(observation)
+        if roots:
+            return roots
+        node_id, _distance = self.nearest_prototype(observation)
+        return [node_id] if node_id is not None else []
+
+    def reset_prediction_stats(self) -> None:
+        self.prediction_stats.clear()
+        self._last_prediction = set()
+        self.prediction_branch.reset()
+
     def observe_prediction(self, observation) -> dict:
         """Compare the recorded prediction with the actually entered state."""
-        actual = set(self._branch_active_features(observation))
+        actual = set(self.prediction_nodes(observation))
         predicted = set(self._last_prediction)
         for node_id in predicted:
             stats = self.prediction_stats.setdefault(

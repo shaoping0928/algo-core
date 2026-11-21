@@ -149,5 +149,25 @@ class BranchTests(unittest.TestCase):
         )
 
 
+    def test_runtime_prediction_falls_back_to_nearest_prototype(self):
+        import numpy as np
+        from node_runtime import NodeRuntime
+
+        runtime = NodeRuntime(
+            obs_dim=1, lag=1, scales=np.asarray([1.0, 1.0]),
+            birth_threshold=0.01, max_nodes=40, exploration=0.0,
+            alpha_v=0.5, alpha_q=0.5, gamma=0.9, lam=0.9,
+        )
+        first = runtime._create_node(np.asarray([0.0, 0.0]))
+        runtime._create_node(np.asarray([1.0, 0.0]))
+        runtime.set_prediction(np.asarray([0.0]))
+        hit = runtime.observe_prediction(np.asarray([0.0]))
+        self.assertEqual(hit["hits"], 1)
+        self.assertIn(first, runtime.prediction_stats)
+        runtime.set_prediction(np.asarray([1.0]))
+        miss = runtime.observe_prediction(np.asarray([0.0]))
+        self.assertEqual(miss["hits"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

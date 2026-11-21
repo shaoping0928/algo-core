@@ -37,6 +37,9 @@ def _summarise(reports):
     for seed, report in reports:
         seed_global = []
         seed_online = []
+        accepted = 0
+        fallback = 0
+        candidate_credibility = []
         for world, episodes in report["results"].items():
             for episode, arms in episodes.items():
                 generated = arms["generated"]["frames"]
@@ -48,11 +51,26 @@ def _summarise(reports):
                 deltas_online.append(delta_online)
                 seed_global.append(delta_global)
                 seed_online.append(delta_online)
+                prior = arms["generated"]["prior"]
+                if prior is not None:
+                    if prior.get("accepted"):
+                        accepted += 1
+                    else:
+                        fallback += 1
+                    candidate_credibility.append(
+                        float(prior.get("credibility", 0.5))
+                    )
         per_seed[seed] = dict(
             context_dim=report["context_dim"],
             candidates=report["candidates"],
             mean_global=float(np.mean(seed_global)),
             mean_online=float(np.mean(seed_online)),
+            accepted=accepted,
+            fallback=fallback,
+            mean_candidate_credibility=(
+                float(np.mean(candidate_credibility))
+                if candidate_credibility else 0.0
+            ),
             deltas_global=seed_global,
             deltas_online=seed_online,
         )
@@ -67,6 +85,12 @@ def _summarise(reports):
         median_online=float(np.median(deltas_online)),
         positive_online=int(sum(d > 0 for d in deltas_online)),
         ties_online=int(sum(d == 0 for d in deltas_online)),
+        accepted=int(sum(item["accepted"] for item in per_seed.values())),
+        fallback=int(sum(item["fallback"] for item in per_seed.values())),
+        mean_candidate_credibility=float(np.mean([
+            item["mean_candidate_credibility"]
+            for item in per_seed.values()
+        ])),
         deltas_global=deltas_global,
         deltas_online=deltas_online,
     )
