@@ -121,8 +121,24 @@ def single_link_clusters(vectors, radius):
     return [mapping[label] for label in labels]
 
 
-def analyse_stream(rows, radius=None, min_length=5):
-    """Everything the stage graph would need from one real stream."""
+def analyse_stream(rows, radius=None, min_length=5, control="none",
+                   rng=None):
+    """Everything the stage graph would need from one real stream.
+
+    ``control``:
+      - ``none``: the real stream;
+      - ``shuffle_actions``: per-episode action labels are permuted (the
+        multiset is kept).  If the segmentation/edges survive, the
+        structure is estimator construction, not action-conditioned
+        dynamics;
+      - ``random_boundaries``: the real number of segments per episode is
+        kept but the boundaries are placed uniformly at random (minimum
+        length respected).  If the edge concentration survives, it is not
+        evidence for event-driven boundaries.
+    All counts are in **frames** (``count_unit`` says so); episode breadth
+    is reported separately.
+    """
+    rng = np.random.RandomState(12345) if rng is None else rng
     scale = np.asarray(
         [np.std([row["obs"][dim] for row in rows]) for dim in range(
             len(rows[0]["obs"])
@@ -146,11 +162,35 @@ def analyse_stream(rows, radius=None, min_length=5):
             for row in episode
         ])
         actions = [int(row["history"][0]) for row in episode]
+        if control == "shuffle_actions":
+            actions = [int(value) for value in rng.permutation(actions)]
         if len(episode) < 2 * min_length:
             short_episodes += 1
-        found = segment_episode(
-            deltas, actions, min_length=min_length, gains=split_gains
-        )
+        if control == "random_boundaries" and len(episode) >= 2 * min_length:
+            # Keep the real segment count, randomise the locations.
+            real = segment_episode(deltas, actions, min_length=min_length)
+            wanted = max(1, len(real))
+            cuts = []
+            for _attempt in range(200):
+                candidates = sorted(rng.choice(
+                    range(min_length, len(episode) - min_length + 1),
+                    size=min(wanted - 1, max(len(episode) - 2 * min_length, 0)),
+                    replace=False,
+                ))
+                gaps = [b - a for a, b in zip(
+                    [0] + candidates, candidates + [len(episode)]
+                )]
+                if all(gap >= min_length for gap in gaps):
+                    cuts = candidates
+                    break
+            bounds = [0] + list(cuts) + [len(episode)]
+            found = [
+                (bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)
+            ]
+        else:
+            found = segment_episode(
+                deltas, actions, min_length=min_length, gains=split_gains
+            )
         episode_report.append(dict(
             episode=episode_id,
             frames=len(episode),
@@ -178,15 +218,20 @@ def analyse_stream(rows, radius=None, min_length=5):
     clusters = len(set(labels))
 
     # (stage, action) support and (stage, action, next stage) edges.
+    # Both are counted in FRAMES; episode breadth is tracked separately.
     cell_frames = Counter()
     cell_episodes = defaultdict(set)
     edge_frames = Counter()
     edge_episodes = defaultdict(set)
     for index, segment in enumerate(segments):
         stage = labels[index]
-        for offset, action in enumerate(segment["actions"]):
-            cell_frames[(stage, action)] += 1
-            cell_episodes[(stage, action)].add(segment["episode"])
+        for action in (0, 1):
+            frames = sum(
+                1 for value in segment["actions"] if value == action
+            )
+            if frames:
+                cell_frames[(stage, action)] += frames
+                cell_episodes[(stage, action)].add(segment["episode"])
         # One edge per (stage, action, next stage); the next stage is the
         # following segment in the same episode, or END at the boundary.
         following = segments[index + 1] \
@@ -194,11 +239,15 @@ def analyse_stream(rows, radius=None, min_length=5):
             and segments[index + 1]["episode"] == segment["episode"] \
             else None
         next_stage = labels[index + 1] if following is not None else -1
-        for action in sorted(set(segment["actions"])):
-            edge_frames[(stage, action, next_stage)] += 1
-            edge_episodes[(stage, action, next_stage)].add(
-                segment["episode"]
+        for action in (0, 1):
+            frames = sum(
+                1 for value in segment["actions"] if value == action
             )
+            if frames:
+                edge_frames[(stage, action, next_stage)] += frames
+                edge_episodes[(stage, action, next_stage)].add(
+                    segment["episode"]
+                )
 
     total_frames = sum(cell_frames.values())
     cell_supports = np.asarray(sorted(cell_frames.values()), dtype=float)
@@ -215,6 +264,16 @@ def analyse_stream(rows, radius=None, min_length=5):
     top_edges = sorted(
         edge_frames.items(), key=lambda item: -item[1]
     )[:6]
+    informative = [
+        (key, count) for key, count in edge_frames.items()
+        if key[2] >= 0 and key[2] != key[0]
+    ]
+    informative_ge2 = sum(1 for _key, count in informative if count >= 2)
+    informative_ge5 = sum(1 for _key, count in informative if count >= 5)
+    informative_cross3 = sum(
+        1 for key, count in informative
+        if count >= 5 and len(edge_episodes[key]) >= 3
+    )
     gains = np.asarray([gain for _cut, gain in split_gains], dtype=float)
     lengths = np.asarray(
         [end - start for start, end in
@@ -223,6 +282,8 @@ def analyse_stream(rows, radius=None, min_length=5):
     )
 
     return dict(
+        control=control,
+        count_unit="frames",
         frames=len(rows),
         episodes=len(episodes),
         short_episodes=short_episodes,
@@ -264,6 +325,9 @@ def analyse_stream(rows, radius=None, min_length=5):
         edge_support_median=float(np.median(edge_supports)),
         edge_support_ge2=sum(1 for value in edge_frames.values() if value >= 2),
         edge_support_ge5=sum(1 for value in edge_frames.values() if value >= 5),
+        edge_informative_ge2=informative_ge2,
+        edge_informative_ge5=informative_ge5,
+        edge_informative_cross3=informative_cross3,
         edge_top4_share=(
             float(sum(count for _key, count in top_edges[:4]))
             / float(edge_total)
@@ -285,35 +349,106 @@ def analyse_stream(rows, radius=None, min_length=5):
     )
 
 
-def run(args):
-    streams = []
-    original_train = sn._train
-
-    def traced_train(transitions, **kwargs):
-        world, agent = original_train(transitions, **kwargs)
-        streams.append(list(transitions))
-        return world, agent
-
-    sn._train = traced_train
-    try:
-        fit(
-            seed=args.seed, steps=args.steps, coverage=0.1,
-            epochs=1, max_nodes=args.max_nodes, birth_threshold=0.45,
-            curiosity_weight=0.5, memory_credit=False,
-            dagger_rounds=args.rounds, dagger_episodes=2,
-            dagger_cap=args.dagger_cap, dagger_frames=args.dagger_frames,
-            dagger_horizon=8, step_stride=2,
+def dump_streams(streams, path):
+    """Save the captured streams so controls can rerun without retraining."""
+    payload = {}
+    for index, stream in enumerate(streams):
+        for key in ("obs", "next_obs", "history", "signals"):
+            payload["p%d_%s" % (index, key)] = np.asarray(
+                [row[key] for row in stream], dtype=float
+            )
+        payload["p%d_done" % index] = np.asarray(
+            [bool(row["done"]) for row in stream], dtype=bool
         )
-    finally:
-        sn._train = original_train
-    return dict(
-        seed=int(args.seed),
-        streams=[
-            dict(phase=index + 1, rows=len(stream),
-                 **analyse_stream(stream, radius=args.stage_radius))
-            for index, stream in enumerate(streams)
-        ],
+        payload["p%d_episode" % index] = np.asarray(
+            [int(row["episode"]) for row in stream], dtype=int
+        )
+    payload["phases"] = np.asarray(
+        ["p%d" % index for index in range(len(streams))]
     )
+    np.savez_compressed(path, **payload)
+
+
+def load_streams(path):
+    data = np.load(path, allow_pickle=False)
+    streams = []
+    for phase in [str(value) for value in data["phases"]]:
+        count = len(data["%s_obs" % phase])
+        rows = []
+        for index in range(count):
+            rows.append(dict(
+                obs=data["%s_obs" % phase][index],
+                next_obs=data["%s_next_obs" % phase][index],
+                history=data["%s_history" % phase][index],
+                signals=data["%s_signals" % phase][index],
+                done=bool(data["%s_done" % phase][index]),
+                episode=int(data["%s_episode" % phase][index]),
+            ))
+        streams.append(rows)
+    return streams
+
+
+def compact(result):
+    """The control-relevant subset (keeps the JSON small)."""
+    return dict(
+        control=result["control"],
+        clusters=result["clusters"],
+        segments=result["segments"],
+        split_gains=len(result["split_gains"]),
+        stage_length_p50=result["stage_length_p50"],
+        edges=result["edges"],
+        edge_support_median=result["edge_support_median"],
+        edge_informative_ge5=result["edge_informative_ge5"],
+        edge_top4_share=result["edge_top4_share"],
+        frame_abstain_rate=result["frame_abstain_rate"],
+    )
+
+
+def run(args):
+    if args.replay:
+        streams = load_streams(args.replay)
+    else:
+        streams = []
+        original_train = sn._train
+
+        def traced_train(transitions, **kwargs):
+            world, agent = original_train(transitions, **kwargs)
+            streams.append(list(transitions))
+            return world, agent
+
+        sn._train = traced_train
+        try:
+            fit(
+                seed=args.seed, steps=args.steps, coverage=0.1,
+                epochs=1, max_nodes=args.max_nodes, birth_threshold=0.45,
+                curiosity_weight=0.5, memory_credit=False,
+                dagger_rounds=args.rounds, dagger_episodes=2,
+                dagger_cap=args.dagger_cap, dagger_frames=args.dagger_frames,
+                dagger_horizon=8, step_stride=2,
+            )
+        finally:
+            sn._train = original_train
+        if args.dump_streams:
+            dump_streams(streams, args.dump_streams)
+    results = []
+    for index, stream in enumerate(streams):
+        entry = dict(
+            phase=index + 1, rows=len(stream),
+            **analyse_stream(stream, radius=args.stage_radius),
+        )
+        if not args.no_controls:
+            entry["controls"] = dict(
+                shuffle_actions=compact(analyse_stream(
+                    stream, radius=args.stage_radius,
+                    control="shuffle_actions",
+                )),
+                random_boundaries=compact(analyse_stream(
+                    stream, radius=args.stage_radius,
+                    control="random_boundaries",
+                )),
+            )
+        results.append(entry)
+    return dict(seed=int(args.seed), streams=results)
 
 
 def print_summary(report):
@@ -355,9 +490,12 @@ def print_summary(report):
         )
         print(
             "  (stage, action, next) edges: %d  support median %.0f  "
-            ">=2: %d  >=5: %d  top4 share %.0f%%  frame abstain %.0f%%"
+            ">=2: %d  >=5: %d  informative>=5: %d (cross>=3 ep: %d)  "
+            "top4 share %.0f%%  abstain %.0f%%"
             % (stream["edges"], stream["edge_support_median"],
                stream["edge_support_ge2"], stream["edge_support_ge5"],
+               stream["edge_informative_ge5"],
+               stream["edge_informative_cross3"],
                100.0 * stream["edge_top4_share"],
                100.0 * stream["edge_frame_abstain_rate"])
         )
@@ -366,6 +504,18 @@ def print_summary(report):
                 "    top edge s%d a%d -> s%d  frames %d"
                 % (edge["stage"], edge["action"], edge["next_stage"],
                    edge["frames"])
+            )
+        for label, control in (stream.get("controls") or {}).items():
+            print(
+                "    control %s: clusters %d, segments %d, splits %d, "
+                "edges %d (median %.0f), informative>=5 %d, "
+                "top4 %.0f%%, length p50 %.0f"
+                % (label, control["clusters"], control["segments"],
+                   control["split_gains"], control["edges"],
+                   control["edge_support_median"],
+                   control["edge_informative_ge5"],
+                   100.0 * control["edge_top4_share"],
+                   control["stage_length_p50"])
             )
     print()
 
@@ -381,6 +531,15 @@ def main():
     parser.add_argument("--stage-radius", type=float, default=None,
                         help="single-link radius for stage clusters; "
                              "default = median pairwise segment distance")
+    parser.add_argument("--dump-streams", default="",
+                        help="save the captured real streams to this npz "
+                             "path so controls can rerun without training")
+    parser.add_argument("--replay", default="",
+                        help="load streams from --dump-streams and only "
+                             "run the analysis/controls")
+    parser.add_argument("--no-controls", action="store_true",
+                        help="skip the action-shuffle and random-boundary "
+                             "controls")
     parser.add_argument("--report", default="")
     args = parser.parse_args()
     report = run(args)
