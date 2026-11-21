@@ -2389,6 +2389,103 @@ class NodeRuntime:
         self._prune_components()
         self.reset()
 
+    def replay_features(self, rows) -> None:
+        """Feature-only backfit pass.
+
+        Replays real transitions to update the feature action/pain cells,
+        the sequence-value cells and the prediction ledger.  Prototypes,
+        action edges, memories and their counts are not touched: the
+        prototype layer keeps its single-pass statistics, which isolates
+        the "reconnect the feature channels" effect from the doubled
+        prototype MC learning of a full second epoch.
+        """
+        rows = list(rows)
+        if not rows or not self.feature_ids:
+            return
+        scale = self.scales[:self.obs_dim]
+        observations = np.asarray([
+            np.asarray(row["obs"], dtype=float) / scale for row in rows
+        ])
+        next_observations = np.asarray([
+            np.asarray(row["next_obs"], dtype=float) / scale for row in rows
+        ])
+        obs_table = self._feature_mask_table(observations)
+        horizons = {self._node_horizon(fid) for fid in self.feature_ids}
+        horizons.add(self.pain_horizon)
+        if self.point_labels:
+            point = [
+                float(np.asarray(row["signals"], dtype=float)[1] > 0.5)
+                for row in rows
+            ]
+            labels_by_horizon = {
+                horizon: point for horizon in sorted(horizons)
+            }
+        else:
+            labels_by_horizon = {
+                horizon: future_pain_labels(rows, horizon)
+                for horizon in sorted(horizons)
+            }
+        value_roots_all = set(self._all_value_roots())
+        active_per_row = []
+        for index, row in enumerate(rows):
+            current_active = [
+                node_id
+                for node_id, mask in zip(self._feature_all, obs_table)
+                if mask is not None and bool(mask[index])
+            ]
+            active_per_row.append(current_active)
+            self._activate_features(current_active)
+            history = np.asarray(row["history"], dtype=float).reshape(-1)
+            acting = int(round(float(history[self.lag]))) \
+                if history.size > self.lag \
+                else int(round(float(history[0])))
+            state = np.concatenate([
+                observations[index], np.zeros(self.lag, dtype=float)
+            ])
+            by_horizon = {}
+            for node_id in current_active:
+                by_horizon.setdefault(
+                    self._node_horizon(node_id), []
+                ).append(node_id)
+            for horizon, node_ids in by_horizon.items():
+                root_ids = [
+                    node_id for node_id in node_ids
+                    if node_id in self.feature_ids
+                ]
+                if root_ids:
+                    self._record_prediction(
+                        root_ids, acting,
+                        labels_by_horizon[horizon][index], state,
+                    )
+                self._update_feature_pain(
+                    node_ids, labels_by_horizon[horizon][index]
+                )
+                self._update_feature_action(
+                    node_ids, acting, labels_by_horizon[horizon][index]
+                )
+        running = 0.0
+        for index in range(len(rows) - 1, -1, -1):
+            row = rows[index]
+            signals = np.asarray(row["signals"], dtype=float)
+            dopamine = float(signals[0])
+            running = dopamine + (
+                0.0 if bool(row["done"]) else self.gamma * running
+            )
+            history = np.asarray(row["history"], dtype=float).reshape(-1)
+            acting = int(round(float(history[self.lag]))) \
+                if history.size > self.lag \
+                else int(round(float(history[0])))
+            roots = [
+                node_id for node_id in active_per_row[index]
+                if node_id in value_roots_all
+            ]
+            if roots:
+                self._update_feature_value(
+                    roots, acting, running,
+                    episode_id=int(row["episode"]),
+                )
+        self.reset()
+
     def induce_rules(self, train_states, train_pain,
                      test_states=None, test_pain=None, coverage_states=None):
         """Induce compositional precursor rules over encoded states.

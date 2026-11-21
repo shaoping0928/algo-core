@@ -400,6 +400,28 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
 下一刀：`curiosity=0`（同样 epochs=2、value_weight=0），隔离好奇心项；
 若仍不恢复，则指向“第二遍原型 MC 学习 / 数据分布”而不是目标列。
 
+**权重隔离第二刀（2026-11-21，epochs=2 + value_weight=0 + curiosity=0）**
+
+| 臂 | 100 | 101 | 102 | 均值 | 中位 |
+|---|---:|---:|---:|---:|---:|
+| epochs=2 基线 | 72.6 | 121.0 | 132.6 | 108.7 | 72 |
+| + value_weight=0 | 101.8 | 122.2 | 105.0 | 109.7 | 72 |
+| + value_weight=0 + curiosity=0 | 85.2 | 124.2 | 62.4 | **90.6** | 72 |
+| paired（vs e2 基线） | +12.6 | +3.2 | −70.2 | **−18.1** | 1/3 |
+
+**判定：价值项与好奇心项都被排除**（关掉后不恢复，反而更差）。剩余嫌疑
+收敛到**第二遍原型 MC 学习 / 采集分布**。
+
+**特征回拟合 pass（2026-11-21，已实现）**
+
+- `NodeRuntime.replay_features(rows)`：只更新特征动作/痛格、价值格与逐行
+  预测账本；**原型、动作边、记忆与其计数保持单遍统计**；
+- `_train(feature_backfit=True)`：epoch 0 正常学习 + 归纳，epoch ≥1 改走
+  `replay_features`；CLI `--feature-backfit`；
+- 285 测试通过（新增 `test_replay_features_updates_cells_without_prototypes`）；
+- A/B：epochs=2 + `--feature-backfit`（默认权重），3 种子进行中——若恢复到
+  基线 152.9 附近，则“e2 崩塌”归因于原型层双遍，特征通道本身可用。
+
 **质量门**：阶段同质性（within-stage residual 显著低于跨阶段）；转移校准
 误差可控、applicability violation 低、support 不足 abstain；seed 101 的
 decision-relevant miss/regret 下降；seed 100/102 selected survives 不降、

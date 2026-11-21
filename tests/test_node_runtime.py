@@ -677,6 +677,46 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertTrue(bool(table[0][0]))
         self.assertFalse(bool(table[0][1]))
 
+    def test_replay_features_updates_cells_without_prototypes(self):
+        from node_features import FeatureRule, Primitive
+
+        runtime = self.make_runtime(
+            obs_dim=1, scales=np.asarray([1.0]), lag=0, max_nodes=20
+        )
+        runtime.rules.rules = [
+            FeatureRule(
+                Primitive(0, False, ">", 0.0), 10, 8.0, 0.8, 5, 4.0, 0.8, 0.8
+            )
+        ]
+        runtime.install_feature_rules()
+        rows = [
+            dict(
+                obs=np.asarray([1.0]), next_obs=np.asarray([2.0]),
+                history=np.asarray([0.0]),
+                signals=np.asarray([1.0, 1.0]), done=False, episode=0,
+            ),
+            dict(
+                obs=np.asarray([2.0]), next_obs=np.asarray([3.0]),
+                history=np.asarray([1.0]),
+                signals=np.asarray([1.0, 0.0]), done=True, episode=0,
+            ),
+        ]
+        runtime.replay_features(rows)
+        root = runtime.feature_ids[0]
+        action_observations = sum(
+            cell[0]
+            for cell in runtime.feature_action_stats.get(root, {}).values()
+        )
+        value_observations = sum(
+            cell[0]
+            for cell in runtime.feature_value_stats.get(root, {}).values()
+        )
+        self.assertGreater(action_observations, 0)
+        self.assertGreater(value_observations, 0)
+        # The prototype layer is untouched: no prototypes were created and
+        # the feature nodes keep their installation statistics.
+        self.assertEqual(len(runtime._prototype_ids), 0)
+
     def test_merged_episode_keeps_backward_references_alive(self):
         # Two real episodes concatenated in one call (what colliding DAgger
         # episode ids used to produce): the mid-call reset must not drop

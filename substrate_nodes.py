@@ -131,6 +131,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         rule_coverage_x=None, pairwise_features: bool = False,
         branch_transitions: bool = False,
         action_edge_weight: float = 0.0,
+        feature_backfit: bool = False,
         action_edge_trust_samples: float = 50.0,
         death_rules: bool = False,
         death_rule_compose: bool = False,
@@ -258,7 +259,12 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
 
     for epoch in range(epochs):
         for episode in ordered:
-            agent.learn_episode(episode)
+            if feature_backfit and epoch > 0:
+                # Feature-only replay: prototypes, edges and memories keep
+                # their single-pass statistics.
+                agent.replay_features(episode)
+            else:
+                agent.learn_episode(episode)
         if induce_features and epoch == 0:
             primary = pain_short if long_window is not None else pain
             agent.induce_rules(
@@ -699,6 +705,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         rule_validation_seed=0, rule_validation_frames=600,
         pairwise_features=False, branch_transitions=False,
         action_edge_weight=0.0, action_edge_trust_samples=50.0,
+        feature_backfit=False,
         death_rules=False, death_rule_compose=False,
         death_rule_max_thresholds=256, death_rule_max_rules=24,
         death_rule_max_literals=5, death_rule_boundary_margin=0.0,
@@ -886,6 +893,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         branch_transitions=branch_transitions,
         action_edge_weight=action_edge_weight,
         action_edge_trust_samples=action_edge_trust_samples,
+        feature_backfit=feature_backfit,
         death_rules=death_rules,
         death_rule_compose=death_rule_compose,
         death_rule_max_thresholds=death_rule_max_thresholds,
@@ -1626,6 +1634,7 @@ def run_seed(task):
     rule_validation_frames = int(task.get("rule_validation_frames", 600))
     pairwise_features = bool(task.get("pairwise_features", False))
     branch_transitions = bool(task.get("branch_transitions", False))
+    feature_backfit = bool(task.get("feature_backfit", False))
     action_edge_weight = float(task.get("action_edge_weight", 0.0))
     action_edge_trust_samples = float(
         task.get("action_edge_trust_samples", 50.0)
@@ -1710,6 +1719,7 @@ def run_seed(task):
         rule_validation_frames=rule_validation_frames,
         pairwise_features=pairwise_features,
         branch_transitions=branch_transitions,
+        feature_backfit=feature_backfit,
         action_edge_weight=action_edge_weight,
         action_edge_trust_samples=action_edge_trust_samples,
         death_rules=death_rules,
@@ -1929,6 +1939,11 @@ def main():
                         action="store_false",
                         help="deprecated alias; pairwise differences are "
                              "off by default")
+    parser.add_argument("--feature-backfit", action="store_true",
+                        help="replay the stream with features only after "
+                             "induction: feature cells, value cells and the "
+                             "prediction ledger learn; prototypes, edges and "
+                             "memories keep their single-pass statistics")
     parser.set_defaults(pairwise_features=False)
     parser.add_argument("--branch-transitions", action="store_true",
                         help="add decayed recent branch sources to "
@@ -2187,6 +2202,7 @@ def main():
             rule_validation_frames=args.rule_validation_frames,
             pairwise_features=args.pairwise_features,
             branch_transitions=args.branch_transitions,
+            feature_backfit=args.feature_backfit,
             action_edge_weight=args.action_edge_weight,
             action_edge_trust_samples=args.action_edge_trust,
             death_rules=args.death_rules,
