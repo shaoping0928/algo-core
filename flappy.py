@@ -44,11 +44,16 @@ SEED = 21
 
 
 class Flappy:
-    def __init__(self, seed, max_t=None):
+    def __init__(self, seed, max_t=None, gravity=None, flap=None):
         self.rng = np.random.RandomState(seed)
         self.max_t = MAXT if max_t is None else int(max_t)
         if self.max_t < 1:
             raise ValueError("max_t must be a positive integer")
+        # Per-instance dynamics.  The defaults preserve the benchmark
+        # physics; a caller may vary them to create worlds whose latent
+        # dynamics differ.  The learner never sees these values.
+        self.gravity = GRAVITY if gravity is None else float(gravity)
+        self.flap = FLAP if flap is None else float(flap)
         self.reset()
 
     def reset(self):
@@ -71,10 +76,10 @@ class Flappy:
 
     def step(self, flap):
         self.t += 1
-        imp = FLAP
+        imp = self.flap
         if flap and V0 > 0.0 and self.vy < 0.0:
             imp *= float(np.exp(self.vy / V0))
-        self.vy += -GRAVITY * (1.0 + KY * (self.y - 0.5) ** 2) \
+        self.vy += -self.gravity * (1.0 + KY * (self.y - 0.5) ** 2) \
             - DRAG * self.vy * abs(self.vy) + (imp if flap else 0.0)
         self.y += self.vy
         for p in self.pipes:

@@ -23,10 +23,10 @@ SEEDS = list(range(100, 120))
 class Latent(Env):
     lag = 0
 
-    def __init__(self, seed):
+    def __init__(self, seed, gravity=None, flap=None):
         self._q = deque([0] * (self.lag + 1), maxlen=self.lag + 1)
         self._alive = 0.0
-        super().__init__(seed)
+        super().__init__(seed, gravity=gravity, flap=flap)
         self.max_t = CAP
 
     def reset(self):
