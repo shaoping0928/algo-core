@@ -27,11 +27,37 @@ from stage_graph import _kmeans
 from substrate_nodes import LAG, _curiosity_off, _encoded_pending, evaluate, fit
 
 
-def labels_for(rows, agent, count):
+def labels_for(rows, agent, count, detrend=False):
     obs = np.asarray([row["obs"] for row in rows], dtype=float)
     pending = _encoded_pending(rows, LAG)
     encoded = np.concatenate([obs, pending], axis=1) / agent.scales
+    if detrend:
+        encoded = remove_time_component(encoded, rows)
     return np.asarray(_kmeans(encoded, count, seed=0), dtype=int), encoded
+
+
+def remove_time_component(encoded, rows):
+    """Drop the part of each coordinate that episode progress alone explains.
+
+    A coordinate that moves with the episode clock turns every partition
+    built on it into a clock: its cells are entered at the same frame in
+    every episode.  Taking the residual of a per-episode linear fit to
+    progress keeps the state content and removes the clock, without
+    naming any coordinate.
+    """
+    out = np.asarray(encoded, dtype=float).copy()
+    episodes = {}
+    for index, row in enumerate(rows):
+        episodes.setdefault(int(row["episode"]), []).append(index)
+    for indices in episodes.values():
+        progress = np.arange(len(indices), dtype=float)
+        block = out[indices]
+        design = np.column_stack([np.ones(len(indices)), progress])
+        coefficients, _residual, _rank, _singular = np.linalg.lstsq(
+            design, block, rcond=None
+        )
+        out[indices] = block - design @ coefficients
+    return out
 
 
 def runs(labels):
@@ -74,6 +100,7 @@ def main():
     parser.add_argument("--seed", type=int, default=100)
     parser.add_argument("--eval-seeds", default="120-124")
     parser.add_argument("--counts", default="4,8,16,32")
+    parser.add_argument("--detrend", action="store_true")
     parser.add_argument("--cap", type=int, default=5000)
     args = parser.parse_args()
     from eval_protocol import parse_seed_spec
@@ -105,7 +132,7 @@ def main():
     print("  k   dwell-p50  in-window  cells  shared  clock-like  eta2(y8)")
 
     for count in counts:
-        labels, _encoded = labels_for(rows, agent, count)
+        labels, _encoded = labels_for(rows, agent, count, detrend=args.detrend)
         episode_labels = {}
         offset = 0
         for eval_seed in eval_seeds:
