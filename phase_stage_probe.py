@@ -27,22 +27,37 @@ from stage_graph import _kmeans
 from substrate_nodes import LAG, _curiosity_off, _encoded_pending, evaluate, fit
 
 
-def estimate_period(observations, low=6, high=80):
-    z = np.asarray(observations, dtype=float)
-    z = (z - z.mean(axis=0)) / (z.std(axis=0) + 1e-9)
-    count = len(z)
-    curves = []
-    for column in range(z.shape[1]):
-        spectrum = np.abs(np.fft.rfft(z[:, column], n=2 * count)) ** 2
-        autocorrelation = np.fft.irfft(spectrum)[:count]
-        if autocorrelation[0] > 1e-12:
-            autocorrelation = autocorrelation / autocorrelation[0]
-        curves.append(autocorrelation)
-    curve = np.mean(curves, axis=0)
-    high = min(high, count // 3)
-    if high <= low:
-        return 1, curve
-    return low + int(np.argmax(curve[low:high])), curve
+def estimate_period(observations, episodes, low=8, high=120):
+    """Dominant per-episode period, median across episodes.
+
+    The earlier autocorrelation estimate peaked at the bottom of its lag
+    range (6 frames), which is short-range smoothness, not a cycle.  A
+    periodogram per episode, restricted to the plausible band, reports the
+    spectral peak instead.
+    """
+    observations = np.asarray(observations, dtype=float)
+    periods = []
+    peaks = []
+    for episode in np.unique(episodes):
+        block = observations[episodes == episode]
+        count = len(block)
+        if count < 3 * low:
+            continue
+        z = (block - block.mean(axis=0)) / (block.std(axis=0) + 1e-9)
+        spectrum = np.abs(np.fft.rfft(z, axis=0)) ** 2
+        power = spectrum.mean(axis=1)
+        frequencies = np.fft.rfftfreq(count)
+        top = min(high, count // 3)
+        mask = (frequencies >= 1.0 / top) & (frequencies <= 1.0 / low)
+        if not mask.any():
+            continue
+        indices = np.flatnonzero(mask)
+        best = indices[int(np.argmax(power[indices]))]
+        periods.append(1.0 / float(frequencies[best]))
+        peaks.append(float(power[best] / (power[1:].sum() + 1e-12)))
+    if not periods:
+        return 1, 0.0, []
+    return int(round(float(np.median(periods)))), float(np.mean(peaks)), periods
 
 
 def horizon_labels(rows, horizon=8):
@@ -148,7 +163,7 @@ def main():
         [observations, pending], axis=1
     ) / agent.scales
 
-    period, curve = estimate_period(observations)
+    period, peak, per_episode = estimate_period(observations, episodes)
     order = np.argsort(episodes)
     phase_index = np.zeros(len(rows), dtype=int)
     for episode in np.unique(episodes):
@@ -162,8 +177,12 @@ def main():
     print("== phase-relative stages: seed %d, %d frames, %d episodes ==" % (
         args.seed, len(rows), len(eval_seeds)
     ))
-    print("  estimated period %d frames (autocorrelation peak %.3f), "
-          "y8 base %.3f" % (period, float(curve[period]), float(y.mean())))
+    print("  estimated period %d frames (spectral peak share %.3f), "
+          "per-episode %s, y8 base %.3f" % (
+              period, peak,
+              ",".join("%.0f" % value for value in per_episode),
+              float(y.mean()),
+          ))
     report("absolute", np.asarray(
         _kmeans(encoded, args.absolute, seed=0), dtype=int
     ), y, episodes)
