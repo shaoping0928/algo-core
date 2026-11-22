@@ -133,3 +133,17 @@ flappy/latent_world → substrate_generic.collect（真实转移）
 4. **`lag` 语义**：动作延迟生效，真正掌管 `s_{t+1}` 的动作是 `history[lag]`（acting action）；特征/价值格子按 acting 键控。
 5. **确定性**：同命令重复运行逐位相同（含 DAgger 多轮与多进程 `--jobs`）；行为流采样器被哈希钉死，任何改动必须有意更新哈希。
 6. **内存可预算**：图节点有 `max_nodes` 上限；原型有方差出生 + 效用修剪；分片/进程并行避免单点爆炸（见 `TODO.md` 运行卫生）。
+
+## 8. 实验线与只读探针
+
+在主线之外，仓库还有若干**并行的实验线**（详见 [07 新增实验线](./07-experiment-lines.md)），它们的共同模式是：**只读地消费主线**（`substrate_nodes.fit` 产出 `world/agent`，探针调用 `evaluate / policy_result / _curiosity_off`），不改默认训练与决策路径。
+
+| 实验线 | 试图回答的问题 | 状态（已记录） |
+|---|---|---|
+| 阶段 / 相位（`stage_*`、`phase_stage_probe`、`state_partition_probe`） | 能否把世界按时间/状态分成粗粒度决策单元 | 分割器抓住的是周期性世界重置；相位相对阶段与线性去趋势均被**否决** |
+| 0/1 死亡规则（`death_rules`、`rule_expressions`、`contextual_rules`、`pattern_library`） | 能否用可证伪的 0/1/UNKNOWN 规则替代概率 hazard | 规则集与精化循环已实现并有测试；反事实失败探针发现规划器极少进入规则遗漏的终止态 |
+| 上下文 / 动力学（`context_model`、`dynamics_context_probe`、`generated_prior_probe`） | 隐藏动力学切换时能否快速重识别 | 共享映射 + 低秩上下文 + 变化检测，三臂对照 |
+| 记忆 / 生成（`memory_tree`、`hierarchical_memory`、`generative_expansion`、`variable_registry`、`branches`） | 结构化分层记忆与"从摘要生成" | 纯库 + 测试；`generated_prior_probe` 验证生成先验 |
+| 动作 / 时程 / 选择诊断（`causal_horizon_probe`、`doom_horizon_probe`、`oracle_selection_probe`、`coarse_search_probe`、`metric_probe`…） | 死亡是视界不够、排序错、还是不可避免 | 证据倾向"视界内仍有存活计划、死亡约 10 帧前封死"→ 余量在长程粗层 |
+
+这些探针与 `wiring_audit` 一起，构成对主线"机制三栏表（实现 / 训练 / 被控制器读取）"的独立验证工具。

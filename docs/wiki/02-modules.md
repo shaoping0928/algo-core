@@ -112,3 +112,30 @@
 - `README.md`：结构与运行入口，含"机制三栏表（实现/训练/被控制器读取）"、基准协议、当前测量与瓶颈清单。
 - `TODO.md`：会话状态 + 四子代理解剖附录（A 信息流 / B 收敛数学 / C 常数审计 / D 文献方法）+ 死机制清单。
 - `docs/substrate.md`：基座规格（0–15 节：原语、执行顺序、学习规则、时间尺度、节点分裂…）+ 附录 A.1–A.28（规则层实验记录）。
+
+## 2.11 新增实验线的模块清单（详见 [07 新增实验线](./07-experiment-lines.md)）
+
+仓库在 01–06 章定稿后继续演进，新增了下列模块。它们**不改变默认训练/决策路径**：要么是纯数据层/库，要么是只读探针。
+
+| 线 | 文件 | 一句话职责 |
+|---|---|---|
+| 阶段/相位 | `stage_graph.py` | 阶段图 schema + 离线动作残差分割器（纯数据层） |
+| 阶段/相位 | `milestone_graph.py` | 任务无关的相位复位分段（慢变量跳变高分量 + NMS）+ 里程碑级转移记忆（分位桶身份、时长分布） |
+| 阶段/相位 | `stage_support_probe.py` / `stage_sweep_probe.py` / `stage_content_probe.py` | 可行性 / 惩罚扫描 / 边界内容审计 |
+| 阶段/相位 | `phase_stage_probe.py` / `state_partition_probe.py` | 相位相对 vs 绝对表示；阶段作为**状态空间类** |
+| 死亡规则 | `rule_expressions.py` | 0/1 谓词可组合表达式树 |
+| 死亡规则 | `death_rules.py` / `death_rule_loop.py` | AQ 式 0/1 死亡规则集 + 失败驱动精化循环 |
+| 死亡规则 | `contextual_rules.py` / `pattern_library.py` | 上下文分桶规则 / 跨世界维度签名模式库 |
+| 死亡规则 | `death_rule_probe.py` / `death_failure_probe.py` / `death_feature_probe.py` / `death_pattern_probe.py` / `death_transition_quality.py` | 离线验证 / 失败选择 / 表示对比 / 跨世界复用 / 误差源分离 |
+| 上下文/动力学 | `context_model.py` | 任务无关潜在上下文线性动力学（共享映射 + 低秩上下文 + 变化检测） |
+| 上下文/动力学 | `dynamics_context_probe.py` / `generated_prior_probe.py` / `context_benchmark.py` | 动力学切换三臂 / 生成先验三臂 / 种子配对基准 |
+| 分支/变量 | `branches.py` / `variable_registry.py` | 角色特异强度分支 / 带类型变量与关系注册表 |
+| 记忆/生成 | `memory_tree.py` / `hierarchical_memory.py` / `generative_expansion.py` | 合并树 / frames→events→phases→worlds 分层记忆 / 从摘要生成近似流 |
+| 学习轨迹 | `learning_trace.py` | 帧级学习轨迹探针（逐决策记录全部学习面） |
+| 动作/时程/选择 | `action_effect.py` | 任务无关动作效应统计库 |
+| 动作/时程/选择 | `action_conditioning_probe.py` / `action_conditioning_diagnostics.py` | 动作预测力 LOEO + 排列检验 / 其异常定位 |
+| 动作/时程/选择 | `causal_horizon_probe.py` / `doom_horizon_probe.py` / `oracle_selection_probe.py` | 因果视界 / 不可避免性 / 视界 vs 排序 |
+| 动作/时程/选择 | `coarse_search_probe.py` / `outcome_coarse_probe.py` | 宏动作长程粗搜索 / 结果桶粗状态 |
+| 动作/时程/选择 | `score_column_probe.py` / `risk_contrast_probe.py` / `metric_probe.py` / `n_tie_probe.py` | 分数列消融 / 风险列决策影响 / 几何邻域假设 / 好奇势平局 |
+| 动作/时程/选择 | `event_lead_probe.py` / `warning_lead_probe.py` / `planner_rollout_quality.py` | 事件领先 / 通道警告领先 / 计划级死亡侧质量（含可复用工具） |
+| 工具 | `probe_cache.py` / `wiring_audit.py` | 探针模型缓存 / 机制接线审计 |

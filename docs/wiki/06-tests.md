@@ -6,9 +6,11 @@
 python -m unittest discover -s tests
 ```
 
-测试基于标准库 `unittest`（无 pytest 依赖）。测试目录 `tests/`，共 12 个文件。
+测试基于标准库 `unittest`（无 pytest 依赖）。测试目录 `tests/`，共 30 个文件（12 个覆盖主线，18 个覆盖 [07 新增实验线](./07-experiment-lines.md)）。
 
 ## 6.2 覆盖总览
+
+**主线（12 个）**
 
 | 测试文件 | 目标模块 | 覆盖重点 | 用例数（约） |
 |---|---|---|---|
@@ -24,6 +26,29 @@ python -m unittest discover -s tests
 | `test_sandbox_regressions.py` | `substrate_sandbox_search.py`、`substrate_value.py` | target_gap 跟随 horizon、risk_action_dim 校验、探针 next-state | 3 |
 | `test_substrate_rules.py` | `substrate_rules.py` | 不变量变化要求、决定性覆盖率 | 2 |
 | `test_recall_split.py` | `recall_world.py` | CLI split 臂 | 1 |
+
+**新增实验线（18 个）**
+
+| 测试文件 | 目标模块 | 覆盖重点 | 用例数（约） |
+|---|---|---|---|
+| `test_stage_graph.py` | `stage_graph.py` | 恒定流单阶段、动作效应切换成边界、打乱对照无额外结构、不可预测流门控弃权、`_kmeans` 分离两种动作效应、词汇表扫描 | 7 |
+| `test_stage_support_probe.py` | `stage_support_probe.py` | BIC 分段找切换点、恒定流单段、分段代价、单链聚类 | 4 |
+| `test_death_rules.py` | `death_rules.py` | 两文字/析取规则恢复、XOR 报 UNKNOWN、反例精化补变量、`coverage_first`、边界裕度返回 UNKNOWN/NEAR、冗余文字移除、`modes` 发现两种死亡模式 | 10 |
+| `test_death_rule_loop.py` | `death_rule_loop.py` | 分离遗漏终止态/误报、精化补第二模式、可跳过误报、无失败即停 | 4 |
+| `test_death_failure_probe.py` | `death_failure_probe.py` | 死亡侧报告口径、随机/全终止添加的数量与标签 | 4 |
+| `test_rule_expressions.py` | `rule_expressions.py` | AND/OR/XOR/NOT 嵌套掩码、数值项比较、组合搜索恢复 XOR/NOT、无法分离时保持可证伪 | 5 |
+| `test_contextual_rules.py` | `contextual_rules.py` | 分桶条件优于全局、稀疏桶回退、精化加桶样本、`classify_death` 从不判 safe | 4 |
+| `test_pattern_library.py` | `pattern_library.py` | `feature_dims` 限制规则语言、跨世界提取共享维度并重实例化 | 2 |
+| `test_context_model.py` | `context_model.py` | 快速上下文适配未见机制、变化检测标记中段切换、关闭检测则不报切换、无标签下发现 basis、`apply_prior` 保留 warmup | 5 |
+| `test_branches.py` | `branches.py`、`node_runtime.py` | current 瞬时/ recent 衰减累加、逐节点预测误差、transition_pairs 权重、value 慢移、共享 id 独立强度 + 5 个运行时集成用例 | 14 |
+| `test_hierarchical_memory.py` | `memory_tree.py`、`hierarchical_memory.py`、`variable_registry.py` | 聚类/查询/分裂、持久 vs 临时方向、父摘要有损可展开、注册关键词；变量关系塑造可信度/学习率；各层级构建与阶段切换 | 12 |
+| `test_generative_expansion.py` | `generative_expansion.py`、`context_model.py`、`hierarchical_memory.py` | 上下文提示改变生成流、从记忆取起点/边界、参考距离偏好匹配流 | 3 |
+| `test_action_effect.py` | `action_effect.py` | 有符号/绝对效应、按维度选动作、归一化尺度、未知动作/空数据报错 | 5 |
+| `test_action_conditioning_probe.py` | `action_conditioning_probe.py` | 岭回归恢复线性映射、动作增量 > 0.5 且胜过打乱、无动作信号时增量小 | 3 |
+| `test_counterfactual_failure_probe.py` | `counterfactual_failure_probe.py` | 采样含尾部、去重限幅、终端报告用死亡侧、加正例限幅打标 | 4 |
+| `test_n_tie_probe.py` | `n_tie_probe.py` | 机器精度平局 + Φ 不同则翻转、Φ 恒定不翻转、分数不同无平局、空决策 | 4 |
+| `test_planner_rollout_quality.py` | `planner_rollout_quality.py` | 配置保留、计划死亡计数、`action_best`/`action_rank` 用可行存活、三态回调、分数/计划差距、裕度分层、oracle_plan 不改环境 | 10 |
+| `test_probe_cache.py` | `probe_cache.py` | 同配置复用、异配置重拟合、`refit` 强制、损坏缓存回退、无 path 每次拟合 | 5 |
 
 ## 6.3 `test_node_runtime.py` 覆盖主题（最核心）
 

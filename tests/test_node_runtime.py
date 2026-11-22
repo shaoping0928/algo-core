@@ -1572,6 +1572,7 @@ class NodeRuntimeTests(unittest.TestCase):
             "variable_registry.py", "hierarchical_memory.py",
             "generative_expansion.py", "branches.py", "death_rules.py",
             "rule_expressions.py", "contextual_rules.py",
+            "milestone_graph.py",
         ):
             text = (root / name).read_text(encoding="utf-8")
             for token in (
@@ -2249,6 +2250,153 @@ class NodeRuntimeTests(unittest.TestCase):
         ))
 
 
+class TerminalHazardLaneTests(unittest.TestCase):
+    def test_max_lane_keeps_the_historical_composition(self):
+        from substrate_nodes import terminal_hazard
+
+        pain = np.array([0.0, 0.2, 0.6])
+        risk = np.array([0.1, 0.5, 0.3])
+        np.testing.assert_allclose(
+            terminal_hazard(pain, risk, 2.0), [0.2, 1.0, 1.2]
+        )
+
+    def test_separate_lane_gives_each_quantity_its_own_weight(self):
+        from substrate_nodes import terminal_hazard
+
+        pain = np.array([0.2, 0.6])
+        risk = np.array([0.5, 0.3])
+        np.testing.assert_allclose(
+            terminal_hazard(pain, risk, 1.0, pain_weight=3.0,
+                            lane="separate"),
+            [0.2 * 3.0 + 0.5, 0.6 * 3.0 + 0.3],
+        )
+        # Without an explicit pain weight the outcome is carried at the same
+        # weight as the estimate - the quantities are still summed, not
+        # merged by a maximum.
+        np.testing.assert_allclose(
+            terminal_hazard(pain, risk, 1.0, lane="separate"), [0.7, 0.9]
+        )
+
+    def test_default_lane_is_bitwise_the_old_terminal_term(self):
+        from latent_world import latent
+        from substrate_nodes import fit, policy_result
+
+        world, agent = fit(100, steps=300, epochs=1, max_nodes=200, lag=3)
+        env = latent[3](100)
+        prefix = np.zeros(3, dtype=float)
+        base = policy_result(env, world, agent, prefix, horizon=2, lag=3)
+        same = policy_result(
+            env, world, agent, prefix, horizon=2, lag=3,
+            risk_lane="max", pain_weight=None,
+        )
+        np.testing.assert_array_equal(base.score, same.score)
+
+    def test_raw_readout_keeps_more_distinct_values_than_the_calibrated_one(self):
+        from substrate_nodes import _encoded_pending, fit
+
+        world, agent = fit(100, steps=300, epochs=1, max_nodes=200, lag=3)
+        rows = agent.milestone_training_rows
+        observations = np.asarray([row["obs"] for row in rows], dtype=float)
+        encoded = np.concatenate(
+            [observations, _encoded_pending(rows, agent.lag)], axis=1
+        ) / agent.scales
+        calibrated = agent.pain_signal_batch(encoded)
+        agent.hazard_readout = "raw"
+        raw = agent.pain_signal_batch(encoded)
+        self.assertGreater(
+            len(np.unique(raw)), len(np.unique(calibrated))
+        )
+
+
+class AssociationValueTests(unittest.TestCase):
+    def test_value_is_bounded_and_covers_the_nodes_the_stream_met(self):
+        from substrate_nodes import _association_value_table
+
+        class Fake:
+            scales = np.ones(4)
+            lag = 1
+
+            def _nearest(self, state):
+                return ("low" if state[0] < 0.5 else "high"), 0.0
+
+        rows = [
+            dict(obs=np.array([0.0, 0.0, 0.0]),
+                 history=np.array([0.0, 0.0]), terminal=False, episode=0),
+            dict(obs=np.array([0.0, 0.0, 0.0]),
+                 history=np.array([0.0, 0.0]), terminal=False, episode=0),
+            dict(obs=np.array([1.0, 0.0, 0.0]),
+                 history=np.array([0.0, 0.0]), terminal=False, episode=0),
+            dict(obs=np.array([1.0, 0.0, 0.0]),
+                 history=np.array([0.0, 0.0]), terminal=True, episode=0),
+        ]
+        values, support = _association_value_table(
+            rows, Fake(), window=2, min_support=1
+        )
+        self.assertIn("low", values)
+        self.assertTrue(all(0.0 <= value <= 1.0 for value in values.values()))
+        self.assertGreaterEqual(support["low"], 1)
+
+
+class MarginTiebreakTests(unittest.TestCase):
+    def _result(self, action):
+        from trajectory_search import SearchResult
+
+        return SearchResult(
+            actions=np.asarray([float(action), 0.0]), score=np.zeros(6),
+            feasible=True, feasible_count=2, candidate_count=2,
+            first_state=np.zeros(2), final_state=np.zeros(2),
+        )
+
+    def test_near_tie_prefers_the_previous_action(self):
+        from substrate_nodes import _apply_margin_tiebreak
+
+        scores = np.array([
+            [0.5005, 0, 0.5, 0, 0, 0],
+            [0.5000, 0, 0.5, 0, 0, 0],
+        ])
+        sequences = np.array([[0.0, 0.0], [1.0, 0.0]])
+        batch = dict(
+            scores=scores, sequences=sequences,
+            feasible=np.array([True, True]), finite=np.array([True, True]),
+        )
+        gated = _apply_margin_tiebreak(
+            self._result(1), [batch], previous_action=0, eps=1e-3
+        )
+        self.assertEqual(int(gated.actions[0]), 0)
+
+    def test_a_real_margin_is_not_overridden(self):
+        from substrate_nodes import _apply_margin_tiebreak
+
+        scores = np.array([
+            [0.9000, 0, 0.9, 0, 0, 0],
+            [0.5000, 0, 0.5, 0, 0, 0],
+        ])
+        sequences = np.array([[0.0, 0.0], [1.0, 0.0]])
+        batch = dict(
+            scores=scores, sequences=sequences,
+            feasible=np.array([True, True]), finite=np.array([True, True]),
+        )
+        gated = _apply_margin_tiebreak(
+            self._result(1), [batch], previous_action=0, eps=1e-3
+        )
+        self.assertEqual(int(gated.actions[0]), 1)
+
+    def test_zero_epsilon_is_inert(self):
+        from substrate_nodes import _apply_margin_tiebreak
+
+        scores = np.zeros((2, 6))
+        sequences = np.array([[0.0, 0.0], [1.0, 0.0]])
+        batch = dict(
+            scores=scores, sequences=sequences,
+            feasible=np.array([True, True]), finite=np.array([True, True]),
+        )
+        result = self._result(1)
+        gated = _apply_margin_tiebreak(
+            result, [batch], previous_action=0, eps=0.0
+        )
+        self.assertIs(gated, result)
+
+
 class PlanScoreTests(unittest.TestCase):
     def test_plan_score_matches_search_selection(self):
         from latent_world import latent
@@ -2393,6 +2541,230 @@ class PlanScoreTests(unittest.TestCase):
         np.testing.assert_array_equal(result.actions, plans[best])
         self.assertAlmostEqual(result.score[0], scores[best][0], places=6)
         self.assertAlmostEqual(result.score[1], scores[best][1], places=6)
+
+
+class DecisionPathTests(unittest.TestCase):
+    """The decision dispatchers must stay task-agnostic and keep the ledger."""
+
+    @staticmethod
+    def _fitted():
+        from latent_world import latent
+        from substrate_nodes import fit
+
+        world, agent = fit(100, steps=300, epochs=1, max_nodes=200, lag=3)
+        return world, agent, latent[3](100), np.zeros(3, dtype=float)
+
+    def test_stage_schedules_is_task_agnostic(self):
+        from substrate_nodes import stage_schedules
+
+        plans = stage_schedules((0, 1), blocks=3, block_frames=4)
+        self.assertEqual(plans.shape, (8, 12))
+        for row in plans:
+            for start in range(0, 12, 4):  # every block is constant
+                block = row[start:start + 4]
+                self.assertEqual(len(set(block.tolist())), 1)
+        # Any discrete alphabet works; the schedule is derived from it, not
+        # from anything about the task.
+        wide = stage_schedules((0, 1, 2), blocks=2, block_frames=2)
+        self.assertEqual(wide.shape, (9, 4))
+        self.assertEqual(sorted(set(wide.ravel().tolist())), [0.0, 1.0, 2.0])
+
+    def test_stage_result_keeps_the_six_column_ledger(self):
+        from substrate_nodes import stage_result
+
+        world, agent, env, prefix = self._fitted()
+        result = stage_result(
+            env, world, agent, prefix, blocks=2, block_frames=2, lag=3
+        )
+        self.assertEqual(result.candidate_count, 4)
+        self.assertEqual(len(result.actions), 4)
+        self.assertEqual(result.actions[0], result.actions[1])
+        self.assertEqual(result.actions[2], result.actions[3])
+        score = result.score
+        self.assertEqual(len(score), 6)
+        self.assertAlmostEqual(
+            score[0], score[2] + score[3] + score[4] + score[5], places=6
+        )
+
+    def test_stage_decision_dispatches_and_records_the_ledger(self):
+        from substrate_nodes import decision_action
+
+        world, agent, env, prefix = self._fitted()
+        ledger = []
+        action = decision_action(
+            env, world, agent, prefix, horizon=6, lag=3,
+            decision="stage", stage_blocks=2, stage_block_frames=2,
+            ledger_out=ledger,
+        )
+        self.assertIn(int(action), (0, 1))
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(len(ledger[0]), 2)
+
+    def test_policy_result_uses_the_agents_action_space(self):
+        from substrate_nodes import policy_result
+
+        world, agent, env, prefix = self._fitted()
+        binary = policy_result(env, world, agent, prefix, horizon=2, lag=3)
+        self.assertEqual(binary.candidate_count, 4)
+        # The search must enumerate whatever alphabet the runtime declares,
+        # so a three-action agent explores 3**2 candidates - the candidate
+        # set is never a task constant baked into the planner.
+        agent.action_space = (0, 1, 2)
+        three = policy_result(env, world, agent, prefix, horizon=2, lag=3)
+        self.assertEqual(three.candidate_count, 9)
+        self.assertTrue(
+            set(int(value) for value in three.actions) <= {0, 1, 2}
+        )
+
+    def test_beam_width_reproduces_exhaustive_when_wide_enough(self):
+        from substrate_nodes import policy_result
+
+        world, agent, env, prefix = self._fitted()
+        plain = policy_result(env, world, agent, prefix, horizon=4, lag=3)
+        wide = policy_result(
+            env, world, agent, prefix, horizon=4, lag=3, beam_width=2 ** 4
+        )
+        np.testing.assert_array_equal(wide.actions, plain.actions)
+        self.assertAlmostEqual(
+            float(wide.score[0]), float(plain.score[0]), places=9
+        )
+
+    def test_milestone_goals_come_from_the_agents_own_stream(self):
+        from substrate_nodes import _milestone_goals_from_transitions
+
+        self.assertEqual(_milestone_goals_from_transitions([]), (None, None))
+        rows = []
+        for episode in range(3):
+            for step in range(100):
+                obs = np.array([
+                    0.5 - (step % 20) / 20.0, 0.4, 0.0, 0.1, 0.0, 0.0
+                ])
+                rows.append(dict(
+                    episode=episode, obs=obs,
+                    signals=np.asarray([1.0, 0.0]),
+                ))
+        goals, summary = _milestone_goals_from_transitions(rows)
+        self.assertIsNotNone(goals)
+        self.assertEqual(goals.shape, (1, 6))
+        self.assertGreaterEqual(summary["distinct"], 1)
+        self.assertGreaterEqual(summary["candidates"], 3)
+
+    def test_milestone_model_survives_a_degenerate_stream(self):
+        from substrate_nodes import _milestone_model_from_transitions
+
+        # Every episode shorter than three rows: the model has no frame, and
+        # the fit-time assignment must not KeyError on the missing key.
+        model = _milestone_model_from_transitions([
+            dict(episode=0, obs=np.zeros(3), history=np.asarray([0.0]),
+                 signals=np.asarray([1.0, 0.0])),
+        ])
+        self.assertIsNone(model["frame"])
+        self.assertEqual(model["keys"], [])
+        self.assertEqual(model["rate"], {})
+        self.assertEqual(model["transitions"], [])
+        self.assertEqual(model["durations"], {})
+
+    def test_milestone_shaping_is_inert_at_zero_weight(self):
+        from substrate_nodes import policy_result
+
+        world, agent, env, prefix = self._fitted()
+        self.assertIsNotNone(agent.milestone_goals)
+        base = policy_result(env, world, agent, prefix, horizon=3, lag=3)
+        zero = policy_result(
+            env, world, agent, prefix, horizon=3, lag=3, milestone_weight=0.0
+        )
+        np.testing.assert_array_equal(zero.actions, base.actions)
+        self.assertEqual(tuple(zero.score), tuple(base.score))
+
+    def test_milestone_model_reads_every_episode_through_one_frame(self):
+        # One frame for every episode: its centre is the mean of the boundary
+        # states pooled across all episodes.
+        from substrate_nodes import _milestone_model_from_transitions
+        from milestone_graph import segment_boundaries
+
+        rows = []
+        for episode in range(3):
+            n = 300
+            signal = -((np.arange(n) % 100) / 100.0) + 0.5
+            obs_list = np.column_stack([signal, np.full(n, 0.4)])
+            for step in range(n):
+                rows.append(dict(
+                    episode=episode, obs=obs_list[step],
+                    history=np.asarray([1.0]),
+                    signals=np.asarray([1.0, 0.0]),
+                ))
+        model = _milestone_model_from_transitions(rows)
+        states = []
+        for episode in range(3):
+            obs = np.asarray([row["obs"] for row in rows
+                              if row["episode"] == episode], dtype=float)
+            boundaries = segment_boundaries(
+                obs, threshold=model["threshold"], scale=model["scale"]
+            )
+            states.extend(obs[int(b)] for b in boundaries)
+        np.testing.assert_allclose(
+            np.asarray(model["frame"]["center"], dtype=float),
+            np.asarray(states, dtype=float).mean(axis=0),
+            rtol=1e-9,
+        )
+        self.assertTrue(model["keys"])
+        self.assertTrue(model["transitions"])
+        self.assertTrue(model["durations"])
+
+    def test_milestone_plan_mode_runs_and_is_inert_at_zero_weight(self):
+        from substrate_nodes import policy_result
+
+        world, agent, env, prefix = self._fitted()
+        base = policy_result(env, world, agent, prefix, horizon=3, lag=3)
+        zero = policy_result(
+            env, world, agent, prefix, horizon=3, lag=3,
+            milestone_weight=0.0, milestone_mode="plan",
+        )
+        np.testing.assert_array_equal(zero.actions, base.actions)
+        shaped = policy_result(
+            env, world, agent, prefix, horizon=3, lag=3,
+            milestone_weight=0.5, milestone_mode="plan",
+        )
+        self.assertEqual(len(shaped.score), 6)
+
+    def test_milestone_shaping_keeps_the_six_column_ledger(self):
+        from substrate_nodes import policy_result
+
+        world, agent, env, prefix = self._fitted()
+        # The goal term reads through the identity frame; supply one so the
+        # term is live regardless of how little the fixture's fit saw.
+        agent.milestone_frame = dict(
+            axis=np.eye(agent.obs_dim)[0], center=np.zeros(agent.obs_dim),
+            sigma=np.ones(agent.obs_dim), scale=1.0, cuts=np.zeros(1),
+        )
+        base = policy_result(env, world, agent, prefix, horizon=3, lag=3)
+        shaped = policy_result(
+            env, world, agent, prefix, horizon=3, lag=3,
+            milestone_weight=1.0, milestone_mode="goal",
+            milestone_goal=np.full(agent.obs_dim, 1e3),
+        )
+        score = shaped.score
+        self.assertEqual(len(score), 6)
+        self.assertAlmostEqual(
+            score[0], score[2] + score[3] + score[4] + score[5], places=6
+        )
+        # The shaping term only ever subtracts: it is minus a weight times a
+        # distance to the goal set.
+        self.assertLess(score[4], base.score[4])
+
+    def test_beam_search_rejects_a_death_callback(self):
+        from substrate_nodes import policy_result
+
+        world, agent, env, prefix = self._fitted()
+
+        def doomed(_states, _sequences, _step):
+            return np.zeros(0, dtype=int)
+
+        with self.assertRaises(ValueError):
+            policy_result(
+                env, world, agent, prefix, horizon=2, lag=3,
+                beam_width=4, death_status_batch=doomed,
+            )
 
 
 if __name__ == "__main__":

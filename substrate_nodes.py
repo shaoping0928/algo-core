@@ -11,9 +11,11 @@ The node graph itself is trained from real transitions with TD(lambda) credit
 assignment and action-conditioned edges.
 """
 import argparse
+import itertools
 import json
 import os
 import sys
+from dataclasses import replace
 from concurrent.futures import (
     ProcessPoolExecutor,
     ThreadPoolExecutor,
@@ -30,6 +32,25 @@ from eval_protocol import (
     parse_seed_spec,
 )
 from latent_world import SEEDS, latent
+from milestone_graph import (
+    MilestoneTracker,
+    boundary_axis,
+    frame_project,
+    frame_project_axes,
+    milestone_coverage,
+    milestone_lookahead,
+    milestone_memory,
+    nearest_stage_risk,
+    pooled_boundary_model,
+    pooled_strength_threshold,
+    segment_prototypes,
+    signature_clusters,
+    signature_keys,
+    signature_stage_risk,
+    strength_boundaries,
+    strength_change_scores,
+    transition_signatures,
+)
 from node_features import FeatureRuleBank
 from node_runtime import NodeRuntime, future_pain_labels, future_return_labels
 from substrate_generic import (
@@ -38,6 +59,8 @@ from substrate_generic import (
     history_features,
 )
 from trajectory_search import (
+    SearchResult,
+    beam_search,
     exhaustive_search,
     merge_candidate_batches,
     override_first_action,
@@ -142,7 +165,10 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         death_rule_max_rules: int = 24,
         death_rule_max_literals: int = 5,
         death_rule_boundary_margin: float = 0.0,
-        death_rule_envelope: bool = False):
+        death_rule_envelope: bool = False,
+        readout_propagation_gain: float = 0.0,
+        readout_propagation_steps: int = 1,
+        readout_propagation_edges: str = "transition"):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -204,6 +230,9 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         branch_transitions=branch_transitions,
         action_edge_weight=action_edge_weight,
         action_edge_trust_samples=action_edge_trust_samples,
+        readout_propagation_gain=readout_propagation_gain,
+        readout_propagation_steps=readout_propagation_steps,
+        readout_propagation_edges=readout_propagation_edges,
     )
     episodes = {}
     for row in transitions:
@@ -782,7 +811,14 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         death_rules=False, death_rule_compose=False,
         death_rule_max_thresholds=256, death_rule_max_rules=24,
         death_rule_max_literals=5, death_rule_boundary_margin=0.0,
-        death_rule_envelope=False):
+        death_rule_envelope=False,
+        readout_propagation_gain=0.0,
+        readout_propagation_steps=1,
+        readout_propagation_edges="transition",
+        milestone_stage="strength",
+        milestone_boundary_k=3.0,
+        hazard_readout="calibrated",
+        value_readout="cells"):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -802,6 +838,16 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("steps must be positive")
     if not 0.0 <= coverage <= 1.0:
         raise ValueError("coverage must be in [0, 1]")
+    if float(readout_propagation_gain) < 0.0:
+        raise ValueError("readout_propagation_gain must be non-negative")
+    if int(readout_propagation_steps) < 1:
+        raise ValueError("readout_propagation_steps must be positive")
+    if str(readout_propagation_edges) not in (
+        "transition", "association", "both"
+    ):
+        raise ValueError(
+            "readout_propagation_edges must be transition/association/both"
+        )
     if epochs < 1:
         raise ValueError("epochs must be positive")
     if int(lag) < 0:
@@ -977,6 +1023,9 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         death_rule_max_literals=death_rule_max_literals,
         death_rule_boundary_margin=death_rule_boundary_margin,
         death_rule_envelope=death_rule_envelope,
+        readout_propagation_gain=readout_propagation_gain,
+        readout_propagation_steps=readout_propagation_steps,
+        readout_propagation_edges=readout_propagation_edges,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -1032,13 +1081,785 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             if report:
                 dagger_log[-1]["ledger_report"] = report
     agent.dagger_log = dagger_log
+    # Which form of the composed hazard the planner reads: the calibrated
+    # rate (a level) or the raw weighted sum (a ranking).  The isotonic map is
+    # monotone, so it cannot invert an order - but on a rare-event target it
+    # collapses almost the whole score range into one plateau, which makes
+    # distinct candidates indistinguishable.  Recorded on the agent so the
+    # choice travels with the readout it belongs to.
+    agent.hazard_readout = hazard_readout
+    # The endpoint value readout: the per-feature cells (empty at epochs=1) or
+    # the association value (the weighted quality of the nodes the stream met
+    # after this one).  Built once, from the same realised stream.
+    agent.value_readout = value_readout
+    # Association value is built once: the high-level successor choice uses
+    # it, and the endpoint value readout reuses it when selected.
+    association_values, association_support = _association_value_table(
+        transitions, agent
+    )
+    agent.association_values = association_values
+    agent.association_support = association_support
+    transition_edges, node_risk, default_action = _transition_table(
+        transitions, agent
+    )
+    agent.transition_edges = transition_edges
+    agent.node_risk = node_risk
+    agent.transition_default_action = default_action
+    transition_policy, transition_values = _transition_values(
+        transition_edges, node_risk
+    )
+    agent.transition_policy = transition_policy
+    agent.transition_values = transition_values
+    # The milestone layer, read off the agent's own stream.  All of it is
+    # inert unless the planner is asked for one of its terms.
+    model = _milestone_model_from_transitions(
+        transitions, world=world, agent=agent, stage=milestone_stage,
+        boundary_k=milestone_boundary_k,
+        successor_value=association_values,
+    )
+    agent.milestone_goals = model["goals"]
+    agent.milestone_threshold = model["threshold"]
+    agent.milestone_rate = model["rate"]
+    agent.milestone_keys = model["keys"]
+    agent.milestone_scale = model["scale"]
+    agent.milestone_frame = model.get("frame")
+    agent.milestone_goals_by_key = model["goals_by_key"]
+    agent.milestone_transitions = model.get("transitions", [])
+    agent.milestone_durations = model.get("durations", {})
+    agent.milestone_feedbacks = model.get("feedbacks", {})
+    agent.milestone_risks = model.get("risks", {})
+    agent.milestone_stages = model.get("stages", {})
+    agent.milestone_clusters = model.get("clusters")
+    agent.milestone_stage_mode = milestone_stage
+    stage_index = model.get("stage_index") or {}
+    agent.milestone_stage_states = np.asarray(
+        stage_index.get("states", ()), dtype=float
+    )
+    agent.milestone_stage_keys = [
+        tuple(int(value) for value in key)
+        for key in stage_index.get("keys", ())
+    ]
+    agent.milestone_summary = model["summary"]
+    # The rows the milestone layer was read from, kept so the layer can be
+    # re-measured without repeating the fit (diagnostics, offline probes).
+    agent.milestone_training_rows = transitions
     return world, agent
+
+
+def _stage_evidence_for_streams(rows_list, world, agent, horizon: int = 6,
+                                boundary_k: float = 3.0):
+    """Stage boundaries and signatures from the learned graph, per stream.
+
+    The criterion is the one the stream itself makes available: a boundary is
+    a frame where the nearest node's strength has just risen *and* the
+    action-conditioned future is no longer the future that came before
+    (:func:`strength_boundaries`).  Strength is the node's own count, i.e. how
+    much of the stream the graph has already committed to that state; the
+    future is the learned model's rollout under each action.  Neither is a
+    task quantity: both are read off `agent` and `world` exactly as they were
+    trained.
+
+    The threshold is pooled across episodes (``k`` times the pooled 90th
+    percentile), so every stream is segmented by the same bar, and ``k``
+    defaults to the same value the geometric segmenter uses - sharing the
+    statistical rule is the point; nothing here is chosen per world.
+
+    Returns ``(boundaries_list, signatures_list)`` or ``None`` when either
+    consumer is missing (offline callers and unit tests keep the geometric
+    default).
+    """
+    if world is None or agent is None:
+        return None
+    evidence = []
+    for rows in rows_list:
+        observations = np.asarray([row["obs"] for row in rows], dtype=float)
+        encoded = np.concatenate(
+            [observations, _encoded_pending(rows, agent.lag)], axis=1
+        ) / agent.scales
+        strength = np.zeros(len(encoded), dtype=float)
+        for index, state in enumerate(encoded):
+            node_id, _distance = agent._nearest(state)
+            node = None if node_id is None else agent.graph.nodes.get(node_id)
+            if node is not None:
+                strength[index] = float(node.count)
+        signatures = transition_signatures(
+            observations, world.predict, agent.lag, horizon
+        )
+        evidence.append((strength, signatures))
+    threshold = pooled_strength_threshold(
+        [strength_change_scores(strength, signatures)
+         for strength, signatures in evidence],
+        k=boundary_k,
+    )
+    boundaries_list = []
+    signatures_list = []
+    for strength, signatures in evidence:
+        boundaries_list.append(np.asarray(
+            strength_boundaries(strength, signatures, threshold=threshold),
+            dtype=int,
+        ))
+        signatures_list.append(signatures)
+    return boundaries_list, signatures_list
+
+
+def _milestone_model_from_transitions(transitions, bins=None, top=1,
+                                      min_support=3, world=None, agent=None,
+                                      stage: str = "strength",
+                                      horizon: int = 6,
+                                      boundary_k: float = 3.0,
+                                      successor_value=None):
+    """Everything the milestone layer needs, read off the agent's own stream.
+
+    * ``frame`` - the time-orthogonal identity frame, calibrated on the pooled
+      stream so every episode is read through one set of directions and cuts;
+    * ``goals`` - the boundary states milestones started in, most frequent
+      first, taken from the *same* segmentation as the identities (the earlier
+      version calibrated a second, per-episode segmentation for the goals);
+    * ``rate`` - per milestone identity, the duration-weighted action rate of
+      the *better half* of the stream (by realised return), not of the whole
+      behaviour policy: cloning the open-loop collection policy's rate would
+      only reinforce the behaviour that fails.
+
+    ``stage`` chooses the segmentation: ``"strength"`` (default) uses the
+    learned graph - a node's strength rises where the action-conditioned
+    future changes (:func:`strength_boundaries`); ``"geometry"`` keeps the
+    earlier boundary statistic of the observation stream.  The two are kept
+    as an explicit switch so the change can be measured rather than assumed.
+
+    Nothing about the task is read.
+    """
+    episodes = {}
+    for row in transitions:
+        episodes.setdefault(int(row.get("episode", 0)), []).append(row)
+    usable_items = [
+        (episode, rows) for episode, rows in episodes.items() if len(rows) >= 3
+    ]
+    usable = [rows for _episode, rows in usable_items]
+    if not usable:
+        return dict(
+            goals=None, summary=None, frame=None, threshold=None,
+            scale=None, rate={}, keys=[], goals_by_key={},
+            transitions=[], durations={}, feedbacks={}, risks={},
+            stages={}, clusters=None,
+        )
+    # One frame of reference for the whole stream.  The identity is only a
+    # common alphabet if every episode is read through the same directions and
+    # the same boundary scale; calibrating per episode (the earlier behaviour)
+    # made the keys incomparable across episodes and left the decision-time
+    # tracker reading a frame taken from a single episode.
+    streams = [np.asarray([row["obs"] for row in rows], dtype=float)
+               for rows in usable]
+    # The boundary statistic is pooled from the within-episode frames only:
+    # episode seams are discontinuities that are not phase resets, and
+    # stitching them together would inflate the high quantile.
+    model = pooled_boundary_model(streams)
+    threshold = model["threshold"]
+    scale = model["scale"]
+    boundaries_list = None
+    signatures_list = None
+    if stage in ("strength", "signature"):
+        evidence = _stage_evidence_for_streams(
+            usable, world, agent, horizon=horizon, boundary_k=boundary_k
+        )
+        if evidence is not None:
+            boundaries_list, signatures_list = evidence
+    identity_list = None
+    clusters = None
+    if stage == "signature" and signatures_list is not None:
+        prototypes = [
+            segment_prototypes(signatures, boundaries)
+            for signatures, boundaries in zip(signatures_list,
+                                              boundaries_list)
+        ]
+        clusters = signature_clusters(prototypes, min_support=min_support)
+        clusters["horizon"] = int(horizon)
+        identity_list = [
+            signature_keys(prototype, clusters["centers"])
+            for prototype in prototypes
+        ]
+    boundaries_by_episode = {}
+    if boundaries_list is not None:
+        boundaries_by_episode = {
+            episode: boundaries
+            for (episode, _rows), boundaries in zip(usable_items,
+                                                    boundaries_list)
+        }
+    frame = boundary_axis(streams, boundaries_list=boundaries_list,
+                          bins=bins, threshold=threshold,
+                          scale=scale, min_support=min_support)
+    goals, summary = _milestone_goals_from_transitions(
+        transitions, bins=bins, top=top, frame=frame,
+        threshold=threshold, scale=scale,
+        boundaries_by_episode=boundaries_by_episode,
+    )
+    collected = {}
+    better = {}
+    key_set = set()
+    memories = []
+    returns = []
+    for stream_index, rows in enumerate(usable):
+        observations = np.asarray([row["obs"] for row in rows], dtype=float)
+        actions = np.asarray([
+            float(np.asarray(row.get("history", (0.0,))).reshape(-1)[0])
+            for row in rows
+        ], dtype=float)
+        signals = np.asarray(
+            [row.get("signals", (0.0, 0.0)) for row in rows], dtype=float
+        )
+        outcome = signals[:, 0:1] - signals[:, 1:2]
+        memories.append(milestone_memory(
+            observations, actions=actions, feedback=outcome,
+            boundaries=None if boundaries_list is None
+            else boundaries_list[stream_index],
+            identity=None if identity_list is None
+            else identity_list[stream_index],
+            threshold=threshold, scale=scale, frame=frame,
+        ))
+        returns.append(float(outcome.sum()))
+    cutoff = float(np.median(returns)) if returns else 0.0
+    for index, memory in enumerate(memories):
+        key_set.update(tuple(int(v) for v in key) for key in memory["keys"])
+        for key, value in memory["key_rate"].items():
+            collected.setdefault(key, []).append(float(value))
+            if returns[index] >= cutoff:
+                better.setdefault(key, []).append(float(value))
+    source = better or collected
+    rate = {key: float(np.mean(values)) for key, values in source.items()}
+    # The subgoal of a milestone, read off the transition graph: the entry
+    # state of the successor the stream most often took from here.
+    prototype_by_key = {}
+    successor = {}
+    for memory in memories:
+        for key, prototype in zip(memory["keys"], memory["prototypes"]):
+            prototype_by_key.setdefault(
+                tuple(int(v) for v in key), np.asarray(prototype, dtype=float)
+            )
+        for row in memory["transitions"]:
+            source_key = tuple(int(v) for v in row["key_from"])
+            target_key = tuple(int(v) for v in row["key_to"])
+            counts = successor.setdefault(source_key, {})
+            counts[target_key] = counts.get(target_key, 0) + int(row["count"])
+    goals_by_key = {}
+    pending_width = int(getattr(agent, "lag", 0)) if agent is not None else 0
+
+    def _successor_value(candidate):
+        """Realised value of the successor's entry state, via node association."""
+        prototype = prototype_by_key.get(candidate)
+        if prototype is None or successor_value is None or agent is None:
+            return None
+        encoded = np.concatenate([
+            np.asarray(prototype, dtype=float),
+            np.zeros(pending_width),
+        ]) / agent.scales
+        node_id, _distance = agent._nearest(encoded)
+        if node_id is None:
+            return None
+        return float(successor_value.get(node_id, 0.0))
+
+    for key, counts in successor.items():
+        modal = max(counts, key=lambda candidate: counts[candidate])
+        best = modal
+        if successor_value is not None:
+            # The high-level choice: the successor whose entry state has the
+            # best realised value, not the one the stream happened to take
+            # most often.  The modal successor is only the fallback.
+            scored = {
+                candidate: _successor_value(candidate) for candidate in counts
+            }
+            valued = [candidate for candidate, value in scored.items()
+                      if value is not None]
+            if valued:
+                best = max(
+                    valued,
+                    key=lambda candidate: (scored[candidate], counts[candidate]),
+                )
+        if best in prototype_by_key:
+            goals_by_key[key] = prototype_by_key[best]
+    # Persist the memory itself: without it "the transition table" was a
+    # local variable and no consumer could ever predict a stage ahead.
+    pooled = {}
+    duration_totals = {}
+    duration_counts = {}
+    feedback_totals = {}
+    for memory in memories:
+        for row in memory["transitions"]:
+            pair = (tuple(int(v) for v in row["key_from"]),
+                    tuple(int(v) for v in row["key_to"]))
+            entry = pooled.setdefault(
+                pair, dict(count=0, duration=0.0, feedback=0.0)
+            )
+            count = int(row["count"])
+            entry["count"] += count
+            entry["duration"] += count * float(row["mean_duration"])
+            entry["feedback"] += count * float(row["mean_feedback"])
+        for key, length, outcome in zip(
+            memory["keys"], memory["durations"], memory["feedback"]
+        ):
+            stage = tuple(int(v) for v in key)
+            duration_totals[stage] = duration_totals.get(stage, 0) + int(length)
+            duration_counts[stage] = duration_counts.get(stage, 0) + 1
+            feedback_totals[stage] = feedback_totals.get(stage, 0.0) + float(
+                outcome
+            )
+    transitions = [
+        dict(
+            count=int(entry["count"]),
+            key_from=list(pair[0]),
+            key_to=list(pair[1]),
+            mean_duration=float(entry["duration"]) / int(entry["count"]),
+            mean_feedback=float(entry["feedback"]) / int(entry["count"]),
+        )
+        for pair, entry in pooled.items()
+    ]
+    transitions.sort(key=lambda row: -row["count"])
+    durations = {
+        stage: float(total) / max(int(duration_counts[stage]), 1)
+        for stage, total in duration_totals.items()
+    }
+    feedbacks = {
+        stage: float(feedback_totals[stage]) / max(float(total), 1.0)
+        for stage, total in duration_totals.items()
+    }
+    # A stage is worse than usual when its per-frame feedback sits below the
+    # stream's own duration-weighted average.  The binary test "feedback <= 0"
+    # almost never fires: a fifty-frame stage that ends in one bad frame still
+    # averages positive, so every charge collapsed to zero and the term became
+    # a constant across plans (measured 2026-11-22: all stage risks 0.00, the
+    # plan term bit-identical at every weight).  The deficit is scaled by the
+    # worst observed deficit, so the charge is in [0, 1] whatever the feedback
+    # scale is - a property of the stream, not a chosen constant.
+    total_feedback = float(sum(feedback_totals.values()))
+    total_frames = float(sum(duration_totals.values()))
+    center = total_feedback / total_frames if total_frames > 0.0 else 0.0
+    deficit = {
+        stage: max(0.0, center - float(value))
+        for stage, value in feedbacks.items()
+    }
+    worst = max(deficit.values()) if deficit else 0.0
+    key_cost = {
+        stage: (value / worst if worst > 0.0 else 0.0)
+        for stage, value in deficit.items()
+    }
+    risks = {}
+    for stage in key_set:
+        walk = milestone_lookahead(
+            transitions, stage, feedbacks, steps=2, key_cost=key_cost
+        )
+        risks[stage] = float(walk["cost"])
+    # What the segmentation is worth, measured from the segmentation itself:
+    # how many frames a stage lasts and how often one stage leads to more than
+    # one successor.  A usable stage graph branches; a chain does not.
+    sources = {}
+    for row in transitions:
+        sources.setdefault(tuple(row["key_from"]), set()).add(
+            tuple(row["key_to"])
+        )
+    # Does the identity carry information?  Each stage contributes its own
+    # per-frame feedback; the between-identity share of that variance (eta^2)
+    # says whether stages are outcome classes or arbitrary labels.
+    stage_rows = []
+    stage_states = []
+    stage_labels = []
+    for stream_index, memory in enumerate(memories):
+        edges = np.concatenate([
+            [0], np.asarray(memory["boundaries"], dtype=int),
+            [len(streams[stream_index])],
+        ])
+        for index, key in enumerate(memory["keys"]):
+            start = int(edges[index])
+            stage_states.append(
+                streams[stream_index][start] if start < len(streams[stream_index])
+                else streams[stream_index][-1]
+            )
+            stage_labels.append(tuple(int(value) for value in key))
+            stage_rows.append((
+                tuple(int(value) for value in key),
+                float(memory["feedback"][index])
+                / max(float(memory["durations"][index]), 1.0),
+            ))
+    feedback_eta2 = 0.0
+    if stage_rows:
+        values = np.asarray([value for _key, value in stage_rows])
+        grand = float(values.mean())
+        spread = float(np.sum((values - grand) ** 2))
+        if spread > 1e-12:
+            between = 0.0
+            for key in set(entry[0] for entry in stage_rows):
+                group = np.asarray(
+                    [value for candidate, value in stage_rows if candidate == key]
+                )
+                between += len(group) * float((group.mean() - grand) ** 2)
+            feedback_eta2 = float(between / spread)
+    stages = dict(
+        streams=len(memories),
+        boundaries=int(sum(len(memory["boundaries"]) for memory in memories)),
+        stages=int(sum(len(memory["keys"]) for memory in memories)),
+        identities=len(key_set),
+        dwell=float(np.mean([
+            float(np.mean(memory["durations"])) for memory in memories
+        ])) if memories else 0.0,
+        sources=len(sources),
+        branch=float(np.mean([len(v) for v in sources.values()]))
+        if sources else 0.0,
+        branching=int(sum(1 for v in sources.values() if len(v) > 1)),
+        feedback_eta2=float(feedback_eta2),
+    )
+    return dict(
+        goals=goals, summary=summary, frame=frame,
+        threshold=threshold, scale=scale, rate=rate, keys=sorted(key_set),
+        goals_by_key=goals_by_key, transitions=transitions,
+        durations=durations, feedbacks=feedbacks, risks=risks,
+        stages=stages, clusters=clusters,
+        stage_index=dict(
+            states=np.asarray(stage_states, dtype=float).tolist(),
+            keys=[list(key) for key in stage_labels],
+        ),
+    )
+
+
+def _milestone_goals_from_transitions(transitions, bins=2, top=1, frame=None,
+                                      threshold=None, scale=None,
+                                      boundaries_by_episode=None):
+    """Goal states for the milestone shaping term, from the agent's own stream.
+
+    The training stream is segmented into milestones and each milestone's
+    starting state becomes a candidate goal.  Candidates are ranked by how
+    often the stream actually started a milestone there: with this world's
+    feedback unable to tell milestones apart (the only feedback is survival
+    per frame, so a milestone's total feedback equals its length), frequency
+    is the informative learned statistic and the modal boundary state is the
+    prototypical place to head for.  Nothing about the task is read - the
+    states are observations the runtime already saw.
+
+    When `frame` is supplied the milestones are the ones read through that
+    shared frame, so the goals and the identities come from the same
+    segmentation; without it the per-episode default is kept for callers that
+    only want prototype states.
+
+    Returns ``(goals, summary)`` or ``(None, None)`` when the stream carries
+    no milestones.
+    """
+    episodes = {}
+    for row in transitions:
+        episodes.setdefault(int(row.get("episode", 0)), []).append(row)
+    prototypes = []
+    for episode, rows in episodes.items():
+        if not rows:
+            continue
+        observations = np.asarray([row["obs"] for row in rows], dtype=float)
+        signals = np.asarray(
+            [row.get("signals", (0.0, 0.0)) for row in rows], dtype=float
+        )
+        outcome = (signals[:, 0] - signals[:, 1]).reshape(-1, 1)
+        boundaries = None
+        if boundaries_by_episode is not None:
+            boundaries = boundaries_by_episode.get(episode)
+        if frame is not None:
+            memory = milestone_memory(
+                observations, feedback=outcome, frame=frame,
+                boundaries=boundaries, threshold=threshold, scale=scale,
+            )
+        else:
+            memory = milestone_memory(
+                observations, feedback=outcome, bins=bins,
+                boundaries=boundaries,
+            )
+        prototypes.extend(
+            np.asarray(prototype, dtype=float)
+            for prototype in memory["prototypes"]
+        )
+    if not prototypes:
+        return None, None
+    prototypes = np.asarray(prototypes, dtype=float)
+    # The modal boundary state wins: identical prototypes are counted.
+    first, counts = {}, []
+    for prototype in prototypes:
+        key = tuple(np.round(prototype, 6).tolist())
+        if key not in first:
+            first[key] = len(counts)
+            counts.append(0)
+        counts[first[key]] += 1
+    ranking = sorted(range(len(counts)), key=lambda index: -counts[index])
+    chosen = ranking[:max(int(top), 1)]
+    keys = list(first.keys())
+    goals = np.asarray([np.asarray(keys[index], dtype=float)
+                        for index in chosen])
+    summary = dict(
+        candidates=len(prototypes),
+        distinct=len(counts),
+        goals=goals.tolist(),
+        counts=[int(counts[index]) for index in chosen],
+    )
+    return goals, summary
+
+
+def terminal_hazard(pain, risk, risk_weight, pain_weight=None, lane="max"):
+    """The endpoint's hazard from two *different* quantities.
+
+    * ``pain`` - the state's realised outcome statistic: how often entering
+      this state was actually painful.  It carries no window: it is the
+      outcome the world already reported here.
+    * ``risk`` - the calibrated probability of reaching pain inside the
+      readout's window.  It is an estimate about the future, not an outcome.
+
+    They are different parameters of the valuation function, so they may be
+    carried with different weights.  ``lane="max"`` keeps the historical
+    composition (the realised outcome replaces the estimate when it is
+    larger, one shared weight); ``lane="separate"`` keeps the two terms, each
+    with its own weight, which is the form that lets the value of a certain
+    outcome differ from the price of a mere possibility.
+    """
+    pain = np.asarray(pain, dtype=float)
+    risk = np.asarray(risk, dtype=float)
+    if lane == "separate":
+        weight = float(risk_weight if pain_weight is None else pain_weight)
+        return weight * pain + float(risk_weight) * risk
+    return np.maximum(pain, risk) * float(risk_weight)
+
+
+def _association_value_table(transitions, agent, window: int = 8,
+                             min_support: int = 5):
+    """Value by association: what tends to follow a state, and how good it is.
+
+    Pure counting over states the stream actually occupied: for every state,
+    the nodes met within ``window`` frames after it, and each successor's
+    realised alive fraction.  The value is the weighted mean of those
+    successors' quality.  No model and no counterfactual - and, unlike a
+    node's own mean return, not confounded with where in the episode the node
+    happens to sit (the failure measured on 2026-11-22).
+    """
+    episodes = {}
+    for row in transitions:
+        episodes.setdefault(int(row.get("episode", 0)), []).append(row)
+    assoc, totals = {}, {}
+    quality, quality_count = {}, {}
+    for rows in episodes.values():
+        observations = np.asarray([row["obs"] for row in rows], dtype=float)
+        encoded = np.concatenate(
+            [observations, _encoded_pending(rows, agent.lag)], axis=1
+        ) / agent.scales
+        nodes = []
+        for state in encoded:
+            node_id, _distance = agent._nearest(state)
+            nodes.append(node_id)
+        alive = np.asarray([
+            0.0 if bool(row.get("terminal")) else 1.0 for row in rows
+        ])
+        for index, node in enumerate(nodes):
+            if node is None:
+                continue
+            stop = min(index + 1 + int(window), len(nodes))
+            fraction = (float(alive[index + 1:stop].mean())
+                        if stop > index + 1 else 0.0)
+            quality[node] = quality.get(node, 0.0) + fraction
+            quality_count[node] = quality_count.get(node, 0) + 1
+            for other in nodes[index + 1:stop]:
+                if other is None or other == node:
+                    continue
+                neighbours = assoc.setdefault(node, {})
+                neighbours[other] = neighbours.get(other, 0) + 1
+                totals[node] = totals.get(node, 0) + 1
+    values = {}
+    for node, neighbours in assoc.items():
+        if totals.get(node, 0) < int(min_support):
+            continue
+        weight_sum = 0.0
+        total = 0.0
+        for other, count in neighbours.items():
+            if quality_count.get(other, 0) <= 0:
+                continue
+            weight = count / float(totals[node])
+            total += weight * quality[other] / quality_count[other]
+            weight_sum += weight
+        if weight_sum > 0.0:
+            values[node] = total / weight_sum
+    support = {
+        node: int(quality_count[node]) for node in values
+        if quality_count.get(node, 0) > 0
+    }
+    return values, support
+
+
+def association_value_batch(agent, encoded):
+    """Read the association value at each state through its nearest prototype."""
+    encoded = np.asarray(encoded, dtype=float)
+    table = getattr(agent, "association_values", None) or {}
+    support_map = getattr(agent, "association_support", None) or {}
+    values = np.zeros(len(encoded))
+    supports = np.zeros(len(encoded))
+    if not table:
+        return values, supports
+    for index, state in enumerate(encoded):
+        node_id, _distance = agent._nearest(state)
+        if node_id is None:
+            continue
+        value = table.get(node_id)
+        if value is None:
+            continue
+        values[index] = float(value)
+        supports[index] = float(support_map.get(node_id, 0))
+    return values, supports
+
+
+def _transition_table(transitions, agent, min_support: int = 2):
+    """Node-to-node transitions from the stream: the unit this policy decides on.
+
+    For every consecutive pair of entered states, record the edge, how often it
+    was taken, which action was used on it, and how often entering the target
+    was immediately painful.  Nothing is predicted: every entry is a transition
+    the stream actually executed.  Returns ``(edges, risk, default_action)``.
+    """
+    episodes = {}
+    for row in transitions:
+        episodes.setdefault(int(row.get("episode", 0)), []).append(row)
+    raw = {}
+    pain = {}
+    visits = {}
+    action_totals = np.zeros(2)
+    for rows in episodes.values():
+        observations = np.asarray([row["obs"] for row in rows], dtype=float)
+        encoded = np.concatenate(
+            [observations, _encoded_pending(rows, agent.lag)], axis=1
+        ) / agent.scales
+        signals = np.asarray(
+            [row.get("signals", (0.0, 0.0)) for row in rows], dtype=float
+        )
+        actions = np.asarray([
+            float(np.asarray(row.get("history", (0.0,))).reshape(-1)[0])
+            for row in rows
+        ], dtype=float)
+        nodes = []
+        for state in encoded:
+            node_id, _distance = agent._nearest(state)
+            nodes.append(node_id)
+        for index, node in enumerate(nodes):
+            if node is None:
+                continue
+            visits[node] = visits.get(node, 0) + 1
+            pain[node] = pain.get(node, 0.0) + float(signals[index, 1] > 0.0)
+            action_totals[int(actions[index])] += 1
+            if index + 1 >= len(nodes):
+                continue
+            target = nodes[index + 1]
+            if target is None:
+                continue
+            edge = raw.setdefault(node, {}).setdefault(
+                target, dict(count=0, actions=[])
+            )
+            edge["count"] += 1
+            edge["actions"].append(int(actions[index]))
+    edges = {}
+    for node, targets in raw.items():
+        kept = {}
+        for target, entry in targets.items():
+            if entry["count"] < int(min_support):
+                continue
+            counts = np.bincount(
+                np.asarray(entry["actions"], dtype=int), minlength=2
+            )
+            kept[target] = dict(
+                count=int(entry["count"]), action=int(np.argmax(counts)),
+            )
+        if kept:
+            edges[node] = kept
+    risk = {
+        node: float(pain[node]) / visits[node]
+        for node in visits if visits[node] > 0
+    }
+    default_action = int(np.argmax(action_totals)) if action_totals.any() else 0
+    return edges, risk, default_action
+
+
+def transition_action(agent, observation, prefix, risk_weight: float = 1.0):
+    """Choose the action that realises the best observed successor transition.
+
+    The decision is the *edge*, not an action sequence: among the successors
+    the stream actually reached from this node, take the one with the best
+    realised value net of its immediate pain rate, and execute the action that
+    edge was taken with.  The world model is not rolled here.
+    """
+    pending = np.asarray(prefix, dtype=float).reshape(-1)[:int(agent.lag)][::-1]
+    if len(pending) < int(agent.lag):
+        pending = np.concatenate([
+            np.zeros(int(agent.lag) - len(pending)), pending,
+        ])
+    encoded = np.concatenate([
+        np.asarray(observation, dtype=float).reshape(-1), pending,
+    ]) / agent.scales
+    node_id, _distance = agent._nearest(encoded)
+    policy = getattr(agent, "transition_policy", None) or {}
+    if node_id in policy:
+        return int(policy[node_id])
+    edges = (getattr(agent, "transition_edges", None) or {}).get(node_id) or {}
+    if not edges:
+        return int(getattr(agent, "transition_default_action", 0))
+    values = getattr(agent, "association_values", None) or {}
+    risks = getattr(agent, "node_risk", None) or {}
+    best = max(
+        edges,
+        key=lambda target: (
+            float(values.get(target, 0.0))
+            - float(risk_weight) * float(risks.get(target, 0.0))
+            + 1e-6 * edges[target]["count"]
+        ),
+    )
+    return int(edges[best]["action"])
+
+
+def _transition_values(edges, risk, gamma: float = 0.95,
+                       iterations: int = 60):
+    """Model-based value iteration on the state-transition graph.
+
+    The graph is the model: ``edges[s][t]`` says successor ``t`` was reached
+    from ``s`` with a given count and action.  Value iteration composes those
+    one-step transitions into a multi-step value, so the policy is chosen on
+    the graph rather than on a frame rollout.  Reward is the world's own
+    signal - alive is +1 and entering a painful state is -1:
+
+    ``r(t) = 1 - 2 * risk(t)``
+
+    Returns ``(policy, values)`` where ``policy[s]`` is the action with the
+    best action-value at ``s``.
+    """
+    nodes = set(edges)
+    values = {node: 0.0 for node in nodes}
+    policy = {}
+    for _ in range(int(iterations)):
+        updated = {}
+        for node, targets in edges.items():
+            by_action = {}
+            for target, entry in targets.items():
+                by_action.setdefault(int(entry["action"]), {})[
+                    target
+                ] = float(entry["count"])
+            best_value = None
+            best_action = None
+            for action, distribution in by_action.items():
+                total = sum(distribution.values())
+                if total <= 0.0:
+                    continue
+                value = 0.0
+                for target, count in distribution.items():
+                    reward = 1.0 - 2.0 * float(risk.get(target, 0.0))
+                    value += (count / total) * (
+                        reward + float(gamma) * values.get(target, 0.0)
+                    )
+                if best_value is None or value > best_value:
+                    best_value = value
+                    best_action = action
+            if best_value is not None:
+                updated[node] = best_value
+                policy[node] = int(best_action)
+        if not updated:
+            break
+        values = updated
+    return policy, values
 
 
 def _curiosity_potential(support):
     """Curiosity potential: high where the readout's evidence is thin.
 
-    ``Φ(s) = 1/sqrt(1 + evidence(s))`` with evidence the mean observation
+    ``濠?s) = 1/sqrt(1 + evidence(s))`` with evidence the mean observation
     count behind the state's active cells.  It is bounded in (0, 1], so
     the shaped objective cannot out-scale the hazard and value terms, and
     it needs no task knowledge - only the counters the learner already
@@ -1051,10 +1872,10 @@ def _curiosity_potential(support):
 def _curiosity_term(phi_start, phi_end, weight, discount, horizon):
     """Potential-based curiosity shaping summed over a fixed-horizon plan.
 
-    PBRS adds ``γΦ(s') - Φ(s)`` per step; over H steps the sum telescopes
-    to ``γ^H Φ(s_H) - Φ(s_0)``.  The planner's step costs are accumulated
-    without a per-step discount (``γ = 1`` in the rollout), so the term
-    enters as ``w * (Φ(s_0) - Φ(s_H))``: a less-supported endpoint lowers
+    PBRS adds ``缂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾惧綊鏌ｉ幋锝呅撻柛銈呭閺屾盯顢曢敐鍡欘槰闂佽鍨抽崑銈夌嵁閺嶎灔搴敆閳ь剚淇婇懖鈺冪＜闁逞屽墴瀹曞ジ鎮㈢粙鍨紟婵犵妲呴崹闈涒枖閺囥垹閱囨い蹇撶墛閻?s') - 濠?s)`` per step; over H steps the sum telescopes
+    to ``缂傚倸鍊搁崐鎼佸磹閹间礁纾归柟闂寸绾剧懓顪冪€ｎ亝鎹ｉ柣顓炴闇夐柨婵嗙墱濞兼劖绻涢崨顖毿㈤棁澶愭煟濡儤鈻曢柛搴＄箳缁辨帡鎮╁畷鍥р拡缂?濠?s_H) - 濠?s_0)``.  The planner's step costs are accumulated
+    without a per-step discount (``缂?= 1`` in the rollout), so the term
+    enters as ``w * (濠?s_0) - 濠?s_H))``: a less-supported endpoint lowers
     the cost.  Every plan shares ``s_0``, so the start term is a constant;
     because this is a potential difference the shaped objective has the
     same optimum as the unshaped one, which is the guardrail against
@@ -1085,19 +1906,74 @@ def _curiosity_off(agent):
         agent.curiosity_weight = saved
 
 
+def _apply_margin_tiebreak(result, batches, previous_action, eps):
+    """Among near-tied plans, prefer one that keeps the previous action.
+
+    The planner's top two candidates routinely differ by ~1e-3 while the terms
+    it is asked to weigh are ~1e-2, so an added term decides the winner on
+    noise.  This gate does not choose a different objective: it only says that
+    when several plans are within `eps` of the best, the one whose first action
+    continues the current one wins.  `eps` is read off the decision's own
+    margin distribution (``decision_margin_probe.py``), not picked per world.
+    """
+    if not batches or previous_action is None or eps <= 0.0:
+        return result
+    scores = np.vstack([np.asarray(batch["scores"], dtype=float)
+                        for batch in batches])
+    sequences = np.vstack([np.asarray(batch["sequences"], dtype=float)
+                           for batch in batches])
+    feasible = np.concatenate([
+        np.asarray(batch.get("feasible", np.ones(len(batch["scores"]), bool)),
+                   dtype=bool)
+        for batch in batches
+    ])
+    finite = np.concatenate([
+        np.asarray(batch.get("finite", np.ones(len(batch["scores"]), bool)),
+                   dtype=bool)
+        for batch in batches
+    ])
+    usable = feasible & finite
+    if usable.sum() < 2:
+        return result
+    cost = scores[:, 0]
+    best = float(np.min(cost[usable]))
+    near = usable & (cost <= best + float(eps))
+    keep = near & (np.asarray(sequences[:, 0], dtype=float)
+                   == float(previous_action))
+    if not keep.any():
+        return result
+    index = int(np.flatnonzero(keep)[np.argmin(cost[keep])])
+    actions = np.asarray(result.actions, dtype=float).copy()
+    actions[:] = sequences[index]
+    return replace(result, actions=actions, score=scores[index])
+
+
 def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   step_stride=2, stride_includes_lag=False,
                   death_status_batch=None, unknown_penalty=0.0,
                   near_penalty=0.0, candidate_callback=None,
                   inquiry_action=None, risk_weight=1.0,
-                  risk_decay=1.0):
+                  risk_decay=1.0, beam_width=0, milestone_weight=0.0,
+                  milestone_mode="off", milestone_rate=None,
+                  milestone_goal=None, pain_weight=None, risk_lane="max",
+                  previous_action=None, margin_eps=0.0, veto_fraction=0.0):
     initial = np.asarray(env.obs(), dtype=float)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
+    captured = []
+    user_callback = candidate_callback
+
+    def _capture(batch):
+        captured.append(batch)
+        if user_callback is not None:
+            user_callback(batch)
+
+    candidate_callback = _capture
     action_dim = int(lag) + 1
     step_stride = max(int(step_stride), 1)
     lag = int(lag)
     risk_weight = float(risk_weight)
     risk_decay = float(risk_decay)
+    milestone_weight = float(milestone_weight)
     error_weight = bool(getattr(agent, "risk_error_weight", False))
     step_errors = list(getattr(agent, "step_errors", ()) or ())
 
@@ -1317,17 +2193,19 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             if getattr(agent, "predicate_readouts", False):
                 # D3: the terminal hazard comes from the predicates only;
                 # the prototype valence no longer bounds it.
-                risk = agent.pain_signal_batch(
-                    encoded, mask_table
-                ) * risk_weight * (risk_decay ** horizon) * error_factor(
-                    horizon - 1
+                signal = agent.pain_signal_batch(encoded, mask_table)
+                risk = signal * risk_weight * (risk_decay ** horizon) * (
+                    error_factor(horizon - 1)
                 )
             else:
-                risk = np.maximum(
-                    pain, agent.pain_signal_batch(encoded, mask_table)
-                ) * risk_weight * (risk_decay ** horizon) * error_factor(
-                    horizon - 1
-                )
+                signal = agent.pain_signal_batch(encoded, mask_table)
+                risk = terminal_hazard(
+                    pain,
+                    signal,
+                    risk_weight,
+                    pain_weight=pain_weight,
+                    lane=risk_lane,
+                ) * (risk_decay ** horizon) * error_factor(horizon - 1)
             # Scalarized objective: accumulated hazard minus the
             # sequence-level value of the endpoint, so a plan that accepts
             # local risk in exchange for a long-survival alignment can win.
@@ -1336,9 +2214,12 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             # would be credited with the population-average return, so the
             # planner would be paid (or charged) for states nothing was
             # ever learned about.
-            value, support = agent.feature_value_batch(
-                encoded, mask_table, return_support=True
-            )
+            if getattr(agent, "value_readout", "cells") == "association":
+                value, support = association_value_batch(agent, encoded)
+            else:
+                value, support = agent.feature_value_batch(
+                    encoded, mask_table, return_support=True
+                )
             trust_samples = getattr(agent, "value_trust_samples", 150.0)
             trust = support / (support + trust_samples)
             value_term = -agent.feature_value_weight * trust * value
@@ -1351,11 +2232,163 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 )
             else:
                 curiosity = np.zeros(len(states))
-            cost = risk + value_term + curiosity
+            # Milestone terms.  Two modes, both inert at weight zero:
+            #   "goal" - pull the rollout endpoint toward the boundary states
+            #     the agent's own stream started milestones in;
+            #   "rate" - the epoch-level action commitment: the high level
+            #     learned, per milestone identity, the action rate the
+            #     behavior policy realised there, and the low level keeps its
+            #     full per-frame freedom but is charged for deviating from
+            #     that tendency.  It is a direction, not a position, so it
+            #     imports no absolute state and no time scale.
+            # The commitment is charged per plan step (`mean_t |a_t - rate|`,
+            # not `|mean_t a_t - rate|`).  Measured (2026-11-22): every
+            # candidate plan's *mean* action sits close to the small learned
+            # rate, so the mean-deviation form is nearly constant across
+            # candidates and cannot discriminate - it bound the decision on
+            # 0-3% of frames.  The per-step form spreads an order of magnitude
+            # wider across candidates (0.1 to 0.9 for `rate ~ 0.1`) and is
+            # what makes the term a live constraint.
+            milestone = np.zeros(len(states))
+            if (milestone_weight > 0.0 and milestone_mode == "goal"):
+                # The subgoal is a state the transition graph leads to (the
+                # successor milestone's entry state), when the caller supplies
+                # one; otherwise the modal boundary states of the stream.
+                goal = milestone_goal
+                if goal is None:
+                    goal = getattr(agent, "milestone_goals", None)
+                frame = getattr(agent, "milestone_frame", None)
+                if goal is not None and frame is not None:
+                    # Distance is measured in the identity's own (time-
+                    # orthogonal) directions, not over every coordinate:
+                    # raw coordinates drag in the offsets that merely track
+                    # how far along the cycle we are.  The second direction is
+                    # what tells the two sides of an identity apart instead of
+                    # collapsing them onto one attractor.
+                    obs_dim = agent.obs_dim
+                    scales = np.asarray(agent.scales[:obs_dim], dtype=float)
+                    center_raw = np.asarray(
+                        frame["center"], dtype=float
+                    )[:obs_dim]
+                    sigma_raw = np.asarray(
+                        frame.get("sigma", np.ones(obs_dim)), dtype=float
+                    )[:obs_dim]
+                    axes = np.asarray(
+                        frame.get(
+                            "axes", np.asarray([frame["axis"]], dtype=float)
+                        ),
+                        dtype=float,
+                    )[:, :obs_dim]
+                    # `encoded` is raw / scales, so the raw-frame projection
+                    # becomes (encoded - center/scales) @ (axes*scales/sigma).
+                    transform = axes * scales / sigma_raw
+                    center_enc = center_raw / scales
+                    spread = float(frame["scale"])
+                    here = (
+                        (encoded[:, :obs_dim] - center_enc) @ transform.T
+                    ) / spread
+                    raw_goal = np.atleast_2d(
+                        np.asarray(goal, dtype=float)
+                    )[:, :obs_dim]
+                    targets = (
+                        ((raw_goal - center_raw) / sigma_raw) @ axes.T
+                    ) / spread
+                    gap = here[:, None, :] - targets[None, :, :]
+                    milestone = -milestone_weight * np.linalg.norm(
+                        gap, axis=2
+                    ).min(axis=1)
+            elif (milestone_weight > 0.0 and milestone_mode == "rate"
+                  and milestone_rate is not None):
+                deviation = np.abs(
+                    sequences - float(milestone_rate)
+                ).mean(axis=1)
+                milestone = milestone_weight * deviation
+            elif (milestone_weight > 0.0
+                  and milestone_mode == "track"):
+                # Phase-invariant tracking: the target is the successor
+                # stage's entry state, but the distance is measured over the
+                # observation coordinates that are *not* clocks.  The identity
+                # frame already separates those; using all of them (instead of
+                # its one-dimensional projection) keeps the gap offsets that
+                # the projection throws away.
+                goal = milestone_goal
+                if goal is None:
+                    goal = getattr(agent, "milestone_goals", None)
+                frame = getattr(agent, "milestone_frame", None)
+                if goal is not None and frame is not None:
+                    obs_dim = agent.obs_dim
+                    scales = np.asarray(agent.scales[:obs_dim], dtype=float)
+                    time_dir = np.asarray(
+                        frame.get("time_dir", np.zeros(obs_dim)), dtype=float
+                    )
+                    keep = np.abs(time_dir) <= 1e-9
+                    if not keep.any():
+                        keep = np.ones(obs_dim, dtype=bool)
+                    target = np.atleast_2d(
+                        np.asarray(goal, dtype=float)
+                    )[0, :obs_dim] / scales
+                    difference = encoded[:, :obs_dim] - target[None, :]
+                    milestone = milestone_weight * np.mean(
+                        difference[:, keep] ** 2, axis=1
+                    )
+            elif (milestone_weight > 0.0
+                  and milestone_mode == "plan"):
+                # Wide, non-frame prediction: the h-step stage walk's
+                # expected feedback deficit is a cost the frame rollout
+                # cannot see.  It is charged per candidate, by the stage the
+                # candidate's own endpoint lands in, so it can change which
+                # plan wins; charging the current stage's risk would be a
+                # constant across candidates.
+                frame = getattr(agent, "milestone_frame", None)
+                stage_states = getattr(agent, "milestone_stage_states", None)
+                clusters = getattr(agent, "milestone_clusters", None)
+                risks = getattr(agent, "milestone_risks", {})
+                if (clusters and clusters.get("horizon")
+                        and np.asarray(clusters.get("centers", ())).size):
+                    # The consistent map: name the endpoint by its own
+                    # action-conditioned future, exactly as the training
+                    # stages were named.  Falls back to entry geometry only
+                    # when the layer was built with the frame identity.
+                    raw_endpoints = encoded[:, :agent.obs_dim] * np.asarray(
+                        agent.scales[:agent.obs_dim]
+                    )
+                    endpoint_sig = transition_signatures(
+                        raw_endpoints, world.predict, agent.lag,
+                        int(clusters["horizon"]),
+                    )
+                    milestone = milestone_weight * signature_stage_risk(
+                        endpoint_sig, clusters["centers"], risks
+                    )
+                elif (frame is not None and stage_states is not None
+                        and len(stage_states)):
+                    endpoint_risk = nearest_stage_risk(
+                        encoded[:, :agent.obs_dim],
+                        stage_states,
+                        getattr(agent, "milestone_stage_keys", ()),
+                        risks,
+                        frame,
+                        scales=np.asarray(agent.scales[:agent.obs_dim]),
+                    )
+                    milestone = milestone_weight * endpoint_risk
+            cost = risk + value_term + curiosity + milestone
+            if veto_fraction > 0.0:
+                # Outcome constraint: the endpoints this decision's readout
+                # ranks worst are a bad result and are excluded, rather than
+                # adding their (globally high) level to every step.  The
+                # cutoff is a within-decision quantile, so only the ranking is
+                # used and the readout's absolute scale cannot leak into the
+                # objective.
+                cutoff = float(np.quantile(
+                    signal, 1.0 - float(veto_fraction)
+                ))
+                margin = float(cost.max() - cost.min()) + 1.0
+                cost = cost + np.where(
+                    signal >= cutoff, 10.0 * margin, 0.0
+                )
             return (
                 np.column_stack([
-                    cost, -dopamine, risk, value_term, curiosity,
-                    np.zeros(len(states)),
+                    cost, -dopamine, risk, value_term,
+                    curiosity + milestone, np.zeros(len(states)),
                 ]),
                 np.isfinite(encoded).all(axis=1),
             )
@@ -1367,9 +2400,30 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
         if candidate_callback is not None:
             candidate_callback(batch)
 
+    if int(beam_width) > 0:
+        # Long-horizon search at full per-frame action resolution: beam search
+        # keeps `2 ** horizon` enumeration out of the picture while leaving the
+        # timing of every step free, which is what the reduced candidate sets
+        # cannot do.  The only knob is the beam width.
+        if death_batch is not None or death_status_batch is not None:
+            raise ValueError(
+                "beam search does not take a death callback; disable the "
+                "death rules or leave --beam-width at 0"
+            )
+        result = beam_search(
+            initial_state=initial,
+            action_space=tuple(getattr(agent, "action_space", (0, 1))),
+            horizon=horizon,
+            transition_batch=predict_batch,
+            evaluate_step=evaluate_step,
+            evaluate_terminal=evaluate_terminal,
+            beam_width=int(beam_width),
+            score_combine="sum",
+        )
+        return result
     result = exhaustive_search(
         initial_state=initial,
-        action_space=(0, 1),
+        action_space=tuple(getattr(agent, "action_space", (0, 1))),
         horizon=horizon,
         transition_batch=predict_batch,
         evaluate_step=evaluate_step,
@@ -1398,7 +2452,121 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 result = override_first_action(
                     result, inquiry_batches, int(action)
                 )
+    if margin_eps > 0.0 and previous_action is not None:
+        result = _apply_margin_tiebreak(
+            result, captured, previous_action, margin_eps
+        )
     return result
+
+
+def stage_schedules(action_space, blocks: int, block_frames: int) -> np.ndarray:
+    """Stage-level candidate set: block-wise constant action sequences.
+
+    A stage is a stretch whose internal steps do not matter; only what the
+    stretch ends in.  The abstraction is therefore over DURATION, not over
+    frames: each candidate holds one action for `block_frames` frames before
+    switching, so the set is ``|A| ** blocks`` rather than ``2 ** span`` while
+    shrinking the lookahead cost the same way a stage abstraction does.
+
+    Nothing here knows what an action means or which one is "do nothing":
+    every action of ``action_space`` is treated symmetrically and the set is
+    built identically for any discrete action space with any number of
+    actions.  The only inputs are the action alphabet and the block duration,
+    which are generic hyperparameters of the same kind as `horizon`.
+    """
+    actions = [int(action) for action in action_space]
+    blocks = int(blocks)
+    block_frames = int(block_frames)
+    span = blocks * block_frames
+    plans = np.zeros((len(actions) ** blocks, span), dtype=float)
+    for row, combo in enumerate(itertools.product(actions, repeat=blocks)):
+        for index, action in enumerate(combo):
+            plans[row, index * block_frames:(index + 1) * block_frames] = action
+    return plans
+
+
+def stage_result(env, world, agent, prefix, blocks=4, block_frames=4, lag=LAG,
+                 step_stride=2, risk_weight=1.0) -> SearchResult:
+    """Stage-level decision: score stage outcomes, not per-frame plans.
+
+    Mirrors `policy_result`'s objective columns so the ledger contract holds,
+    but the candidates are `stage_schedules` evaluated over a horizon the
+    per-frame search cannot afford, and the executed action is the first action
+    of the best-scoring schedule.  Nothing is read from the task: the actions
+    come from the runtime's own `action_space` and the score uses the same
+    learned hazard and value readouts as the fine search.
+    """
+    initial = np.asarray(env.obs(), dtype=float)
+    pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
+    action_dim = int(lag) + 1
+    step_stride = max(int(step_stride), 1)
+    risk_weight = float(risk_weight)
+    actions = tuple(getattr(agent, "action_space", (0, 1)))
+    span = int(blocks) * int(block_frames)
+    count = len(actions) ** int(blocks)
+    if count > 20000:
+        raise ValueError(
+            "stage candidate count %d is too large; lower --stage-blocks"
+            % count
+        )
+    plans = stage_schedules(actions, blocks, block_frames)
+    states = np.broadcast_to(initial, (count, len(initial))).copy()
+    risk_total = np.zeros(count, dtype=float)
+    history = None
+    for step in range(span):
+        history = history_features(
+            plans, step + 1, pending_prefix, action_dim=action_dim
+        )
+        pending = history[:, :agent.lag][:, ::-1]
+        encoded = np.concatenate([states, pending], axis=1) / agent.scales
+        if step % step_stride == 0:
+            risk_total += np.asarray(
+                agent.pain_signal_batch(encoded), dtype=float
+            )
+        states = np.asarray(world.predict(states, history), dtype=float)
+    history = history_features(
+        plans, span, pending_prefix, action_dim=action_dim
+    )
+    pending = history[:, :agent.lag][:, ::-1]
+    encoded = np.concatenate([states, pending], axis=1) / agent.scales
+    pain, dopamine = agent.valence_state_batch(encoded)
+    mask_table = agent._feature_mask_table(encoded[:, :agent.obs_dim])
+    risk_end = np.maximum(
+        np.asarray(pain, dtype=float),
+        np.asarray(agent.pain_signal_batch(encoded, mask_table), dtype=float),
+    )
+    risk = (risk_total + risk_end) * risk_weight
+    if getattr(agent, "value_readout", "cells") == "association":
+        value, support = association_value_batch(agent, encoded)
+    else:
+        value, support = agent.feature_value_batch(
+            encoded, mask_table, return_support=True
+        )
+    trust = support / (support + getattr(agent, "value_trust_samples", 150.0))
+    value_term = -agent.feature_value_weight * trust * value
+    cost = risk + value_term
+    finite = np.isfinite(cost) & np.isfinite(value_term)
+    if not finite.any():
+        raise ValueError("stage search found no finite candidate")
+    ranking = np.where(finite, cost, np.inf)
+    index = int(np.argmin(ranking))
+    score = (
+        float(cost[index]),
+        0.0,
+        float(risk[index]),
+        float(value_term[index]),
+        0.0,
+        0.0,
+    )
+    return SearchResult(
+        actions=np.asarray(plans[index], dtype=float).copy(),
+        score=score,
+        feasible=True,
+        feasible_count=int(finite.sum()),
+        candidate_count=count,
+        first_state=np.asarray(states[index], dtype=float).copy(),
+        final_state=np.asarray(states[index], dtype=float).copy(),
+    )
 
 
 def policy_action(env, world, agent, prefix, horizon, lag=LAG,
@@ -1477,7 +2645,12 @@ def cell_q_action(env, world, agent, prefix, lag=LAG):
 def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                     step_stride=2, stride_includes_lag=False,
                     decision="search", ledger_out=None, risk_weight=1.0,
-                    risk_decay=1.0):
+                    risk_decay=1.0, stage_blocks=4, stage_block_frames=4,
+                    beam_width=0, milestone_weight=0.0,
+                    milestone_mode="off", milestone_rate=None,
+                    milestone_goal=None, pain_weight=None, risk_lane="max",
+                    plan_out=None, candidate_callback=None,
+                    previous_action=None, margin_eps=0.0, veto_fraction=0.0):
     """Dispatch one decision to the searched or the cell-Q-only policy.
 
     With `ledger_out` (a list) and the search decision, the winning
@@ -1487,6 +2660,12 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
     regressed against its realized outcome (P4 objective learning).  The
     curiosity share (column 4) is a fixed shaping term and is deliberately
     not part of that ledger.
+
+    `decision="stage"` scores block-wise constant action schedules over
+    `stage_blocks * stage_block_frames` frames instead of per-frame plans over
+    `horizon`: inside an uneventful stretch only the stretch's outcome
+    matters, which buys a lookahead the per-frame search cannot afford at a
+    fraction of its candidate count.
     """
     if decision == "search":
         result = policy_result(
@@ -1495,12 +2674,43 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
             stride_includes_lag=stride_includes_lag,
             risk_weight=risk_weight,
             risk_decay=risk_decay,
+            beam_width=beam_width,
+            milestone_weight=milestone_weight,
+            milestone_mode=milestone_mode,
+            milestone_rate=milestone_rate,
+            milestone_goal=milestone_goal,
+            pain_weight=pain_weight,
+            risk_lane=risk_lane,
+            candidate_callback=candidate_callback,
+            previous_action=previous_action,
+            margin_eps=margin_eps,
+            veto_fraction=veto_fraction,
         )
         if ledger_out is not None:
             score = result.score
             ledger_out.append((
                 float(score[2]), float(score[3]),
             ))
+        if plan_out is not None:
+            # The search's own answer: the state it believes the chosen plan
+            # ends in.  Recorded only when asked (diagnostics), so the
+            # production path is untouched.
+            plan_out.append(dict(
+                frame=int(env.t),
+                final=np.asarray(result.final_state, dtype=float),
+                actions=np.asarray(result.actions, dtype=float),
+                cost=float(np.asarray(result.score).reshape(-1)[0]),
+            ))
+        return int(result.actions[0])
+    if decision == "stage":
+        result = stage_result(
+            env, world, agent, prefix, blocks=stage_blocks,
+            block_frames=stage_block_frames, lag=lag,
+            step_stride=step_stride, risk_weight=risk_weight,
+        )
+        if ledger_out is not None:
+            score = result.score
+            ledger_out.append((float(score[2]), float(score[3])))
         return int(result.actions[0])
     if decision == "cellq":
         if ledger_out is not None:
@@ -1520,7 +2730,7 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
     endpoint; under the contrast objective it is the accumulated action
     contrast minus the value term.  Column 1 is the negative terminal
     dopamine.  With a non-zero curiosity weight the scalar also carries
-    ``w * (Φ(s_0) - Φ(s_H))`` (the potential-difference shaping term).
+    ``w * (濠?s_0) - 濠?s_H))`` (the potential-difference shaping term).
     Used by diagnostics that compare fixed plans against the
     searched plan, and later by plan-level posteriors.
     """
@@ -1604,7 +2814,11 @@ def plan_score(initial_state, world, agent, prefix, plan, horizon, lag=LAG,
 def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
              step_stride=2, stride_includes_lag=False, env_seed=None,
              record=False, episode=0, decision="search",
-             risk_weight=1.0, risk_decay=1.0):
+             risk_weight=1.0, risk_decay=1.0, stage_blocks=4,
+             stage_block_frames=4, beam_width=0, metrics_out=None,
+             spacing=None, milestone_weight=0.0, milestone_mode="off",
+             pain_weight=None, risk_lane="max", plan_out=None,
+             candidate_out=None, margin_eps=0.0, veto_fraction=0.0):
     """Run one deterministic evaluation episode.
 
     ``env_seed`` selects the world instance; when omitted the historical
@@ -1621,15 +2835,54 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
     if step_stride < 1:
         raise ValueError("step_stride must be positive")
     lag = int(lag)
-    env = latent[lag](seed if env_seed is None else int(env_seed))
+    env = latent[lag](
+        seed if env_seed is None else int(env_seed),
+        spacing=None if spacing is None else float(spacing),
+    )
     prefix = np.zeros(lag, dtype=float)
     recent = [0.0] * lag
     actions = []
+    last_action = None
     transitions = []
+    # Epoch-level commitment: the tracker tells the planner which milestone
+    # identity the stream is in right now, and the rate learned for that
+    # identity is the action tendency the plan should honour.  Built for
+    # either milestone mode so the coverage of the *decision-time* stream
+    # against the memory learned on the *behaviour* stream is measurable -
+    # a shift that used to make an unseen identity silently skip its term.
+    tracker = None
+    if milestone_mode in ("goal", "rate", "track"):
+        threshold = getattr(agent, "milestone_threshold", None)
+        frame = getattr(agent, "milestone_frame", None)
+        if threshold is not None and frame is not None:
+            tracker = MilestoneTracker(
+                threshold, frame, scale=getattr(agent, "milestone_scale", None)
+            )
+    visited = [] if tracker is not None else None
     while not env.dead and env.t < cap:
         obs = np.asarray(env.obs(), dtype=float)
+        active_rate = None
+        active_goal = None
+        if tracker is not None:
+            tracker.observe(obs)
+            visited.append(tracker.key)
+            if milestone_mode == "rate":
+                active_rate = getattr(agent, "milestone_rate", {}).get(
+                    tracker.key
+                )
+            elif milestone_mode in ("goal", "track"):
+                # The subgoal is where the transition graph leads from here,
+                # resolved per frame rather than fixed at fit time.
+                active_goal = getattr(
+                    agent, "milestone_goals_by_key", {}
+                ).get(tracker.key)
         ledger: List[Tuple[float, float]] = []
         ledger_out = ledger if record else None
+        collected = None
+        callback = None
+        if candidate_out is not None:
+            collected = []
+            callback = collected.append
         action = decision_action(
             env, world, agent, prefix, horizon, lag=lag,
             step_stride=step_stride,
@@ -1637,7 +2890,23 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             decision=decision, ledger_out=ledger_out,
             risk_weight=risk_weight,
             risk_decay=risk_decay,
+            stage_blocks=stage_blocks,
+            stage_block_frames=stage_block_frames,
+            beam_width=beam_width,
+            milestone_weight=milestone_weight,
+            milestone_mode=milestone_mode,
+            milestone_rate=active_rate,
+            milestone_goal=active_goal,
+            pain_weight=pain_weight,
+            risk_lane=risk_lane,
+            plan_out=plan_out,
+            candidate_callback=callback,
+            previous_action=last_action,
+            margin_eps=margin_eps,
+            veto_fraction=veto_fraction,
         )
+        if candidate_out is not None:
+            candidate_out.append(collected)
         history = np.asarray([float(action)] + recent[:lag], dtype=float)
         prediction_hook = getattr(agent, "prediction_branch", None) is not None
         if prediction_hook:
@@ -1646,6 +2915,7 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             )[0]
             agent.set_prediction(predicted)
         actions.append(action)
+        last_action = int(action)
         prefix = np.concatenate([[float(action)], prefix[:-1]])
         env.step(action)
         if prediction_hook:
@@ -1672,6 +2942,18 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
                 ledger=(ledger[0] if ledger else (0.0, 0.0)),
             ))
         recent = [float(action)] + recent[:-1]
+    if metrics_out is not None:
+        # Task-level progress the world reports but the learner never sees:
+        # how many progress milestones the episode reached.  Frames count
+        # time; milestones count outcomes, which is the scale a frame-horizon
+        # planner cannot reach on its own.
+        metrics_out["passes"] = int(getattr(env, "passed", 0))
+        if visited is not None:
+            # How much of the planner's own stream the milestone memory -
+            # learned on the behaviour stream - can actually speak to.
+            metrics_out["milestone_coverage"] = milestone_coverage(
+                visited, getattr(agent, "milestone_keys", ())
+            )
     return env.t, actions, transitions
 
 
@@ -1709,6 +2991,12 @@ def run_seed(task):
     step_stride = int(task.get("step_stride", 2))
     stride_includes_lag = bool(task.get("stride_includes_lag", False))
     decision = str(task.get("decision", "search"))
+    stage_blocks = int(task.get("stage_blocks", 4))
+    stage_block_frames = int(task.get("stage_block_frames", 4))
+    beam_width = int(task.get("beam_width", 0))
+    eval_spacing = float(task.get("eval_spacing", 0.0))
+    milestone_weight = float(task.get("milestone_weight", 0.0))
+    milestone_mode = str(task.get("milestone_mode", "off"))
     ood_trust_scale = float(task.get("ood_trust_scale", 0.0))
     obs_trust = float(task.get("obs_trust", 1.0))
     feature_action_prior = float(task.get("feature_action_prior", 2.0))
@@ -1762,6 +3050,15 @@ def run_seed(task):
     )
     death_rule_envelope = bool(
         task.get("death_rule_envelope", False)
+    )
+    readout_propagation_gain = float(
+        task.get("readout_propagation_gain", 0.0)
+    )
+    readout_propagation_steps = int(
+        task.get("readout_propagation_steps", 1)
+    )
+    readout_propagation_edges = str(
+        task.get("readout_propagation_edges", "transition")
     )
     voi_threat_min = float(task.get("voi_threat_min", 0.25))
     eval_episodes = int(task.get("eval_episodes", 1))
@@ -1842,6 +3139,9 @@ def run_seed(task):
         death_rule_max_literals=death_rule_max_literals,
         death_rule_boundary_margin=death_rule_boundary_margin,
         death_rule_envelope=death_rule_envelope,
+        readout_propagation_gain=readout_propagation_gain,
+        readout_propagation_steps=readout_propagation_steps,
+        readout_propagation_edges=readout_propagation_edges,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -1862,6 +3162,7 @@ def run_seed(task):
                     env_seed = int(eval_seed)
                 else:
                     env_seed = int(eval_seed) * 10000 + episode
+                metrics = {}
                 frames, actions, _ = evaluate(
                     seed, world, agent, cap=cap, horizon=horizon, lag=lag,
                     step_stride=step_stride,
@@ -1870,6 +3171,13 @@ def run_seed(task):
                     decision=decision,
                     risk_weight=risk_weight,
                     risk_decay=risk_decay,
+                    stage_blocks=stage_blocks,
+                    stage_block_frames=stage_block_frames,
+                    beam_width=beam_width,
+                    metrics_out=metrics,
+                    spacing=eval_spacing if eval_spacing > 0.0 else None,
+                    milestone_weight=milestone_weight,
+                    milestone_mode=milestone_mode,
                 )
                 rows.append(dict(
                     train_seed=seed,
@@ -1877,9 +3185,13 @@ def run_seed(task):
                     episode=episode,
                     env_seed=int(env_seed),
                     frames=int(frames),
+                    passes=int(metrics.get("passes", 0)),
                     action_rate=(
                         float(np.mean(actions)) if actions else 0.0
                     ),
+                    milestone_coverage=metrics.get(
+                        "milestone_coverage", {}
+                    ).get("fraction"),
                 ))
     return dict(
         seed=seed,
@@ -1890,6 +3202,7 @@ def run_seed(task):
         prediction=agent.prediction_summary(),
         dagger=getattr(agent, "dagger_log", []),
         death_rules=getattr(agent, "death_rule_summary", None),
+        milestone=getattr(agent, "milestone_summary", None),
         top_nodes=agent.top_nodes(5),
         top_edges=agent.top_edges(5),
     )
@@ -1969,10 +3282,85 @@ def main():
     parser.add_argument("--stride-includes-lag", action="store_true",
                         help="also query step == lag, the first predicted "
                              "state the plan action can affect")
-    parser.add_argument("--decision", choices=("search", "cellq"),
+    parser.add_argument("--decision", choices=("search", "cellq", "stage"),
                         default="search",
                         help="search = full MPC planning; cellq = read the "
-                             "learned (feature, action) cells directly")
+                             "learned (feature, action) cells directly; "
+                             "stage = score block-wise constant action "
+                             "schedules over blocks * block-frames frames")
+    parser.add_argument("--stage-blocks", type=int, default=4,
+                        help="number of action blocks a stage-level "
+                             "(--decision stage) schedule holds")
+    parser.add_argument("--stage-block-frames", type=int, default=4,
+                        help="frames each stage-level action block lasts")
+    parser.add_argument("--beam-width", type=int, default=0,
+                        help="beam width for the searched decision: 0 keeps "
+                             "the exhaustive 2**horizon enumeration (bitwise "
+                             "unchanged); positive values switch to beam "
+                             "search, which keeps per-frame action timing at "
+                             "a bounded candidate count")
+    parser.add_argument("--eval-spacing", type=float, default=0.0,
+                        help="pipe spacing of the evaluation worlds (0 = the "
+                             "world default).  Raising it stretches the same "
+                             "task over more frames, which is how the "
+                             "time-scale invariance of a decision policy is "
+                             "measured; training worlds are unaffected")
+    parser.add_argument("--milestone-weight", type=float, default=0.0,
+                        help="weight of the milestone shaping term: the "
+                             "rollout endpoint is pulled toward the boundary "
+                             "states the agent's own stream started "
+                             "milestones in.  0 (default) leaves the "
+                             "objective bitwise unchanged")
+    parser.add_argument("--milestone-mode",
+                        choices=("off", "goal", "rate", "plan", "track"),
+                        default="off",
+                        help="how the milestone term attaches: 'off' is "
+                             "inert; 'goal' pulls a rollout endpoint toward "
+                             "the modal boundary states of the agent's own "
+                             "stream; 'rate' honours, per milestone identity, "
+                             "the duration-weighted action rate the behavior "
+                             "policy realized there - an epoch-level action "
+                             "commitment that carries no position and no "
+                             "time scale; 'plan' charges each candidate the "
+                             "expected feedback deficit of the stage its own "
+                             "endpoint lands in (the two-stage walk of the "
+                             "learned transition table); the frame horizon "
+                             "is unchanged")
+    parser.add_argument("--milestone-stage",
+                        choices=("geometry", "strength", "signature"),
+                        default="strength",
+                        help="how stages are cut: 'geometry' uses the "
+                             "observation stream's boundary statistic; "
+                             "'strength' uses the learned graph (a node's "
+                             "strength rises where the action-conditioned "
+                             "future changes) and keeps the frame identity; "
+                             "'signature' additionally names each stage by "
+                             "the pooled cluster of its future")
+    parser.add_argument("--milestone-boundary-k", type=float, default=3.0,
+                        help="stage-boundary threshold in pooled score "
+                             "quantiles; the same statistical rule (three "
+                             "quantiles above the 90th) the geometric "
+                             "segmenter uses")
+    parser.add_argument("--hazard-readout",
+                        choices=("calibrated", "raw"), default="calibrated",
+                        help="what the planner reads as hazard: 'calibrated' "
+                             "is the isotonic rate (a level; on a rare-event "
+                             "target it collapses most of the score range "
+                             "into one plateau), 'raw' is the weighted "
+                             "channel sum (a ranking, uncalibrated)")
+    parser.add_argument("--value-readout",
+                        choices=("cells", "association"), default="cells",
+                        help="what the planner reads as endpoint value: "
+                             "'cells' is the per-feature cell (empty at "
+                             "epochs=1); 'association' is the counting "
+                             "readout - the weighted realised quality of the "
+                             "nodes the stream met after this one")
+    parser.add_argument("--veto-fraction", type=float, default=0.0,
+                        help="exclude the worst fraction of candidate "
+                             "endpoints by the hazard readout within each "
+                             "decision (0 = off); the cutoff is a "
+                             "within-decision quantile, so only the ranking "
+                             "is used")
     parser.add_argument("--value-horizon", type=int, default=0,
                         help="k-step bootstrap target for the sequence-value "
                              "cells; 0 keeps the full-episode MC return")
@@ -2106,6 +3494,19 @@ def main():
                         help="treat states inside the boundary margin as "
                              "death for the planner's hard constraint "
                              "(model-error-aware envelope); off by default")
+    parser.add_argument("--readout-propagation", type=float, default=0.0,
+                        help="relax the readout's soft-neighbour seed "
+                             "weights over learned graph edges before "
+                             "reading values/rates, so the readout reflects "
+                             "the topological neighbourhood instead of the "
+                             "Euclidean one (0 = off, the geometric readout)")
+    parser.add_argument("--readout-propagation-steps", type=int, default=1,
+                        help="relaxation steps for --readout-propagation")
+    parser.add_argument("--readout-propagation-edges",
+                        choices=("transition", "association", "both"),
+                        default="transition",
+                        help="which learned edges carry the readout "
+                             "relaxation")
     parser.add_argument("--iterative-induction", action="store_true",
                         help="F5: re-induce gap banks every epoch, with "
                              "the previous generation's missed positives "
@@ -2189,6 +3590,20 @@ def main():
         raise ValueError("--cap must be positive")
     if args.horizon < 1:
         raise ValueError("--horizon must be positive")
+    if args.stage_blocks < 1:
+        raise ValueError("--stage-blocks must be positive")
+    if args.stage_block_frames < 1:
+        raise ValueError("--stage-block-frames must be positive")
+    if args.beam_width < 0:
+        raise ValueError("--beam-width must be non-negative")
+    if args.eval_spacing < 0.0:
+        raise ValueError("--eval-spacing must be non-negative")
+    if args.milestone_weight < 0.0:
+        raise ValueError("--milestone-weight must be non-negative")
+    if args.milestone_boundary_k <= 0.0:
+        raise ValueError("--milestone-boundary-k must be positive")
+    if not (0.0 <= args.veto_fraction < 1.0):
+        raise ValueError("--veto-fraction must be in [0, 1)")
     if args.max_nodes < 1:
         raise ValueError("--max-nodes must be positive")
     if args.birth_threshold <= 0.0:
@@ -2305,6 +3720,13 @@ def main():
             step_stride=args.step_stride,
             stride_includes_lag=args.stride_includes_lag,
             decision=args.decision,
+            stage_blocks=args.stage_blocks,
+            stage_block_frames=args.stage_block_frames,
+            beam_width=args.beam_width,
+            eval_spacing=args.eval_spacing,
+            milestone_weight=args.milestone_weight,
+            milestone_mode=args.milestone_mode,
+                veto_fraction=args.veto_fraction,
             value_horizon=args.value_horizon,
             ood_trust_scale=args.ood_trust_scale,
             obs_trust=args.obs_trust,
@@ -2346,6 +3768,13 @@ def main():
             death_rule_max_literals=args.death_rule_max_literals,
             death_rule_boundary_margin=args.death_rule_margin,
             death_rule_envelope=args.death_rule_envelope,
+            readout_propagation_gain=args.readout_propagation,
+            readout_propagation_steps=args.readout_propagation_steps,
+            readout_propagation_edges=args.readout_propagation_edges,
+            milestone_stage=args.milestone_stage,
+            milestone_boundary_k=args.milestone_boundary_k,
+            hazard_readout=args.hazard_readout,
+            value_readout=args.value_readout,
             eval_seeds=eval_seeds,
             eval_episodes=args.eval_episodes,
             dagger_rounds=args.dagger_rounds,
@@ -2416,15 +3845,22 @@ def main():
             print(" dagger seed %d: %s" % (row["seed"], ", ".join(parts)))
 
     eval_rows = [row for result in rows for row in result["evals"]]
-    print("\ntrain  eval  ep  env_seed  frames  action_rate")
+    print("\ntrain  eval  ep  env_seed  frames  passes  action_rate")
     for row in eval_rows:
-        print(" %5d  %4d  %2d  %8d  %6d  %10.3f"
+        print(" %5d  %4d  %2d  %8d  %6d  %6d  %10.3f"
               % (row["train_seed"], row["eval_seed"], row["episode"],
-                 row["env_seed"], row["frames"], row["action_rate"]))
+                 row["env_seed"], row["frames"], row["passes"],
+                 row["action_rate"]))
 
     per_train = group_summaries(eval_rows, group="train_seed")
     per_eval = group_summaries(eval_rows, group="eval_seed")
     overall = cluster_summary(eval_rows, cluster="train_seed")
+    per_train_passes = group_summaries(
+        eval_rows, value="passes", group="train_seed"
+    )
+    overall_passes = cluster_summary(
+        eval_rows, value="passes", cluster="train_seed"
+    )
     print("\nframes per training seed (mean over evaluation worlds)")
     for key, summary in per_train.items():
         print(" train %4s  n=%2d  mean %6.1f  median %6.1f  range %d-%d"
@@ -2442,6 +3878,28 @@ def main():
     print("bootstrap 95%% CI over %d training seeds: [%.1f, %.1f]"
           % (overall["clusters"], overall["cluster_ci_low"],
              overall["cluster_ci_high"]))
+    print("\nprogress milestones overall: n=%d mean %.2f median %.1f "
+          "range %d-%d  (share of episodes with progress: %.3f)"
+          % (overall_passes["n"], overall_passes["mean"],
+             overall_passes["median"], int(overall_passes["min"]),
+             int(overall_passes["max"]),
+             float(np.mean([row["passes"] > 0 for row in eval_rows]))))
+    print("bootstrap 95%% CI over %d training seeds: [%.2f, %.2f]"
+          % (overall_passes["clusters"], overall_passes["cluster_ci_low"],
+             overall_passes["cluster_ci_high"]))
+    coverages = [row["milestone_coverage"] for row in eval_rows
+                 if row.get("milestone_coverage") is not None]
+    if coverages:
+        # The milestone memory is learned on the behaviour stream and applied
+        # to the planner's; this is how much of the planner's own stream it
+        # can actually speak to.  Low coverage is a distribution shift, not a
+        # weight to tune.
+        coverages = np.asarray(coverages, dtype=float)
+        print("milestone memory coverage of the planner's stream: "
+              "mean %.3f median %.3f min %.3f  (fraction of frames whose "
+              "identity the memory had seen)"
+              % (coverages.mean(), float(np.median(coverages)),
+                 coverages.min()))
     if overall["clusters"] < 5:
         print("warning: fewer than 5 trained models; the interval is "
               "descriptive, not a significance test")
@@ -2462,6 +3920,13 @@ def main():
                 step_stride=args.step_stride,
                 stride_includes_lag=args.stride_includes_lag,
                 decision=args.decision,
+                stage_blocks=args.stage_blocks,
+                stage_block_frames=args.stage_block_frames,
+                beam_width=args.beam_width,
+                milestone_weight=args.milestone_weight,
+                milestone_mode=args.milestone_mode,
+                veto_fraction=args.veto_fraction,
+                eval_spacing=args.eval_spacing,
                 value_horizon=args.value_horizon,
                 ood_trust_scale=args.ood_trust_scale,
                 obs_trust=args.obs_trust,
@@ -2489,6 +3954,10 @@ def main():
                 dagger_horizon=args.dagger_horizon,
             ),
             rows=eval_rows,
+            milestones=[
+                dict(seed=row["seed"], summary=row["milestone"])
+                for row in rows
+            ],
             dagger=[
                 dict(seed=row["seed"], rounds=row["dagger"])
                 for row in rows
@@ -2496,6 +3965,8 @@ def main():
             per_train_seed=per_train,
             per_eval_seed=per_eval,
             overall=overall,
+            per_train_seed_passes=per_train_passes,
+            overall_passes=overall_passes,
         )
         with open(args.report, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, sort_keys=True)

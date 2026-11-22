@@ -106,3 +106,13 @@
 
 - `substrate_nodes.main()` 按 `sys._is_gil_enabled()` 检测 free-threaded 构建：GIL 构建用 `ProcessPoolExecutor`，free-threaded 用 `ThreadPoolExecutor`（常量 `FREE_THREADED`）。因此多进程分支会重新导入整个依赖树——**模块级不应有副作用**（这正是"import 不解析 CLI"守卫存在的原因）。
 - 当前 `.venv` 是 GIL 构建；free-threaded `python3.15t` 存在但 numpy 的 `_multiarray_umath` DLL 被应用控制策略阻止加载（见 `README.md`）。
+
+## 4.7 新增实验线的依赖（见 [07 新增实验线](./07-experiment-lines.md)）
+
+| 层 | 模块 | 依赖 |
+|---|---|---|
+| L0 纯数值/数据层（仅 numpy / 标准库） | `rule_expressions`、`stage_graph`、`action_effect`、`context_model`、`branches`、`variable_registry`、`memory_tree`、`generative_expansion`、`probe_cache` | 不 import 项目其他模块（`probe_cache` 默认在函数内延迟 import `substrate_nodes.fit`） |
+| L1 组合库 | `death_rules`（→ `node_features.Primitive`、`rule_expressions`）、`death_rule_loop`（→ `death_rules`）、`contextual_rules`（→ `death_rules`）、`pattern_library`（→ `death_rules`）、`hierarchical_memory`（→ `memory_tree`、`variable_registry`）、`planner_rollout_quality`（→ `trajectory_search`、`substrate_nodes`、`death_transition_quality`、`probe_cache`） | 见括号内 |
+| L3 只读探针（最上层） | `stage_*_probe`、`phase_stage_probe`、`state_partition_probe`、`death_*_probe`、`death_transition_quality`、`action_conditioning_*`、`causal_horizon_probe`、`doom_horizon_probe`、`oracle_selection_probe`、`coarse_search_probe`、`outcome_coarse_probe`、`score_column_probe`、`risk_contrast_probe`、`metric_probe`、`n_tie_probe`、`event_lead_probe`、`warning_lead_probe`、`dynamics_context_probe`、`generated_prior_probe`、`context_benchmark`、`learning_trace`、`wiring_audit` | 普遍 import `substrate_nodes`（`fit/evaluate/policy_result/_curiosity_off/_encoded_pending/collect/_train`）、`latent_world`，常配合 `probe_cache`、`eval_protocol` |
+
+纪律不变：探针只读主线，**不改变默认训练与决策路径**；探针之间的复用只经由 `probe_cache` / `eval_protocol` / `planner_rollout_quality` 这类无副作用工具。

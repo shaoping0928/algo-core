@@ -109,7 +109,8 @@ def history_features(sequences, steps, prefix, action_dim=ACTION_DIM):
 
 
 def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
-            budget=0, episode_start=0, propensities=None):
+            budget=0, episode_start=0, propensities=None, spacing=None,
+            gravity=None, flap=None, speed=None):
     """Collect real transitions using only observation/action/feedback.
 
     `guide(obs) -> action or None` optionally overrides the behavior action
@@ -117,7 +118,10 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
     on top of (never instead of) the existing sampler.  `propensities`,
     when given, receives the sampling probability of every emitted action
     (1.0 marks a guide override).  `episode_start` offsets the episode ids
-    so two collection stages produce fresh episodes.
+    so two collection stages produce fresh episodes.  `spacing`, `gravity`,
+    `flap` and `speed` are world properties supplied by the task, exactly like
+    the numbers `flappy` already takes; they change the world, never any logic
+    here.
     """
     lp = LayerPair(k_max=8)
     rng = np.random.RandomState(seed * 10000)
@@ -127,7 +131,10 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
     episode = int(episode_start)
     spent = 0
     while done < steps:
-        env = latent[int(lag)](seed * 10000 + episode)
+        env = latent[int(lag)](
+            seed * 10000 + episode, spacing=spacing, gravity=gravity,
+            flap=flap, speed=speed,
+        )
         lp.hist = [0.0] * 8
         while not env.dead and done < steps:
             gains = np.abs(lp.h)

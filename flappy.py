@@ -45,7 +45,7 @@ SEED = 21
 
 class Flappy:
     def __init__(self, seed, max_t=None, gravity=None, flap=None,
-                 drag=None, speed=None):
+                 drag=None, speed=None, spacing=None):
         self.rng = np.random.RandomState(seed)
         self.max_t = MAXT if max_t is None else int(max_t)
         if self.max_t < 1:
@@ -57,14 +57,26 @@ class Flappy:
         self.flap = FLAP if flap is None else float(flap)
         self.drag = DRAG if drag is None else float(drag)
         self.speed = SPEED if speed is None else float(speed)
+        # The pipe spacing sets how much *time* separates one progress
+        # milestone from the next: the geometry of a passage is unchanged,
+        # only the number of frames between passages moves.  A world with a
+        # larger spacing is the same task at a longer time scale.
+        self.spacing = SPACING if spacing is None else float(spacing)
+        if self.spacing <= 0.0:
+            raise ValueError("spacing must be positive")
         self.reset()
 
     def reset(self):
         self.y = 0.5
         self.vy = 0.0
-        self.pipes = [[1.0, self._gap()], [1.0 + SPACING, self._gap()]]
+        self.pipes = [[1.0, self._gap()],
+                      [1.0 + self.spacing, self._gap()]]
         self.t = 0
         self.dead = False
+        # Task metric, not an observation: how many pipes the bird has left
+        # behind.  It is a world fact of the same kind as `t`, and is read
+        # only by the evaluation protocol - never fed to the learner.
+        self.passed = 0
         self._feedback = {"dopamine": 0.0, "pain": 0.0}
 
     def _gap(self):
@@ -89,7 +101,8 @@ class Flappy:
             p[0] -= self.speed
         if self.pipes[0][0] < -0.2:
             self.pipes.pop(0)
-            self.pipes.append([self.pipes[-1][0] + SPACING, self._gap()])
+            self.pipes.append([self.pipes[-1][0] + self.spacing, self._gap()])
+            self.passed += 1
         # collision
         for px, gc in self.pipes:
             if abs(px - BIRD_X) < 0.06 and abs(self.y - gc) > GAP / 2:

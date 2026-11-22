@@ -316,6 +316,9 @@ class NodeRuntime:
         action_edge_trust_samples: float = 50.0,
         seed: int = 0,
         scales: Optional[Sequence[float]] = None,
+        readout_propagation_gain: float = 0.0,
+        readout_propagation_steps: int = 1,
+        readout_propagation_edges: str = "transition",
     ):
         if int(obs_dim) < 1:
             raise ValueError("obs_dim must be positive")
@@ -337,6 +340,16 @@ class NodeRuntime:
             raise ValueError("value_trust_samples must be non-negative")
         if float(curiosity_weight) < 0.0:
             raise ValueError("curiosity_weight must be non-negative")
+        if float(readout_propagation_gain) < 0.0:
+            raise ValueError("readout_propagation_gain must be non-negative")
+        if int(readout_propagation_steps) < 1:
+            raise ValueError("readout_propagation_steps must be positive")
+        if str(readout_propagation_edges) not in (
+            "transition", "association", "both"
+        ):
+            raise ValueError(
+                "readout_propagation_edges must be transition/association/both"
+            )
         if int(max_nodes) < 1:
             raise ValueError("max_nodes must be positive")
         if not 0.0 <= float(exploration) <= 1.0:
@@ -528,6 +541,18 @@ class NodeRuntime:
         # down-weighted relative to induced, verified feature channels; 1.0
         # keeps the historical max-combination behaviour.
         self.obs_trust = float(obs_trust)
+        # Readout propagation: relax the soft-neighbour seed weights over the
+        # learned graph edges before reading values/rates, so the readout
+        # averages the *topological* neighbourhood instead of the Euclidean
+        # one.  Gain 0 (default) keeps the historical geometric readout
+        # bit-for-bit; the relaxation only runs when the gain is positive.
+        self.readout_propagation_gain = float(readout_propagation_gain)
+        self.readout_propagation_steps = int(readout_propagation_steps)
+        self.readout_propagation_edges = str(readout_propagation_edges)
+        # Derived readout structures (prototype adjacency + per-prototype
+        # columns).  Dropped whenever the runtime learns, so an evaluation
+        # phase builds them once and every query reuses them.
+        self._readout_cache: Optional[dict] = None
         self.value_baseline = 0.0
         # Retained for API compatibility: the baseline is a 1/n cumulative
         # mean of the value targets (see `_update_feature_value`), not a
@@ -1018,6 +1043,11 @@ class NodeRuntime:
                   next_features: Iterable[str] = (),
                   learn_memory_credit: bool = False) -> None:
         """Create association, causal transition and signal-driven memory."""
+        # Every learning path (observe / learn_transition / learn_episode)
+        # funnels through here, so one invalidation keeps the cached readout
+        # columns and adjacency from going stale after a transition updates
+        # edges, prototypes or association rates.
+        self._invalidate_readout_cache()
         pain = float(pain)
         dopamine = float(dopamine)
         current_features = list(dict.fromkeys(current_features))
@@ -1462,34 +1492,27 @@ class NodeRuntime:
             indices, weights, nearest_min = self._soft_weights_batch(states)
             prototype = np.zeros(len(states), dtype=float)
             if indices is not None:
-                # The association rate is constant over one readout, so
-                # read every prototype once per batch instead of once per
-                # neighbour slot, and reuse memory rates the same way.
-                associations = np.asarray([
-                    self._pain_association(node_id)
-                    for node_id in self._prototype_ids
-                ], dtype=float)
-                memory_rates: Dict[str, float] = {}
-                for row in range(len(states)):
-                    total = 0.0
-                    weighted = 0.0
-                    node_ids = []
-                    for column, index in enumerate(indices[row]):
-                        node_id = self._prototype_ids[int(index)]
-                        node_weight = float(weights[row, column])
-                        node_ids.append(node_id)
-                        total += node_weight
-                        weighted += node_weight * associations[int(index)]
-                    for memory_id, strength in self.memories_for(
-                        node_ids
-                    ).items():
-                        rate = memory_rates.get(memory_id)
-                        if rate is None:
-                            rate = self._pain_association(memory_id)
-                            memory_rates[memory_id] = rate
-                        total += float(strength)
-                        weighted += float(strength) * rate
-                    prototype[row] = weighted / total if total > 0.0 else 0.0
+                if self.readout_propagation_gain > 0.0:
+                    # Propagated readout: the per-prototype hazard column
+                    # (each prototype's own rate folded with the rates of the
+                    # memories it binds) is cached by `_prototype_columns`, so
+                    # the expensive scan runs once per readout phase and the
+                    # query itself only relaxes the seed's own support.
+                    _pain, _dopamine, combined, associations = (
+                        self._prototype_columns()
+                    )
+                    prototype = self._propagated_readout(
+                        indices, weights, combined
+                    )
+                else:
+                    # Vectorised: the row's neighbouring prototypes carry the
+                    # association rate, and the memories they bind fold their
+                    # own rates in.  One ragged expand replaces the historical
+                    # per-row Python walk (and its per-row ``memories_for``).
+                    associations = self._prototype_associations()
+                    prototype[:] = self._prototype_hazard_from_weights(
+                        indices, weights
+                    )
                 if self.ood_trust_scale > 0.0:
                     # The shrink target is only read when trust scaling is
                     # on; with the default zero scale the baseline sweep
@@ -1556,7 +1579,8 @@ class NodeRuntime:
                 if column is not None and weight > 0.0:
                     read = read + float(weight) * column
             calibration = self.hazard_calibration
-            if calibration is not None:
+            readout = getattr(self, "hazard_readout", "calibrated")
+            if calibration is not None and readout != "raw":
                 mids, rates = calibration
                 read = np.interp(read, mids, rates)
             return read
@@ -2050,6 +2074,7 @@ class NodeRuntime:
 
     def reset(self) -> None:
         """Reset episode-local state; node values and edges are retained."""
+        self._invalidate_readout_cache()
         self.pending = self._zero_pending()
         self.last_node = None
         self.last_action = None
@@ -3780,6 +3805,429 @@ class NodeRuntime:
             values, dtype=float
         ) + (1.0 - trust) * float(baseline)
 
+    # ---- readout cache -----------------------------------------------------
+    def _invalidate_readout_cache(self) -> None:
+        """Drop the derived readout structures after any learning mutation.
+
+        The prototype adjacency (an O(E) edge pass) and the per-prototype
+        columns (an O(P) memory retrieval) depend on the graph state, not on
+        the query, yet the planner reads them many times per decision.  A
+        cache makes an evaluation phase pay for them once; every learning
+        entry point drops it so training readouts never see stale numbers.
+        """
+        self._readout_cache = None
+
+    def _readout_signature(self):
+        """Cheap structural fingerprint of the state the cache depends on.
+
+        Value/weight updates during training are caught by the explicit
+        invalidation in `_interact`; this guard additionally catches any
+        structural change (births, rule materialisation, pruning) that
+        happens outside that funnel, without needing a hook per call site.
+        """
+        return (
+            len(self._prototype_ids),
+            len(self.graph.nodes),
+            len(self.graph.edges),
+        )
+
+    def _store_readout_cache(self, key, value) -> None:
+        if self._readout_cache is None:
+            self._readout_cache = {}
+        self._readout_cache["signature"] = self._readout_signature()
+        self._readout_cache[key] = value
+
+    def _cached_readout(self, key):
+        cache = self._readout_cache
+        if (cache is not None and key in cache
+                and cache.get("signature") == self._readout_signature()):
+            return cache[key]
+        return None
+
+    def _prototype_associations(self):
+        """Cached per-prototype association rate.
+
+        ``_pain_association`` is deterministic for a fixed graph, yet the
+        readout asks for all ``P`` prototypes on every query within a phase
+        (the association rate does not depend on the query).  Caching it turns
+        that into one sweep per phase.
+        """
+        cached = self._cached_readout("associations")
+        if cached is not None:
+            return cached
+        values = np.asarray(
+            [self._pain_association(node_id) for node_id in self._prototype_ids],
+            dtype=float,
+        )
+        self._store_readout_cache("associations", values)
+        return values
+
+    def _prototype_memory_index(self):
+        """Cached CSR of prototype -> (memory, membership weight).
+
+        Returns ``(out_start, out_count, mem_slot, mem_weight, rates)``:
+        ``out_start[p]``/``out_count[p]`` delimit prototype ``p``'s reachable
+        memories inside the flat ``mem_slot``/``mem_weight`` arrays, and
+        ``rates`` holds each listed memory's own association rate.
+
+        A single incidence pass resolves every node's membership weights once
+        and reuses them for each prototype that associates with it, instead of
+        rebuilding a dictionary per prototype (or per row) as ``memories_for``
+        does.  A ``(prototype, memory)`` pair keeps the maximum weight over
+        the paths reaching it, which is exactly the value ``memories_for``
+        returns.  Cached until the runtime learns.
+        """
+        cached = self._cached_readout("memory_index")
+        if cached is not None:
+            return cached
+        prototypes = self._prototype_ids
+        count = len(prototypes)
+        membership: Dict[str, Dict[str, float]] = {}
+
+        def weights_of(node_id: str) -> Dict[str, float]:
+            weights = membership.get(node_id)
+            if weights is None:
+                weights = {}
+                for key in self.graph.incoming.get(node_id, ()):
+                    if key[2] != MEMBERSHIP:
+                        continue
+                    value = float(self.graph.edges[key].weight)
+                    if value > weights.get(key[0], 0.0):
+                        weights[key[0]] = value
+                membership[node_id] = weights
+            return weights
+
+        src: List[int] = []
+        slot: List[int] = []
+        weight: List[float] = []
+        rates: List[float] = []
+        slots: Dict[str, int] = {}
+        for row, node_id in enumerate(prototypes):
+            reachable: Dict[str, float] = {}
+            for memory_id, value in weights_of(node_id).items():
+                reachable[memory_id] = value
+            # Associations are one-hop retrieval paths to memories of related
+            # nodes; a single edge is registered under both endpoints, so it
+            # is followed from whichever end is a prototype.
+            for key in self.graph.outgoing.get(node_id, ()):
+                if key[2] != ASSOCIATION:
+                    continue
+                edge = self.graph.edges[key]
+                other = (
+                    edge.target if edge.source == node_id else edge.source
+                )
+                for memory_id, value in weights_of(other).items():
+                    if value > reachable.get(memory_id, 0.0):
+                        reachable[memory_id] = value
+            for memory_id, value in reachable.items():
+                if value <= 0.0:
+                    continue
+                index = slots.get(memory_id)
+                if index is None:
+                    index = len(rates)
+                    slots[memory_id] = index
+                    rates.append(self._pain_association(memory_id))
+                src.append(row)
+                slot.append(index)
+                weight.append(value)
+        src_arr = np.asarray(src, dtype=np.int64)
+        out_count = np.bincount(src_arr, minlength=count).astype(np.int64)
+        out_start = np.concatenate([
+            np.zeros(1, dtype=np.int64), np.cumsum(out_count)[:-1]
+        ])
+        result = (
+            out_start,
+            out_count,
+            np.asarray(slot, dtype=np.int64),
+            np.asarray(weight, dtype=float),
+            np.asarray(rates, dtype=float),
+        )
+        self._store_readout_cache("memory_index", result)
+        return result
+
+    def _prototype_columns(self):
+        """Cached per-prototype columns: (pain, dopamine, hazard, assoc).
+
+        ``hazard`` folds each prototype's own association rate and the rates
+        of the memories it binds into one number, so the relaxed readout is a
+        single matmul instead of a per-row dictionary walk.  The memory
+        weights come from ``_prototype_memory_index``'s shared incidence pass
+        rather than one ``memories_for`` call per prototype.
+        """
+        cached = self._cached_readout("columns")
+        if cached is not None:
+            return cached
+        prototypes = self._prototype_ids
+        count = len(prototypes)
+        nodes = [self.graph.nodes[node_id] for node_id in prototypes]
+        pain = np.asarray(
+            [node.value + node.immediate_pain for node in nodes], dtype=float
+        )
+        dopamine = np.asarray(
+            [node.dopamine + node.immediate_dopamine for node in nodes],
+            dtype=float,
+        )
+        associations = self._prototype_associations()
+        hazard = associations.copy()
+        mass = np.ones(count, dtype=float)
+        if count:
+            out_start, out_count, mem_slot, mem_weight, rates = (
+                self._prototype_memory_index()
+            )
+            if mem_slot.size:
+                rows = np.repeat(
+                    np.arange(count, dtype=np.int64), out_count
+                )
+                mass += np.bincount(
+                    rows, weights=mem_weight, minlength=count
+                )
+                hazard += np.bincount(
+                    rows, weights=mem_weight * rates[mem_slot],
+                    minlength=count,
+                )
+        hazard = hazard / np.where(mass > 0.0, mass, 1.0)
+        columns = (pain, dopamine, hazard, associations)
+        self._store_readout_cache("columns", columns)
+        return columns
+
+    def _prototype_transition(self):
+        """Sparse row-normalised transition operator over prototypes.
+
+        Returns ``(out_start, out_count, edge_dst, edge_weight)``: a CSR view
+        grouped by *source* prototype, so ``out_start[c]``/``out_count[c]``
+        delimit the outgoing edges of prototype ``c`` inside the flat
+        ``edge_dst``/``edge_weight`` arrays.  Grouping by source is what makes
+        a relaxation step cheap: the seed's support is only ``soft_neighbors``
+        wide per row, so the step expands just those entries along their
+        outgoing edges instead of touching a dense ``batch x P`` block.  The
+        graph is sparse while ``P`` reaches a few thousand, so a dense
+        operator would make every step O(batch * P) rather than
+        O(batch * soft_neighbors * outdegree).
+
+        Association edges are added in both directions.  A prototype with no
+        outgoing edge keeps an identity self-loop, so every source has at
+        least one outgoing edge and mass is conserved.  Cached until the
+        runtime learns.
+        """
+        cached = self._cached_readout("transition")
+        if cached is not None:
+            return cached
+        count = len(self._prototype_ids)
+        empty_int = np.zeros(0, dtype=np.int64)
+        if count == 0:
+            result = (empty_int, empty_int, empty_int, np.zeros(0))
+            self._store_readout_cache("transition", result)
+            return result
+        index = {
+            node_id: row for row, node_id in enumerate(self._prototype_ids)
+        }
+        src: List[int] = []
+        dst: List[int] = []
+        weight: List[float] = []
+        want = self.readout_propagation_edges
+        for edge in self.graph.edges.values():
+            if edge.kind == TRANSITION_EDGE:
+                if want == "association":
+                    continue
+            elif edge.kind == ASSOCIATION:
+                if want == "transition":
+                    continue
+            else:
+                continue
+            source = index.get(edge.source)
+            target = index.get(edge.target)
+            if source is None or target is None:
+                continue
+            value = float(edge.weight)
+            if value <= 0.0:
+                continue
+            src.append(source)
+            dst.append(target)
+            weight.append(value)
+            if edge.kind == ASSOCIATION:
+                src.append(target)
+                dst.append(source)
+                weight.append(value)
+        src_arr = np.asarray(src, dtype=np.int64)
+        dst_arr = np.asarray(dst, dtype=np.int64)
+        weight_arr = np.asarray(weight, dtype=float)
+        present = np.zeros(count, dtype=bool)
+        present[src_arr] = True
+        missing = np.flatnonzero(~present)
+        if missing.size:
+            src_arr = np.concatenate([src_arr, missing])
+            dst_arr = np.concatenate([dst_arr, missing])
+            weight_arr = np.concatenate([weight_arr, np.ones(missing.size)])
+        row_sum = np.bincount(src_arr, weights=weight_arr, minlength=count)
+        weight_arr = weight_arr / row_sum[src_arr]
+        order = np.argsort(src_arr, kind="stable")
+        src_arr = src_arr[order]
+        dst_arr = dst_arr[order]
+        weight_arr = weight_arr[order]
+        out_count = np.bincount(src_arr, minlength=count).astype(np.int64)
+        out_start = np.concatenate([
+            np.zeros(1, dtype=np.int64), np.cumsum(out_count)[:-1]
+        ])
+        result = (out_start, out_count, dst_arr, weight_arr)
+        self._store_readout_cache("transition", result)
+        return result
+
+    def _prototype_hazard_from_weights(self, indices, weights) -> np.ndarray:
+        """Vectorised per-row prototype hazard for the geometric readout.
+
+        The historical implementation walked each row's ``soft_neighbors`` in
+        Python and rebuilt a memory dictionary per row, which is the readout's
+        dominant cost (hundreds of thousands of ``memories_for`` calls per
+        evaluation).  This computes the same quantity - the association rate
+        of the row's neighbouring prototypes, folded with the rates of the
+        memories those prototypes bind - with one ragged expand plus a
+        ``maximum`` reduce over the ``(row, memory)`` pairs, so the union and
+        the max-weighted strength match ``memories_for`` exactly, while the
+        per-row Python loop disappears.
+        """
+        indices = np.asarray(indices, dtype=np.int64)
+        weights = np.asarray(weights, dtype=float)
+        batch = len(indices)
+        associations = self._prototype_associations()
+        total = weights.sum(axis=1)
+        weighted = (weights * associations[indices]).sum(axis=1)
+        _start, out_count, mem_slot, mem_weight, rates = (
+            self._prototype_memory_index()
+        )
+        if mem_slot.size:
+            n_mem = int(rates.size)
+            flat = indices.reshape(-1)
+            degree = out_count[flat]
+            edge = self._ragged_edge_indices(degree, _start, flat)
+            if edge.size:
+                pair_rows = np.repeat(
+                    np.arange(batch, dtype=np.int64), indices.shape[1]
+                )
+                keys = np.repeat(pair_rows, degree) * n_mem + mem_slot[edge]
+                order = np.argsort(keys, kind="stable")
+                keys = keys[order]
+                strength = mem_weight[edge][order]
+                bounds = np.flatnonzero(np.concatenate(
+                    ([True], keys[1:] != keys[:-1])
+                ))
+                unique = keys[bounds]
+                best = np.maximum.reduceat(strength, bounds)
+                unique_rows = unique // n_mem
+                total = total + np.bincount(
+                    unique_rows, weights=best, minlength=batch
+                )
+                weighted = weighted + np.bincount(
+                    unique_rows, weights=best * rates[unique % n_mem],
+                    minlength=batch,
+                )
+        return np.where(
+            total > 0.0,
+            weighted / np.where(total > 0.0, total, 1.0),
+            0.0,
+        )
+
+    @staticmethod
+    def _ragged_edge_indices(degree, start, index):
+        """Positions in a CSR edge list after expanding ``index`` by ``degree``.
+
+        For a CSR whose row ``i`` occupies ``start[i] .. start[i]+count[i]``,
+        this maps each entry of ``index`` to the run of ``degree`` consecutive
+        edge positions it owns, laid out back to back - the flat gather a
+        ragged expansion needs.
+        """
+        total = int(degree.sum())
+        if total == 0:
+            return np.zeros(0, dtype=np.int64)
+        group = np.cumsum(degree) - degree
+        return (
+            np.repeat(start[index], degree)
+            + np.arange(total, dtype=np.int64)
+            - np.repeat(group, degree)
+        )
+
+    def _relax_step(self, rows, cols, vals, gain, count, operator):
+        """One ``q <- (1-g)*q + g*(q @ A)`` step on sparse triplets.
+
+        ``(rows, cols, vals)`` are the nonzero entries of the current mass.
+        Each entry is repeated for every outgoing edge of its prototype (a
+        ragged gather), the flow is scaled by ``g``, the retained mass by
+        ``1-g``, and the two lists are coalesced in a single ``np.unique``
+        pass so duplicate ``(row, prototype)`` pairs sum instead of
+        overwriting each other.
+        """
+        out_start, out_count, edge_dst, edge_w = operator
+        degree = out_count[cols]
+        edge = self._ragged_edge_indices(degree, out_start, cols)
+        if edge.size == 0:
+            return rows, cols, vals
+        keys = np.concatenate([
+            rows * count + cols,
+            np.repeat(rows, degree) * count + edge_dst[edge],
+        ])
+        merged = np.concatenate([
+            (1.0 - gain) * vals,
+            gain * np.repeat(vals, degree) * edge_w[edge],
+        ])
+        unique, inverse = np.unique(keys, return_inverse=True)
+        coalesced = np.bincount(
+            inverse.reshape(-1), weights=merged, minlength=unique.size
+        )
+        keep = coalesced != 0.0
+        unique = unique[keep]
+        coalesced = coalesced[keep]
+        return unique // count, unique % count, coalesced
+
+    def _propagated_readout(self, indices, weights, columns):
+        """Contract the edge-relaxed seed weights with per-prototype columns.
+
+        ``indices``/``weights`` are the geometric seed
+        (``_soft_weights_batch``) and ``columns`` is ``(P,)`` or ``(P, m)``;
+        the return is ``(batch,)`` or ``(batch, m)``.  Mass is relaxed
+        ``steps`` times by ``q <- (1-g)*q + g*(q @ A)`` and then contracted,
+        so the readout reflects the topological neighbourhood of each row
+        instead of just its geometric neighbours.
+
+        The relaxation never materialises a dense ``batch x P`` block: the
+        seed has ``soft_neighbors`` entries per row and each step expands
+        them along the outgoing edges, so the work follows the support.  The
+        contraction is a ``np.bincount`` per output column, i.e. C-level
+        NumPy with no per-row Python loop.
+        """
+        columns = np.asarray(columns, dtype=float)
+        flat = columns.ndim == 1
+        if flat:
+            columns = columns[:, None]
+        width = columns.shape[1]
+        count = columns.shape[0]
+        batch = len(indices)
+        if batch == 0:
+            out = np.zeros((0, width), dtype=float)
+            return out[:, 0] if flat else out
+        idx = np.asarray(indices, dtype=np.int64)
+        rows = np.repeat(
+            np.arange(batch, dtype=np.int64), idx.shape[1]
+        )
+        cols = idx.reshape(-1)
+        vals = np.asarray(weights, dtype=float).reshape(-1)
+        gain = self.readout_propagation_gain
+        if gain > 0.0 and cols.size:
+            operator = self._prototype_transition()
+            if operator[2].size:
+                for _ in range(self.readout_propagation_steps):
+                    rows, cols, vals = self._relax_step(
+                        rows, cols, vals, gain, count, operator
+                    )
+        if rows.size:
+            total = np.bincount(rows, weights=vals, minlength=batch)
+            vals = vals / np.where(total[rows] > 0.0, total[rows], 1.0)
+        contributions = vals[:, None] * columns[cols]
+        out = np.zeros((batch, width), dtype=float)
+        for column in range(width):
+            out[:, column] = np.bincount(
+                rows, weights=contributions[:, column], minlength=batch
+            )
+        return out[:, 0] if flat else out
+
     def _soft_weights_batch(self, states: np.ndarray):
         states = np.asarray(states, dtype=float)
         if states.ndim != 2 or states.shape[1] != len(self.scales):
@@ -3839,18 +4287,34 @@ class NodeRuntime:
         if indices is None:
             length = len(np.asarray(states))
             return np.zeros(length), np.zeros(length)
-        nodes = [
-            self.graph.nodes[self._prototype_ids[int(index)]]
-            for index in indices.ravel()
-        ]
-        pain_values = np.asarray([
-            node.value + node.immediate_pain for node in nodes
-        ]).reshape(indices.shape)
-        dopamine_values = np.asarray([
-            node.dopamine + node.immediate_dopamine for node in nodes
-        ]).reshape(indices.shape)
-        pain = (weights * pain_values).sum(axis=1)
-        dopamine = (weights * dopamine_values).sum(axis=1)
+        if self.readout_propagation_gain > 0.0:
+            # Relax the geometric seed over learned edges first, so the node
+            # values are averaged over the topological neighbourhood.  The
+            # per-prototype columns come from the cache, so the scan is paid
+            # once per readout phase rather than once per query, and the two
+            # valence channels share one relaxation.
+            pain_column, dopamine_column, _hazard, _assoc = (
+                self._prototype_columns()
+            )
+            channels = self._propagated_readout(
+                indices, weights,
+                np.stack([pain_column, dopamine_column], axis=1),
+            )
+            pain = channels[:, 0]
+            dopamine = channels[:, 1]
+        else:
+            nodes = [
+                self.graph.nodes[self._prototype_ids[int(index)]]
+                for index in indices.ravel()
+            ]
+            pain_values = np.asarray([
+                node.value + node.immediate_pain for node in nodes
+            ]).reshape(indices.shape)
+            dopamine_values = np.asarray([
+                node.dopamine + node.immediate_dopamine for node in nodes
+            ]).reshape(indices.shape)
+            pain = (weights * pain_values).sum(axis=1)
+            dopamine = (weights * dopamine_values).sum(axis=1)
         # Both valence channels read the same memory neighbourhoods; one
         # retrieval pass per prototype serves both instead of rescanning
         # the membership/association graph for each attribute.

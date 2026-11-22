@@ -242,6 +242,7 @@ beam_search(initial_state, action_space, horizon,
 - `evaluate_death_status(states, sequences, step) -> 1/0/-1`：`1`=死亡、`0`=安全、`-1`=未知；与 `evaluate_death` 互斥。未知不单独否决计划，`unknown_penalty` 只给主目标按未知步数加罚（返回的 `score` 仍是未加罚目标）。
 - `candidate_callback(batch)`：诊断/探针钩子，接收每批候选的序列、分数、可行性、首死/首未知/未知步数与预测状态；搜索本身不依赖它。
 - 无可行解 → 返回最低分候选 + `feasible=False`；核心不保存完整轨迹（只留 current/first/final）。`evaluate_death=None` 且 `unknown_penalty=0` 时选择路径逐位不变。
+- 工具函数（供探针复用）：`best_candidate_index(scores, feasible)`、`merge_candidate_batches(batches)`、`override_first_action(result, batches, ...)`。
 
 ---
 
@@ -263,7 +264,7 @@ beam_search(initial_state, action_space, horizon,
 | `policy_action(...)` / `cell_q_action(env, world, agent, prefix, lag=LAG)` | 搜索动作 / 单步 `argmin_a[hazard − w·V_f]`（cellq 消融） |
 | `decision_action(env, world, agent, prefix, horizon, ...)` | 交付选中计划（可 `ledger_out` 写决策账本） |
 | `plan_score(initial_state, world, agent, prefix, plan, horizon, ...)` | 对**固定计划**按同一目标打分（有与搜索一致性单测） |
-| `evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG, record=False)` | 评测；`record=True` 返回规划器**实际执行**的真实转移（schema 同 `collect`） |
+| `evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG, record=False, spacing=None, metrics_out=None)` | 评测；`record=True` 返回规划器**实际执行**的真实转移（schema 同 `collect`）；`spacing` 设评测世界的时间尺度；`metrics_out` 旁路回填世界侧的 `passes`（进度里程碑数） |
 | `run_seed(task)` / `main()` | 任务封装 / CLI（`--jobs` 进程或线程池 + `--report`） |
 
 CLI 旗标分组（默认值）：
@@ -275,7 +276,7 @@ CLI 旗标分组（默认值）：
 - **读出/目标**：`--feature-value-weight 0.02 --value-quantile 0.8 --no-value-features --value-dispersion-labels --value-bank-only --value-trust-samples 150 --value-horizon 0 --contrast-objective --control-risk-weight 0 --predicate-readouts --subgraph-cells --no-event-memory-risk --no-compose-readout`
 - **可信度**：`--ood-trust-scale 0 --obs-trust 1.0 --feature-action-prior 2.0 --feature-value-prior 4.0`
 - **探索/闭环**：`--curiosity-weight 0.5 --voi-fraction 0 --voi-target 3 --voi-threat-min 0.25 --importance-weighting --memory-credit --dagger-rounds 0 --dagger-episodes 2 --dagger-cap 1200 --dagger-offset 50000 --dagger-horizon 0 --dagger-frames 0`
-- **决策/评测**：`--decision {search,cellq} --step-stride 2 --stride-includes-lag --eval-seeds "" --eval-episodes 1 --no-learn-objective --report ""`
+- **决策/评测**：`--decision {search,stage,cellq} --step-stride 2 --stride-includes-lag --beam-width 0 --stage-blocks 4 --stage-block-frames 4 --eval-spacing 0 --milestone-weight 0 --milestone-mode {off,goal,rate} --eval-seeds "" --eval-episodes 1 --no-learn-objective --report ""`
 - **预设**：`--fast`（1500/3/1000/cap400/H8）、`--benchmark`（1500×1 + 5000 在线，cap5000）
 
 ---
@@ -371,3 +372,48 @@ CLI：`--task-baseline --engine {exhaustive,beam} --horizon --beam-width --jobs 
 `predict_layer.py`：`class LayerPair(k_max=8, eta0=0.05, tau=2e4, learn=True)`（`predict/observe/lag_profile/identified`）。
 
 `eval_protocol.py`：`parse_seed_spec(spec)`、`bootstrap_mean_ci(values, samples=2000, confidence=0.95, seed=0)`、`summarize(values)`、`group_values/group_summaries(rows, value="frames", group="train_seed")`、`cluster_summary(rows, value="frames", cluster="train_seed", samples=2000, seed=0)`、`paired_delta(left, right, key="train_seed", value="frames")`。
+
+---
+
+## 3.13 新增实验线的核心接口
+
+> 完整职责与结论见 [07 新增实验线](./07-experiment-lines.md)。
+
+**阶段/相位**
+
+- `stage_graph.py`：`@dataclass Stage(index, episode, start, end, action_means, action_effect, residual_rss, support, action_counts)`（`.frames`）、`StageTransition(source, action, target, frames, episodes)`、`StageGraph(stages, transitions, cluster_radius, gate_r2, clusters, stream_frames, episodes)`（`cross_episode_informative`、`summary`）；`pooled_oof_r2(features, target, groups, alpha=RIDGE_ALPHA)`、`build_stage_graph(rows, lag=3, min_length=5, penalty=1.0, ...)`、`sweep_vocabulary`、`shuffle_actions`、`evaluate_stream`、`_kmeans(vectors, count, seed=0, iterations=60)`。常量 `MIN_LENGTH=5`、`RIDGE_ALPHA=1.0`、`ACTING_FALLBACK=0`。
+- `phase_stage_probe.py`：`estimate_period(observations, episodes, low=8, high=120)`（逐 episode 周期图 → 周期中位数/谱峰占比/列表）、`horizon_labels`、`auc`、`leave_one_episode_out`、`eta_squared`、`report`。
+- `state_partition_probe.py`：`labels_for`、`remove_time_component`、`runs`、`horizon_labels`、`eta_squared`。
+- `stage_support_probe.py`：`segment_cost`、`segment_episode`、`single_link_clusters`、`analyse_stream`、`dump_streams`、`load_streams`、`compact`、`run`、`print_summary`；对照模式 `none/shuffle_actions/random_boundaries`。
+- `stage_sweep_probe.py` / `stage_content_probe.py`：`last_leads` / `distance` + `build_stage_graph` 审计。
+
+**0/1 死亡规则**
+
+- `rule_expressions.py`：`Expr` / `Literal` / `Not` / `Nary(op, children)` / `Term` / `FeatureTerm` / `NumericOp` / `Compare(term, op, threshold)` / `ExpressionRule(expression, label, support, positives, negatives)`；`search_compositions(states, target, literals, label, negatives=None, max_base=24, max_pairs=256, max_rules=8, min_support=2, max_complexity=8)`。
+- `death_rules.py`：`UNKNOWN=-1`、`NEAR=2`、`negate(primitive)`；`@dataclass(frozen) DeathRule(literals, label, support, positives, negatives)`；`DeathRuleSet(max_rules=24, max_literals=4, min_support=2, max_thresholds=48, max_attempts=96, compose=False, coverage_first=False, boundary_margin=0.0, feature_dims=None, pure_support_fraction=0.05, compose_max_base=24, compose_max_pairs=256, compose_rules=8, compose_complexity=8)` → `fit/classify/classify_death/classify_death_status/verify/coverage_report/refine/add_examples/rules_for/modes/describe_modes/describe`。
+- `death_rule_loop.py`：`RefineRound(round, added_missed, added_false_alarm, before, after)`、`death_failures`、`refine_once(rules, states, labels, include_false_alarms=True)`、`run_loop(rules, collect, rounds=3, include_false_alarms=True, min_coverage_gain=0.0)`。
+- `contextual_rules.py`：`ContextualDeathRuleSet(buckets=2, min_positive=2, fallback_global=True, thresholds=None, **rule_kwargs)`。
+- `pattern_library.py`：`Pattern(dims, label, support, text, world=None)`、`PatternLibrary(min_support=1)`（`add_rule/add_rules/add_rule_sets/schema_dims/instantiate/describe`）。
+- `death_transition_quality.py`：`seed_spec`、`encode_state`、`history_for`、`true_rollout`、`predicted_rollout`、`counts_rule`、`counts_hazard`。
+
+**上下文 / 动力学 / 记忆**
+
+- `context_model.py`：`ContextualLinearModel(obs_dim, action_dim, ridge=1e-8, context_dim=4, context_ridge=1e-2, window=64, change_detection=True, change_patience=3, change_factor=3.0, warmup=4, segment_size=128, discovery="cluster", merge_threshold=0.5)` → `fit/predict/observe/reset_context/begin_episode/apply_prior/end_episode`；`_cluster_corrections(vectors, fraction=0.5)`。
+- `branches.py`：`NodeBranch(name, graph=None, decay=0.0, learn_rate=1.0, timescale="fast")`（`activate/step/read/top/reset/compare/snapshot`）+ `CurrentBranch/RecentBranch(decay=0.8)/PredictionBranch/ValueBranch(learn_rate=0.05)`；`BranchBank(graph=None)`（`add/get/activate/step/reset/transition_pairs(action=None, top=32, threshold=1e-6)/prediction_error/snapshot`）。
+- `variable_registry.py`：`Variable(variable_id, kind, estimate, support=0.0, variance=0.0, timescale="slow", metadata={})`、`VariableRegistry(base_prior=4.0, parent_gain=1.0, fast_base=0.5, slow_scale=1.0)`。
+- `memory_tree.py`：`@dataclass MemoryNode(...)`（`.variance()`）、`MemoryTree(dim, max_fanout=4, leaf_capacity=24, merge_radius=0.5, split_variance=1.0, min_count=0.1, decay=0.95, keyword_dim=2)` → `insert/query/expand/keyword_persistence/persistence/decay/snapshot`。
+- `hierarchical_memory.py`：`FrameSummary/EventSummary/PhaseSummary/EpisodeSummary`；`HierarchicalMemory(context_dim, observation_dim, window=4, salience_z=1.5, phase_split=0.6, max_phase_gap=24, world_fanout=4, world_radius=1.5, world_capacity=24, decay=0.95, base_prior=4.0, keyword_dim=2)`。
+- `generative_expansion.py`：`GenerativeExpander(model, memory=None, policy=None, horizon=24, phase_len=6, bound_scale=6.0)`（`pick_start/bounds/expand/summarize`）；`nearest_reference_distance(generated, reference)`。
+- `learning_trace.py`：`node_label/encode_state/feature_read/frame_context/trace_episode/read_with_agent/snapshot_feature_cells/snapshot_episode/episode_deltas/install_learning_wrapper/run_fit/survival/emit_window/main` 等（只读包装器）。
+
+**动作 / 时程 / 选择诊断**
+
+- `action_effect.py`：`ActionEffect(action, count, mean_delta, mean_abs_delta, scale)`、`ActionEffectLibrary`（`fit/effect/change/normalized_change/preferred/ranked/describe`）。
+- `action_conditioning_probe.py`：`ridge_fit/loeo_r2/build_dataset/acting_episodes/action_matrix/run/print_summary`；`action_conditioning_diagnostics.py`：`fold_details/robust_details`。
+- `planner_rollout_quality.py`：`status_callback/near_status_callback/oracle_plan/flatten_batches/plan_death_counts/action_best/action_rank/action_score_gap/plan_score_gap/oracle_best_details/summarize_margins/probe_config`。
+- 其余探针（`causal_horizon_probe` / `doom_horizon_probe` / `oracle_selection_probe` / `coarse_search_probe` / `outcome_coarse_probe` / `score_column_probe` / `risk_contrast_probe` / `metric_probe` / `n_tie_probe` / `event_lead_probe` / `warning_lead_probe`）均为 `run(args)` + CLI 结构。
+
+**共享工具**
+
+- `probe_cache.py`：`load_or_fit(config, path=None, refit=False, fit_fn=None) -> (world, agent, loaded)`。
+- `wiring_audit.py`：`spearman`、`run(args)`、`print_report(report)`；得分列常量 `COLUMNS=("cost","-dopamine","risk","value","curiosity","q")`。

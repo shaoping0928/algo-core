@@ -17,14 +17,17 @@
 | [03 关键类与函数](./03-core-api.md) | 重要类/函数签名、参数、方法职责（含 `NodeRuntime`、`NodeGraph`、搜索与价值头） |
 | [04 依赖关系](./04-dependencies.md) | 外部依赖、内部 import 图、分层规则与耦合边界 |
 | [05 运行方式](./05-runbook.md) | 环境搭建、测试、各入口命令、`--fast`/`--benchmark` 预设、确定性与线程 |
-| [06 测试与回归](./06-tests.md) | 12 个测试文件覆盖范围、pinning 回归、架构中立性守卫 |
+| [06 测试与回归](./06-tests.md) | 30 个测试文件覆盖范围、pinning 回归、架构中立性守卫 |
+| [07 新增实验线](./07-experiment-lines.md) | 阶段/相位、0/1 死亡规则、上下文/动力学/记忆、动作/时程/选择诊断、共享工具 |
+
+> **覆盖范围与时效**：01–06 章先落地，覆盖主线（环境/图与运行时/特征/搜索/价值/规则/测试）。仓库随后持续演进（`main` 领先 `origin/main` 38+ 提交，探针与实验脚本大量增加），因此新增的 `stage_* / phase_stage_probe / death_* / context_* / *_probe / 记忆树` 等模块集中在 **07 章**。本 wiki 的模块清单以 `git ls-files` 为准；若数字与文件列表不一致，以仓库实际为准。
 
 ## 快速事实
 
 | 项 | 值 |
 |---|---|
 | 语言 / 依赖 | Python 3；`numpy>=1.24,<3`（见 `requirements.txt`） |
-| 规模 | 约 80 个 `.py`（含 12 个测试），主线 `node_runtime.py` 约 3381 行、`substrate_nodes.py` 约 2015 行 |
+| 规模 | 约 120 个 `.py`（含 30 个测试文件），主线 `node_runtime.py` 约 3857 行、`substrate_nodes.py` 约 2427 行 |
 | 主入口（活跃线） | `substrate_nodes.py`（节点中心规划） |
 | 旧/对照入口 | `substrate_sandbox_search.py`（世界反馈价值）、`substrate_generic.py`（任务无关原型）、`substrate_graph_search.py` |
 | 环境模型 | `flappy.py`（无延迟）+ `latent_world.py`（`lag=0..3` 延迟世界） |
@@ -53,4 +56,5 @@
 2. 要动手跑实验 → [05 运行方式](./05-runbook.md)；
 3. 要改代码 → [02 主要模块职责](./02-modules.md) 定位文件，再查 [03 关键类与函数](./03-core-api.md) 的签名；
 4. 要增删依赖或判断分层 → [04 依赖关系](./04-dependencies.md)；
-5. 提交前跑 [06 测试与回归](./06-tests.md) 的用例。
+5. 要了解探针/实验线 → [07 新增实验线](./07-experiment-lines.md)；
+6. 提交前跑 [06 测试与回归](./06-tests.md) 的用例。
