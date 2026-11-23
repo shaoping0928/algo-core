@@ -480,6 +480,37 @@ decisions；`branches=8 + tail=4`、horizon 8、无 hard death veto；事件
   危险读出，不进 world）这一种形态；否则回到候选分辨力的其他机制。
   **不采纳、不跑 3 种子、不改默认。**
 
+### 接线诊断（`time_wiring_probe.py`，seed 100 / 1500 帧）
+
+- **wiring 校验通过**：online `TimeInStateEnv` 与 offline
+  `augment_observations` 的 raw、age、actions 全部逐位一致。
+- age 统计：mean 0.552、std 0.382、17 个离散值；`corr(age, alive) =
+  -0.120`；`corr(alive, step) = 1.000` → age 不是时钟的副本。
+- **raw next-state**：base held-out R² 已经 1.0000；逐目标 base MSE：
+  - 垂直目标 0/1/3/5：3.2e-5 / 3.2e-3 / 3.2e-5 / 3.2e-5；
+  - 水平/时间目标 2/4/6：1.6e-13 / 1.0e-12 / 4.5e-10。
+  → 水平/时间上的“巨大相对增益”是机器精度噪声，不能当证据。
+- age 残差对垂直目标有**真实小信号**：MSE gain ≈ +0.15；
+  `corr(age, residual)` 在 y/vy 上是 **-0.398**，在 gap 上是
+  **+0.398** → 世界模型确实漏掉了“距上次拍翅”的状态依赖。
+- **hazard 读出不应加 age**：
+  - raw：point-pain AUC 0.785 / pain8 0.855；
+  - raw+age：0.758 / 0.813（变差）；
+  - age only：0.448 / 0.484（无信号）；
+  - clock only：0.870 / 0.880，但这是**时间-死亡混淆**；
+    raw+clock 与 raw 相同（clock 已由 alive 携带）。
+- **质量不足的位置不是特征计算，而是消费者/门控**：
+  1. conditioned gate 用“共享残差模型 + history + 全目标聚合 MSE”，
+     把垂直目标的小信号稀释，并被水平/时间噪声主导 → 判零；
+  2. 残差模型应 **per-target、age-only**，只对垂直目标 0/1/3/5 开；
+  3. age 对 hazard 无益，clock 是冗余/混淆项；
+  4. 绝对误差已经很小，垂直改善约 1e-4–1e-3 量级，是否改变候选
+     第一动作仍需决策级探针（first-action gap / regret），不能只看 MSE。
+
+**下一步（若继续 P0）**：per-target、age-only 的残差 gate，只修
+0/1/3/5；然后测候选第一动作 gap/regret。若仍无决策改变，关闭 P0。
+**不要加 current-frame clock；不要用 age 进 hazard readout。**
+
 ### 判据（未变）
 
 - 3 种子方向 + 6 种子确认（≥5/6 同向）；
