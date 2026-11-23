@@ -54,6 +54,21 @@
   x1_high、x0_high、x5_low、x3_low）；动作回声类（impulse/apex）
   与状态协变量类被五测分开；**阶段/世界周期边界在被动流里 0-1 次/
   5000 帧，support 不可学**。详见 Batch 8 结果。
+- **P1-B 事件级预警（被动流 3 种子，全部 pass）**：4 个稳定先导
+  （x1_high/x0_high/x5_low/x3_low，lift 2.4–3.8，中位 lead 3–5 帧）；
+  事件历史特征使 terminal hazard ΔAUC **+0.026/+0.082/+0.113**
+  （≥+0.02，placebo 过线 +0.03~+0.11）；next-event top-1 baseline
+  **0.46–0.48**（≈2.8× chance）。事件层带转移信息，不只是可读标记。
+- **P1-C 阶段层（planner 流 3 种子，已完成）**：过柱重置
+  **7 / 22 / 0 次**每 ~5000 帧（100/101/102）；seed 101 首次达
+  support → 五测全过但**动作对比 ≈0 → boundary**（外生边界，
+  阶段协变量，不是决策层）；seed 102 的流里连重置都没有。
+- **P0-F 6 步 executor 基线（benchmark 协议，已完成）**：
+  h6 vs h8 配对（15 个世界）：seed 100 **−119.8**（全部塌到 72 帧
+  地板，拍翅率不变但时机错）、101 **−68.6**、102 **+15.8**；
+  合并 h6 ≈95.3 vs h8 152.9（**−57.6**，1/3 种子改善）。
+  → **短视界不能单独切换**：6 步 executor 必须由事件层补偿，
+  这正是 Batch 8 的动机，也量化了“只依赖帧的近视”代价。
 
 > **范围说明**：以上 B0–B1-plan 全部是 **frame-level 默认栈** 的诊断
 > （8 步帧级 rollout / 帧级 endpoint risk）。它们回答“为什么不能继续
@@ -133,19 +148,23 @@
 - [x] **帧级 8 帧调试线（B0–B1-plan）关闭**（2026-11-23）：只保留两条
       基线证据（B0 决策分类、8 步组合终点不可靠）；不再加帧级探针、
       不做帧级 endpoint re-ranker（原 P0-E 删除）。
-- [ ] **P0-F 6 步 fine executor 基线**：horizon 6 vs 8，3 种子、
-      120–124；记录 frames/passes、候选 gap、决策质量。6 步是
-      新目标，但先作为基线验证，不直接改默认。
+- [x] **P0-F 6 步 executor 基线 A/B**（2026-11-23）：h6 合并
+      **−57.6 帧**（100 塌到 72 帧地板、101 −68.6、102 +15.8）；
+      拍翅率不变、时机错 → **6 步不能单独切换**，需事件层补偿。
 - [x] **P1 事件/阶段结果转移审计**（2026-11-23，被动流 3 种子）：
       6 个事件级 level 候选跨种子稳定通过五测；动作回声/状态协变量
       被分开；阶段/世界周期边界在被动流 0–1 次/5000 帧，不可学。
       详见 Batch 8。
-- [ ] **P1-B 事件级转移 / 早期预警模型（当前执行）**：lead 分析 +
-      A0/A1 terminal hazard（事件历史特征 + 局内 shuffle placebo）+
-      next-event top-1；通过标准见 Batch 8。失败判读：状态已足够 →
-      事件只作可读标记。
-- [ ] **P1-C 阶段层的数据审计**：planner/DAgger 流（更长 episode）
-      重跑同一 audit，检验结构重置是否可学。
+- [x] **P1-B 事件级转移 / 早期预警模型**（2026-11-23，3/3 pass）：
+      4 个强先导（lift 2.4–3.8，lead 3–5 帧）；事件历史特征
+      ΔAUC +0.026/+0.082/+0.113（placebo 过线）；next-event top-1
+      ≈2.1–2.8× chance。事件层带转移信息。
+- [x] **P1-C 阶段层的数据审计**（2026-11-23，planner 流）：
+      过柱重置 7/22/0 次；seed 101 首次达 support → boundary
+      （动作对比 ≈0，外生协变量）；102 连重置都没有。
+- [ ] **P1-D 6 步 executor + 事件级预警组合**（后置设计）：
+      预警作为 opt-in 方向/约束信号（不进逐帧 cost），在 h6 上
+      重跑 executor A/B；组合 ≥ h8 基线才谈切换。
 - [ ] **P1 阶段数据规模**：结果分布身份已通过，但每局约 1 条转移；需要
       采集规模（~100 局/option）才能填 `(stage, option)` 单元。
       P0 time-in-state 已判零，不能靠 clock/phase 补这个规模。
@@ -1174,58 +1193,75 @@ leave-episode-fold 校准。
    action contrast、support/UNKNOWN。
    **口径自足**：B0 的“2/10 action contrast”是当前帧级候选集的性质，
    不用来 gate 事件/阶段层；事件层的对比按自己的 option/事件口径测。
-2. **事件级转移 / 早期预警模型（P1-B，当前执行）**：
+2. **事件级转移 / 早期预警模型（P1-B）——已完成，三种子 pass**：
 
    **对象**：audit 稳定的 6 个 level（terminal + x0_sign / x1_high /
    x0_high / x5_low / x3_low）；位移跳变家族暂不入模（种子间去重存活的
-   维不同，跨种子不可比）。
+   维不同，跨种子不可比）。设计：lead 分析（对事件密度期望覆盖率的
+   lift）+ terminal hazard A0(state-only)/A1(+因果事件历史特征：
+   since/count16/recent4)/A1p(局内打乱 placebo)，leave-episode-fold；
+   next-event top-1（modal-successor 基线 vs state-only hazard
+   argmax，同一 fold 划分）。
 
-   **三个组件**：
+   **结果（被动流 100/101/102）**：
 
-   1. **lead 分析**：每个 terminal 前 `w_pre=8` 帧，各 level 的
-      precursor 覆盖率与中位 lead；对照 = 该 level 的事件密度期望
-      覆盖率（lift = 实测/期望）。
-   2. **A0 vs A1 terminal hazard**：
-      - A0 = state-only（phi + 动作 lags + time basis，同 audit）；
-      - A1 = + 事件历史特征（每 level：`since`=距上次触发的帧数/
-        cap、`count16`=近 16 帧触发次数、`recent4`=近 4 帧是否触发；
-        因果：只用 entry 之前的帧）；
-      - leave-episode-fold；A1 另有 **feature-shuffle placebo**：
-        只在事件历史块内做局内置换，phi/lags 不动。
-   3. **next-event top-1**：
-      - 基线 = modal-successor（纯统计，逐 source 取最频后继）；
-      - 模型 = 各 level 的 state-only hazard `argmax_j F_j(8)`
-        （OOF，与 A0/A1 同一 fold 划分）。
-
-   **指标**：coverage/lift、median lead；ΔAUC8/Δskill8（A1−A0）、
-   A1−placebo；top-1/chance；校准 skill8>0。
-
-   **通过标准（全部满足）**：
-
-   - ≥2 个 level 对 terminal 的 lift ≥ 2×，或 coverage ≥ 0.5 且
-     中位 lead ≥ 2 帧；
-   - ΔAUC8 ≥ **+0.02** 且 Δskill8 > 0，且 A1 − placebo ≥ +0.01 AUC；
-   - top-1 ≥ **1.5×** chance（n ≥ 50）；
-   - A1 skill8 > 0。
-
-   **失败判读**：
-
-   - ΔAUC ≈ 0 → “状态已足够，事件只是可读标记”：
-     早期预警直接消费状态阈值，事件层只保留可解释性；
-   - lead ≈ 0 或 lift ≈ 1 → 无预警价值；
-   - top-1 ≈ chance → 事件序列无结构，transition 层不建。
+   - **强先导 4 个**（lift = 实测覆盖率/事件密度期望覆盖率）：
+     `x1_high` lift 2.37–2.45（中位 lead 4–5）、`x0_high` lift
+     3.69–3.76（中位 3，coverage 0.65–0.71）、`x5_low` lift 2.45–2.55
+     （中位 4）、`x3_low` lift 2.37–2.57（中位 3–4）；
+     `x0_sign` 是反先导（lift 0.27–0.41：恢复性事件，发生在脱险后）。
+   - **事件历史特征带来增量信息**：terminal hazard
+     A0(state-only) AUC 0.769/0.811/0.778 →
+     A1(+事件历史) 0.850/0.837/0.891，
+     **ΔAUC +0.082/+0.026/+0.113**（≥+0.02）；
+     局内特征打乱 placebo A1p 0.764/0.809/0.783，
+     **A1−placebo +0.086/+0.029/+0.108**（≥+0.01）；
+     A1 skill +0.394/+0.431/+0.429 > 0。
+   - **next-event top-1**：modal-successor 基线
+     0.475/0.473/0.463（n=400–410，≈2.8× chance 0.167）；
+     state-only hazard argmax 0.355/0.388/0.410（n≈1200，2.1–2.5×）。
+   - **判定：3/3 pass。** 事件层带转移信息（不只是可读标记），
+     4 个先导有 3–5 帧 lead，可作为早期预警/方向信号。
+     失败判读未触发（ΔAUC≈0 的“状态已足够”假设被否定）。
 
    **非目标**：不进逐帧 cost；不做全局 veto；不改 8 帧默认栈；
    动作回声类（impulse/apex）与位移跳变家族不建 outcome 模型。
-3. **阶段层的数据审计（只读）**：用 planner/DAgger 流（更长 episode）
-   重跑同一 audit，检验结构重置是否变得可学；被动流不再重复。
-4. **6 步 fine executor 基线 A/B（3 种子，120–124）**：
-   horizon 6 vs 8；记录 frames/passes、候选 first-action gap、
-   decision regret、selected survives；默认栈先不改。这是 executor
-   校准，不是方案本身。
-5. **只有 1–4 过门**才做 opt-in router：
-   6 步 fine executor + 事件/阶段 coarse 方向/约束；
-   3 种子配对、6 种子确认；默认关。
+3. **阶段层数据审计（P1-C）——已完成**：planner/DAgger 流重跑同一
+   audit（`--source planner`，episode ≥50000 的行）：
+
+   - seed 100：63 局/5036 行（局长 ~80），过柱重置 **7 次** →
+     support 拒绝；
+   - seed 101：46 局/5148 行，过柱重置 **22 次/16 局** → 首次达
+     support → 五测全过但**动作对比 ≈0（−0.001）→ boundary**；
+     `x2_sign`（管道对准鸟）49 次/20 局 → 同为 boundary
+     （AUC 0.910、skill +0.246）；
+   - seed 102：68 局/5072 行，重置 **0 次**（dims 2/4 在该流仍是
+     counter，连候选都没生成）。
+   - **判定**：阶段/世界周期边界的可辨识性由**数据寿命**决定
+     （~1 次/80 帧 × 存活超过 80 帧的局）；即便可学，动作对比 ≈0
+     证明它是**外生 boundary**——只能当阶段协变量/入口条件，
+     不是决策层。事件级 level 在两种流上都稳定。
+
+4. **6 步 fine executor 基线 A/B（P0-F）——已完成**：benchmark 协议
+   （每种子 × 每 horizon 独立 fit：1500 帧 + 5000 帧 DAgger，
+   held-out 120–124，decision=search，death-rules 默认关）：
+
+   | seed | h6 均值 | h8 均值 | Δframes | Δpasses | 方向 |
+   |---|---:|---:|---:|---:|---|
+   | 100 | 72.0 | 191.8 | **−119.8** | −1.40 | 0/5 改善（全部塌到 72 帧地板） |
+   | 101 | 109.8 | 178.4 | **−68.6** | −1.00 | 1/3 改善 |
+   | 102 | 104.2 | 88.4 | **+15.8** | +0.20 | 1/0 改善 |
+   | 合并 | 95.3 | 152.9 | **−57.6** | −0.73 | 1/3 种子 |
+
+   拍翅率几乎不变（100: 0.086 vs 0.081）——塌陷不是“不拍”，
+   是**拍翅时机错了**：6 帧内看不到的死亡不可见。
+   - **判定：6 步 executor 不能单独切换**。短视界的代价被量化
+     （合并 −57.6 帧）；必须由事件级预警/方向层补偿后再评估组合，
+     这正是 Batch 8 的动机。
+
+5. **下一步 P1-D（后置设计）**：6 步 executor + 事件级预警的组合
+   ——预警作为 opt-in 方向/约束信号（不进逐帧 cost），在 h6 上
+   重跑本 A/B；只有组合 ≥ h8 基线才谈切换。router 仍后置。
 
 ### 非目标
 
