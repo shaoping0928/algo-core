@@ -140,9 +140,10 @@
       6 个事件级 level 候选跨种子稳定通过五测；动作回声/状态协变量
       被分开；阶段/世界周期边界在被动流 0–1 次/5000 帧，不可学。
       详见 Batch 8。
-- [ ] **P1-B 事件级转移 / 早期预警模型**：在 6 个稳定 level 上建
-      next-event / terminal-within-w hazard 链；next-event top-1、
-      event→terminal lead、leave-episode 校准；只做预警/方向信号。
+- [ ] **P1-B 事件级转移 / 早期预警模型（当前执行）**：lead 分析 +
+      A0/A1 terminal hazard（事件历史特征 + 局内 shuffle placebo）+
+      next-event top-1；通过标准见 Batch 8。失败判读：状态已足够 →
+      事件只作可读标记。
 - [ ] **P1-C 阶段层的数据审计**：planner/DAgger 流（更长 episode）
       重跑同一 audit，检验结构重置是否可学。
 - [ ] **P1 阶段数据规模**：结果分布身份已通过，但每局约 1 条转移；需要
@@ -1173,11 +1174,49 @@ leave-episode-fold 校准。
    action contrast、support/UNKNOWN。
    **口径自足**：B0 的“2/10 action contrast”是当前帧级候选集的性质，
    不用来 gate 事件/阶段层；事件层的对比按自己的 option/事件口径测。
-2. **事件级转移 / 早期预警模型（下一步，只读→opt-in）**：
-   在 6 个稳定 level 上建 next-event / terminal-within-w 的 hazard 链
-   （用已算出的事件→事件转移 + duration 分布）；
-   指标 next-event top-1、event→terminal lead、leave-episode 校准；
-   只做预警/方向信号，不进逐帧 cost。
+2. **事件级转移 / 早期预警模型（P1-B，当前执行）**：
+
+   **对象**：audit 稳定的 6 个 level（terminal + x0_sign / x1_high /
+   x0_high / x5_low / x3_low）；位移跳变家族暂不入模（种子间去重存活的
+   维不同，跨种子不可比）。
+
+   **三个组件**：
+
+   1. **lead 分析**：每个 terminal 前 `w_pre=8` 帧，各 level 的
+      precursor 覆盖率与中位 lead；对照 = 该 level 的事件密度期望
+      覆盖率（lift = 实测/期望）。
+   2. **A0 vs A1 terminal hazard**：
+      - A0 = state-only（phi + 动作 lags + time basis，同 audit）；
+      - A1 = + 事件历史特征（每 level：`since`=距上次触发的帧数/
+        cap、`count16`=近 16 帧触发次数、`recent4`=近 4 帧是否触发；
+        因果：只用 entry 之前的帧）；
+      - leave-episode-fold；A1 另有 **feature-shuffle placebo**：
+        只在事件历史块内做局内置换，phi/lags 不动。
+   3. **next-event top-1**：
+      - 基线 = modal-successor（纯统计，逐 source 取最频后继）；
+      - 模型 = 各 level 的 state-only hazard `argmax_j F_j(8)`
+        （OOF，与 A0/A1 同一 fold 划分）。
+
+   **指标**：coverage/lift、median lead；ΔAUC8/Δskill8（A1−A0）、
+   A1−placebo；top-1/chance；校准 skill8>0。
+
+   **通过标准（全部满足）**：
+
+   - ≥2 个 level 对 terminal 的 lift ≥ 2×，或 coverage ≥ 0.5 且
+     中位 lead ≥ 2 帧；
+   - ΔAUC8 ≥ **+0.02** 且 Δskill8 > 0，且 A1 − placebo ≥ +0.01 AUC；
+   - top-1 ≥ **1.5×** chance（n ≥ 50）；
+   - A1 skill8 > 0。
+
+   **失败判读**：
+
+   - ΔAUC ≈ 0 → “状态已足够，事件只是可读标记”：
+     早期预警直接消费状态阈值，事件层只保留可解释性；
+   - lead ≈ 0 或 lift ≈ 1 → 无预警价值；
+   - top-1 ≈ chance → 事件序列无结构，transition 层不建。
+
+   **非目标**：不进逐帧 cost；不做全局 veto；不改 8 帧默认栈；
+   动作回声类（impulse/apex）与位移跳变家族不建 outcome 模型。
 3. **阶段层的数据审计（只读）**：用 planner/DAgger 流（更长 episode）
    重跑同一 audit，检验结构重置是否变得可学；被动流不再重复。
 4. **6 步 fine executor 基线 A/B（3 种子，120–124）**：
