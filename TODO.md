@@ -5,7 +5,41 @@
 > 未完成事项、新方向设计**。更早的审计与解剖材料保留在文末
 > 「历史附录（只读）」，不再维护。
 
+## 最近更新（2026-11-23 晚）
+
+- **B0（`729aa24`）**：seed 101、85 决策、10 个 relevant miss；
+  6 个首动作不同、4 个同动作；**8/10 是 plan/suffix 问题**，
+  只有 2/10 有真实首动作对比。首动作 router 只有 2/10 理论空间，
+  近并列可修 0/10。
+- **B0.5（`0d3fe73`）**：8 个 plan-level miss 上只有 **risk 一列活跃**
+  （8/8 非零、positive share 1.00）；value/curiosity/q 全为 0；
+  没有任何单列或非退化列组合能恢复 plan-level miss（0/8）。
+- **B0.6（`0d3fe73`）**：risk 的 step 部分全为 0，risk 列几乎全是
+  **endpoint terminal hazard**；预测 terminal 在 8/8 把 selected 排得
+  更安全，真实 terminal 在 7/8 判对；state error 0.111。
+  判定 `step_readout_flat_endpoint_drift`。
+- **B1-plan（`bc9bf17`）**：predicted endpoint 的 leave-one-world-out
+  读数 same-action top1 **68/69**、same-AUC **0.789**、B0 miss **9/10**
+  （fine 61/69、2/10；shuffle placebo 65/69、6/10）。
+  **ranking gate 通过，calibration gate 失败**（Brier skill −0.092、
+  within-Brier skill −0.793）；OOD/fine 作为特征会打掉 within-decision
+  信号。未接线。
+- **B1-plan-3seed（100/101/102，已完成）**：
+  - seed 101：A1 68/69、B0 miss 9/10、improved 7 / worsened 1；
+  - seed 100：A0 fine 62/62，A1 60/62（improved 0 / worsened 2），
+    flip precision 0.00；
+  - seed 102：候选 terminal base rate **0.000**，48 个决策全是
+    非终止标签；模型退化，无法评估；
+  - calibration 在所有 seed 上失败；候选 endpoint OOD 率
+    101/100/102 = 28.7% / 68.9% / 63.0%。
+  → **3 种子非退化门失败**：seed 101 的增益不迁移，seed 100 退化，
+  seed 102 退化。不接线；下一步只考虑 OOD/UNKNOWN 门后的
+  rank-only 复测，或回到 world endpoint 改善。
+
 ## 里程碑 / 阶段 / 长程：2026-11-23 总结
+
+> 以下是当日较早的总结；最新 B0–B1-plan-3seed 结论见上方
+> 「最近更新」。默认栈与基准未变。
 
 **一句话**：预测侧（动力学、短窗危险、长窗危险、静态联想、状态级价值、
 结果分布身份）**全部达标**；失效集中在**候选之间的分辨力**——第一动作 gap
@@ -63,14 +97,25 @@
       探针、schema、每目标稀疏规则、共享 applicability、事件谓词、
       关键节点读数、stage/interval 目标、组件 free-run、查询图世界模型
       已落地；剩余 planner/NodeRuntime 接线与决策侧质量门。默认栈不变。
-- [ ] **P0-C 候选分辨力（Batch 7）**：先做候选存在性审计
-      （无逃生 / 有逃生但 score 排后 / 已选 oracle-best），再用
-      margin-gated、endpoint-only 的长 lead 信号只修可识别性；
-      不用全局逐帧 cost、不全局 veto。详见下方 Batch 7。
+- [x] **P0-C 候选分辨力（Batch 7）诊断阶段**（2026-11-23）：
+      B0/B0.5/B0.6 已完成，判定 seed 101 的主瓶颈是
+      **plan-level endpoint drift**，不是首动作排序、列权重或覆盖；
+      B1-plan seed 101 ranking 通过、calibration 失败；
+      3seed 已完成并判定非退化失败。详见下方 Batch 7。
+- [x] **P0-D B1-plan-3seed / 校准**（2026-11-23）：seed 100/101/102
+      已完成；seed 101 有 ranking 增益但 calibration 失败；seed 100
+      从 62/62 退化到 60/62（worsened 2, improved 0）；seed 102
+      terminal base rate 0.000，模型退化。**非退化门失败**，不接线。
+- [ ] **P0-E OOD/UNKNOWN 门后的 rank-only 复测（可选，后做）**：
+      只在 fine 近并列且 endpoint 在训练密度内时允许重排；
+      否则 UNKNOWN/保持 fine。先做 3 种子只读，不得默认开。
+      若 OOD 门不能恢复 100/102，则停止 plan-level endpoint
+      correction，转回 world endpoint 改善。
 - [ ] **P1 阶段数据规模**：结果分布身份已通过，但每局约 1 条转移；需要
       采集规模（~100 局/option）才能填 `(stage, option)` 单元。
-- [ ] **P1 value 保持 opt-in**：状态级有效、计划级不差、局级 1/3；等表示层
-      落地后重测。
+      P0 time-in-state 已判零，不能靠 clock/phase 补这个规模。
+- [ ] **P1 value 保持 opt-in**：状态级有效、计划级不差、局级 1/3；
+      P0 表示层已判零；等 endpoint/world 读数修复后再重测。
 - [ ] 可复现探针：`milestone_retest_probe.py`、`stage_diag_probe.py`、
       `stage_reach_probe.py`、`milestone_plan_ab.py`、`decision_diag_probe.py`、
       `decision_margin_probe.py`、`hazard_readout_ab.py`、`hazard_lane_ab.py`、
@@ -86,6 +131,10 @@
 
 
 ## Batch 6：查询驱动图重写与最小规则库（2026-11-23）
+
+> **状态（2026-11-23）**：结构性部分已完成并保留作参考；默认栈未变。
+> 剩余 planner/NodeRuntime 接线是独立后置项，不与当前 B1-plan 的
+> plan-level endpoint 校正混在一起。
 
 > 结构性部分已完成（2026-11-23）；默认栈不变，所有新机制 opt-in。目标
 > 不是再加一层预测，而是把“转移的类型 / 适用条件 / 消费方式”从硬编码
@@ -397,6 +446,9 @@ decisions；`branches=8 + tail=4`、horizon 8、无 hard death veto；事件
 
 ## P0 表示层：time-in-state（2026-11-23）
 
+> **状态：已关闭（中性/null）**；保留作参考。不要把 time-in-state /
+> clock / phase 重新引入 hazard 或 world。
+
 **目标**：把“距上次拍翅帧数 / 相位变化率”放进状态，直接针对候选
 分辨力；不改默认栈，先做 opt-in A/B。
 
@@ -547,26 +599,38 @@ decisions；`branches=8 + tail=4`、horizon 8、无 hard death veto；事件
 **一句话**：候选分辨力不是“再加一个分数项”，而是四个不同问题：
 **存在性、可识别性、稳定性、实现性**。不同 seed / 状态落在不同问题
 上，不能用一个全局 cost 同时解决。**H=8→H=12 只是把帧窗口放大，
-不是多视界；真正的解是“不同概念层级的结果转移 + router”。**
+不是多视界。B0 后已确认：seed 101 的主问题是 plan/suffix 的
+predicted endpoint drift，首动作 router 不是主杠杆。**
 
 ### 四个子问题
 
 | 子问题 | 问题 | 当前证据 |
 |---|---|---|
 | **存在性** | 当前状态附近，H 帧内有没有更好的候选？ | `oracle@8 = policy@8`；H=8/10 内所有候选都死；H=12 有逃生，但默认策略走到的状态 12 帧内宏/随机方案存活率 0% |
-| **可识别性** | 有更好候选时，score/readout 能不能排上来？ | seed 101：oracle-best **10/10 feasible**，但 **10/10 被 score 排后**；seed 100/102：decision-relevant miss **0** |
+| **可识别性** | 有更好候选时，score/readout 能不能排上来？ | seed 101：oracle-best **10/10 feasible**，但 **10/10 被 score 排后**；B0：**8/10 是 plan/suffix**，只有 2/10 有真实首动作对比；B0.5：只有 risk 活跃，0/8 单列修复；B0.6：risk 是 endpoint terminal hazard，预测 endpoint 反向 8/8 |
 | **稳定性** | 顶端候选差距是否小于噪声/新项？ | 第一动作 gap 中位 **0.008–0.026**；**4–33%** 决策 <1e-3；顶端 margin p50 **1e-3** |
 | **实现性** | 第一动作选对后，后续重规划是否吃掉优势？ | 计划级 value 选对率 0.82/0.86 vs 0.73/0.79，几乎不分歧；伤害是分叉后的累积 |
 
 ### 证据排序
 
-1. **seed 101：可识别性不足（最高优先）**
-   - 10 个 decision-relevant miss；
-   - oracle-best 10/10 feasible；
-   - 10/10 被 score 排后；
-   - death veto 0。
-   → 不是没候选、不是死亡规则没抓，而是 **score 没把更长存活计划排上来**。
-   需要 ≥10 帧 lead 的**可信排序信号**，不是再加一个逐帧项。
+1. **seed 101：plan-level endpoint drift（最高优先，B0–B1-plan 已定位）**
+   - 10 个 decision-relevant miss；oracle-best 10/10 feasible；
+     10/10 被 score 排后；death veto 0；
+   - B0：8/10 是 plan/suffix（4 个同动作 + 4 个零首动作对比），
+     只有 2/10 有正的首动作对比；近并列动作级可修 0/10；
+   - B0.5：8 个 plan-level miss 上只有 risk 活跃；value/curiosity/q
+     全 0；0/8 能被单列/列组合修复；
+   - B0.6：risk 的 step 部分为 0，几乎全是 endpoint terminal hazard；
+     预测 terminal 反向 8/8，真实 terminal 7/8 正确；
+     state error 0.111；
+   - B1-plan：predicted endpoint 读数 same-AUC 0.789、B0 miss 9/10；
+     ranking 通过，calibration 失败（Brier skill −0.092）；
+   - B1-plan-3seed：seed 101 +7/−1，但 seed 100 从 62/62 退化到
+     60/62（improved 0 / worsened 2），seed 102 terminal base rate
+     0.000、模型退化；**非退化门失败**。
+   → 不是没候选、不是死亡规则没抓、不是列权重；seed 101 的
+   plan-level endpoint 读数不迁移，不能直接接线。下一步只剩
+   OOD/UNKNOWN 门后的 rank-only 复测或 world endpoint 改善。
 
 2. **seed 100/102：存在性不足（晚期状态）**
    - H=8 内所有候选都死；
@@ -613,7 +677,7 @@ Router：
   → 粗层不能覆盖有效的细层判断
 ```
 
-最小可行版本（不碰阶段身份）：
+**B0 前的最小可行版本（已被 B0 修正，保留作历史）**：
 
 - 学 **horizon-indexed、action-conditioned 结果模型**：
   `P(terminal within h | state, a)` 或 `E[survival | state, a]`，
@@ -630,6 +694,32 @@ Router：
 - 目标是**结果**（terminal/survival），不是全状态；
 - 只在决策边际小的时候消费，避免改写强信号；
 - H=12 搜索不是默认，只由粗层风险触发、按状态局部扩展。
+
+### B0 后的修正（2026-11-23，当前有效）
+
+B0/B0.5/B0.6/B1-plan 把 seed 101 的问题从“首动作/分数列”缩到
+**plan-level predicted endpoint**：
+
+- 8/10 miss 的 selected 与 oracle-best 在各自最佳后缀下首动作等价，
+  首动作 router 即使完美也修不了；
+- 8 个 plan-level miss 只有 risk 一列活跃，value/curiosity/q 为 0；
+- risk 的 step 部分为 0，几乎全是 endpoint terminal hazard；
+  预测 terminal 反向 8/8，真实 terminal 7/8 正确；
+- predicted endpoint 的 leave-one-world-out 读数在 seed 101 把
+  same-action top1 从 61/69 提到 68/69、B0 miss 从 2/10 提到 9/10，
+  但 calibration 失败（Brier skill −0.092、within −0.793）。
+
+当前最小可行版本改成：
+
+- 输入 = planner 的 **predicted endpoint**（7 维；不加 OOD/fine 特征）；
+- 标签 = 候选真实 terminal（within H）；leave-one-world-out；
+- 输出先只做 **rank-only**：同动作内最低预测风险；
+- OOD 距离只做排序后的 gate，不做特征；
+- **3seed 已失败**：seed 100 退化、seed 102 无 terminal 标签；
+  只剩 OOD/UNKNOWN 门后的 rank-only 复测，否则回到 world endpoint；
+- 过门后才考虑 opt-in plan-level near-tie assist；默认关。
+- 首动作 action-conditioned hazard / router 继续暂缓，除非未来出现
+  正首动作对比且支持足够的状态。
 
 ### 两份设计备忘录的合并结论（2026-11-23）
 
@@ -664,7 +754,21 @@ Router：
    contrast 校准，否则 router 只是换一种噪声。
 3. 1500 帧只够筛查；3 种子方向 + 6 种子确认，安慰剂/打乱臂必需。
 
+**B1-plan 后的更新（2026-11-23）**：
+
+- endpoint 读数在 seed 101 ranking 通过（same-AUC 0.789、B0 miss
+  9/10），但 3seed 非退化失败：seed 100 62/62 → 60/62，
+  seed 102 terminal base rate 0.000；calibration 全失败；
+- 候选 endpoint OOD 率 101/100/102 = **28.7% / 68.9% / 63.0%**；
+  OOD 高的 seed 正是失败的 seed；
+- 因此不再把 action-conditioned state hazard 当 fallback（seed 101
+  本身没有首动作对比），也不直接接 endpoint 读数；下一步只做
+  OOD/UNKNOWN 门后的 rank-only 复测，或 world endpoint 改善。
+
 ### 实验 A：候选存在性审计（只读，先做）
+
+> **状态：已并入 B0/B0.5/B0.6**（2026-11-23）。B0 已完成候选存在性/
+> 可识别性/plan-level 分类；本节保留作定义参考，不再单独执行。
 
 在每个真实决策点，把决策分类：
 
@@ -841,12 +945,40 @@ leave-one-world-out；标签是候选真实 terminal（within H=8）。
   校准 + 多种子 shuffle placebo；只有 rank-only near-tie assist
   可用后才考虑 B2-plan。
 
+**B1-plan-3seed 结果（2026-11-23，100/101/102）**：
+
+| seed | decisions | A0 same-oracle | A1 same-oracle | A1 improved/worsened | A1 dec/same AUC | terminal base rate | endpoint OOD |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 101 | 69 | 61/69 | **68/69** | +7 / −1 | 0.760 / 0.789 | 0.110 | 0.287 |
+| 100 | 62 | **62/62** | 60/62 | 0 / −2 | 0.352 / 0.250* | 0.158 | 0.689 |
+| 102 | 48 | 48/48 | 48/48 | 0 / 0 | None (0) | **0.000** | 0.630 |
+
+\* seed 100 只有 2 个决策同时含两类候选，AUC 只作描述，不作证据。
+
+- seed 101：B0 miss 2/10 → 9/10，ranking 有信号；但 calibration
+  失败（Brier skill −0.092、within −0.793）。
+- seed 100：fine 已经 62/62；A1 反而 **60/62**（worsened 2），
+  flip precision 0；endpoint OOD 68.9%，模型不在训练密度内。
+- seed 102：48 个可用决策里 **没有任何 terminal 候选**，
+  base rate 0.000；模型只剩常数/并列，AUC 不可算，无法评估。
+- placebo（A4/A4b）与 A1 在 seed 100 同为 60/62；seed 101 上
+  A4 6/10 vs A1 9/10。增益确实是 seed-specific。
+- **判定：3 种子非退化门失败，B1-plan 不接线。**
+  - 不是“再校准一下”的问题：seed 100 的失败是泛化/覆盖，
+    seed 102 是标签退化；
+  - 只有 OOD/UNKNOWN 门后的 rank-only 复测还有一点空间：
+    当 endpoint OOD 或 fine 已明确不并列时保持 fine；
+  - 若 OOD 门仍不能让 100/102 不退化，停止 plan-level endpoint
+    correction，转回 world endpoint 改善 / 更早行动。
+- 不做 B2-plan；不默认开；不调 risk 权重；不加逐帧项。
+
 ### 实验 B：多视界结果转移 + router（opt-in，B0 后暂缓）
 
-**前置状态（B0 后）**：首动作 router 只有 2/10 的理论空间，
-其中近并列可修 0/10；当前主瓶颈是 plan/suffix 排序。B1/B2 的设计保留，
-但先做 B0.5 的 score 诊断；只有当 plan-level 修复后仍有正首动作对比
-且支持足够时，才启动本实验。
+**前置状态（B0/B1-plan 后）**：首动作 router 只有 2/10 的理论空间，
+其中近并列可修 0/10。plan-level endpoint 读数在 seed 101 有 ranking
+信号，但 3seed 非退化门失败（seed 100 退化、seed 102 无 terminal
+标签）。B1/B2 的 action-level 设计继续保留；当前不启动，先做
+OOD/UNKNOWN 门后的 rank-only 复测或 world endpoint 改善。
 
 **B1：结果转移库**
 
@@ -904,6 +1036,10 @@ leave-one-world-out；标签是候选真实 terminal（within H=8）。
 
 ### 实验 C：定向反事实覆盖（可选，后做）
 
+> **状态**：B0 后只对 2 个真实首动作对比状态（120@67、124@68）
+> 有直接价值；当前不启动。若 OOD-gated rank-only 也失败，再考虑
+> 用配对采集补 endpoint/首动作标签。
+
 只在**高不确定/高危险候选端点**上尝试另一个动作，收集 paired
 transition，重训 world/hazard；指标是候选端点 R² 和 plan-level 选对率，
 不是全局覆盖率。现有全局 coverage / VOI 在 6 种子是 null，不再重复。
@@ -915,13 +1051,15 @@ transition，重训 world/hazard；指标是候选端点 R² 和 plan-level 选�
 - 不用全状态长程预测替代结果转移（endpoint drift 已有证据）；
 - 不做全局逐帧长窗罚项 / 全局端点 veto（已有 0/3、121.7 vs 152.9）；
 - 不在没有阶段数据/身份时继续 stage/option 消费；
+- 不在 3seed 非退化门和校准门未过时接 plan-level endpoint 重排；
 - 不用小 beam 长视界做贪心剪枝（w64 长视界 −22）；
 - 不把“再加一个 0.01–0.1 的项”当成候选分辨力的解。
 
-## 当前状态（2026-11-21）
+## 历史状态（2026-11-21，只读）
 
-> 本节描述**默认栈与主线瓶颈**（2026-11-21 口径）；**里程碑/阶段方向**的最新状态
-> 与待办见上一节（2026-11-23 总结）。
+> 本节是 2026-11-21 的默认栈与瓶颈快照，**已被顶部 2026-11-23
+> 总结和 Batch 7 取代**；保留作对照，不再更新。当前基准与默认栈
+> 以文首和 README 为准。
 
 **默认栈（未变）**：点事件 pain；默认目标（NNLS 组合）；好奇 0.5
 （评测 0）；成对特征关；动作边 Q 读关；death-rules /
@@ -975,13 +1113,20 @@ held-out 世界 120–124；基线 129.1 / 147（3 种子）。
       共形区间 + OOD 门；只在 plan/suffix 层面重排，不改首动作，
       不加逐帧项；B1-plan 首轮（seed 101）：A1 endpoint-only
       same-AUC 0.789、B0 miss 9/10，ranking 通过；但 Brier skill
-      −0.092、within-Brier skill −0.793，calibration 失败。下一步
-      3 种子 + 校准；OOD 只做排序后门控，不做特征；
+      −0.092、within-Brier skill −0.793，calibration 失败。3seed
+      （100/101/102）：seed 101 68/69，但 seed 100 从 62/62 退化到
+      60/62，seed 102 terminal base rate 0.000、模型退化；
+      **非退化门失败，不接线**。只剩 OOD/UNKNOWN 门后的 rank-only
+      复测或 world endpoint 改善；OOD 只做排序后门控，不做特征；
 - [ ] **早期预警 / 时域 / 候选集**：seed 100/102 的晚期状态在 H=8 内
       所有候选都死，需要更早行动或更长时域/更好的候选生成；
 - [ ] 决策侧改动准入：真实基准 3 种子配对（fast 屏不作为证据）。
 
 ### B. 新方向：记忆树 / 阶段图 / 多尺度预测 / 粗到细决策（2026-11-21 用户方向）
+
+> **状态：历史设计稿**。当前实现与结论以 Batch 7、B0–B1-plan 为准；
+> 其中 stage/context 聚类、固定层次和 action-level coarse router
+> 已被 B0/B0.5/B0.6 的数据否定或降级，保留作设计参考。
 
 **目标**：让系统自己发现事件的层级与关键事件，把"阶段"作为记忆树的一层，
 在相邻阶段间学习转移；决策时先预测长期转移（深度由系统判断），确定方向
@@ -1349,8 +1494,9 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
 - `_train(feature_backfit=True)`：epoch 0 正常学习 + 归纳，epoch ≥1 改走
   `replay_features`；CLI `--feature-backfit`；
 - 285 测试通过（新增 `test_replay_features_updates_cells_without_prototypes`）；
-- A/B：epochs=2 + `--feature-backfit`（默认权重），3 种子进行中——若恢复到
-  基线 152.9 附近，则“e2 崩塌”归因于原型层双遍，特征通道本身可用。
+- A/B：epochs=2 + `--feature-backfit`（默认权重），3 种子已完成
+  （见下）——若恢复到基线 152.9 附近，则“e2 崩塌”归因于原型层双遍，
+  特征通道本身可用。
 
 **特征回拟合 A/B 第一波（2026-11-21，seed 100–102，3×5 held-out）**
 
@@ -1445,8 +1591,8 @@ frames≥5、episodes≥3）。动作打乱对照内置。282 测试通过。
 
 `--risk-decay d`：第 t 步的 hazard 贡献乘 `d^t`（终端乘 `d^H`），默认
 1.0 逐位不变；286 测试（含 risk_decay=0 的 identity 回归）。A/B：
-`--risk-decay 0.8` × 3 种子进行中——若正向，说明“少信后段预测”有效；
-若负向，则需要真正提升多步预测（context model 接 planner 或更长时域）。
+`--risk-decay 0.8` × 3 种子已完成（见下）——若正向，说明“少信后段预测”
+有效；若负向，则需要真正提升多步预测（context model 接 planner 或更长时域）。
 
 **A/B 结果（2026-11-21）：负向**
 
