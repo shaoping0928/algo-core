@@ -186,6 +186,31 @@ class QueryGraphTest(unittest.TestCase):
         self.assertEqual(result.visited, 2)
         self.assertEqual(result.applied, 2)
 
+    def test_recursive_resolution_handles_three_steps(self):
+        rule = linear_rule(
+            "step", Slot("x", 1), (Slot("x", 0),), [0.0, 1.0]
+        )
+        bank = RuleBank([rule])
+        result = bank.query(Query(
+            target_slots=(Slot("x", 3),),
+            source={Slot("x", 0): 4.0},
+        ))
+        self.assertEqual(result.values[Slot("x", 3)], 4.0)
+        self.assertEqual(result.visited, 3)
+        self.assertEqual(result.applied, 3)
+
+    def test_exact_dt_mismatch_does_not_fill_a_shorter_target(self):
+        rule = linear_rule(
+            "two-step", Slot("x", 2), (Slot("x", 0),), [0.0, 1.0]
+        )
+        bank = RuleBank([rule])
+        result = bank.query(Query(
+            target_slots=(Slot("x", 1),),
+            source={Slot("x", 0): 4.0},
+        ))
+        self.assertIs(result.values[Slot("x", 1)], UNKNOWN)
+        self.assertEqual(result.visited, 0)
+
     def test_shared_group_filters_rules_before_visiting(self):
         gate = Applicability(support=10)
         group_zero = linear_rule(

@@ -207,19 +207,22 @@
   free 0.927；说明“代码教、转移算”闭环可跑，但 free-run 会漂。
   5000 帧复跑：`vy` teacher 0.929 / free 0.985；difference teacher
   1.000 / free 0.912（漂移随数据量缩小）。
+  3 种子（100/101/102，1500 帧）：`vy` free 0.987/0.985/0.996，
+  difference free 0.927/0.926/0.951。
 - `graph_rewrite_scale_probe.py` 新增实际搜索表（1500 帧、k=16）：
   `global-shared` 与 `cluster-shared` 的 visited = 1/2/3/7（m=1/2/3/7）；
   `independent` = 16/32/48/112，pruned = 15/30/45/105；无 UNKNOWN/
-  conflict。**共享是 O(m)，独立是 O(k·m)。** 5000 帧同样成立。
+  conflict。**共享是 O(m)，独立是 O(k·m)。** 5000 帧与种子 101/102
+  同样成立。
 
 仍未做：
 
-- `fit_event_rule` 尚未在真实流上与 `death_rules` 对照
-  precision/recall/UNKNOWN；当前只有合成测试。
-- `ComponentDerivationBank` 尚未接进 `ComponentBank`/`NodeRuntime` 的
-  预测路径；当前是独立模块 + 探针，默认不生效。
-- 深度 >2 的递归、stage/interval 目标、UNKNOWN 传播的完整测试。
-- 3 种子复跑与决策侧质量门。
+- `ComponentDerivationBank` 尚未接进 `NodeRuntime` 的预测路径；当前是
+  独立模块 + 探针 + `ComponentBank.free_run_step`，默认不生效。
+- stage/interval 目标（变长 `dt` 的粗查询）尚未实现；当前精确查询会
+  结构上拒绝变长规则。
+- 3 种子只跑了诊断探针（组件/读数/搜索），决策侧质量门尚未做。
+- 关键节点查询尚未接 planner；`required_slots` 仍由探针手动传入。
 
 ### 实施清单
 
@@ -246,7 +249,12 @@
 - [ ] 派生概念接 `NodeRuntime` 预测路径：需要把 derivation bank 与
       component id 绑定并在 rollout 中调用；当前只有 bank 方法。
 - [x] 测试：pattern/time 不匹配拒绝；UNKNOWN 传播；共享 O(k)；
-      关闭时逐位不变（新模块独立；390+ 测试全过）。
+      深度 3 递归；精确 `dt` 不匹配；关闭时逐位不变（新模块独立；
+      393 测试全过）。
+- [x] 3 种子诊断复跑：组件 free-run、key-node readout、搜索表在
+      100/101/102 上同向；这不是决策侧质量门。
+- [ ] stage/interval 目标：变长 `dt` 的粗查询尚未实现；当前精确查询
+      结构上拒绝变长规则。
 
 ### 质量门
 
