@@ -42,6 +42,7 @@ import json
 import numpy as np
 
 from endpoint_correction_probe import fit_logistic, predict_logistic, rank_auc
+from probe_cache import load_or_fit
 from substrate_generic import collect
 from substrate_nodes import LAG
 
@@ -727,6 +728,33 @@ def stage_structure(boundary_name, masks, names, tables, entries,
     )
 
 
+def load_rows(args):
+    """Passive behaviour stream, or the fitted agent's planner/DAgger rows."""
+    if args.source == "behavior":
+        rows, _counts = collect(
+            seed=args.seed, steps=args.steps, coverage=args.coverage,
+            lag=LAG,
+        )
+        return rows
+    config = dict(
+        seed=args.seed, steps=1500, epochs=1, max_nodes=1000,
+        birth_threshold=0.45, dagger_rounds=1, dagger_frames=5000,
+        dagger_cap=5000, dagger_horizon=8, step_stride=2,
+        curiosity_weight=0.5, death_rules=True,
+        death_rule_max_thresholds=256,
+        death_rule_boundary_margin=args.margin,
+    )
+    _world, agent, _cached = load_or_fit(
+        config, args.cache or None, refit=bool(args.refit),
+    )
+    rows = list(agent.milestone_training_rows)
+    if args.source == "planner":
+        rows = [
+            row for row in rows if int(row.get("episode", 0)) >= 50000
+        ]
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=101)
@@ -751,12 +779,18 @@ def main():
                              "the clock heuristic excludes them")
     parser.add_argument("--l2", type=float, default=0.01)
     parser.add_argument("--iterations", type=int, default=30)
+    parser.add_argument("--source", choices=("behavior", "planner"),
+                        default="behavior",
+                        help="behaviour stream via collect, or the "
+                             "planner/DAgger rows of a fitted agent "
+                             "(episode ids >= 50000)")
+    parser.add_argument("--margin", type=float, default=0.01)
+    parser.add_argument("--cache", default="")
+    parser.add_argument("--refit", action="store_true")
     parser.add_argument("--report", default="")
     args = parser.parse_args()
 
-    rows, _counts = collect(
-        seed=args.seed, steps=args.steps, coverage=args.coverage, lag=LAG,
-    )
+    rows = load_rows(args)
     tables = episode_tables(rows)
     obs_dim = tables[0]["obs"].shape[1]
     clock_stats = clock_report(tables, obs_dim)
@@ -782,10 +816,10 @@ def main():
     entries = build_entries(tables, dims, args.n_lags, args.stride)
     total_rows = int(sum(len(table["actions"]) for table in tables))
     print(
-        "outcome level audit: seed %d, %d rows, %d episodes, "
+        "outcome level audit: seed %d source %s, %d rows, %d episodes, "
         "%d dims (clock %s), %d predicates, %d entries" % (
-            args.seed, total_rows, len(tables), len(dims), clock,
-            len(predicates), len(entries["row"]),
+            args.seed, args.source, total_rows, len(tables), len(dims),
+            clock, len(predicates), len(entries["row"]),
         )
     )
     reports = []
@@ -854,7 +888,8 @@ def main():
         )
     )
     summary = dict(
-        seed=args.seed, rows=total_rows, episodes=len(tables),
+        seed=args.seed, source=args.source, rows=total_rows,
+        episodes=len(tables),
         clock_dims=clock, clock_stats=clock_stats, dims=dims,
         predicates=names,
         reports=reports, transitions=transitions, stage=stage,
