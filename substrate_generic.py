@@ -110,7 +110,7 @@ def history_features(sequences, steps, prefix, action_dim=ACTION_DIM):
 
 def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
             budget=0, episode_start=0, propensities=None, spacing=None,
-            gravity=None, flap=None, speed=None):
+            gravity=None, flap=None, speed=None, env_factory=None):
     """Collect real transitions using only observation/action/feedback.
 
     `guide(obs) -> action or None` optionally overrides the behavior action
@@ -131,7 +131,8 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
     episode = int(episode_start)
     spent = 0
     while done < steps:
-        env = latent[int(lag)](
+        factory = env_factory if env_factory is not None else latent[int(lag)]
+        env = factory(
             seed * 10000 + episode, spacing=spacing, gravity=gravity,
             flap=flap, speed=speed,
         )

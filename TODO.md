@@ -53,6 +53,10 @@
       “距上次拍翅的帧数 / 相位变化率”，再验证：(a) 阶段转移坏段基率与
       top-1 是否提升；(b) 图策略是否不再退化为常数动作；(c) 长窗读数是否
       转化为决策改善。判据：3 种子方向 + 6 种子确认（≥5/6 同向）。
+      **2026-11-23 实现已落地**（`time_in_state.py` + `env_factory`）；
+      seed 100 首批负向且被维度控制混淆（常数额外维也 312→192），
+      action/phase 未超过 control；暂不跑 3 种子。详见下方
+      「P0 表示层：time-in-state」。
 - [x] **P0-B 查询驱动图重写 / 最小规则库**（Batch 6，2026-11-23）：
       探针、schema、每目标稀疏规则、共享 applicability、事件谓词、
       关键节点读数、stage/interval 目标、组件 free-run、查询图世界模型
@@ -380,6 +384,59 @@ decisions；`branches=8 + tail=4`、horizon 8、无 hard death veto；事件
   component 当运行时 oracle；不做任务专用阶段词/几何；死亡仍
   0/1/UNKNOWN，不用概率/梯度。
 
+
+## P0 表示层：time-in-state（2026-11-23）
+
+**目标**：把“距上次拍翅帧数 / 相位变化率”放进状态，直接针对候选
+分辨力；不改默认栈，先做 opt-in A/B。
+
+### 已实现
+
+- `time_in_state.py`：
+  - `TimeInStateEnv` 追加每个动作的 age（帧数，capped）作为状态；
+  - 可选 phase：`sin/cos(2πt/period)` + `1/period`；
+  - `make_env_factory(period, include_actions, include_phase)`；
+  - `augment_observations`（离线流版本）；
+  - `estimate_period`（逐 episode 频谱，任务无关）。
+- `env_factory` opt-in：`substrate_generic.collect`、
+  `substrate_nodes.fit/evaluate/collect_planner`；默认 `None`，默认路径
+  不变。
+- `time_in_state_probe.py`：同一 fit 配置、同一 held-out 世界，比较
+  baseline / time；`--features action|phase|both`。
+
+### 首批读数（seed 100，1500 帧，eval 120–121）
+
+| variant | frames | passes | action rate |
+|---|---:|---:|---:|
+| baseline | 312.0 | 6 | 0.0787 |
+| both (age+phase, max_age 64) | 192.0 | 3 | 0.0865 |
+| action, all ages, 64 | 169.0 | 3 | 0.1036 |
+| action, all ages, 16 | 140.5 | 2 | 0.1101 |
+| action 1 only, 16 | 189.0 | 3 | 0.0848 |
+| **control: one constant extra dim** | **192.0** | **3** | **0.0783** |
+
+读法：
+
+1. **维度控制是决定性的**：只加一个常数维度（无信息）就把 312→192，
+   与 both/action 的损失同量级 → 本轮负向主要是**固定原型容量/分辨率
+   被额外维度稀释**，不能归因于“时间特征无用”。
+2. **action-only 没有超过 control**：169/140.5/189 vs control 192；
+   没有正向信号，不进入 3 种子。
+3. **phase 不可辨识**：period 估计 1500/5000/15000 帧分别是 12/14/14，
+   不是世界周期 ~80；行为流 episode 太短、没有完整相位。phase 要等
+   有相位的流或更可靠的 reset 检测。
+4. **公平复测的必要条件**：保持有效原型密度（按维度缩放 `max_nodes`），
+   或把时间特征只接世界模型/读侧，不改 agent 的原型状态。当前实现
+   是“全状态追加”，不是公平 A/B。
+
+**结论：本轮 P0 首批为负向且被维度控制混淆，不采纳、不跑 3 种子；
+下一步是公平的容量匹配 A/B 或 world-model/readout-only 接口。**
+
+### 判据（未变）
+
+- 3 种子方向 + 6 种子确认（≥5/6 同向）；
+- 先看 frames/passes，再看候选第一动作 gap / decision regret；
+- 默认关，未过质量门不接默认。
 
 ## 当前状态（2026-11-21）
 

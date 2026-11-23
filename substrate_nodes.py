@@ -566,7 +566,7 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
 def collect_planner(seed, world, agent, episodes=2, cap=1200, horizon=10,
                     lag=LAG, step_stride=2, stride_includes_lag=False,
                     offset=50000, max_frames=None, risk_weight=1.0,
-                    risk_decay=1.0):
+                    risk_decay=1.0, env_factory=None):
     """Record the trajectories the planner actually executes.
 
     These are real transitions with real world feedback, in the same schema
@@ -590,6 +590,7 @@ def collect_planner(seed, world, agent, episodes=2, cap=1200, horizon=10,
             episode=int(offset) + episode,
             risk_weight=risk_weight,
             risk_decay=risk_decay,
+            env_factory=env_factory,
         )
         transitions.extend(rows)
         frames.append(int(length))
@@ -818,7 +819,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         milestone_stage="strength",
         milestone_boundary_k=3.0,
         hazard_readout="calibrated",
-        value_readout="cells"):
+        value_readout="cells",
+        env_factory=None):
     """Collect transitions and train the node runtime on them.
 
     With `voi_fraction > 0` collection runs in two stages: the first stage
@@ -912,7 +914,10 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         if steps < 2:
             raise ValueError("two-stage collection needs at least 2 steps")
         steps1 = max(1, int(round(steps * (1.0 - voi_fraction))))
-        stage1, _counts = collect(seed, steps1, coverage=coverage, lag=lag)
+        stage1, _counts = collect(
+            seed, steps1, coverage=coverage, lag=lag,
+            env_factory=env_factory,
+        )
         if not stage1:
             raise ValueError("collection produced no transitions")
         _bootstrap_world, guide_agent = _train(
@@ -950,10 +955,14 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             guide=guide_agent.counterfactual_action,
             budget=int(round(voi_fraction * steps)),
             propensities=propensities,
+            env_factory=env_factory,
         )
         transitions = list(transitions)
     else:
-        transitions, _counts = collect(seed, steps, coverage=coverage, lag=lag)
+        transitions, _counts = collect(
+            seed, steps, coverage=coverage, lag=lag,
+            env_factory=env_factory,
+        )
     if not transitions:
         raise ValueError("collection produced no transitions")
     rule_validation_x = None
@@ -964,6 +973,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         validation_rows, _ = collect(
             int(rule_validation_seed), steps=int(rule_validation_frames),
             coverage=coverage, lag=lag,
+            env_factory=env_factory,
         )
         if validation_rows:
             rule_validation_x = np.asarray(
@@ -1055,6 +1065,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             max_frames=(int(dagger_frames) or None),
             risk_weight=risk_weight,
             risk_decay=risk_decay,
+            env_factory=env_factory,
         )
         if not planner:
             break
@@ -2818,7 +2829,8 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
              stage_block_frames=4, beam_width=0, metrics_out=None,
              spacing=None, milestone_weight=0.0, milestone_mode="off",
              pain_weight=None, risk_lane="max", plan_out=None,
-             candidate_out=None, margin_eps=0.0, veto_fraction=0.0):
+             candidate_out=None, margin_eps=0.0, veto_fraction=0.0,
+             env_factory=None):
     """Run one deterministic evaluation episode.
 
     ``env_seed`` selects the world instance; when omitted the historical
@@ -2835,7 +2847,7 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
     if step_stride < 1:
         raise ValueError("step_stride must be positive")
     lag = int(lag)
-    env = latent[lag](
+    env = (env_factory if env_factory is not None else latent[lag])(
         seed if env_seed is None else int(env_seed),
         spacing=None if spacing is None else float(spacing),
     )
