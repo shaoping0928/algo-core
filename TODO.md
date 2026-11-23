@@ -48,8 +48,12 @@
   - calibration 在所有 seed 上失败；候选 endpoint OOD 率
     101/100/102 = 28.7% / 68.9% / 63.0%。
   → **3 种子非退化门失败**：seed 101 的增益不迁移，seed 100 退化，
-  seed 102 退化。不接线；下一步只考虑 OOD/UNKNOWN 门后的
-  rank-only 复测，或回到 world endpoint 改善。
+  seed 102 退化。不接线；该线已关闭（见「方向校正」）。
+- **Batch 8 事件/阶段 outcome audit（被动流 3 种子，已完成）**：
+  6 个事件级 level 候选跨种子稳定通过五测（terminal、x0_sign、
+  x1_high、x0_high、x5_low、x3_low）；动作回声类（impulse/apex）
+  与状态协变量类被五测分开；**阶段/世界周期边界在被动流里 0-1 次/
+  5000 帧，support 不可学**。详见 Batch 8 结果。
 
 > **范围说明**：以上 B0–B1-plan 全部是 **frame-level 默认栈** 的诊断
 > （8 步帧级 rollout / 帧级 endpoint risk）。它们回答“为什么不能继续
@@ -132,9 +136,15 @@
 - [ ] **P0-F 6 步 fine executor 基线**：horizon 6 vs 8，3 种子、
       120–124；记录 frames/passes、候选 gap、决策质量。6 步是
       新目标，但先作为基线验证，不直接改默认。
-- [ ] **P1 事件/阶段结果转移审计（当前主线，只读）**：按 Batch 8 的
-      outcome predicate + stopping-time 设计做审计；不是旧的
-      context/stage 聚类。详见 Batch 8。
+- [x] **P1 事件/阶段结果转移审计**（2026-11-23，被动流 3 种子）：
+      6 个事件级 level 候选跨种子稳定通过五测；动作回声/状态协变量
+      被分开；阶段/世界周期边界在被动流 0–1 次/5000 帧，不可学。
+      详见 Batch 8。
+- [ ] **P1-B 事件级转移 / 早期预警模型**：在 6 个稳定 level 上建
+      next-event / terminal-within-w hazard 链；next-event top-1、
+      event→terminal lead、leave-episode 校准；只做预警/方向信号。
+- [ ] **P1-C 阶段层的数据审计**：planner/DAgger 流（更长 episode）
+      重跑同一 audit，检验结构重置是否可学。
 - [ ] **P1 阶段数据规模**：结果分布身份已通过，但每局约 1 条转移；需要
       采集规模（~100 局/option）才能填 `(stage, option)` 单元。
       P0 time-in-state 已判零，不能靠 clock/phase 补这个规模。
@@ -1105,9 +1115,57 @@ transition，重训 world/hazard；指标是候选端点 R² 和 plan-level 选�
 - 评估：事件支持、动作特异性、非时钟性、事件后 regime 改变、
   跨 episode 校准；**不是** 8 步 state MSE 或 frame endpoint drift。
 
+### 事件/阶段 outcome audit 结果（2026-11-23，被动流 3 种子，已完成）
+
+协议：`collect` 被动流 5000 帧（coverage 0.1），122–132 局，局长
+p50 **34.5** / p90 **72**；候选谓词 = terminal + 各维分位穿越/过零/
+极值/跳变（时钟计数维排除，排除决策带 std/jump 比率入报告，
+`--keep-dims` 可做敏感性）；每谓词一个 distributed-lag
+cause-specific hazard（person-period，stop-time 口径），五测；
+leave-episode-fold 校准。
+
+**跨种子稳定通过五测的 level 候选（100/101/102 全部）**：
+
+| 谓词 | 解读（仅分析语） | events | AUC8 | skill8 | Δ8 |
+|---|---|---:|---:|---:|---:|
+| terminal | 死亡 | 121–131 | 0.75–0.80 | +0.34~+0.40 | +0.14~+0.19 |
+| x0_sign | 高度越过中线 | 123–129 | 0.69–0.72 | +0.07~+0.09 | +0.16~+0.19 |
+| x1_high | 快速上升（vy>q90） | 102–111 | 0.90–0.91 | +0.35~+0.38 | +0.39~+0.41 |
+| x0_high | 接近上边界（y>q90） | 94–99 | 0.98 | +0.63~+0.65 | +0.27~+0.28 |
+| x5_low | 远低于下一缺口中心 | 60–81 | 0.96–0.97 | +0.48~+0.53 | +0.26~+0.31 |
+| x3_low | 远低于当前缺口中心 | 67–72 | 0.96 | +0.41~+0.45 | +0.27~+0.29 |
+
+另有一个“大单帧位移”跳变事件家族（x0/x3/x5 jump，同族，每种子
+经去重存活一个）通过五测：AUC 0.95–0.98、skill +0.25~+0.50。
+
+**三类非 level 结论**：
+
+- **动作回声**（x1_jump 拍翅脉冲、x1_extr 顶点/谷，×3 seeds）：
+  状态可预测（AUC 0.79–0.82）但过去动作对比 ≈0（+0.01~+0.05）
+  → 它们是决策的后果，不是状态结果；属于 option/策略层，
+  不是 outcome 谓词。
+- **状态协变量**（x1_low、x0_low、x1_sign、x0_extr 等，regime fail）：
+  无 regime 改变的 band 穿越；可作入口条件，不是转移层。
+- **阶段/世界周期边界**：结构重置（2 号维跳变）在被动流中
+  **0–1 次/5000 帧**（101/102 为 0，100 为 1）→ support 拒绝；
+  **阶段层在当前被动数据上不可学**，需要更长寿命的数据流
+  （planner/DAgger 流或定向采集），不是帧级问题。
+
+**转移结构已可算**（事件→事件，seed 101 例）：`x3_low → terminal`
+中位 ~2 帧（n=13）；`x1_high → x0_high` ~1 帧（n=18）；
+`x0_sign → x1_extr` ~3 帧（n=48）。这正是事件级早期预警需要的链。
+
+**协议修正记录（全部无任务词汇）**：
+
+- 时钟规则：时钟 = 单调计数器（增量近恒定且无跳变）；锯齿+重置
+  坐标不是时钟；排除决策带 std/jump 比率入报告。
+- 跳变阈值 = `(q50+max)/2`：两值增量分布下尾分位退化，
+  中点规则分开两个众数。
+- regime 窗口 = 4：上下文窗口必须小于典型局长（p50 34.5）。
+
 ### 首批实验
 
-1. **事件/阶段 outcome audit（只读，第一优先）**：
+1. **事件/阶段 outcome audit（只读，第一优先）——已完成**：
    从 feedback/terminal/pain/reset 与观测分位生成候选结果谓词；拟合
    distributed-lag cause-specific hazard / stopping-time 模型；
    过五测（支持、动作条件性、非时钟、事件后 regime 改变、
@@ -1115,14 +1173,18 @@ transition，重训 world/hazard；指标是候选端点 R² 和 plan-level 选�
    action contrast、support/UNKNOWN。
    **口径自足**：B0 的“2/10 action contrast”是当前帧级候选集的性质，
    不用来 gate 事件/阶段层；事件层的对比按自己的 option/事件口径测。
-2. **6 步 fine executor 基线 A/B（3 种子，120–124）**：
+2. **事件级转移 / 早期预警模型（下一步，只读→opt-in）**：
+   在 6 个稳定 level 上建 next-event / terminal-within-w 的 hazard 链
+   （用已算出的事件→事件转移 + duration 分布）；
+   指标 next-event top-1、event→terminal lead、leave-episode 校准；
+   只做预警/方向信号，不进逐帧 cost。
+3. **阶段层的数据审计（只读）**：用 planner/DAgger 流（更长 episode）
+   重跑同一 audit，检验结构重置是否变得可学；被动流不再重复。
+4. **6 步 fine executor 基线 A/B（3 种子，120–124）**：
    horizon 6 vs 8；记录 frames/passes、候选 first-action gap、
    decision regret、selected survives；默认栈先不改。这是 executor
    校准，不是方案本身。
-3. **事件级早期预警（只读）**：
-   用当前状态的事件 hazard 触发更早行动；与 frame-level baseline
-   比较 escape/regret；不是逐帧 cost。
-4. **只有 1–3 过门**才做 opt-in router：
+5. **只有 1–4 过门**才做 opt-in router：
    6 步 fine executor + 事件/阶段 coarse 方向/约束；
    3 种子配对、6 种子确认；默认关。
 
