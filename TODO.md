@@ -163,6 +163,27 @@
   流方向正确，但读数仍受 5 局/种子噪声与形态不互补影响。下一步：
   E2.2（表+参数化 rank 融合，零新采集）或直接 E3 基准 A/B。
 
+## 当前决策点（2026-11-23，待用户）
+
+> 三条互斥选项都已有前置证据；默认栈与 8 步基线不变，6 步 executor
+> 在读数达到触发级之前不切。
+
+1. **E2.2 形态融合（推荐先做，零新采集）**：表 + 参数化
+   `rank_fuse = 0.5·rank(table_deploy) + 0.5·rank(logistic_deploy)`，
+   tau 仍来自部署流折外预测。预注册判据：3 种子 span16 precision
+   均 ≥0.5，或 2/3 且第三 ≥0.45。需要一次重跑（当前报告只存聚合
+   指标，未存 per-entry 预测），约 10–15 分钟/种子 + 模型重拟合。
+2. **加大部署流**：同一配置 >5000 帧（更多局），针对 101 的 table
+   过拟合（50 局、tau 0.400 偏严 → coverage 0.095、recall 0.150）。
+   判据同 E2.1 deploy gain（span12/16 precision 与 coverage 同时达标）。
+3. **E3 基准 A/B**：span16 `table_deploy`（必要时 support 百分位门控）
+   作为 endpoint hazard 项接 score，3 种子配对基准 vs 默认栈；
+   门：≥ 基线帧数、passes 不降。这是唯一能回答「2–3× lift 是否
+   改善决策」的实验；101 作为已知弱种子如实报告。
+
+**共用约束**：粗层只作读数/软项，不覆盖 fine；决策侧改动必须走
+benchmark 协议；offline tau 不可迁移，阈值必须在部署配置上校准。
+
 > **范围说明**：以上 B0–B1-plan 全部是 **frame-level 默认栈** 的诊断
 > （8 步帧级 rollout / 帧级 endpoint risk）。它们回答“为什么不能继续
 > 调 8 步帧级 score”，**不是**对事件/阶段级 outcome transition 的测试，

@@ -18,7 +18,48 @@
 - **seed 101 的 10 个 miss 已定位到 plan/suffix 排序**：B0 只读诊断（85 决策）显示 8/10 在选中/最佳首动作的各自最佳后缀下真实存活并列，只有 2/10 存在正的首动作对比；动作级 coarse router 不是当前主杠杆。详见 `TODO.md` 实验 B0。
 - **plan-level miss 的 score 实际只有 risk 一列活跃**：B0.5 显示 8 个 plan-level miss 中 risk 差值为正且占 100%，value/curiosity/q 全为 0；去掉任何列都不能恢复 plan-level miss。B0.6 进一步显示 risk 的 step 部分全为 0、几乎全是 endpoint terminal hazard；预测 endpoint 把 selected 排得更安全（8/8），真实 terminal 在 7/8 判对。主因是 **world endpoint 漂移**，不是 risk 权重；下一步是 plan-level endpoint 校正/重排，而不是首动作 router。
 - **B1-plan endpoint 读数：seed 101 有 ranking 信号，但不迁移**：predicted endpoint（仅 7 维）在 seed 101 把 same-action top1 从 61/69 提到 **68/69**、B0 miss 从 2/10 提到 **9/10**，same-AUC **0.789**；但 3 种子门失败：seed 100 从 **62/62 退化到 60/62**（worsened 2, improved 0），seed 102 的 48 个可用决策 **terminal base rate 0.000**、模型退化；calibration 在所有 seed 上失败（Brier skill −0.09…−0.36）。OOD 距离/fine score 作为特征会打掉 within-decision 信号。**不接线**；只剩 OOD/UNKNOWN 门后的 rank-only 复测或 world endpoint 改善。
-- 因此当前方向不是再加一层长期机制，而是先修“决策尺度上的危险读出/候选分辨力”和 **plan/suffix score**；详见 [2026-11-23 归档](docs/archive/README-2026-11-23.md)。
+- 8 帧帧级线（B0–B1-plan）已关闭；当前方向是**事件/阶段级 outcome transition 的粗层读数**（见下节），不是继续加帧级层或调帧级 score；历史结论见 [2026-11-23 归档](docs/archive/README-2026-11-23.md)。
+
+### 事件/阶段层后续（Batch 8 follow-up，2026-11-23 晚）
+
+- **P0-F 尸检（`h6_autopsy_probe.py`，3 种子）**：沿 h6 真实评测轨迹
+  75 决策/种子、全候选 oracle、h8 同状态对照。三种子一致：**窗内排序
+  基本没错**（in-window misrank 仅 1/3/3，只有 near-tie/challenge；
+  临终 15 决策 window-blind 0）；**失败是死亡进窗太晚**——63–66% 的
+  采样决策处于动作对称的死亡走廊（两动作都在 ≤6 步内死），h8 的逃逸
+  全部落在 h6 的 post-window 状态（12/12、15/15、12/13）。判定
+  `h6_horizon_visibility_not_ranking`：短视界是视野问题，不是候选
+  排序问题；帧级打分无法修复。
+- **事件视窗跨度（`event_span_probe.py`，3 种子）**：12–16 帧 span
+  hazard（状态+事件历史）迁移到 planner 流 AUC 0.70–0.91（2/3 种子
+  0.85–0.91，近死带 0.78–0.82）；但**离散先导事件不是 8–12 帧
+  触发器**（首次 lead ≥8 仅覆盖 6–40% 死亡；规则 h12 precision
+  0.21–0.48）；被动 tau 迁移 precision 0.23–0.38。→ 信号在连续
+  readout 里，触发形态错了。
+- **E1 粗层 span 状态树（`tree_transition_probe.py`，3 种子）**：
+  两级 state-only 表在 planner 消费分布内 AUC 0.80–0.96、
+  precision@tau 0.39–0.51（首次接近 0.5）；事件历史作为表格维度
+  3/3 变差（K=32 切碎支撑），兄弟池化在当前规模惰性；被动→planner
+  迁移不稳。
+- **E2 消费分布读数（`span_consume_probe.py`，3 种子）**：h6 DAgger
+  训练 + 折外校准，在 h6 评测流（120–124）上 span12 3/3 未达门；
+  span16 的 state-only 表跨世界可用（AUC 0.82–0.88、lift 2.0–2.4×、
+  召回 0.76–0.94、precision 0.34–0.46）；被动训练退化为基率检测器；
+  support 可作 abstention（AUC 0.75–0.92）。
+- **E2.1 部署配置流（`span_consume_probe.py --deploy-*`，3 种子）**：
+  `curiosity off` + 同 horizon/decision 再采 5000 帧。部署流局长
+  **重现评测流的 72 帧地板**（DAgger ~81）→ **采集配置位移实锤**。
+  deploy 增益 2/3 种子成立（span12 precision +0.21/+0.20；span16
+  0.475–0.611），101 反向（table 对 50 局过拟合；参数化臂在 5%
+  coverage 下 precision 0.667）。**世界数量/数据量不是瓶颈**：被动
+  128 局、DAgger 62 局，每局都是新环境实例；评测 120–124 只是同
+  分布另 5 个抽样。触发级仍未稳定达标（span12 全种子 <0.5 或
+  coverage <0.05；span16 2/3 达 0.475–0.611）。
+- **当前读法**：粗层的可用形态是**连续 span readout（12–16 帧，
+  state-only 表 + 参数化互补），在部署配置上训练与校准**；还不是
+  3 种子稳定的触发器。默认栈不变，6 步 executor 继续关闭。三条
+  后续路线（E2.2 融合 / 加大部署流 / E3 基准 A/B）与判据见
+  `TODO.md`「当前决策点」。
 
 ## 当前结构
 
