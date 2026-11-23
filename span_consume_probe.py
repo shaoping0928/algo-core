@@ -1,0 +1,450 @@
+"""E2: calibrate the span readout on the h6 consumption distribution.
+
+E1 showed the two-level span table holds inside the planner stream, but its
+passive-to-planner transfer is coverage-brittle and the tabular history
+features fragment the support.  P1-D.0 showed the event-instance warning
+does not transfer to the h6 executor's own evaluation stream at all
+(precision 0.50 -> 0.12-0.49).  This probe closes that loop: the readout
+is fitted on the distribution where it is consumed - the h6 DAgger stream -
+and the threshold is calibrated on held-out episodes of that same stream,
+then read on the h6 evaluation episodes (held-out worlds 120-124).
+
+Arms (span 8/12/16, primary 12):
+
+- ``table_dagger``: state-only two-level span table, fitted on h6 DAgger
+  episodes, tau from episode-fold predictions;
+- ``table_passive``: the same table fitted on the passive stream (the old
+  distribution control);
+- ``logistic_dagger``: the parametric state + lags + event-history hazard
+  fitted on h6 DAgger episodes (the E1-recommended parametric arm);
+- ``logistic_passive``: the same hazard fitted on the passive stream.
+
+Also measured on the eval stream: reliability bins of the table readout,
+and two online-usable uncertainty proxies (fine-node support and distance
+to the nearest node) against the realised error - can the table know when
+it is wrong?  Read-only; no score column, planner path or default changes.
+
+Usage::
+
+    python span_consume_probe.py --seed 100 --report consume-100.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+
+import numpy as np
+
+from endpoint_correction_probe import rank_auc
+from event_span_probe import _fit_blocks, _stream, _survival_blocks
+from event_transition_probe import (
+    EVENT_LEVELS, _oof_curve, history_features,
+)
+from executor_horizon_probe import horizon_config
+from latent_world import latent
+from outcome_level_probe import (
+    clock_report, entry_labels, fold_splits,
+)
+from probe_cache import load_or_fit
+from substrate_generic import collect
+from substrate_nodes import LAG, _curiosity_off, evaluate
+from tree_transition_probe import (
+    HORIZON, _assign, _valid, calibration_transfer, evaluate_table,
+    fit_tree, predict_tree,
+)
+
+WINDOWS = (8, 12, 16)
+
+
+def load_h6(seed, args):
+    config = horizon_config(seed, 6)
+    world, agent, cached = load_or_fit(
+        config, "%s-%d-6.pkl" % (args.cache_prefix, seed),
+        refit=bool(args.refit),
+    )
+    print("h6 model: %s" % ("cache" if cached else "fit"))
+    rows = [
+        row for row in agent.milestone_training_rows
+        if int(row.get("episode", 0)) >= 50000
+    ]
+    return world, agent, rows
+
+
+def eval_tables(seed, world, agent, eval_seeds):
+    """Replay the h6 evaluation episodes and rebuild their frame tables."""
+    tables = []
+    for eval_seed in eval_seeds:
+        env_seed = int(eval_seed) * 10000
+        with _curiosity_off(agent):
+            frames, actions, _rows = evaluate(
+                int(seed), world, agent, cap=5000, horizon=6, lag=LAG,
+                step_stride=2, env_seed=env_seed, decision="search",
+                record=False, episode=0,
+            )
+        actions = np.asarray(actions, dtype=int)
+        if not len(actions):
+            continue
+        env = latent[LAG](env_seed)
+        observations = []
+        done = np.zeros(len(actions), dtype=bool)
+        for position, action in enumerate(actions):
+            observations.append(np.asarray(env.obs(), dtype=float))
+            env.step(int(action))
+            done[position] = bool(env.dead)
+        tables.append(dict(
+            episode=int(eval_seed), obs=np.asarray(observations),
+            actions=actions, done=done,
+        ))
+    return tables
+
+
+def restandardize(entries, train_entries):
+    raw = entries["phi"] * entries["scale"] + entries["mean"]
+    return (raw - train_entries["mean"]) / train_entries["scale"]
+
+
+def table_oof_windows(features, step, remaining, episode, windows, args,
+                      folds=5):
+    fold = fold_splits(episode, folds)
+    output = {
+        int(window): np.full(len(step), np.nan) for window in windows
+    }
+    for value in np.unique(fold):
+        train = fold != value
+        test = fold == value
+        if not train.any() or not test.any():
+            continue
+        model = fit_tree(
+            features[train], step[train], remaining[train],
+            horizon=HORIZON, k_fine=args.k_fine, k_coarse=args.k_coarse,
+            seed=args.seed + int(value),
+        )
+        for window in windows:
+            output[int(window)][test] = predict_tree(
+                model, features[test], window,
+            )
+    return output
+
+
+def table_arm(train_stream, eval_stream, args):
+    entries = train_stream["entries"]
+    step, _duration, _ = entry_labels(
+        train_stream["terminal"], entries, HORIZON,
+    )
+    remaining = entries["remaining"]
+    features = np.asarray(entries["phi"], dtype=float)
+    oof = table_oof_windows(
+        features, step, remaining, entries["episode"], WINDOWS, args,
+    )
+    model = fit_tree(
+        features, step, remaining, horizon=HORIZON,
+        k_fine=args.k_fine, k_coarse=args.k_coarse, seed=args.seed,
+    )
+    eval_entries = eval_stream["entries"]
+    eval_step, _duration, _ = entry_labels(
+        eval_stream["terminal"], eval_entries, HORIZON,
+    )
+    eval_remaining = eval_entries["remaining"]
+    eval_features = restandardize(eval_entries, entries)
+    report = {}
+    for window in WINDOWS:
+        prediction = predict_tree(model, eval_features, window)
+        metrics = evaluate_table(
+            prediction, eval_step, eval_remaining, window,
+        )
+        metrics.update(calibration_transfer(
+            oof[window], step, remaining, window,
+            prediction, eval_step, eval_remaining,
+            precision_target=args.precision_target,
+        ))
+        report[str(window)] = metrics
+    return report, model, eval_features
+
+
+def logistic_arm(train_stream, eval_stream, args):
+    entries = train_stream["entries"]
+    step, duration, _ = entry_labels(
+        train_stream["terminal"], entries, HORIZON,
+    )
+    hist_train = history_features(
+        train_stream["masks"], train_stream["names"], entries,
+    )
+    blocks_train = [entries["phi"], entries["lags"], hist_train]
+    curve = _oof_curve(
+        blocks_train, step, duration, entries["episode"], HORIZON,
+        args.folds, l2=args.l2, iterations=args.iterations,
+    )
+    coefficients, mean, scale = _fit_blocks(
+        blocks_train, step, duration, HORIZON, args.l2, args.iterations,
+    )
+    eval_entries = eval_stream["entries"]
+    eval_step, _duration, _ = entry_labels(
+        eval_stream["terminal"], eval_entries, HORIZON,
+    )
+    eval_hist = history_features(
+        eval_stream["masks"], eval_stream["names"], eval_entries,
+    )
+    eval_blocks = [
+        restandardize(eval_entries, entries),
+        eval_entries["lags"],
+        eval_hist,
+    ]
+    eval_curve = _survival_blocks(
+        coefficients, mean, scale, eval_blocks, HORIZON,
+    )
+    eval_remaining = eval_entries["remaining"]
+    report = {}
+    for window in WINDOWS:
+        metrics = evaluate_table(
+            eval_curve[:, int(window) - 1], eval_step, eval_remaining,
+            window,
+        )
+        metrics.update(calibration_transfer(
+            curve[:, int(window) - 1], step, entries["remaining"],
+            window, eval_curve[:, int(window) - 1], eval_step,
+            eval_remaining, precision_target=args.precision_target,
+        ))
+        report[str(window)] = metrics
+    return report
+
+
+def reliability_bins(prediction, step, remaining, window, bins=4):
+    keep = _valid(step, remaining) & np.isfinite(prediction)
+    truth = ((np.asarray(step) > 0) & (np.asarray(step) <= window)).astype(
+        float
+    )
+    values = np.asarray(prediction)[keep]
+    labels = truth[keep]
+    edges = np.linspace(0.0, 1.0, int(bins) + 1)
+    report = []
+    for low, high in zip(edges[:-1], edges[1:]):
+        mask = (values >= low) & (values < high)
+        if not mask.any():
+            continue
+        report.append(dict(
+            low=float(low), high=float(high), n=int(mask.sum()),
+            mean_prediction=float(values[mask].mean()),
+            mean_truth=float(labels[mask].mean()),
+        ))
+    return report
+
+
+def uncertainty_report(model, features, step, remaining, window):
+    prediction = predict_tree(model, features, window)
+    keep = _valid(step, remaining) & np.isfinite(prediction)
+    truth = ((np.asarray(step) > 0) & (np.asarray(step) <= window)).astype(
+        float
+    )
+    error = np.abs(prediction - truth)
+    if not keep.any():
+        return None
+    stand = (features - model["mean"]) / model["scale"]
+    difference = stand[:, None, :] - model["centers"][None, :, :]
+    distance = np.sqrt(
+        np.einsum("ijk,ijk->ij", difference, difference)
+    )
+    fine = distance.argmin(axis=1)
+    support = model["fine_total"][fine]
+    nearest = distance.min(axis=1)
+    cutoff = float(np.median(error[keep]))
+    correct = (error <= cutoff).astype(float)
+    return dict(
+        n=int(keep.sum()),
+        mean_error=float(np.mean(error[keep])),
+        auc_support=rank_auc(support[keep], correct[keep]),
+        auc_distance=rank_auc(nearest[keep], correct[keep]),
+        support_low=float(np.mean(support[keep] <= 5.0)),
+        distance_median=float(np.median(nearest[keep])),
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=100)
+    parser.add_argument("--eval-seeds", default="120-124")
+    parser.add_argument("--steps", type=int, default=5000)
+    parser.add_argument("--coverage", type=float, default=0.1)
+    parser.add_argument("--stride", type=int, default=2)
+    parser.add_argument("--n-lags", type=int, default=8)
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--k-fine", type=int, default=32)
+    parser.add_argument("--k-coarse", type=int, default=4)
+    parser.add_argument("--l2", type=float, default=0.01)
+    parser.add_argument("--iterations", type=int, default=30)
+    parser.add_argument("--precision-target", type=float, default=0.5)
+    parser.add_argument("--cache-prefix", default="consume")
+    parser.add_argument("--refit", action="store_true")
+    parser.add_argument("--report", default="")
+    args = parser.parse_args()
+
+    from death_transition_quality import seed_spec
+    eval_seeds = seed_spec(args.eval_seeds)
+    world, agent, dagger_rows = load_h6(args.seed, args)
+    passive_rows, _counts = collect(
+        seed=args.seed, steps=args.steps, coverage=args.coverage, lag=LAG,
+    )
+    from outcome_level_probe import episode_tables
+    dagger_tables = episode_tables(dagger_rows)
+    passive_tables = episode_tables(passive_rows)
+    evaluation_tables = eval_tables(args.seed, world, agent, eval_seeds)
+    if not dagger_tables or not evaluation_tables:
+        raise SystemExit("missing streams")
+    dims = [
+        dim for dim, info in clock_report(
+            dagger_tables, dagger_tables[0]["obs"].shape[1],
+        ).items() if not info["excluded"]
+    ]
+    dagger = _stream(
+        dagger_tables, dims, EVENT_LEVELS, HORIZON, args.n_lags, args.stride,
+    )
+    passive = _stream(
+        passive_tables, dims, EVENT_LEVELS, HORIZON, args.n_lags,
+        args.stride,
+    )
+    print(
+        "span consume probe: seed %d  h6 dagger %d ep / %d deaths  "
+        "passive %d ep  eval %d ep  dims %s" % (
+            args.seed, len(dagger_tables), dagger["n_deaths"],
+            len(passive_tables), len(evaluation_tables), dims,
+        )
+    )
+    print("  eval frames: %s" % "/".join(
+        str(len(table["actions"])) for table in evaluation_tables
+    ))
+
+    arms = {}
+    diagnostics = {}
+    for name, train_stream in (
+        ("dagger", dagger), ("passive", passive),
+    ):
+        eval_stream = _stream(
+            evaluation_tables, dims, EVENT_LEVELS, HORIZON, args.n_lags, 1,
+            predicates=train_stream["predicates"],
+        )
+        table_report, model, eval_features = table_arm(
+            train_stream, eval_stream, args,
+        )
+        arms["table_" + name] = table_report
+        diagnostics["table_" + name] = dict(
+            reliability=reliability_bins(
+                predict_tree(model, eval_features, 12),
+                entry_labels(eval_stream["terminal"],
+                             eval_stream["entries"], HORIZON)[0],
+                eval_stream["entries"]["remaining"], 12,
+            ),
+            uncertainty=uncertainty_report(
+                model, eval_features,
+                entry_labels(eval_stream["terminal"],
+                             eval_stream["entries"], HORIZON)[0],
+                eval_stream["entries"]["remaining"], 12,
+            ),
+        )
+        arms["logistic_" + name] = logistic_arm(
+            train_stream, eval_stream, args,
+        )
+
+    for name in ("table_dagger", "table_passive", "logistic_dagger",
+                 "logistic_passive"):
+        row = arms[name]["12"]
+        print(
+            "  %-17s span12 AUC %s  band %s  base %s  tau %s  "
+            "precision %s  coverage %s  recall %s" % (
+                name,
+                _fmt(row.get("auc")), _fmt(row.get("band_auc")),
+                _fmt(row.get("base")), _fmt(row.get("tau")),
+                _fmt(row.get("precision")), _fmt(row.get("coverage")),
+                _fmt(row.get("recall")),
+            )
+        )
+    for name in ("table_dagger", "table_passive"):
+        uncertainty = diagnostics[name]["uncertainty"]
+        print(
+            "  %-17s uncertainty: support AUC %s  distance AUC %s  "
+            "low-support share %s  mean |error| %s" % (
+                name,
+                _fmt(uncertainty["auc_support"]),
+                _fmt(uncertainty["auc_distance"]),
+                _fmt(uncertainty["support_low"]),
+                _fmt(uncertainty["mean_error"]),
+            )
+        )
+        print("    reliability: " + "  ".join(
+            "[%.1f,%.1f) n=%d pred %.2f truth %.2f" % (
+                item["low"], item["high"], item["n"],
+                item["mean_prediction"], item["mean_truth"],
+            )
+            for item in diagnostics[name]["reliability"]
+        ))
+
+    def best(prefix, key):
+        values = [
+            arms[name]["12"].get(key) for name in arms
+            if name.startswith(prefix)
+        ]
+        values = [value for value in values if value is not None]
+        return max(values) if values else None
+
+    calibrated = [
+        name for name in arms
+        if (arms[name]["12"].get("precision") or 0.0)
+        >= args.precision_target
+        and (arms[name]["12"].get("coverage") or 0.0) >= 0.05
+    ]
+    checks = dict(
+        eval_calibration=bool(calibrated),
+        eval_ranking=bool(
+            best("", "auc") is not None and best("", "auc") >= 0.75
+            and best("", "band_auc") is not None
+            and best("", "band_auc") >= 0.70
+        ),
+        consumption_gain=bool(
+            (best("table_dagger", "auc") or 0.0)
+            >= (best("table_passive", "auc") or 0.0) + 0.03
+            or (best("logistic_dagger", "auc") or 0.0)
+            >= (best("logistic_passive", "auc") or 0.0) + 0.03
+        ),
+        uncertainty=bool(any(
+            diagnostics[name]["uncertainty"]["auc_support"] is not None
+            and (
+                diagnostics[name]["uncertainty"]["auc_support"] >= 0.60
+                or (
+                    diagnostics[name]["uncertainty"]["auc_distance"]
+                    is not None
+                    and diagnostics[name]["uncertainty"]["auc_distance"]
+                    <= 0.40
+                )
+            )
+            for name in diagnostics
+        )),
+    )
+    verdict = (
+        "pass" if checks["eval_calibration"] and checks["eval_ranking"]
+        else "ranking_only" if checks["eval_ranking"] else "fail"
+    )
+    print(
+        "== E2 verdict: %s  (calibration %s, ranking %s, "
+        "consumption gain %s, uncertainty %s) ==" % (
+            verdict,
+            "pass" if checks["eval_calibration"] else "fail",
+            "pass" if checks["eval_ranking"] else "fail",
+            "pass" if checks["consumption_gain"] else "fail",
+            "pass" if checks["uncertainty"] else "fail",
+        )
+    )
+    report = dict(
+        seed=args.seed, dims=dims, arms=arms,
+        diagnostics=diagnostics, checks=checks, verdict=verdict,
+    )
+    if args.report:
+        with open(args.report, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2, default=str)
+        print("report written to %s" % args.report)
+    return report
+
+
+def _fmt(value):
+    return "None" if value is None else "%.3f" % value
+
+
+if __name__ == "__main__":
+    main()
