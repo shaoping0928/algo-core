@@ -20,7 +20,12 @@ Arms (span 8/12/16, primary 12):
 - ``table_passive``: the same table fitted on the passive stream;
 - ``logistic_deploy`` / ``logistic_dagger`` / ``logistic_passive``: the
   parametric state + lags + event-history hazard on the same three
-  streams.
+  streams;
+- ``fuse_deploy``: E2.2, the within-stream rank average of the two deploy
+  readouts (``0.5 * rank(table) + 0.5 * rank(logistic)``), with tau still
+  calibrated on the deploy stream's out-of-fold predictions.  Per-entry
+  evaluation predictions are stored in the report so a later fusion does
+  not need another collection run.
 
 Also measured on the eval stream: reliability bins of the table readout,
 and two online-usable uncertainty proxies (fine-node support and distance
@@ -177,8 +182,10 @@ def table_arm(train_stream, eval_stream, args):
     eval_remaining = eval_entries["remaining"]
     eval_features = restandardize(eval_entries, entries)
     report = {}
+    eval_prediction = {}
     for window in WINDOWS:
         prediction = predict_tree(model, eval_features, window)
+        eval_prediction[int(window)] = prediction
         metrics = evaluate_table(
             prediction, eval_step, eval_remaining, window,
         )
@@ -188,7 +195,13 @@ def table_arm(train_stream, eval_stream, args):
             precision_target=args.precision_target,
         ))
         report[str(window)] = metrics
-    return report, model, eval_features
+    return dict(
+        report=report, model=model, eval_features=eval_features,
+        train_prediction={int(key): value for key, value in oof.items()},
+        eval_prediction=eval_prediction,
+        step=step, eval_step=eval_step,
+        remaining=remaining, eval_remaining=eval_remaining,
+    )
 
 
 def logistic_arm(train_stream, eval_stream, args):
@@ -235,7 +248,110 @@ def logistic_arm(train_stream, eval_stream, args):
             eval_remaining, precision_target=args.precision_target,
         ))
         report[str(window)] = metrics
-    return report
+    return dict(
+        report=report, train_prediction=curve, eval_prediction=eval_curve,
+        step=step, eval_step=eval_step,
+        remaining=entries["remaining"], eval_remaining=eval_remaining,
+    )
+
+
+def percentile_rank(values):
+    """Average-rank percentile in [0, 1]; ties share a rank, NaN stays NaN.
+
+    Ranks are taken inside one stream, so the fusion arm compares a stream's
+    own entries with each other.  That is the pre-registered
+    ``rank(table_deploy)``/``rank(logistic_deploy)`` form: a scale-free
+    combination that needs no shared units between an empirical table and a
+    parametric curve.
+    """
+    values = np.asarray(values, dtype=float)
+    output = np.full(values.shape, np.nan)
+    keep = np.isfinite(values)
+    count = int(keep.sum())
+    if count == 0:
+        return output
+    order = np.argsort(values[keep], kind="mergesort")
+    ordered = values[keep][order]
+    ranks = np.empty(count, dtype=float)
+    start = 0
+    while start < count:
+        end = start + 1
+        while end < count and ordered[end] == ordered[start]:
+            end += 1
+        ranks[start:end] = 0.5 * (start + end - 1)
+        start = end
+    ranked = np.empty(count, dtype=float)
+    ranked[order] = ranks
+    output[keep] = ranked / max(1.0, count - 1.0)
+    return output
+
+
+def blend_ranks(left, right, weight=0.5):
+    """Weighted rank average; a NaN side falls back to the other side."""
+    left = np.asarray(left, dtype=float)
+    right = np.asarray(right, dtype=float)
+    both = np.isfinite(left) & np.isfinite(right)
+    return np.where(
+        both, float(weight) * left + (1.0 - float(weight)) * right,
+        np.where(np.isfinite(left), left, right),
+    )
+
+
+def fusion_arm(table_output, logistic_output, args, weight=0.5):
+    """E2.2: fuse the two deploy-stream readouts by within-stream rank.
+
+    The threshold calibration (training stream) and the read (evaluation
+    stream) use the same fusion, so tau still comes from the deployment
+    stream's out-of-fold predictions and no evaluation label enters a fit.
+    """
+    report = {}
+    entries = {}
+    for window in WINDOWS:
+        if int(window) not in table_output["train_prediction"]:
+            continue
+        if int(window) not in table_output["eval_prediction"]:
+            continue
+        train_fused = blend_ranks(
+            percentile_rank(table_output["train_prediction"][int(window)]),
+            percentile_rank(
+                logistic_output["train_prediction"][:, int(window) - 1]
+            ),
+            weight,
+        )
+        eval_fused = blend_ranks(
+            percentile_rank(table_output["eval_prediction"][int(window)]),
+            percentile_rank(
+                logistic_output["eval_prediction"][:, int(window) - 1]
+            ),
+            weight,
+        )
+        step = np.asarray(table_output["eval_step"])
+        metrics = evaluate_table(
+            eval_fused, step, table_output["eval_remaining"], window,
+        )
+        metrics.update(calibration_transfer(
+            train_fused, table_output["step"],
+            table_output["remaining"], window,
+            eval_fused, table_output["eval_step"],
+            table_output["eval_remaining"],
+            precision_target=args.precision_target,
+        ))
+        report[str(window)] = metrics
+        entries[str(window)] = dict(
+            prediction=eval_fused.tolist(),
+            table=table_output["eval_prediction"][int(window)].tolist(),
+            logistic=logistic_output["eval_prediction"][
+                :, int(window) - 1
+            ].tolist(),
+            step=step.tolist(),
+            remaining=np.asarray(
+                table_output["eval_remaining"]
+            ).tolist(),
+            label=(
+                (step > 0) & (step <= int(window))
+            ).astype(int).tolist(),
+        )
+    return report, entries
 
 
 def reliability_bins(prediction, step, remaining, window, bins=4):
@@ -353,6 +469,7 @@ def main():
 
     arms = {}
     diagnostics = {}
+    outputs = {}
     for name, train_stream in (
         ("deploy", deploy), ("dagger", dagger), ("passive", passive),
     ):
@@ -360,30 +477,39 @@ def main():
             evaluation_tables, dims, EVENT_LEVELS, HORIZON, args.n_lags, 1,
             predicates=train_stream["predicates"],
         )
-        table_report, model, eval_features = table_arm(
-            train_stream, eval_stream, args,
-        )
-        arms["table_" + name] = table_report
+        table_output = table_arm(train_stream, eval_stream, args)
+        arms["table_" + name] = table_output["report"]
+        outputs["table_" + name] = table_output
         diagnostics["table_" + name] = dict(
             reliability=reliability_bins(
-                predict_tree(model, eval_features, 12),
+                predict_tree(
+                    table_output["model"], table_output["eval_features"], 12,
+                ),
                 entry_labels(eval_stream["terminal"],
                              eval_stream["entries"], HORIZON)[0],
                 eval_stream["entries"]["remaining"], 12,
             ),
             uncertainty=uncertainty_report(
-                model, eval_features,
+                table_output["model"], table_output["eval_features"],
                 entry_labels(eval_stream["terminal"],
                              eval_stream["entries"], HORIZON)[0],
                 eval_stream["entries"]["remaining"], 12,
             ),
         )
-        arms["logistic_" + name] = logistic_arm(
-            train_stream, eval_stream, args,
+        logistic_output = logistic_arm(train_stream, eval_stream, args)
+        arms["logistic_" + name] = logistic_output["report"]
+        outputs["logistic_" + name] = logistic_output
+
+    fusion_entries = {}
+    if "table_deploy" in outputs and "logistic_deploy" in outputs:
+        fusion_report, fusion_entries = fusion_arm(
+            outputs["table_deploy"], outputs["logistic_deploy"], args,
         )
+        arms["fuse_deploy"] = fusion_report
 
     for name in ("table_deploy", "table_dagger", "table_passive",
-                 "logistic_deploy", "logistic_dagger", "logistic_passive"):
+                 "logistic_deploy", "logistic_dagger", "logistic_passive",
+                 "fuse_deploy"):
         row = arms[name]["12"]
         print(
             "  %-18s span12 AUC %s  band %s  base %s  tau %s  "
@@ -415,7 +541,8 @@ def main():
             for item in diagnostics[name]["reliability"]
         ))
 
-    for name in ("table_deploy", "table_dagger", "table_passive"):
+    for name in ("table_deploy", "table_dagger", "table_passive",
+                 "fuse_deploy"):
         row = arms[name]["16"]
         print(
             "  %-18s span16 AUC %s  band %s  precision %s  "
@@ -481,6 +608,17 @@ def main():
             for name in diagnostics
         )),
     )
+    fusion = arms.get("fuse_deploy", {}).get("16", {})
+    fusion_gate = dict(
+        precision=fusion.get("precision"),
+        coverage=fusion.get("coverage"),
+        recall=fusion.get("recall"),
+        target=float(args.precision_target),
+        pass_=bool(
+            (fusion.get("precision") or 0.0) >= float(args.precision_target)
+        ),
+    )
+    checks["fusion_span16"] = fusion_gate["pass_"]
     verdict = (
         "pass" if checks["eval_calibration"] and checks["eval_ranking"]
         else "ranking_only" if checks["eval_ranking"] else "fail"
@@ -488,7 +626,7 @@ def main():
     print(
         "== E2.1 verdict: %s  (calibration %s, ranking %s, "
         "consumption gain %s, deploy gain %s %.3f/%.3f, "
-        "uncertainty %s) ==" % (
+        "uncertainty %s, fusion span16 precision %s/%s) ==" % (
             verdict,
             "pass" if checks["eval_calibration"] else "fail",
             "pass" if checks["eval_ranking"] else "fail",
@@ -496,12 +634,14 @@ def main():
             "pass" if checks["deploy_gain"] else "fail",
             deploy_gain["span_12"], deploy_gain["span_16"],
             "pass" if checks["uncertainty"] else "fail",
+            _fmt(fusion.get("precision")), _fmt(fusion_gate["target"]),
         )
     )
     report = dict(
         seed=args.seed, dims=dims, arms=arms,
         diagnostics=diagnostics, checks=checks,
         deploy_gain=deploy_gain, verdict=verdict,
+        fusion_gate=fusion_gate, fusion_entries=fusion_entries,
     )
     if args.report:
         with open(args.report, "w", encoding="utf-8") as handle:
