@@ -106,6 +106,8 @@
 | [coarse_search_probe.py](file:///c:/workspace/code/algo_core/coarse_search_probe.py) | 宏动作长程粗搜索能否看到 8 帧细搜索看不到的东西 |
 | [score_column_probe.py](file:///c:/workspace/code/algo_core/score_column_probe.py) | 逐列消融：去掉 risk/value/curiosity/q 哪列能命中 oracle |
 | [decision_b0_probe.py](file:///c:/workspace/code/algo_core/decision_b0_probe.py) | B0 只读诊断：seed 101 miss 的首动作 gap、oracle-best、局部动作支持、端点 OOD 与 plan/suffix 判定 |
+| [plan_score_probe.py](file:///c:/workspace/code/algo_core/plan_score_probe.py) | B0.5：把 miss 的 regret 分解为 action/suffix，逐列与子集消融 risk/value/curiosity/q |
+| [risk_readout_probe.py](file:///c:/workspace/code/algo_core/risk_readout_probe.py) | B0.6：预测轨迹 vs 真实轨迹的风险读数对照，区分 step/terminal 与 world 漂移 |
 | [risk_contrast_probe.py](file:///c:/workspace/code/algo_core/risk_contrast_probe.py) | 风险列实际能改变多少决策（有/无风险列的首步动作翻转率） |
 | [metric_probe.py](file:///c:/workspace/code/algo_core/metric_probe.py) | 几何接近是否意味着结果接近（检验原型高斯核假设） |
 | [n_tie_probe.py](file:///c:/workspace/code/algo_core/n_tie_probe.py) | 好奇心端点势 Φ 在平局时是否真能改变决策 |

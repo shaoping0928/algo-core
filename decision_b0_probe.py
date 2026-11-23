@@ -30,6 +30,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 
 import numpy as np
@@ -410,13 +411,16 @@ def decision_points(frames, branches, tail):
     return sorted(points)
 
 
-def run(args):
+def run(args, trace_out=None, context_out=None):
     config = probe_config(args)
     world, agent, cached = load_or_fit(
         config, args.cache or None, refit=bool(args.refit)
     )
     print("model cache: %s" % ("hit" if cached else "fit"))
     agent.death_rule_hard = False
+    if context_out is not None:
+        context_out["world"] = world
+        context_out["agent"] = agent
     rules = getattr(agent, "death_rules", None)
     if rules is None:
         raise SystemExit("the fitted agent has no death rules")
@@ -661,6 +665,27 @@ def run(args):
                 row, args.min_support, args.min_episodes
             ) if decision_relevant else "not_relevant"
             rows.append(row)
+            if trace_out is not None:
+                trace_out.append(dict(
+                    eval_seed=int(eval_seed),
+                    point=int(point),
+                    trace=trace,
+                    result=tri,
+                    env=copy.deepcopy(env),
+                    prefix=prefix.copy(),
+                    obs=np.asarray(env.obs(), dtype=float).copy(),
+                    sequences=sequences,
+                    scores=scores,
+                    feasible=feasible,
+                    true_first=true_first,
+                    true_value=true_value,
+                    best_value=int(best_value),
+                    best_true=best_true,
+                    selected_action=int(selected_action),
+                    oracle_action=int(oracle_action),
+                    oracle_index=int(details["oracle_best_index"]),
+                    row=row,
+                ))
             decisions += 1
 
     summary = summarize(rows, decisions, args.horizon)

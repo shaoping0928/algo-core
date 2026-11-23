@@ -16,6 +16,7 @@
 - **危险读出没有覆盖死亡封闭的尺度（≥10 帧）**：8 帧处危险 AUC 已降到 0.55–0.59。显式前兆窗口可以把 h12 判别力做到 0.92–0.94，但作为逐帧罚项或端点否决都不超过默认栈。
 - **阶段/图策略不能替代模型**：阶段级信号在 8 帧帧网格上无法被消费；单步转移图与图上值迭代因覆盖不足，不能替代可外推的世界模型。
 - **seed 101 的 10 个 miss 已定位到 plan/suffix 排序**：B0 只读诊断（85 决策）显示 8/10 在选中/最佳首动作的各自最佳后缀下真实存活并列，只有 2/10 存在正的首动作对比；动作级 coarse router 不是当前主杠杆。详见 `TODO.md` 实验 B0。
+- **plan-level miss 的 score 实际只有 risk 一列活跃**：B0.5 显示 8 个 plan-level miss 中 risk 差值为正且占 100%，value/curiosity/q 全为 0；去掉任何列都不能恢复 plan-level miss。B0.6 进一步显示 risk 的 step 部分全为 0、几乎全是 endpoint terminal hazard；预测 endpoint 把 selected 排得更安全（8/8），真实 terminal 在 7/8 判对。主因是 **world endpoint 漂移**，不是 risk 权重；下一步是 plan-level endpoint 校正/重排，而不是首动作 router。
 - 因此当前方向不是再加一层长期机制，而是先修“决策尺度上的危险读出/候选分辨力”和 **plan/suffix score**；详见 [2026-11-23 归档](docs/archive/README-2026-11-23.md)。
 
 ## 当前结构

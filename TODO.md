@@ -744,6 +744,61 @@ C. 已选中 oracle-best      → 正常
 - 若没有任何单列能修复，问题在 world 预测漂移或列间组合，
   再考虑 plan-level endpoint 重排（带 OOD 门），而不是首动作 router。
 
+**B0.5 结果（2026-11-23，seed 101）**：
+
+- 10 个 miss：8 plan-level、2 action-level；8 个 plan-level 的
+  suffix regret 为 2–5 帧，same-action-best 的 score rank 中位 7、
+  均值 9.5。
+- **默认 score 在这些决策上实际只有一个活跃列：risk**。
+  plan-level 的 same-best-minus-selected 风险差 +0.042…+0.072，
+  value / curiosity / q 差值全部为 0（8/8 非零列只有 risk；
+  positive share = 1.00）。
+- **没有任何单列或列组合消融能恢复 plan-level miss**：
+  plan-level global 0/8、same-action 0/8；全部 miss 的 global 也是 0/10。
+  去掉 risk 后成本近似常数，之前的“fix”是并列下的词典序偶然。
+- 结论：不是“某一列权重太大”，而是 **risk 列本身的排序错了**：
+  它给真实更差的后缀更低的风险。下一步必须区分
+  **world 预测漂移**与 **risk readout/calibration 错误**。
+
+### 实验 B0.6：risk readout 真/预测轨迹对照（只读）
+
+对 8 个 plan-level miss 的 selected 与 same-action-best 后缀：
+
+- 用同一个 `world.predict` 复现 planner 的预测轨迹，按 `step_stride`
+  累加 risk；用真实环境复现同一序列，在真实状态上按相同步长累加 risk；
+- 记录 `risk_pred_selected/best`、`risk_true_selected/best`、
+  `state_error`、真实首死步；
+- 判据：
+  - `risk_true(best) < risk_true(selected)` 在多数 miss 成立 →
+    risk readout 在真实状态上是对的，主因是 **world 预测漂移**；
+  - 若在真实状态上也反了 → risk readout/calibration 本身错误，
+    先修 readout，不要做 plan-level endpoint 重排；
+  - 若两者都不成立 → 检查 pain 标签/风险合成本身。
+- 只在真实转移上计算，不训练新模型；输出逐 miss 对照与聚合。
+
+**B0.6 结果（2026-11-23，seed 101）**：
+
+- 复现校验 **8/8**：预测轨迹的 risk 与 planner 的 risk 列逐位一致。
+- **预测 risk 的 step 部分全为 0**（pred step margin 0.0000）；
+  整个 risk 列是 endpoint 的 **terminal hazard**。
+- 预测 terminal risk 在 8/8 把 selected 排得更安全
+  （pred terminal margin -0.053），但真实 selected 在 4–7 帧死亡、
+  best 后缀全部存活。
+- 真实 terminal risk 在 **7/8** 把 best 排得更安全
+  （true terminal margin +0.706）；真实 step risk 只有 2/8 正确，
+  first-step 0/8，step margin 仅 +0.008。
+- state error mean **0.111**；predictive endpoint 漂移。
+- 例外 `122@67`：真实 terminal 也给 best 1.0（readout 认为 best 也
+  终态危险），true total 反而偏向 selected；这是唯一 readout 侧反例。
+- **判定：`step_readout_flat_endpoint_drift`。**
+  - 不是 risk 权重/列组合问题：step 风险几乎全 0；
+  - 真实 endpoint 的 terminal 读数基本正确（7/8），
+    错在 **world 预测的 endpoint**；
+  - 逐帧罚项无法修复（step 信号为 0）；首动作 router 也无关。
+- 下一步：**plan-level endpoint 校正/重排**，用 planner 的 predicted
+  endpoint + 真实 terminal 标签训练/校准，带 OOD 门；或先修 world
+  endpoint 漂移。改 risk 权重/加逐帧项均不在候选内。
+
 ### 实验 B：多视界结果转移 + router（opt-in，B0 后暂缓）
 
 **前置状态（B0 后）**：首动作 router 只有 2/10 的理论空间，
@@ -864,12 +919,19 @@ held-out 世界 120–124；基线 129.1 / 147（3 种子）。
 
 ### A. Batch 4 尾项：决策侧 score
 
-- [ ] **score component 诊断**：在 seed 101 的 10 个 decision-relevant
+- [x] **score component 诊断**：在 seed 101 的 10 个 decision-relevant
       miss 上逐列消融（risk / value / curiosity），定位把存活计划排后的
-      那一列；B0 已把范围缩到 8 个 plan-level miss（4 同动作 +
-      4 零首动作对比），先跑这 8 个；
+      那一列；B0.5：8 个 plan-level miss 只有 risk 活跃，
+      value/curiosity/q 全为 0；0/8 能被单列或列组合修复。
+      B0.6：risk 的 step 部分为 0，主要是 endpoint terminal hazard；
+      预测 endpoint 反向（8/8），真实 terminal 7/8 正确 → world
+      endpoint 漂移。逐列/权重方向关闭；
 - [ ] **score calibration / 保守下界**：只在分数边际小或 support 低时
       改变排序，避免全局重标定；
+- [ ] **plan-level endpoint 校正/重排**：用 planner 的 predicted endpoint
+      + 真实 terminal 标签训练/校准一个小读数，episode-held-out +
+      共形区间 + OOD 门；只在 plan/suffix 层面重排，不改首动作，
+      不加逐帧项；
 - [ ] **早期预警 / 时域 / 候选集**：seed 100/102 的晚期状态在 H=8 内
       所有候选都死，需要更早行动或更长时域/更好的候选生成；
 - [ ] 决策侧改动准入：真实基准 3 种子配对（fast 屏不作为证据）。
