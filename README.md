@@ -17,6 +17,7 @@
 - **阶段/图策略不能替代模型**：阶段级信号在 8 帧帧网格上无法被消费；单步转移图与图上值迭代因覆盖不足，不能替代可外推的世界模型。
 - **seed 101 的 10 个 miss 已定位到 plan/suffix 排序**：B0 只读诊断（85 决策）显示 8/10 在选中/最佳首动作的各自最佳后缀下真实存活并列，只有 2/10 存在正的首动作对比；动作级 coarse router 不是当前主杠杆。详见 `TODO.md` 实验 B0。
 - **plan-level miss 的 score 实际只有 risk 一列活跃**：B0.5 显示 8 个 plan-level miss 中 risk 差值为正且占 100%，value/curiosity/q 全为 0；去掉任何列都不能恢复 plan-level miss。B0.6 进一步显示 risk 的 step 部分全为 0、几乎全是 endpoint terminal hazard；预测 endpoint 把 selected 排得更安全（8/8），真实 terminal 在 7/8 判对。主因是 **world endpoint 漂移**，不是 risk 权重；下一步是 plan-level endpoint 校正/重排，而不是首动作 router。
+- **B1-plan endpoint 读数：ranking 有信号，calibration 失败**：predicted endpoint（仅 7 维）在 leave-one-world-out 下 same-action top1 **68/69**、same-AUC **0.789**、B0 miss **9/10**，高于 fine（61/69、2/10）和 shuffle placebo（65/69、6/10）；但 pooled Brier skill −0.092、within-Brier skill −0.793，不能作为概率。OOD 距离与 fine score 作为特征会打掉 within-decision 信号；OOD 只能做排序后的门控。未接线，下一步 3 种子 + 校准。
 - 因此当前方向不是再加一层长期机制，而是先修“决策尺度上的危险读出/候选分辨力”和 **plan/suffix score**；详见 [2026-11-23 归档](docs/archive/README-2026-11-23.md)。
 
 ## 当前结构

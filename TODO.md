@@ -799,6 +799,48 @@ C. 已选中 oracle-best      → 正常
   endpoint + 真实 terminal 标签训练/校准，带 OOD 门；或先修 world
   endpoint 漂移。改 risk 权重/加逐帧项均不在候选内。
 
+### 实验 B1-plan：predicted endpoint 校正（只读）
+
+用 B0 的 69 个有效决策（16 个无可行 same-action 候选被跳过；
+10 个 relevant miss 全在）和 16102 个候选，按 `eval_seed` 做
+leave-one-world-out；标签是候选真实 terminal（within H=8）。
+对比：
+
+- A0：fine score，同动作内选最低；
+- A1：predicted endpoint（7 维）；
+- A2：endpoint + OOD 距离；
+- A3：endpoint + OOD + fine score 列；
+- A5：fine score 列（校准器）；
+- A4 / A4b：label-shuffle / feature-shuffle placebo。
+
+**B1-plan 结果（2026-11-23，seed 101）**：
+
+| arm | same-oracle | same-regret | relevant-miss | within dec-AUC | within same-AUC | top1 |
+|---|---:|---:|---:|---:|---:|---:|
+| A0 fine | 61/69 | 0.362 | 10 | — | — | — |
+| **A1 endpoint** | **68/69** | **0.058** | **3** | **0.760** | **0.789** | **68/69** |
+| A2 endpoint+ood | 67/69 | 0.101 | 4 | 0.543 | 0.465 | 67/69 |
+| A3 endpoint+fine | 65/69 | 0.203 | 6 | 0.618 | 0.554 | 65/69 |
+| A5 fine-only | 62/69 | 0.333 | 9 | 0.182 | 0.189 | 62/69 |
+| A4 label-shuffle | 65/69 | 0.188 | 6 | 0.543 | 0.545 | 65/69 |
+| A4b feature-shuffle | 65/69 | 0.188 | 6 | 0.545 | 0.550 | 65/69 |
+
+- B0 miss 子集：A0 same-oracle **2/10**，A1 **9/10**
+  （improved 7 / worsened 1），A4 6/10。
+- **A1 endpoint-only 是唯一有清晰 within-decision 信号的 arm**：
+  same-AUC 0.789 vs placebo 0.545–0.550；fine-only 0.189（反向）。
+- **A2/A3 把信号打掉**：OOD 距离和 fine score 作为特征会主导
+  within-decision 排序；OOD 应做 **排序后的门控**，不是特征。
+- **校准失败**：A1 pooled Brier skill **−0.092**、ECE 0.097、
+  slope 0.037；within-Brier skill **−0.793**；预测 p-std 仅 0.0265。
+  它是 ranker，不是可用的概率读数。
+- 例外 `122@67` 仍是 A1 唯一 worsened 的 miss，与 B0.6 的
+  readout-side 反例一致。
+- **判定：ranking gate 通过，calibration gate 失败；不接线。**
+  下一步 B1-plan-3seed：seed 100/102 非退化 + 温度/isotonic/嵌套
+  校准 + 多种子 shuffle placebo；只有 rank-only near-tie assist
+  可用后才考虑 B2-plan。
+
 ### 实验 B：多视界结果转移 + router（opt-in，B0 后暂缓）
 
 **前置状态（B0 后）**：首动作 router 只有 2/10 的理论空间，
@@ -931,7 +973,10 @@ held-out 世界 120–124；基线 129.1 / 147（3 种子）。
 - [ ] **plan-level endpoint 校正/重排**：用 planner 的 predicted endpoint
       + 真实 terminal 标签训练/校准一个小读数，episode-held-out +
       共形区间 + OOD 门；只在 plan/suffix 层面重排，不改首动作，
-      不加逐帧项；
+      不加逐帧项；B1-plan 首轮（seed 101）：A1 endpoint-only
+      same-AUC 0.789、B0 miss 9/10，ranking 通过；但 Brier skill
+      −0.092、within-Brier skill −0.793，calibration 失败。下一步
+      3 种子 + 校准；OOD 只做排序后门控，不做特征；
 - [ ] **早期预警 / 时域 / 候选集**：seed 100/102 的晚期状态在 H=8 内
       所有候选都死，需要更早行动或更长时域/更好的候选生成；
 - [ ] 决策侧改动准入：真实基准 3 种子配对（fast 屏不作为证据）。
