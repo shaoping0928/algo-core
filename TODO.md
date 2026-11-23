@@ -546,7 +546,8 @@ decisions；`branches=8 + tail=4`、horizon 8、无 hard death veto；事件
 
 **一句话**：候选分辨力不是“再加一个分数项”，而是四个不同问题：
 **存在性、可识别性、稳定性、实现性**。不同 seed / 状态落在不同问题
-上，不能用一个全局 cost 同时解决。
+上，不能用一个全局 cost 同时解决。**H=8→H=12 只是把帧窗口放大，
+不是多视界；真正的解是“不同概念层级的结果转移 + router”。**
 
 ### 四个子问题
 
@@ -590,6 +591,46 @@ decisions；`branches=8 + tail=4`、horizon 8、无 hard death veto；事件
    - 同状态两个动作的真实结局样本很少（plan-level 仅 11–14 个可判定决策）。
    → 候选评分在危险附近动作对比上数据不足。
 
+### 修正：不是 H=8→H=12，而是多视界结果转移 + router
+
+固定帧视界是近视的：H=8 看不到死亡封闭，H=12 又太贵，而且默认策略
+走到的状态在 12 帧内也封死。**继续加 H 只是扩大窗口，不是改变决策
+单位。**
+
+需要的结构：
+
+```text
+多视界结果转移库：
+  层级 = 帧 / 事件 / 阶段 / 回合（由目标结果决定，不由固定帧数决定）
+  每条边 = entry_condition + action/option
+           + target_outcome / next_level
+           + duration_distribution
+           + support / calibration / validity
+Router：
+  request(target, required_resolution, level, margin)
+  → 细层模型优先；粗层只做早期预警/剪枝/排序
+  → 入口不满足或支持不足 → UNKNOWN
+  → 粗层不能覆盖有效的细层判断
+```
+
+最小可行版本（不碰阶段身份）：
+
+- 学 **horizon-indexed、action-conditioned 结果模型**：
+  `P(terminal within h | state, a)` 或 `E[survival | state, a]`，
+  h = 1/4/8/12/16；
+- 用现有 precursor 标签；episode-held-out 校准；
+- 同时报告 **action contrast**：`risk(a=1) - risk(a=0)`；
+- router 只在 baseline 第一动作 gap 小、或细层看不到 terminal 时
+  启用粗层；
+- coarse 只改候选排序/剪枝，不进入逐帧 cost。
+
+为什么这不是之前失败的阶段图：
+
+- 不学 context 簇/阶段身份，不依赖 clock/phase；
+- 目标是**结果**（terminal/survival），不是全状态；
+- 只在决策边际小的时候消费，避免改写强信号；
+- H=12 搜索不是默认，只由粗层风险触发、按状态局部扩展。
+
 ### 实验 A：候选存在性审计（只读，先做）
 
 在每个真实决策点，把决策分类：
@@ -618,21 +659,40 @@ C. 已选中 oracle-best      → 正常
 - 若 A 在所有 seed 占主导 → 不要再加 score 项，直接做更早行动/视界；
 - 只读，不改默认。
 
-### 实验 B：endpoint-only 长 lead 信号（opt-in）
+### 实验 B：多视界结果转移 + router（opt-in）
 
-只针对 **可识别性**，不改逐帧 cost：
+**B1：结果转移库**
 
-- 候选端点用 `pain_gamma=0.9` 或长窗 hazard（h=12，precursor
-  窗口 10/16）打分；
-- **只在 baseline 第一动作 gap < ε 时启用**；
-- 只做**相对排序/下限比较**，不把绝对水平加进 cost；
-- 不全局 veto；新信号与 baseline 冲突且无足够 lead 时保留 baseline。
+- 学 **horizon-indexed、action-conditioned** 结果：
+  `P(terminal within h | state, a)` / `E[survival | state, a]`，
+  h = 1/4/8/12/16；
+- 用现有 precursor 标签；episode-held-out 校准；
+- 同时报告 **action contrast**：`risk(a=1) - risk(a=0)`；
+- 目标只是结果，不是全状态；不学阶段身份、不依赖 clock/phase；
+- 支持/校准不足 → 该 horizon 不启用。
+
+**B2：router 探针**
+
+- 在候选第一动作/端点上查询结果库；
+- **只在 baseline 第一动作 gap < ε、或细层看不到 terminal 时启用**；
+- 只做相对排序/下限比较，不把绝对水平加进逐帧 cost；
+- 不全局 veto；粗层与细层冲突且无足够 lead 时保留细层；
+- 比较 fine-only / coarse-only / coarse-to-fine；
+- 指标：seed 101 decision-relevant miss / regret；seed 100/102
+  selected survives；UNKNOWN 率。
+
+**B3：自适应搜索（后做）**
+
+- 只有当粗层风险高、且 H=8 内全死时，才对**该状态**局部扩展到
+  H=12；不是默认 H=12；
+- 记录成本/收益：新增搜索时间、找到的 escape、决策改变、regret。
+- 若成本不可接受或只改变近并列噪声，关闭。
 
 质量门：
 
-- seed 101：decision-relevant miss / regret 下降；
-- seed 100/102：selected survives 不下降；
-- 3 种子配对；6 种子确认（≥5/6 同向）。
+- B1：h=12 action contrast 有可用校准/支持；不是只报 AUC；
+- B2：seed 101 miss/regret 下降；seed 100/102 survives 不下降；
+- 3 种子配对；6 种子确认（≥5/6 同向）；
 - 默认关；未过门不接默认。
 
 ### 实验 C：定向反事实覆盖（可选，后做）
@@ -644,6 +704,8 @@ transition，重训 world/hazard；指标是候选端点 R² 和 plan-level 选�
 ### 非目标
 
 - 不再加 time-in-state / current-frame clock / phase（P0 已判零）；
+- 不把 H=12 当默认或唯一解；H=12 只是粗层触发的局部扩展；
+- 不用全状态长程预测替代结果转移（endpoint drift 已有证据）；
 - 不做全局逐帧长窗罚项 / 全局端点 veto（已有 0/3、121.7 vs 152.9）；
 - 不在没有阶段数据/身份时继续 stage/option 消费；
 - 不用小 beam 长视界做贪心剪枝（w64 长视界 −22）；
