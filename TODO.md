@@ -631,6 +631,39 @@ Router：
 - 只在决策边际小的时候消费，避免改写强信号；
 - H=12 搜索不是默认，只由粗层风险触发、按状态局部扩展。
 
+### 两份设计备忘录的合并结论（2026-11-23）
+
+**训练侧**：
+
+- 层 = 结果谓词 `(O, A_O)`，跨度 = 停时分布 `P(T | entry, option)`；
+- 粗层只学 outcome/terminal/survival，不学全状态端点；
+- 一个 distributed-lag cause-specific hazard，一次训练、任意窗口查询；
+- 层要过五测：事件支持、动作条件性、非时钟性、事件后 regime 改变、
+  跨 episode 校准；
+- 默认单段；只有 held-out 结果似然失败才分段；merge 按 outcome
+  散度，不按 context 距离；
+- 被动数据可学事件/停时/入口/行为结果/逐 lag 动作剖面；长跨度
+  option 对比需要定向配对采集（序列 propensity 乘积会塌）。
+
+**推理侧**：
+
+- fine-first router；粗层只在近并列 / 细层失明 / OOD 时查询；
+- 三种模式：SUBSTITUTE（细层 UNKNOWN/全死）、ASSIST（近并列
+  band 内排序）、CHALLENGE（粗层反对时触发局部细层重搜）；
+- 区间/共形下界仲裁；`L_coarse > U_fine + δ` 才改动作；
+- 不做全局逐帧 cost、不做全局 veto；UNKNOWN 不当安全；
+- 规则 router 先行，不学习 router；默认关，关闭时逐位不变；
+- 接线在 `policy_result` 外部后选择，不改 6 列 score 账本。
+
+**两份备忘录的分歧/风险**：
+
+1. 推理侧先提“候选端点 `P(terminal within 4 | final_state)`”，
+   训练侧警告全状态端点会漂移；必须先测 **endpoint OOD 率**。
+   若 OOD 高，改用 action-conditioned state hazard，而不是端点模型。
+2. 长跨度 action contrast 可能不可识别；B1/B2 必须先过
+   contrast 校准，否则 router 只是换一种噪声。
+3. 1500 帧只够筛查；3 种子方向 + 6 种子确认，安慰剂/打乱臂必需。
+
 ### 实验 A：候选存在性审计（只读，先做）
 
 在每个真实决策点，把决策分类：
@@ -659,6 +692,28 @@ C. 已选中 oracle-best      → 正常
 - 若 A 在所有 seed 占主导 → 不要再加 score 项，直接做更早行动/视界；
 - 只读，不改默认。
 
+### 实验 B0：seed 101 miss 诊断门（B2 前置，只读）
+
+对 seed 101 的 10 个 decision-relevant miss，逐条记录：
+
+- `first_action_gap` / `plan_margin`；
+- `oracle_best_feasible` / `oracle_best_score_gap` / rank；
+- selected vs oracle-best 的第一动作；
+- 粗层对该两个动作的 support / calibration / admissible；
+- 候选端点 OOD 率。
+
+判定树：
+
+```text
+>=7/10 miss 的 gap <= 0.03 且两动作粗层可准入 → 跑 coarse-rank
+>=5/10 miss 的 gap > 0.1 → 契约不允许直接改；跑 coarse-challenge
+                                        或先修 fine score
+粗层对 oracle-best 动作不可准入 >=5/10 → 覆盖失败；先做定向采集
+```
+
+**B0 先决定这是排序问题、覆盖问题，还是细层分数问题；**
+**不过 B0，不进入 B1/B2。**
+
 ### 实验 B：多视界结果转移 + router（opt-in）
 
 **B1：结果转移库**
@@ -673,13 +728,33 @@ C. 已选中 oracle-best      → 正常
 
 **B2：router 探针**
 
-- 在候选第一动作/端点上查询结果库；
-- **只在 baseline 第一动作 gap < ε、或细层看不到 terminal 时启用**；
-- 只做相对排序/下限比较，不把绝对水平加进逐帧 cost；
-- 不全局 veto；粗层与细层冲突且无足够 lead 时保留细层；
-- 比较 fine-only / coarse-only / coarse-to-fine；
-- 指标：seed 101 decision-relevant miss / regret；seed 100/102
-  selected survives；UNKNOWN 率。
+- fine-first：细层有效且 gap > ε 时，不查询粗层；
+- 只在 `first_action_gap < ε`、细层失明、OOD 或端点歧义时查询；
+- 三种模式：SUBSTITUTE（细层 UNKNOWN/全死）、ASSIST（近并列
+  band 内排序）、CHALLENGE（粗层反对时触发局部细层重搜）；
+- 区间/共形下界仲裁：`L_coarse > U_fine + δ` 才改动作；区间重叠
+  → abstain，保留细层；不用“保持上一步”当 abstain；
+- 不做全局逐帧 cost、不做全局 veto；UNKNOWN 不当安全；
+- 端点模型必须报 **endpoint OOD 率**；OOD 高则改用
+  action-conditioned state hazard，不用端点；
+- 探针臂：
+  - A0 baseline；A1 placebo-random（same band，flip 数匹配）；
+    A2 placebo-shuffle（决策内打乱粗值）；
+    A3 coarse-rank；A4 coarse-prune；A5 coarse-challenge；
+- 指标：seed 101 decision-relevant miss / mean regret / improved-
+  worsened；seed 100/102 selected survives；changed rate；
+  coarse admissible / UNKNOWN rate；成本。
+
+**B2 通过标准（建议）**：
+
+- seed 101：mean regret 或 relevant-miss 相对 baseline 下降
+  ≥20%，且优于 A1/A2；`improved >= worsened + 3`；
+- seed 100/102：selected survives 不低于 baseline−1，mean regret
+  不高于 baseline+0.05；changed rate ≤10%；
+- 粗层在 seed 101 miss 状态上 admissible ≥30%；整体 UNKNOWN
+  ≤50%；action contrast accuracy ≥0.55；
+- 成本 ≤1.5× baseline；不默认跑 H=12；
+- 3 种子方向 + 6 种子确认（≥5/6 同向）。
 
 **B3：自适应搜索（后做）**
 
