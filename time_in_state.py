@@ -154,6 +154,166 @@ def make_env_factory(period: int, max_age: int = 64, lag: int = 3,
     return factory
 
 
+@dataclass
+class ControlFeatureEnv:
+    """A non-constant, task-free extra dimension for dimension controls."""
+
+    base: object
+    frequency: float = 0.7
+
+    @property
+    def feature_dim(self) -> int:
+        return 1
+
+    def features(self) -> np.ndarray:
+        return np.asarray([
+            float(np.sin(self.frequency * float(getattr(self.base, "t", 0))))
+        ])
+
+    def obs(self) -> np.ndarray:
+        return np.concatenate([
+            np.asarray(self.base.obs(), dtype=float), self.features(),
+        ])
+
+    def step(self, action: int):
+        _obs, feedback, dead = self.base.step(int(action))
+        return self.obs(), feedback, dead
+
+    def reset(self):
+        self.base.reset()
+        return self.obs()
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+
+def make_control_env_factory(lag: int = 3, frequency: float = 0.7):
+    """An env factory with one non-constant control dimension."""
+    from latent_world import latent
+
+    def factory(seed: int, **kwargs):
+        return ControlFeatureEnv(
+            latent[int(lag)](seed, **kwargs), frequency=frequency,
+        )
+
+    return factory
+
+
+class ConditionedTimeWorld:
+    """Keep the raw world as the predictor and add a time-feature residual.
+
+    The full state is raw observation plus auxiliary time features.  The raw
+    world predicts the next raw observation exactly as the baseline; a small
+    residual model may correct it from the time features, and the auxiliary
+    features are advanced by their known update rule.  The agent never sees
+    the auxiliary dimensions, so this is the world-model-only test.
+    """
+
+    def __init__(self, base, residual, raw_dim: int, feature_dim: int,
+                 max_age: int, age_actions: Tuple[int, ...],
+                 residual_scale: float = 1.0,
+                 validation_gain: float = 0.0):
+        self.base = base
+        self.residual = residual
+        self.raw_dim = int(raw_dim)
+        self.feature_dim = int(feature_dim)
+        self.max_age = max(int(max_age), 1)
+        self.age_actions = tuple(int(value) for value in age_actions)
+        self.residual_scale = float(residual_scale)
+        self.validation_gain = float(validation_gain)
+
+    @property
+    def obs_dim(self) -> int:
+        return self.raw_dim + self.feature_dim
+
+    @classmethod
+    def from_base(cls, base, observations, histories, next_observations,
+                  max_age: int = 16,
+                  age_actions: Sequence[int] = (1,),
+                  ridge: float = 1e-3,
+                  residual_scale: float = 1.0,
+                  episodes: Optional[Sequence[int]] = None,
+                  min_gain: float = 1e-6):
+        from substrate_generic import LinearObservationModel
+
+        observations = np.asarray(observations, dtype=float)
+        histories = np.asarray(histories, dtype=float)
+        next_observations = np.asarray(next_observations, dtype=float)
+        raw_dim = int(base.obs_dim)
+        raw = observations[:, :raw_dim]
+        features = observations[:, raw_dim:]
+        target = next_observations[:, :raw_dim]
+        residual = target - base.predict(raw, histories)
+        gate_gain = 0.0
+        if episodes is not None and len(episodes) == len(observations):
+            episodes = np.asarray(episodes)
+            train = episodes % 5 != 4
+            test = ~train
+            if int(train.sum()) >= 10 and int(test.sum()) >= 5:
+                model = LinearObservationModel(
+                    features.shape[1], histories.shape[1],
+                    ridge=float(ridge),
+                ).fit(
+                    features[train], histories[train], residual[train],
+                )
+                prediction = model.predict(
+                    features[test], histories[test]
+                )
+                mse_zero = float(np.mean(residual[test] ** 2))
+                mse_model = float(np.mean((residual[test] - prediction) ** 2))
+                gate_gain = (mse_zero - mse_model) / (mse_zero + 1e-12)
+                if gate_gain <= float(min_gain):
+                    residual_scale = 0.0
+                return cls(
+                    base=base,
+                    residual=model,
+                    raw_dim=raw_dim,
+                    feature_dim=features.shape[1],
+                    max_age=max_age,
+                    age_actions=age_actions,
+                    residual_scale=residual_scale,
+                    validation_gain=gate_gain,
+                )
+        model = LinearObservationModel(
+            features.shape[1], histories.shape[1], ridge=float(ridge)
+        ).fit(features, histories, residual)
+        return cls(
+            base=base,
+            residual=model,
+            raw_dim=raw_dim,
+            feature_dim=features.shape[1],
+            max_age=max_age,
+            age_actions=age_actions,
+            residual_scale=residual_scale,
+            validation_gain=gate_gain,
+        )
+
+    def _advance(self, features: np.ndarray,
+                 histories: np.ndarray) -> np.ndarray:
+        ages = np.rint(
+            np.asarray(features, dtype=float) * float(self.max_age)
+        ).astype(int)
+        actions = np.asarray(histories, dtype=float)[:, 0].astype(int)
+        ages = np.minimum(ages + 1, self.max_age)
+        for column, action in enumerate(self.age_actions):
+            if column >= ages.shape[1]:
+                break
+            ages[actions == int(action), column] = 0
+        return ages / float(self.max_age)
+
+    def predict(self, states, histories) -> np.ndarray:
+        states = np.asarray(states, dtype=float)
+        histories = np.asarray(histories, dtype=float)
+        raw = states[:, :self.raw_dim]
+        features = states[:, self.raw_dim:]
+        raw_next = (
+            self.base.predict(raw, histories)
+            + self.residual_scale * self.residual.predict(features, histories)
+        )
+        next_features = self._advance(features, histories)
+        return np.concatenate([raw_next, next_features], axis=1)
+
+
 def augment_observations(observations: np.ndarray,
                          actions: Optional[np.ndarray],
                          episodes: np.ndarray,

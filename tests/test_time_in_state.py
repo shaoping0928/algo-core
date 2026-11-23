@@ -5,13 +5,17 @@ import unittest
 import numpy as np
 
 from time_in_state import (
+    ConditionedTimeWorld,
+    ControlFeatureEnv,
     TimeInStateEnv,
     augment_observations,
     estimate_period,
+    make_control_env_factory,
     make_env_factory,
 )
-from substrate_generic import collect
+from substrate_generic import LinearObservationModel, collect
 from substrate_nodes import evaluate, fit
+from time_world_probe import StandardizedLinearModel
 
 
 class ToyEnv:
@@ -125,6 +129,115 @@ class TimeInStateTest(unittest.TestCase):
         self.assertGreater(len(rows), 0)
         self.assertEqual(len(rows[0]["obs"]), 9)
         self.assertEqual(len(rows[0]["next_obs"]), 9)
+
+    def test_control_feature_is_nonconstant_and_task_free(self):
+        wrapper = ControlFeatureEnv(ToyEnv(), frequency=0.7)
+        self.assertEqual(wrapper.feature_dim, 1)
+        self.assertEqual(len(wrapper.obs()), 3)
+        self.assertAlmostEqual(wrapper.obs()[2], 0.0)
+        wrapper.step(1)
+        self.assertAlmostEqual(wrapper.obs()[2], np.sin(0.7))
+        self.assertEqual(wrapper.t, 1)
+
+    def test_standardized_world_matches_the_linear_fit(self):
+        rng = np.random.RandomState(9)
+        observations = rng.normal(size=(300, 3))
+        histories = rng.normal(size=(300, 1))
+        next_observations = np.zeros((300, 2))
+        next_observations[:, 0] = (
+            0.5 + 0.4 * observations[:, 0] - 0.2 * histories[:, 0]
+        )
+        next_observations[:, 1] = -0.3 + 0.6 * observations[:, 2]
+        base = LinearObservationModel(3, 1).fit(
+            observations, histories, next_observations,
+        )
+        standardized = StandardizedLinearModel(3, 1).fit(
+            observations, histories, next_observations,
+        )
+        np.testing.assert_allclose(
+            standardized.predict(observations, histories),
+            base.predict(observations, histories),
+            atol=1e-6,
+        )
+
+    def test_conditioned_world_advances_ages_and_keeps_raw_predictions(self):
+        rng = np.random.RandomState(12)
+        raw = rng.normal(size=(200, 2))
+        histories = rng.randint(0, 2, size=(200, 1)).astype(float)
+        next_raw = 0.5 * raw + 0.1
+        base = LinearObservationModel(2, 1).fit(raw, histories, next_raw)
+        ages = np.zeros((200, 1))
+        observations = np.concatenate([raw, ages], axis=1)
+        next_observations = np.concatenate(
+            [next_raw, np.zeros((200, 1))], axis=1
+        )
+        world = ConditionedTimeWorld.from_base(
+            base, observations, histories, next_observations,
+            max_age=4, age_actions=(1,),
+        )
+        states = np.asarray([
+            [0.0, 0.0, 0.25],
+            [0.0, 0.0, 0.25],
+        ])
+        actions = np.asarray([[0.0], [1.0]])
+        prediction = world.predict(states, actions)
+        self.assertEqual(prediction.shape, (2, 3))
+        self.assertAlmostEqual(prediction[0, 2], 0.5)
+        self.assertEqual(prediction[1, 2], 0.0)
+        expected_raw = base.predict(states[:, :2], actions)
+        np.testing.assert_allclose(
+            prediction[:, :2], expected_raw, atol=1e-3,
+        )
+        zero = ConditionedTimeWorld.from_base(
+            base, observations, histories, next_observations,
+            max_age=4, age_actions=(1,), residual_scale=0.0,
+        )
+        np.testing.assert_allclose(
+            zero.predict(states, actions)[:, :2],
+            expected_raw,
+            atol=1e-12,
+        )
+
+    def test_conditioned_world_gate_keeps_a_predictive_feature(self):
+        rng = np.random.RandomState(13)
+        raw = rng.normal(size=(300, 2))
+        histories = rng.randint(0, 2, size=(300, 1)).astype(float)
+        base_target = 0.4 * raw + 0.1
+        base = LinearObservationModel(2, 1).fit(
+            raw, histories, base_target,
+        )
+        features = rng.normal(size=(300, 1))
+        target = base_target + 2.0 * features
+        observations = np.concatenate([raw, features], axis=1)
+        next_observations = np.concatenate(
+            [target, np.zeros((300, 1))], axis=1
+        )
+        episodes = np.arange(300) // 15
+        world = ConditionedTimeWorld.from_base(
+            base, observations, histories, next_observations,
+            max_age=16, age_actions=(1,), episodes=episodes,
+        )
+        self.assertGreater(world.validation_gain, 0.0)
+        self.assertGreater(world.residual_scale, 0.0)
+
+    def test_conditioned_world_gate_drops_an_irrelevant_feature(self):
+        rng = np.random.RandomState(14)
+        raw = rng.normal(size=(300, 2))
+        histories = rng.randint(0, 2, size=(300, 1)).astype(float)
+        target = 0.4 * raw + 0.1
+        base = LinearObservationModel(2, 1).fit(raw, histories, target)
+        features = rng.normal(size=(300, 1))
+        observations = np.concatenate([raw, features], axis=1)
+        next_observations = np.concatenate(
+            [target, np.zeros((300, 1))], axis=1
+        )
+        episodes = np.arange(300) // 15
+        world = ConditionedTimeWorld.from_base(
+            base, observations, histories, next_observations,
+            max_age=16, age_actions=(1,), episodes=episodes,
+        )
+        self.assertLessEqual(world.validation_gain, 1e-6)
+        self.assertEqual(world.residual_scale, 0.0)
 
     def test_fit_and_evaluate_accept_the_time_env_factory(self):
         factory = make_env_factory(

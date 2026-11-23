@@ -1969,6 +1969,12 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   milestone_goal=None, pain_weight=None, risk_lane="max",
                   previous_action=None, margin_eps=0.0, veto_fraction=0.0):
     initial = np.asarray(env.obs(), dtype=float)
+    agent_obs_dim = int(agent.obs_dim)
+
+    def agent_view(batch):
+        """The agent's raw observation; a world may carry extra state dims."""
+        return np.asarray(batch, dtype=float)[:, :agent_obs_dim]
+
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
     captured = []
     user_callback = candidate_callback
@@ -2037,7 +2043,8 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             else np.zeros(0, dtype=float)
         )
         encoded_start = np.concatenate(
-            [initial.reshape(1, -1), pending_start.reshape(1, -1)], axis=1
+            [agent_view(initial.reshape(1, -1)), pending_start.reshape(1, -1)],
+            axis=1,
         ) / agent.scales
         phi_start = float(
             _curiosity_potential(agent.evidence_batch(encoded_start))[0]
@@ -2071,13 +2078,13 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 sequences, step + 1, pending_prefix, action_dim=action_dim
             )
             pending = history[:, :agent.lag][:, ::-1]
-            encoded = np.concatenate([states, pending], axis=1) / agent.scales
+            encoded = np.concatenate([agent_view(states), pending], axis=1) / agent.scales
             previous_history = history_features(
                 sequences, step, pending_prefix, action_dim=action_dim
             )
             previous_pending = previous_history[:, :agent.lag][:, ::-1]
             previous_encoded = np.concatenate(
-                [previous, previous_pending], axis=1
+                [agent_view(previous), previous_pending], axis=1
             ) / agent.scales
             threat, excess = agent.pain_graded_batch(encoded)
             q_cost = np.zeros(len(states))
@@ -2106,7 +2113,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 sequences, horizon, pending_prefix, action_dim=action_dim
             )
             pending = history[:, :agent.lag][:, ::-1]
-            encoded = np.concatenate([states, pending], axis=1) / agent.scales
+            encoded = np.concatenate([agent_view(states), pending], axis=1) / agent.scales
             _pain, dopamine = agent.valence_state_batch(encoded)
             mask_table = agent._feature_mask_table(
                 encoded[:, :agent.obs_dim]
@@ -2155,14 +2162,15 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             )
             pending = history[:, :agent.lag][:, ::-1]
             encoded = (
-                np.concatenate([states, pending], axis=1) / agent.scales
+                np.concatenate([agent_view(states), pending], axis=1)
+                / agent.scales
             )
             previous_history = history_features(
                 sequences, step, pending_prefix, action_dim=action_dim
             )
             previous_pending = previous_history[:, :agent.lag][:, ::-1]
             previous_encoded = np.concatenate(
-                [previous, previous_pending], axis=1
+                [agent_view(previous), previous_pending], axis=1
             ) / agent.scales
             risk = agent.pain_signal_batch(encoded) * risk_weight * (
                 risk_decay ** step
@@ -2195,7 +2203,8 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             # pending.
             pending = history[:, :agent.lag][:, ::-1]
             encoded = (
-                np.concatenate([states, pending], axis=1) / agent.scales
+                np.concatenate([agent_view(states), pending], axis=1)
+                / agent.scales
             )
             pain, dopamine = agent.valence_state_batch(encoded)
             mask_table = agent._feature_mask_table(
@@ -2873,10 +2882,11 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
     visited = [] if tracker is not None else None
     while not env.dead and env.t < cap:
         obs = np.asarray(env.obs(), dtype=float)
+        agent_obs = obs[:int(agent.obs_dim)]
         active_rate = None
         active_goal = None
         if tracker is not None:
-            tracker.observe(obs)
+            tracker.observe(agent_obs)
             visited.append(tracker.key)
             if milestone_mode == "rate":
                 active_rate = getattr(agent, "milestone_rate", {}).get(
@@ -2925,13 +2935,15 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             predicted = world.predict(
                 obs.reshape(1, -1), history.reshape(1, -1)
             )[0]
-            agent.set_prediction(predicted)
+            agent.set_prediction(predicted[:int(agent.obs_dim)])
         actions.append(action)
         last_action = int(action)
         prefix = np.concatenate([[float(action)], prefix[:-1]])
         env.step(action)
         if prediction_hook:
-            agent.observe_prediction(np.asarray(env.obs(), dtype=float))
+            agent.observe_prediction(
+                np.asarray(env.obs(), dtype=float)[:int(agent.obs_dim)]
+            )
         if record:
             feedback = env.feedback()
             transitions.append(dict(

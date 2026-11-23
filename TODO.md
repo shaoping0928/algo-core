@@ -49,13 +49,14 @@
 
 ### 未决 / 下一步
 
-- [ ] **P0 表示层：把时序放进状态**（唯一有机制依据的下一步）。状态加入
-      “距上次拍翅的帧数 / 相位变化率”，再验证：(a) 阶段转移坏段基率与
-      top-1 是否提升；(b) 图策略是否不再退化为常数动作；(c) 长窗读数是否
-      转化为决策改善。判据：3 种子方向 + 6 种子确认（≥5/6 同向）。
-      **2026-11-23 实现已落地**（`time_in_state.py` + `env_factory`）；
-      seed 100 首批负向且被维度控制混淆（常数额外维也 312→192），
-      action/phase 未超过 control；暂不跑 3 种子。详见下方
+- [x] **P0 表示层：把时序放进状态**（2026-11-23 已判定）。状态加入
+      “距上次拍翅的帧数 / 相位变化率”：
+      - full-state 首批负向被维度控制混淆（常数额外维也 312→192）；
+      - conditioned world 的 episode-held-out gate 判零
+        （validation gain **-0.314**，residual_scale 0），行为与
+        baseline 逐位相同 **312/6 → 312/6**；
+      - phase period 12/14/14 vs ~80，当前流不可辨识。
+      → **中性/null，不采纳、不跑 3 种子**。详见下方
       「P0 表示层：time-in-state」。
 - [x] **P0-B 查询驱动图重写 / 最小规则库**（Batch 6，2026-11-23）：
       探针、schema、每目标稀疏规则、共享 applicability、事件谓词、
@@ -429,8 +430,55 @@ decisions；`branches=8 + tail=4`、horizon 8、无 hard death veto；事件
    或把时间特征只接世界模型/读侧，不改 agent 的原型状态。当前实现
    是“全状态追加”，不是公平 A/B。
 
-**结论：本轮 P0 首批为负向且被维度控制混淆，不采纳、不跑 3 种子；
-下一步是公平的容量匹配 A/B 或 world-model/readout-only 接口。**
+**首批结论：full-state 的负向被维度控制混淆，不可归因于特征；
+后续 conditioned world 的 held-out gate 判零（gain -0.314），
+最终是中性/null。不采纳、不跑 3 种子。**
+
+### 第二轮：world-model-only（agent 保持 raw）
+
+- baseline：raw world + raw agent + raw env；
+- time-world：world 在 augmented 观测上拟合，agent 仍 raw，env 返回
+  augmented；`policy_result` 只把 raw 前缀给 agent。
+- seed 100，1500 帧，eval 120–121，action 1 age / max_age 16：
+  baseline **312 帧 / 6 过柱** → time-world **117 帧 / 1 过柱**。
+- 但 constant-extra-dim 的 world 控制也是 **120 帧 / 1 过柱**，同样
+  大幅下降；常数维与 intercept 共线，`LinearObservationModel` 的
+  ridge 1e-8 可能数值不稳。
+- 非恒定 control（`sin(0.7t)`，无信息）仍是 **152 帧 / 2 过柱**，
+  远低于 baseline → world 多一维/未标准化本身就会破坏搜索，不能
+  直接比较。正在用 **per-column 标准化 world**（baseline/time/control
+  都标准化）复核；若 control 回到 baseline 附近，才谈时间特征的净效应。
+- 结论暂不成立：需要标准化 world 或容量匹配，才能区分“时间特征
+  有害”与“world 多一维/分裂接口有问题”。
+
+### 第三轮：conditioned world（最终判据）
+
+- `ConditionedTimeWorld`：raw world 保持 baseline 不变；时间特征只作为
+  **输入残差模型**，不进入输出维度；辅助 age 由确定性更新规则推进；
+  agent 仍 raw。
+- 这是目前最干净的 world-model-only 形态：base raw 预测与 baseline
+  完全相同，时间特征只能通过残差修正影响候选。
+- 标准化 control 已说明：baseline/control 都标准化时是 152/2 vs
+  152/2；而标准化本身就把未标准化的 312/6 降到 152/2，所以
+  “标准化 world”不能当无偏对照。
+- `ConditionedTimeWorld` 新增 `residual_scale`：control 设 0，残差
+  完全不生效，base raw 预测与 baseline 逐位相同；这是接口 control。
+- **conditioned control（constant age 99, residual_scale=0）已回到
+  baseline 逐位相同：312/6 → 312/6，delta 0/0。** split 接口
+  通过。
+- conditioned time 未加 gate：**234/4** vs baseline **312/6**
+  （eval 120: 472→316；eval 121: 152→152）→ 残差修正会改变行为并
+  在一个世界上变差。
+- **gated conditioned time（episode-held-out）**：
+  validation gain **-0.314** → `residual_scale=0.000`；
+  行为回到 baseline 逐位相同：**312/6 → 312/6，delta 0/0**。
+- 判定：**action-1 age 对 raw next-state 没有可迁移增益**；
+  gate 正确判零。P0 在本数据上是**中性/null**，不是“age 有害”，
+  也没有达到 3 种子门槛。
+- phase 仍不可辨识（period 12/14/14 vs ~80），暂不测。
+- 若继续 P0，只剩 **readout-only hazard conditioning**（age 只进
+  危险读出，不进 world）这一种形态；否则回到候选分辨力的其他机制。
+  **不采纳、不跑 3 种子、不改默认。**
 
 ### 判据（未变）
 
