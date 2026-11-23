@@ -708,13 +708,48 @@ C. 已选中 oracle-best      → 正常
 >=7/10 miss 的 gap <= 0.03 且两动作粗层可准入 → 跑 coarse-rank
 >=5/10 miss 的 gap > 0.1 → 契约不允许直接改；跑 coarse-challenge
                                         或先修 fine score
+>=5/10 miss 的 true_action_contrast = 0 → plan/suffix 排序问题；
+                                         先修 fine score / suffix
 粗层对 oracle-best 动作不可准入 >=5/10 → 覆盖失败；先做定向采集
 ```
 
 **B0 先决定这是排序问题、覆盖问题，还是细层分数问题；**
 **不过 B0，不进入 B1/B2。**
 
-### 实验 B：多视界结果转移 + router（opt-in）
+**B0 结果（2026-11-23，seed 101，120–124，85 决策）**：
+
+- 复现 10 个 decision-relevant miss：6 个首动作不同，4 个首动作相同。
+- **只有 2/10 有正的真实首动作对比**（120@67、124@68）；
+  其余 8/10 在选中/最佳首动作的各自最佳后缀下真实存活并列
+  （4 个同动作 + 4 个不同动作但 `true_action_contrast=0`），
+  属于 **plan/suffix 排序**，首动作 router 即使完美也无法修复。
+- 动作级可修 2/10；其中局部 support 可达 1/10（124@68，
+  gap 0.0878，intermediate），**近并列可修 0/10**。
+- flap 局部支持极薄：6 个首动作不同的 miss 中，最近 64 个训练状态里
+  flap 行为 0–3 次（仅 124@68 为 7 次）；pending 上下文覆盖
+  （57/58/60）不等于动作对比覆盖。
+- selected / oracle-best 端点 OOD **0/10**；但全部候选端点 OOD
+  q95 **37%**、q99 **19%**，中位 percentile 0.87 → 全局 endpoint
+  ranker 必须带 OOD 门；relevant pair 本身不是 OOD 问题。
+- **B0 判定：`plan_level`，不是 `ranking`，也不是单纯 `coverage`。**
+  先修 fine score / 后缀排序；首动作 coarse router/B1/B2 暂缓。
+  仅对 2 个正对比状态考虑定向配对采集。
+
+### 实验 B0.5：plan/suffix score 诊断（B0 后，只读）
+
+- 对 8 个 plan-level miss 逐列消融 risk / value / curiosity / q，
+  定位把 oracle-best 后缀排后的列/段；
+- 记录 selected 与 oracle-best 的完整 score 向量、各列排序贡献、
+  以及同一首动作下最佳后缀的差距；
+- 若没有任何单列能修复，问题在 world 预测漂移或列间组合，
+  再考虑 plan-level endpoint 重排（带 OOD 门），而不是首动作 router。
+
+### 实验 B：多视界结果转移 + router（opt-in，B0 后暂缓）
+
+**前置状态（B0 后）**：首动作 router 只有 2/10 的理论空间，
+其中近并列可修 0/10；当前主瓶颈是 plan/suffix 排序。B1/B2 的设计保留，
+但先做 B0.5 的 score 诊断；只有当 plan-level 修复后仍有正首动作对比
+且支持足够时，才启动本实验。
 
 **B1：结果转移库**
 
@@ -831,7 +866,8 @@ held-out 世界 120–124；基线 129.1 / 147（3 种子）。
 
 - [ ] **score component 诊断**：在 seed 101 的 10 个 decision-relevant
       miss 上逐列消融（risk / value / curiosity），定位把存活计划排后的
-      那一列；
+      那一列；B0 已把范围缩到 8 个 plan-level miss（4 同动作 +
+      4 零首动作对比），先跑这 8 个；
 - [ ] **score calibration / 保守下界**：只在分数边际小或 support 低时
       改变排序，避免全局重标定；
 - [ ] **早期预警 / 时域 / 候选集**：seed 100/102 的晚期状态在 H=8 内
