@@ -136,6 +136,13 @@ def clock_dimensions(tables, obs_dim, tolerance=0.05, jump_ratio=3.0):
 
 
 def stream_stats(tables, dims):
+    """Per-dimension generic statistics used to seed event candidates.
+
+    The jump threshold is the midpoint between the typical and the largest
+    increment: tail quantiles are degenerate when a coordinate's increments
+    take only two values (e.g. a constant drift plus one discrete impulse),
+    and a midpoint rule separates the modes without naming either.
+    """
     stats = {}
     for dim in dims:
         values = np.concatenate([table["obs"][:, dim] for table in tables])
@@ -146,7 +153,11 @@ def stream_stats(tables, dims):
         stats[dim] = dict(
             q10=float(np.quantile(values, 0.10)),
             q90=float(np.quantile(values, 0.90)),
-            jump=float(np.quantile(deltas, 0.95)) if len(deltas) else 0.0,
+            jump=(
+                0.5 * (
+                    float(np.quantile(deltas, 0.50)) + float(deltas.max())
+                ) if len(deltas) else 0.0
+            ),
             spans_zero=bool(values.min() < 0.0 < values.max()),
         )
     return stats
