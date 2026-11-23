@@ -107,5 +107,29 @@ class RankFusionTest(unittest.TestCase):
         self.assertEqual(len(entries["12"]["prediction"]), len(step))
 
 
+    def test_probability_fusion_keeps_tau_on_the_training_stream(self):
+        train = np.linspace(0.0, 1.0, 100)
+        train_step = np.where(np.arange(100) >= 90, 2, 50).astype(int)
+        eval_table = np.asarray([0.05, 0.1, 0.2, 0.8, 0.9])
+        eval_logistic = np.asarray([0.1, 0.2, 0.3, 0.7, 0.8])
+        step = np.asarray([50, 50, 50, 2, 2])
+        remaining = np.asarray([50, 50, 50, 2, 2])
+        table_output = dict(
+            train_prediction={16: train},
+            eval_prediction={16: eval_table},
+            step=train_step, remaining=np.full(100, 50),
+            eval_step=step, eval_remaining=remaining,
+        )
+        logistic_output = dict(
+            train_prediction=np.column_stack([train] * 16),
+            eval_prediction=np.column_stack([eval_logistic] * 16),
+        )
+        args = SimpleNamespace(precision_target=0.5)
+        from span_consume_probe import probability_fusion
+        report = probability_fusion(table_output, logistic_output, args)
+        self.assertIn("tau", report["16"])
+        self.assertGreaterEqual(report["16"]["precision"], 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -354,6 +354,45 @@ def fusion_arm(table_output, logistic_output, args, weight=0.5):
     return report, entries
 
 
+def probability_fusion(table_output, logistic_output, args, weight=0.5):
+    """E2.3: average the two deploy readouts as calibrated probabilities.
+
+    Rank fusion is a good ranker but its score is a percentile, so a
+    threshold calibrated on the deploy stream does not transfer to a stream
+    with a different share of dangerous entries (the six-seed failure was
+    mostly this).  Both source arms are already probability-like (table:
+    node stop-time frequency; logistic: cumulative hazard), so a weighted
+    average keeps the ranking and stays calibratable.  tau still comes from
+    the deploy stream's out-of-fold predictions.
+    """
+    report = {}
+    for window in WINDOWS:
+        if int(window) not in table_output["train_prediction"]:
+            continue
+        train = (
+            float(weight) * table_output["train_prediction"][int(window)]
+            + (1.0 - float(weight))
+            * logistic_output["train_prediction"][:, int(window) - 1]
+        )
+        evaluation = (
+            float(weight) * table_output["eval_prediction"][int(window)]
+            + (1.0 - float(weight))
+            * logistic_output["eval_prediction"][:, int(window) - 1]
+        )
+        metrics = evaluate_table(
+            evaluation, table_output["eval_step"],
+            table_output["eval_remaining"], window,
+        )
+        metrics.update(calibration_transfer(
+            train, table_output["step"], table_output["remaining"], window,
+            evaluation, table_output["eval_step"],
+            table_output["eval_remaining"],
+            precision_target=args.precision_target,
+        ))
+        report[str(window)] = metrics
+    return report
+
+
 def reliability_bins(prediction, step, remaining, window, bins=4):
     keep = _valid(step, remaining) & np.isfinite(prediction)
     truth = ((np.asarray(step) > 0) & (np.asarray(step) <= window)).astype(
@@ -506,10 +545,13 @@ def main():
             outputs["table_deploy"], outputs["logistic_deploy"], args,
         )
         arms["fuse_deploy"] = fusion_report
+        arms["prob_deploy"] = probability_fusion(
+            outputs["table_deploy"], outputs["logistic_deploy"], args,
+        )
 
     for name in ("table_deploy", "table_dagger", "table_passive",
                  "logistic_deploy", "logistic_dagger", "logistic_passive",
-                 "fuse_deploy"):
+                 "fuse_deploy", "prob_deploy"):
         row = arms[name]["12"]
         print(
             "  %-18s span12 AUC %s  band %s  base %s  tau %s  "
@@ -542,7 +584,7 @@ def main():
         ))
 
     for name in ("table_deploy", "table_dagger", "table_passive",
-                 "fuse_deploy"):
+                 "fuse_deploy", "prob_deploy"):
         row = arms[name]["16"]
         print(
             "  %-18s span16 AUC %s  band %s  precision %s  "
@@ -619,6 +661,18 @@ def main():
         ),
     )
     checks["fusion_span16"] = fusion_gate["pass_"]
+    probability = arms.get("prob_deploy", {}).get("16", {})
+    probability_gate = dict(
+        precision=probability.get("precision"),
+        coverage=probability.get("coverage"),
+        recall=probability.get("recall"),
+        target=float(args.precision_target),
+        pass_=bool(
+            (probability.get("precision") or 0.0)
+            >= float(args.precision_target)
+        ),
+    )
+    checks["prob_span16"] = probability_gate["pass_"]
     verdict = (
         "pass" if checks["eval_calibration"] and checks["eval_ranking"]
         else "ranking_only" if checks["eval_ranking"] else "fail"
@@ -626,7 +680,8 @@ def main():
     print(
         "== E2.1 verdict: %s  (calibration %s, ranking %s, "
         "consumption gain %s, deploy gain %s %.3f/%.3f, "
-        "uncertainty %s, fusion span16 precision %s/%s) ==" % (
+        "uncertainty %s, fusion span16 precision %s/%s, "
+        "prob span16 precision %s) ==" % (
             verdict,
             "pass" if checks["eval_calibration"] else "fail",
             "pass" if checks["eval_ranking"] else "fail",
@@ -635,13 +690,15 @@ def main():
             deploy_gain["span_12"], deploy_gain["span_16"],
             "pass" if checks["uncertainty"] else "fail",
             _fmt(fusion.get("precision")), _fmt(fusion_gate["target"]),
+            _fmt(probability.get("precision")),
         )
     )
     report = dict(
         seed=args.seed, dims=dims, arms=arms,
         diagnostics=diagnostics, checks=checks,
         deploy_gain=deploy_gain, verdict=verdict,
-        fusion_gate=fusion_gate, fusion_entries=fusion_entries,
+        fusion_gate=fusion_gate, probability_gate=probability_gate,
+        fusion_entries=fusion_entries,
     )
     if args.report:
         with open(args.report, "w", encoding="utf-8") as handle:
