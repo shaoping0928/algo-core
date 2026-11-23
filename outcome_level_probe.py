@@ -615,7 +615,8 @@ def audit_predicate(predicate, mask, tables, entries, event_step, duration,
     else:
         regime = regime_change(
             mask, tables, entries["dims"], entries["mean"], entries["scale"],
-            window=8, draws=args.bootstrap, seed=args.seed + 2,
+            window=args.regime_window, draws=args.bootstrap,
+            seed=args.seed + 2,
         )
         regime_required = True
     support_ok = (
@@ -736,6 +737,10 @@ def main():
     parser.add_argument("--n-lags", type=int, default=8)
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--shuffle-draws", type=int, default=8)
+    parser.add_argument("--regime-window", type=int, default=4,
+                        help="frames on each side of an event for the "
+                             "post-event regime test; must fit inside "
+                             "typical episode length")
     parser.add_argument("--bootstrap", type=int, default=200)
     parser.add_argument("--min-events", type=int, default=20)
     parser.add_argument("--min-episodes", type=int, default=5)
