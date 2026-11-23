@@ -53,6 +53,11 @@
       “距上次拍翅的帧数 / 相位变化率”，再验证：(a) 阶段转移坏段基率与
       top-1 是否提升；(b) 图策略是否不再退化为常数动作；(c) 长窗读数是否
       转化为决策改善。判据：3 种子方向 + 6 种子确认（≥5/6 同向）。
+- [ ] **P0-B 查询驱动图重写 / 最小规则库**（2026-11-23 设计，见下方
+      Batch 6）：先用探针比较“共享/独立 applicability”和“全查/关键
+      节点”的实际搜索节点数；再实现每目标一条稀疏规则 + 共享
+      applicability + 事件谓词 + 关键节点查询；默认关，过质量门后才接
+      planner。
 - [ ] **P1 阶段数据规模**：结果分布身份已通过，但每局约 1 条转移；需要
       采集规模（~100 局/option）才能填 `(stage, option)` 单元。
 - [ ] **P1 value 保持 opt-in**：状态级有效、计划级不差、局级 1/3；等表示层
@@ -64,7 +69,148 @@
       `value_harm_probe.py`、`stage_option_probe.py`、
       `transition_policy_probe.py`、`hierarchy_ab.py`、`hierarchy_track_ab.py`、
       `margin_gate_ab.py`、`pain_horizon_probe.py`、`precursor_ab.py`、
-      `veto_ab.py`、`plan_level_probe.py`。
+      `veto_ab.py`、`plan_level_probe.py`、`graph_rewrite_scale_probe.py`。
+
+
+## Batch 6：查询驱动图重写与最小规则库（2026-11-23）
+
+> 本节是当前的结构性下一步；默认栈不变，所有新机制 opt-in。目标不是
+> 再加一层预测，而是把“转移的类型 / 适用条件 / 消费方式”从硬编码改成
+> **查询驱动 + 结构匹配**。
+
+### 动机
+
+- 预测侧已达标（动力学 h1 R² 0.99、短窗/长窗危险、静态联想、结果分布
+  身份）；失效在候选分辨力与阶段/事件的单位。
+- 阶段图第一轮：动作条件化真实（LOEO ΔR² 0.18–0.21），但同 K 下
+  real ≈ shuffle、身份跨 episode 不共享、主断点常是世界时钟；
+  **不能把 context 簇直接当概念图**。
+- 图策略失败在覆盖（图外状态被最近原型别名），不是算术；**图应做评估，
+  控制仍由世界模型/帧级搜索承担**。
+- 因此下一步是“查询驱动图重写”：源图 + 目标模板 + 规则检索/应用 +
+  读侧；不是给转移硬编码 type，也不是把阶段项塞进逐帧 cost。
+
+### 量级实测（`graph_rewrite_scale_probe.py`，seed 100）
+
+| 项 | 1500 帧 | 5000 帧 |
+|---|---:|---:|
+| 每目标 fan-in | 2.0 | 2.3 |
+| 动作进入的目标 | 垂直 0/1/3/5 | 同 |
+| 动作槽选择 | `history[3]` | 同 |
+| 全局 held-out R² | 1.000 | 0.998 |
+| k=16 规则数 | 112 | 112 |
+| k=16 共享搜索 | 16 | 16 |
+| k=16 独立搜索 | 2.7×10⁸ | 2.7×10⁸ |
+| 关键节点 m=2 / m=3 独立 | ~256 / ~4.1k | 同 |
+| 近第二 regime 行冲突率 | 4.1% | 7.9% |
+| 原型图出度 p50 / p90 | 1 / 2 | 1 / 2 |
+
+读法：
+
+1. **帧级动力学近似 regime 不变**：每目标一条稀疏规则已 held-out
+   R² ≈ 1.0；按 2/4/8/16 个 regime 拆开没有增益（k 越大还略降）。
+   → 默认不建 `k × 7` 规则库。
+2. **规则库本身线性增长**；爆炸来自“每目标独立选 regime”：共享是
+   O(k)，独立是 O(k^m)。k=16、m=7 时是 2.7×10⁸，不可接受。
+3. **动作只进入垂直目标**，水平/时间目标不读动作；动作槽自动选中
+   `history[3]` → 动作窗口 + 稀疏 scope 可以发现延迟，不必硬编码 lag。
+4. **关键节点 m=2–3 时独立搜索也只有几百到几千**；全查 7 个才到
+   1×10⁸。查询只填读侧需要的节点。
+5. **小数据下 scope 不可辨识**：1500 帧水平目标选中累计时间而不是
+   水平坐标；5000 帧才选中水平坐标。晋升规则前必须有跨 episode /
+   跨数据量的稳定性门。
+
+### 最小规则库（默认形态）
+
+- **每目标一条稀疏规则**，不是每目标每 regime 一条。
+- `Rule`：`pattern_in` / `pattern_out` / `dt` / `rule` / `support` /
+  `confidence` / `applicability`。
+- **共享 applicability**：一个当前 regime/context 节点，搜索 O(k) 而
+  不是 O(k^m)；只有某个目标证明按 regime 拆分有 held-out 增益时，
+  才分裂那一条规则。
+- **事件谓词**：碰撞/过柱/终止是读侧规则，读组合状态、写
+  event/terminal；不计算状态，不进入帧 cost。
+- **关键节点查询**：读侧声明 `required_slots`，只填需要的槽位，其余
+  `UNKNOWN`；m=2–3 足以覆盖近期决策，不要求补全整个状态。
+- **不硬编码 type**：type 由 `pattern_out + dt + 查询目标` 涌现；
+  代码层只声明图/时间代数、统一器、未知传播、预算。
+- **查询驱动流程**：源图 → 目标模板 → 反向检索 → 正向应用 → 读侧；
+  目标图是锚点，解决“类型/适用性循环定义”。
+
+### 派生概念节点：训练期标注，推理期转移
+
+- 训练/观测：代码层 `difference` / `capacitor` / `resistor` 作为
+  **labeler**，产生 sign 标签；component sign 节点仍是普通 `CONCEPT`
+  节点。
+- 推理/预测：**不调用 `ComponentBank.step`**；概念节点由学到的
+  `DerivationRule` 填；无规则/冲突 → `UNKNOWN`，不能当安全。
+- 先做 `difference`（无隐藏状态）：如 `sign(dy)` from `vy` / `y`
+  history；再做 `capacitor` / `resistor`（隐藏 leaky 状态）——需要
+  latent / 窗口 / observer 三选一。
+- **当前前提**：`_component_step` 传的是节点激活 `{node_id: 1.0}`，
+  不是原始数值；要做“`vy > 0 → dy > 0`”这种数值概念，先对齐 base
+  变量为 value-bearing 槽，或把规则直接建在原始观测上。
+- 验证必须区分 **teacher-forced** 与 **free-running**；下游转移要用
+  scheduled sampling / 自由运行验证，避免概念分布漂移。
+
+### 探针扩展（同一个探针）
+
+- 在 `graph_rewrite_scale_probe.py` 增加“实际搜索”而不只算组合上界：
+  - 共享 applicability vs 每目标独立；
+  - 全查 7 个目标 vs 关键节点 m=1..3；
+  - 预算内实际访问节点数、被 support/confidence 剪掉的规则数、
+    `UNKNOWN` 槽位数、规则冲突数。
+- 读侧指标：帧预测 per-variable 误差/R²；事件谓词 0/1/UNKNOWN 的
+  precision/recall/coverage；派生概念自由运行准确率/UNKNOWN
+  （先 difference）。
+- 数据：seed 100、1500/5000 帧先跑；稳定后再 3 种子。
+
+### 实施清单
+
+- [ ] schema：`Rule` / `Pattern` / `Query` / `Readout` /
+      `Applicability` 纯数据类 + 单测；不写 `FRAME/STAGE` 枚举，
+      type 由 `pattern_out + dt` 派生。
+- [ ] 探针：shared/independent × full/key-node 的实际搜索节点数；
+      记录预算、剪枝、`UNKNOWN`、冲突。
+- [ ] 拟合每目标一条稀疏规则（1500/5000），报告 scope 稳定性；
+      动作窗口只作为候选总线，scope 选 lag。
+- [ ] 共享 applicability：regime/context 节点；与独立选择对照，
+      只有 held-out 增益才分裂。
+- [ ] 事件谓词：碰撞/终止的 `required_slots` + 0/1/UNKNOWN；
+      与现有 `death_rules` 对照，不新增第二套死亡语义。
+- [ ] 关键节点查询：读侧 `required_slots`；full vs m=2–3 的实际
+      搜索/UNKNOWN/决策覆盖。
+- [ ] 派生概念：component label/free-run 模式；difference 规则；
+      teacher-forced vs free-run；默认关。
+- [ ] 测试：pattern/time 不匹配拒绝；UNKNOWN 传播；共享 O(k)；
+      关闭时逐位不变。
+
+### 质量门
+
+- 关闭时决策路径逐位不变；362+ 测试全过。
+- 帧规则：held-out R² 不低于全局线性模型；scope 跨 1500/5000 与
+  3 种子稳定；动作 lag 选择一致。
+- 搜索：共享 applicability 的实际访问节点数 << 独立；key-node
+  m=2–3 覆盖读侧且 `UNKNOWN` 率可控。
+- 事件谓词：held-out precision/recall/`UNKNOWN` 达标；无任务专用
+  槽位/几何。
+- 派生概念：free-run sign 准确率/`UNKNOWN` 可接受，下游转移不落到
+  support 外；否则保持 teacher-forced 或 opt-in。
+- 决策侧仍只由 3 种子配对基准准入；fast 屏只筛 bug。
+
+### 开放问题 / 非目标
+
+- 关键节点由读侧声明还是学习 relevance？先声明，后学习。
+- 共享 applicability 用 regime 簇还是阶段图？先 regime；阶段图需先
+  解决身份/时钟，不要再用 context 距离单独合并。
+- 同槽位多规则冲突：优先级 = 时间/分辨率精确 > support/confidence；
+  仍冲突 → `UNKNOWN`，不平均。
+- 隐藏状态：capacitor/resistor 的 `u` 是 latent / 窗口 / observer？
+  先 difference。
+- Scope 可辨识性：时钟/滚动共线；用跨 episode/跨数据量/干预。
+- 非目标：默认不建 `k × 7` 规则库；不硬编码转移 type；不把代码
+  component 当运行时 oracle；不做任务专用阶段词/几何；死亡仍
+  0/1/UNKNOWN，不用概率/梯度。
 
 
 ## 当前状态（2026-11-21）
