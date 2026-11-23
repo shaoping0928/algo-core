@@ -204,6 +204,12 @@
   - 同槽位同时有精确/粗规则时，精确优先；
   - 变量规则约定 `pattern_out` 相对时间 0，查询从当前时刻起算；
   - 3 条窗口测试。
+- `query_world.py` + `query_world_probe.py`：查询图世界模型与线性
+  世界模型在同一批 held-out 行上**逐目标一致**（teacher-forced 最大差
+  3e-8；8 步 rollout RMSE 0.000000）；但 Python 图查询比向量化线性
+  模型慢 **18.7×**（0.045 vs 0.0024 ms/row）。→ 查询图是结构载体，
+  不是默认世界模型的性能替代；planner 接入应是选择性/门控，不是整体
+  替换。
 - `ComponentBank.free_run_step(derivation, state)`：不更新数值
   `RuntimeComponent`、不写计数/联想，只按学习规则激活/停用三个 sign
   节点；无规则/无输入 → 三个 sign 全停用并返回 `UNKNOWN`。默认路径
@@ -225,8 +231,11 @@
 
 - `ComponentDerivationBank` 尚未接进 `NodeRuntime` 的预测路径；当前是
   独立模块 + 探针 + `ComponentBank.free_run_step`，默认不生效。
-- 3 种子只跑了诊断探针（组件/读数/搜索），决策侧质量门尚未做。
+- 3 种子只跑了诊断探针（组件/读数/搜索/查询世界模型），决策侧质量门
+  尚未做。
 - 关键节点查询尚未接 planner；`required_slots` 仍由探针手动传入。
+- 查询图世界模型与线性模型等价但慢 18.7×，因此 planner 接入只能是
+  选择性/门控，不能整体替换；需要先定义接入点与质量门。
 
 ### 实施清单
 
@@ -247,6 +256,10 @@
       = m，但 horizontal 误差 0.31–0.38，说明过柱事件仍未建模。
 - [ ] 关键节点查询接 planner：把 readout 的 required_slots 接到决策
       路径，比较 full vs m=2–3 的 UNKNOWN/决策覆盖；当前仍是探针。
+- [x] 查询图世界模型：`query_world.py` 与线性模型逐目标一致
+      （最大差 3e-8，8 步 RMSE 0.000000），但慢 18.7×。
+- [ ] planner 接入：不能整体替换线性世界模型；只考虑选择性/门控
+      （阶段入口、关键节点、事件谓词），并先过 3 种子质量门。
 - [x] 派生概念：difference 规则 + label/free-run 探针；默认关。
 - [x] 派生概念接 `ComponentBank`：`free_run_step` 不跑数值过滤器，
       无规则/输入 → UNKNOWN；默认路径不变。
