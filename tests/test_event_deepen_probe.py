@@ -9,7 +9,7 @@ class EventDeepenProbeTest(unittest.TestCase):
     def test_summarize_pairs_three_arms(self):
         rows = []
         for eval_seed, (f8, f6, fd) in enumerate(
-            [(200, 150, 190), (120, 100, 140)], start=120,
+            [(200, 150, 210), (120, 100, 140)], start=120,
         ):
             rows.append(dict(train_seed=100, eval_seed=eval_seed, arm="h8",
                              frames=f8, passes=2, stats={}))
@@ -20,12 +20,16 @@ class EventDeepenProbeTest(unittest.TestCase):
         summary = summarize(rows, [6, 8])
         overall = summary["overall"]
         self.assertEqual(overall["n"], 2)
-        self.assertAlmostEqual(overall["mean_frames"]["h8"], 160.0)
-        self.assertAlmostEqual(overall["mean_frames"]["deep"], 165.0)
-        self.assertAlmostEqual(overall["deep_vs_h8"], 5.0)
+        self.assertAlmostEqual(
+            overall["mean_frames"]["h8"]["frames"], 160.0
+        )
+        self.assertAlmostEqual(
+            overall["mean_frames"]["deep"]["frames"], 175.0
+        )
+        self.assertAlmostEqual(overall["deep_vs_h8"], 15.0)
         self.assertEqual(overall["deep_better"], 2)
         self.assertAlmostEqual(
-            summary["per_seed"][100]["mean_deep"], 165.0
+            summary["per_seed"][100]["mean_deep"], 175.0
         )
 
 
