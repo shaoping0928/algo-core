@@ -5,6 +5,231 @@
 > 未完成事项、新方向设计**。更早的审计与解剖材料保留在文末
 > 「历史附录（只读）」，不再维护。
 
+## P0：多视窗状态转移机制重设计（当前主线）
+
+**核心判断**：这里不是再找一个更好的 span hazard / 触发阈值；问题在于
+训练对象与预测对象不是同一个转移。统一成**动作对齐的经验转移测度**：
+
+```text
+(source node, 实际作用动作) -> (successor node, feedback, terminal)
+```
+
+- 训练只消费真实转移；实际作用动作取 `history[lag]`，不是刚发出的
+  `history[0]`。
+- 同一个 kernel 在任意窗口递推，返回 successor 分布、反馈/terminal
+  累积量、support、UNKNOWN；可选目标节点集的 first-passage CDF，其
+  差分就是停时分布。窗口是**查询分辨率**，不是多套模型。
+- 候选预测输入实际的候选动作序列；只在已观测的 source/action 支持
+  上传播。缺边 / OOD → UNKNOWN，不当安全、不补反事实标签。
+- fine MPC 保持执行权；新 kernel 先作为 shadow prediction 评估，
+  过 held-out 多视窗转移门后才做配对决策 A/B。
+
+**已落地的底座**：`multiview_transitions.py` 在 `fit()` 后从实际行训练
+kernel；`predict_views()` 对任意窗口递推并显式传播未知质量。旧
+`_transition_table()` 已修正 action delay 对齐，并保留每条边的动作计数，
+不再把动作合并为多数票。默认 planner 尚未消费该对象。
+
+**第一版结论（seed 100/101，leave-episode-out，初步）**：h1 successor
+top1 0.668/0.686，full support 0.812/0.780；h4 top1 0.389/0.399，
+full support 0.385/0.419；h8 full support **0.064/0.055**；h16
+**0.034/0.048**。UNKNOWN 随 rollout 深度累积，精确 frame-node kernel
+不能直接支撑长视窗。修正过的 probe 按每个 horizon 独立纳入起点，并以
+事件时刻 / 右删失 survival likelihood 计终止；不会再把死在短窗内的样本
+筛掉。Terminal NLL 只在 full-support 子集上计算，且该子集会偏向某些
+结果，不能单独当 calibration 通过证据。
+
+**留出限制**：当前 probe 留出的是 transition edges / episode rows，
+但 fine node vocabulary 来自已拟合 agent（看过这些 episode 的状态）；
+所以它只诊断“固定表示下边表能否迁移”，不是完整的 representation
+generalization gate。预测等价 quotient 必须在每折训练 episode 上拟合，
+测试 episode 只能映射到该折的冻结表示；映射失败计 UNKNOWN。
+
+**机制收敛**：不能只把稀疏一步图反复相乘；也不能用精确 prototype
+连续 run 直接作宏段（真实流的 prototype run length p50=1、p90≈5）。
+下一版必须学习**预测等价的粗状态商**：合并那些在真实 action-conditioned
+successor / feedback 分布上不可区分的细状态，再从真实轨迹直接记录粗状态
+之间的 `(出口状态, 停时, feedback, terminal/censoring)` 分布。合并深度由
+held-out 预测似然与支撑选择，不设固定节点数/层数。候选动作序列按
+`history[lag]` 顺序原样输入，不压成无序动作直方图；不支持就 UNKNOWN。
+细层 executor 保持兜底。
+
+**下一步 P0（先验证实现，再谈接线）**：
+
+1. `multiview_transition_probe.py` 已完成初版 rolling-origin /
+   leave-episode-out：h=1/4/8/16 successor、终止生存似然与 UNKNOWN。
+   结论是**一步核多步支撑坍塌**；不接 planner。
+2. **折外表示已完成**：`multiview_transition_probe.py` 默认 `fold-refit`，
+   每折只用训练 episode 重建 state vocabulary；评测节点无映射 → UNKNOWN。
+   seed 100/101 五折结果已收齐（每折最多500起点）。
+3. **探索性 quotient 原型已落地**：
+   `predictive_state_quotient.py` 按真实 action-conditioned successor /
+   feedback profile 聚合细节点。seed 100 双折 pilot：flat K=1 虽有支撑，
+   但 top1≈1 是常数退化；K=4/16 在 h4 后支撑仍坍塌。→ 不能选一个全局 K。
+4. **五折跨种子结果：有支持率/混合分辨率正信号，但尚未通过**：
+   `hierarchical_transitions.py` 的 16→4→1 backoff 对比 fine-only：
+   - seed100/101 的 h8 full support **0.831/0.794**（fine **0.077/0.065**），
+     mixed-resolution top1 **0.728/0.788**；
+   - h16 full support **0.832/0.793**（fine **0.048/0.049**），
+     mixed-resolution top1 **0.909/0.972**；
+   - h16 的回退量约 44% 在父层、35%/38% 在根层。
+   这些 top1 将不同抽象分辨率混在一起，不能单独作为预测能力门槛。
+   seed100 两折分层诊断中，h16 fine 层 top1≈0.30、q4≈0.68、root=1
+   （单状态恒真），平均状态分辨率约645/1000；q16 层无可评估支持。
+   所以支持率改善不是全由 root 解释，但跨种子的逐层质量尚未确认；
+   默认 planner 继续不接线。
+5. **[x] 跨种子独立逐层审计**：`multiview_transition_probe.py` 已新增
+   fine/q16/q4/root 各自独立 kernel 的评估，不再把混合回退分辨率当逐层
+   质量；报告训练折 endpoint base-rate、UNKNOWN、coverage、log-loss、
+   top-1 和 fine-node resolution。seed100/101，fold-refit 五折，窗口
+   h=1/4/8/16，每局最多500个起点。
+   - h1 有支持子集上的非根层信号跨 seed 一致（fine 条件 log-loss gain
+     +3.26/+3.42，q16 +1.20/+1.15，q4 +0.25/+0.16），但全样本 log-loss
+     因 UNKNOWN 反而劣于 base-rate。
+   - 长窗覆盖不能成立：h4 q16 为 0/0，q4 为 0.26/0；h8 fine 为
+     0.035/0.032、q4 为 0.169/0；h16 fine 为 0.001/0.005、q4 为
+     0.062/0。q4 的 h8/h16 有支持子集也未稳定胜过匹配 base-rate。
+   - root 的 h4–h16 支持率虽约 0.81–0.90，但 root 是单类恒真：
+     base top-1=1、base log-loss=0；混合粒度 top-1 不能作为预测能力证据。
+   → **长视窗门失败**：只确认 h1/部分 h4 的局部信号，不足以支持粗层
+   长程转移；停止 quotient 调 K，不接 planner。
+6. **[x] 不启动动作序列 shadow**：第5项长窗非根层 coverage / 跨 seed
+   质量门未过；不在 `policy_result()` 插 shadow，也不进入配对决策 A/B。
+7. 当前 hierarchy 仍是粗状态上的 frame kernel 递推，不是 semi-Markov。
+   直接 first-passage/stopping-time 学习暂缓；本轮没有通过 shadow 前置门，
+   不从未验证的 quotient 继续扩建。
+8. **[x] delayed-action / terminal 边界审计**：`NodeRuntime` 的 action
+   条件学习与 `_transition_table` 均按 `history[lag]` 归因；当前
+   `history[0]` 用于读取新发动作/推进 pending queue，不是转移归因。
+   旧 planner graph 的错位在现行表中已修正。另给 `_transition_table`
+   加 terminal 行截断，防止同一 episode id 下的脏尾行生成死后边；
+   `test_terminal_row_does_not_create_an_outgoing_graph_edge` 覆盖该边界。
+   全量测试 **524 passed**。
+
+详细契约与边界见 [`docs/multiview-transition-design.md`](docs/multiview-transition-design.md)。
+
+## 通用阶段记忆基座（2026-11-24，用户确认）
+
+**目标校正**：这里要解决的是通用的决策近视，不是给单个任务加一个
+更长的帧搜索窗口。基座从任务提供的观测、实际动作、反馈和终止信息中
+发现关键信号与阶段，并学习阶段间的非帧转移；不认识任务几何、事件名称
+或手写控制律。阶段持续时间是转移结果，不是固定 horizon。
+
+**自监督输入边界（用户确认）**：唯一外部来源是世界交互：观测、实际作用
+动作、世界反馈与 episode 终止。prediction error / novelty / key signal、
+阶段身份、StageDemand 和 feature→successor 关联都由内部模型和这些真实记录
+推导；生产运行不接受 task-provided 阶段标签、目标阶段、启发权重或控制规则。
+`evaluate` 的 provider 仅是内部学习器的组合接口，不从 task 字典或 CLI 注入；
+`run_seed` 不读取 provider 字段。合成输入只用于单元测试。
+
+**结构约定**：
+
+- 阶段实例记录一次真实 episode 中的入口/出口状态、关键信号、按序动作
+  轨迹、持续时间、反馈以及 terminal / censoring。
+- 阶段上下文形成可变深度记忆树；在线从当前阶段的最具体历史上下文向父级
+  回退。每个上下文下的兄弟阶段只由真实有向转移边定义，树上的相似/兄弟
+  关系本身不代表可达转移。
+- 转移记录为 `(stage context, ordered action option) -> (sibling outcome,
+  duration, feedback, terminal/censoring)`；只消费实际发生的转移。
+  episode 支撑不足或动作选项未见时返回 `UNKNOWN`，root 仅表示粗分辨率基准，
+  不把常数 root 的覆盖冒充预测能力。
+- 阶段分段/身份、阶段树合并与有向转移图分离：前者产生可寻址的阶段记忆，
+  后者才学习阶段的时间顺序和结果。
+
+**第一片已实现（纯数据层，默认未接 planner）**：新增
+`stage_outcome_memory.py`：
+
+- `KeySignal` 使用不透明 channel / polarity，不含任务语义；
+  `GenericKeySignalDetector` 从训练 episode 为 observation-change、
+  feedback-change 和可选 prediction-error 通道拟合分位阈值，held-out 只做
+  frozen transform；`segment_episode()` 按信号上升沿切出变长阶段，不设固定帧长。
+- `StageOccurrence` 保存入口/出口向量、信号强度、保序 RLE action trace、
+  持续时间、累计反馈、终止/删失标记，以及逐转移 active-feature 快照。
+- `StageOutcomeMemory` 从真实相邻阶段实例统计有向结果；查询按最近阶段历史
+  的变阶后缀上下文从具体层回退到 root，动作轨迹精确匹配；报告 sibling
+  结果、episode support、持续时间分位数、反馈统计、terminal/censoring。
+- `DemandAssociationSample.from_stage_episodes()` 把真实阶段内的 feature
+  snapshots 与实际下一阶段配对，避免把整个阶段末尾才出现的 feature 当成
+  阶段入口特征；默认池化动作选项，精确 option 条件另行显式提供。
+- `tests/test_stage_outcome_memory.py` 的 11 条测试覆盖折内信号阈值、变长分段、信号持续值
+  去重、兄弟结果、父级回退、动作顺序、episode 支撑、UNKNOWN 与删失。
+  全量测试 **530 passed**。
+
+**需求导向排序（纯启发式，默认关闭）**：新增
+`stage_demand_heuristic.py` 与 `trajectory_search.beam_search(rank_step=...)`：
+
+- `StageDemand` 可由高层已支持的兄弟阶段预测生成，表达目标阶段及其 context /
+  action option；它不携带或修改最终价值。
+- `StageDemandHeuristic` 只从真实样本统计
+  `(stage context, action option, active feature) -> observed next stage`，
+  以目标阶段在该 context 下的 base rate 为基线，返回平滑后的方向性 log-lift
+  作为 priority；跨 episode 支撑不足则 UNKNOWN。该相关性用于排序，不宣称因果。
+- `beam_search` 的可选 `rank_step` 只用于中间 frontier 保留；不改变 feasibility、
+  objective `scores`、terminal 价值或最终 score。无 rank hint 时保留旧路径。
+- Runtime adapter 使用候选状态的只读 feature masks；`policy_result`、
+  `decision_action`、`evaluate` 已接入 `StageDemand + StageDemandHeuristic`，
+  `stage_demand_provider` 每次决策提供当前需求，并可通过
+  `observe_transition` 仅接收真实执行后的转移/反馈。provider 必须由内部阶段
+  学习器产生，不从 task 输入；默认无 provider、rank hint 关闭。
+- 验证：需求关联 / base-rate lift / UNKNOWN / 回退 6 条测试，rank-only 与终局
+  价值分离 1 条测试，provider 到真实反馈更新链 5 条测试；全量测试
+  **530 passed**。
+
+**重排后的 gap 与后续方向（严格自监督）**：
+
+1. **P0：自动经验管线**。唯一外部来源是世界交互产生的观测、实际作用动作、
+   反馈和 episode 终止。按 episode 先切分，再由内部 residual / novelty /
+   feedback-change 机制拟合信号阈值、切 stage、记录每个真实状态的
+   active-feature snapshots；actions 按 `history[lag]`。当前这些组件存在，
+   但 `fit()` 还没有自动把真实训练 rows 变成 stage / demand 样本。
+2. **P0：当前状态到历史阶段 resolver**。精确 signal-token key 不能覆盖连续
+   状态。需要 train-fold 拟合、held-out 冻结的状态/信号表示；未映射状态 → UNKNOWN。
+3. **P0：预测等价的多级阶段树**。当前是最近阶段历史的变阶后缀回退，不是阶段
+   类型的 merge/split 树。用 held-out successor、duration、feedback 预测等价
+   决定父子/兄弟关系；报告各层分辨率、support、UNKNOWN 和相对 base-rate 的增益，
+   不用 task geometry、纯欧氏相似或固定 K 定身份。
+4. **P0：内部高层需求选择器**。内部阶段搜索枚举有真实支持的 sibling /
+   action-option 路径，再由世界交互反馈训练出的 outcome/value readout 选
+   `StageDemand`。StageDemand 不能来自 task、CLI、人工目标或 modal-successor
+   规则。
+5. **P1：需求关联及 option 口径**。当前启发值是 observational log-lift，不是因果
+   value。默认样本跨 option 池化以避免用未来完整动作 trace 泄漏；若要
+   option-conditional priority，option 必须在决策时已知且有跨 episode 实际支持，
+   否则 UNKNOWN。当前没有真实 feature/stage 样本及关联校准。
+6. **P1：rank-only 搜索质量门**。beam rank 会影响中间保留集合，可能剪掉高 value
+   路径。固定相同预算测目标阶段路径 recall、扩展量、UNKNOWN 与最终真实价值；
+   必须保持最终 selection 只用独立价值，rank priority 不写入 node value、反馈、
+   六列账本或 objective。需求必须有阶段边界/失效条件，不可成为全局逐帧吸引项。
+7. **P1：真实数据与决策验收**。目前只有合成测试，无 episode-held-out 校准、
+   跨 seed 稳定性或 planner A/B。所有表示/阈值/identity/demand/heuristic 只在
+   训练 episode 拟合；先 shadow，再 3-seed 筛选、6-seed 确认。UNKNOWN 不作安全结论。
+
+**阶段记忆本身的未完成项（此模块目前不宣称已经学到任务阶段）**：
+
+1. 当前 detector 只覆盖观测变化、反馈变化和调用方可提供的 prediction
+   error；尚未加入新颖度、action-conditioned 转移分布变化或多信号边界
+   校准，现有 quantile detector 也尚未在真实任务流验证。
+2. 当前 stage identity 是精确 key-signal token 组合；尚未实现从连续当前状态
+   检索历史阶段，也没有基于 held-out predictive equivalence 的跨签名 merge /
+   split。因此当前上下文树是阶段历史的变阶 backoff，不是完整的状态抽象树。
+3. 选项 trace 目前严格精确匹配；尚无从真实行为中归纳可复用 option 的机制，
+   新 action trace 一律 UNKNOWN。这是诚实的 support 限制，不用动作直方图
+   或反事实补边掩盖。
+4. duration 目前只报告经验分位数；删失样本单独标记，但尚未实现 competing
+   risk / survival likelihood 或校准，不能把这些分位数当作生存预测。
+5. 尚未在真实多 episode / 多任务流验证阶段身份、duration likelihood、
+   feedback / terminal 校准、父级收益及 root 常数退化；合成测试只验证数据结构
+   和计数正确性。
+6. provider 与 rank-only 通道已接到 beam-search policy/evaluate；但还没有由
+   自监督阶段记忆自动生成 provider / 训练数据桥接，也未接入默认路径。不存在
+   阶段级行为收益证据，默认决策路径逐位不变。
+
+**实施顺序**：先自动化世界交互数据→内部信号→stage occurrences→pointwise
+feature snapshots；再做 episode-held-out current-state resolver 和预测等价阶段树；
+然后让内部阶段 outcome/value search 产生 StageDemand；最后接上 rank-only
+frontier，并验证目标路径 recall / 扩展效率 / 真实价值。中间任何阶段身份、
+信号、目标或选项都不能由 task 标签补入。质量门和 3/6-seed 配对实验通过前不
+默认启用，不做帧级长视界搜索。
+
 ## 方向校正（2026-11-23，用户）
 
 - **8 步帧级组合是默认栈的基线诊断，不是设计轴。** 它的 endpoint drift
@@ -1752,8 +1977,8 @@ held-out 世界 120–124；基线 129.1 / 147（3 种子）。
 
 ## 待办
 
-> **里程碑方向的两条 P0 待办（存活 / 相位数据）见文首「里程碑方向：当前状态与
-> 待办」**；本节及以下为**主线（默认栈）**的既有待办。
+> 本节及以下保留较早的默认栈待办和历史设计记录；当前主线与未决门槛
+> 以文首「P0：多视窗状态转移机制重设计」和「方向校正」为准。
 
 ### A. Batch 4 尾项：决策侧 score
 

@@ -1,0 +1,197 @@
+"""Tests for wiring stage demands into the generic beam rank channel."""
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
+
+from stage_demand_heuristic import StageDemand
+from substrate_nodes import (
+    decision_action,
+    evaluate,
+    make_node_demand_rank_step,
+    policy_result,
+)
+
+
+class FakeRuntime:
+    obs_dim = 1
+    scales = np.ones(1)
+    feature_ids = ["aligned", "other"]
+    _feature_all = ["aligned", "other"]
+
+    @staticmethod
+    def _feature_mask_table(observations):
+        observations = np.asarray(observations, dtype=float)
+        return [
+            observations[:, 0] >= 0.5,
+            observations[:, 0] < 0.5,
+        ]
+
+
+class FakeHeuristic:
+    @staticmethod
+    def score(features, _demand):
+        if "aligned" in features:
+            return dict(status="supported", priority=1.5)
+        return dict(status="unknown", priority=None)
+
+
+class FakeEnv:
+    def __init__(self):
+        self.t = 0
+        self.dead = False
+        self.passed = 0
+        self.feedback_calls = 0
+
+    def obs(self):
+        return np.asarray([float(self.t)])
+
+    def step(self, _action):
+        self.t += 1
+        self.dead = self.t >= 1
+
+    def feedback(self):
+        self.feedback_calls += 1
+        return dict(dopamine=0.2, pain=0.1)
+
+
+class FakeDemandProvider:
+    def __init__(self, demand, heuristic):
+        self.demand = demand
+        self.heuristic = heuristic
+        self.reset_args = None
+        self.requests = []
+        self.transitions = []
+
+    def reset_episode(self, episode, seed):
+        self.reset_args = (episode, seed)
+
+    def __call__(self, _agent, observation, prefix, actions):
+        self.requests.append((
+            np.asarray(observation).copy(),
+            np.asarray(prefix).copy(),
+            tuple(actions),
+        ))
+        return self.demand, self.heuristic
+
+    def observe_transition(self, transition):
+        self.transitions.append(transition)
+
+
+class StageDemandWiringTests(unittest.TestCase):
+    def test_runtime_features_feed_the_separate_rank_channel(self):
+        demand = StageDemand(
+            target_stage=("target",),
+            stage_history=(("source",),),
+        )
+        rank_step = make_node_demand_rank_step(
+            FakeRuntime(), demand, FakeHeuristic(),
+        )
+        states = np.asarray([[0.0], [1.0], [0.25]])
+        priorities = rank_step(
+            states, np.zeros((3, 2)), step=0,
+        )
+        np.testing.assert_array_equal(priorities, [0.0, 1.5, 0.0])
+
+    def test_policy_result_builds_ranker_from_demand_and_runtime_features(self):
+        class Env:
+            @staticmethod
+            def obs():
+                return np.asarray([0.0])
+
+        class Heuristic:
+            @staticmethod
+            def score(features, _demand):
+                if "aligned" in features:
+                    return dict(status="supported", priority=2.0)
+                return dict(status="unknown", priority=None)
+
+        captured = {}
+
+        def fake_beam_search(**kwargs):
+            captured["rank_step"] = kwargs["rank_step"]
+            return object()
+
+        with patch("substrate_nodes.beam_search", side_effect=fake_beam_search):
+            result = policy_result(
+                Env(), None, FakeRuntime(), prefix=[0.0],
+                horizon=2, lag=1, beam_width=2,
+                stage_demand=StageDemand(
+                    target_stage=("target",),
+                    stage_history=(("source",),),
+                ),
+                demand_heuristic=Heuristic(),
+            )
+        self.assertIsNotNone(result)
+        priorities = captured["rank_step"](
+            np.asarray([[0.0], [1.0]]),
+            np.asarray([[0.0, 0.0], [1.0, 0.0]]),
+            0,
+        )
+        np.testing.assert_array_equal(priorities, [0.0, 2.0])
+
+    def test_policy_result_requires_beam_for_demand_ranking(self):
+        class Env:
+            @staticmethod
+            def obs():
+                return np.asarray([0.0])
+
+        with self.assertRaisesRegex(ValueError, "requires beam search"):
+            policy_result(
+                Env(), None, FakeRuntime(), prefix=[0.0],
+                horizon=1, lag=1, beam_width=0,
+                rank_step=lambda _states, _sequences, _step: np.zeros(1),
+            )
+
+    def test_decision_action_passes_the_rank_only_callback(self):
+        callback = lambda _states, _sequences, _step: np.zeros(1)
+        with patch(
+            "substrate_nodes.policy_result",
+            return_value=SimpleNamespace(actions=np.asarray([1.0])),
+        ) as policy:
+            result = decision_action(
+                None, None, None, prefix=[0.0], horizon=1, lag=1,
+                decision="search", beam_width=2, rank_step=callback,
+            )
+        self.assertEqual(result, 1)
+        self.assertIs(policy.call_args.kwargs["rank_step"], callback)
+
+    def test_evaluate_provider_sees_and_learns_only_real_transitions(self):
+        env = FakeEnv()
+        demand = StageDemand(
+            target_stage=("target",),
+            stage_history=(("source",),),
+        )
+        provider = FakeDemandProvider(demand, FakeHeuristic())
+        agent = SimpleNamespace(obs_dim=1)
+        with patch("substrate_nodes.decision_action", return_value=1) as call:
+            frames, actions, transitions = evaluate(
+                seed=3,
+                world=None,
+                agent=agent,
+                cap=1,
+                horizon=1,
+                lag=1,
+                episode=4,
+                env_factory=lambda _seed, spacing=None: env,
+                beam_width=2,
+                stage_demand_provider=provider,
+            )
+        self.assertEqual((frames, actions, transitions), (1, [1], []))
+        self.assertEqual(provider.reset_args, (4, 3))
+        self.assertEqual(len(provider.requests), 1)
+        self.assertEqual(len(provider.transitions), 1)
+        realized = provider.transitions[0]
+        self.assertEqual(realized["history"].tolist(), [1.0, 0.0])
+        self.assertEqual(realized["signals"].tolist(), [0.2, 0.1])
+        self.assertTrue(realized["done"])
+        self.assertIs(call.call_args.kwargs["stage_demand"], demand)
+        self.assertIs(
+            call.call_args.kwargs["demand_heuristic"], provider.heuristic
+        )
+        self.assertEqual(env.feedback_calls, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

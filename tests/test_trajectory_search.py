@@ -148,6 +148,37 @@ class TrajectorySearchTests(unittest.TestCase):
         self.assertEqual(result.final_state[0], 2.0)
         self.assertGreater(result.candidate_count, 0)
 
+    def test_beam_rank_hint_orders_frontier_but_not_final_value(self):
+        def evaluate_step(states, _sequences, _step):
+            return np.zeros(len(states)), np.ones(len(states), dtype=bool)
+
+        def evaluate_terminal(states, _sequences):
+            return np.abs(states[:, 0] - 1.0), np.ones(
+                len(states), dtype=bool
+            )
+
+        kwargs = dict(
+            initial_state=np.asarray([0.0]),
+            action_space=(0, 1),
+            horizon=2,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            evaluate_terminal=evaluate_terminal,
+            beam_width=2,
+        )
+        baseline = beam_search(**kwargs)
+        guided = beam_search(
+            **kwargs,
+            rank_step=lambda states, _sequences, _step: states[:, 0],
+        )
+        # The hint explores the high-state route first, but the final choice
+        # among retained paths is still made by the true terminal objective.
+        np.testing.assert_array_equal(guided.actions, [1.0, 0.0])
+        self.assertEqual(guided.final_state[0], 1.0)
+        self.assertEqual(guided.score, 0.0)
+        self.assertEqual(baseline.score, guided.score)
+        self.assertFalse(np.array_equal(baseline.actions, guided.actions))
+
     def test_max_combine_penalizes_the_worst_step(self):
         def evaluate_step(_states, sequences, step):
             raised = sequences[:, 0] > 0.5

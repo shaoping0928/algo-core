@@ -523,12 +523,18 @@ def beam_search(
     ]] = None,
     beam_width: int = 256,
     score_combine: Union[str, Sequence[str]] = "sum",
+    rank_step: Optional[Callable[
+        [np.ndarray, np.ndarray, int], np.ndarray
+    ]] = None,
 ) -> SearchResult:
     """Beam-limited version of exhaustive_search for long horizons.
 
     At each depth it expands every live beam with every action, keeps the best
     `beam_width` candidates by the same lexicographic objective, and then applies the
-    optional terminal evaluator. It is a search approximation, not a task-specific policy.
+    optional terminal evaluator. ``rank_step`` is an optional, higher-is-better
+    ordering hint used only when pruning intermediate beams. Its increments do
+    not change feasibility, accumulated objective scores, or final selection
+    among the surviving candidates.
     """
     state0 = np.asarray(initial_state, dtype=float)
     if state0.ndim == 0:
@@ -544,6 +550,7 @@ def beam_search(
     states = state0.reshape(1, -1)
     sequences = np.zeros((1, horizon), dtype=float)
     scores = None
+    priorities = None
     feasible = np.ones(1, dtype=bool)
     first_states = None
     candidate_count = 0
@@ -595,13 +602,42 @@ def beam_search(
         if not len(selectable):
             raise ValueError("evaluators returned no finite score for any candidate")
 
-        order = _lexicographic_order(candidate_scores, selectable)
-        keep = selectable[order[:beam_width]]
+        if rank_step is None:
+            # Keep the old path exactly when the opt-in hint is disabled.
+            order = _lexicographic_order(candidate_scores, selectable)
+            keep = selectable[order[:beam_width]]
+            next_priorities = None
+        else:
+            increments_priority = np.asarray(
+                rank_step(next_states, next_sequences, step), dtype=float,
+            )
+            if increments_priority.ndim == 2 and increments_priority.shape[1] == 1:
+                increments_priority = increments_priority[:, 0]
+            if increments_priority.shape != (count * width,):
+                raise ValueError(
+                    "rank_step must return one scalar per candidate"
+                )
+            if not np.isfinite(increments_priority).all():
+                raise ValueError("rank_step priorities must be finite")
+            next_priorities = increments_priority.copy()
+            if priorities is not None:
+                next_priorities += np.repeat(priorities, width)
+            keep = np.asarray(sorted(
+                selectable.tolist(),
+                key=lambda index: (
+                    -float(next_priorities[index]),
+                    tuple(float(value) for value in candidate_scores[index]),
+                    int(index),
+                ),
+            )[:beam_width], dtype=int)
         states = next_states[keep]
         sequences = next_sequences[keep]
         scores = candidate_scores[keep]
         feasible = candidate_feasible[keep]
         first_states = candidate_first_states[keep]
+        priorities = (
+            None if next_priorities is None else next_priorities[keep]
+        )
         candidate_count += count * width
 
     if evaluate_terminal is not None:

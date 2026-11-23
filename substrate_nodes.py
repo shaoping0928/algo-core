@@ -51,6 +51,7 @@ from milestone_graph import (
     strength_change_scores,
     transition_signatures,
 )
+from multiview_transitions import MultiViewTransitionModel
 from node_features import FeatureRuleBank
 from node_runtime import NodeRuntime, future_pain_labels, future_return_labels
 from substrate_generic import (
@@ -1121,6 +1122,14 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     )
     agent.transition_policy = transition_policy
     agent.transition_values = transition_values
+    # Unified frame-to-arbitrary-window transition measure.  It is fit from
+    # realized transitions only and keeps the action that actually acted on
+    # each state edge (history[lag]), rather than the action just issued.
+    # The planner does not consume it by default; probes can query the same
+    # fitted object at multiple windows without training separate hazards.
+    agent.multiview_transitions = MultiViewTransitionModel.fit_rows(
+        transitions, agent, lag=agent.lag,
+    )
     # The milestone layer, read off the agent's own stream.  All of it is
     # inert unless the planner is asked for one of its terms.
     model = _milestone_model_from_transitions(
@@ -1310,10 +1319,21 @@ def _milestone_model_from_transitions(transitions, bins=None, top=1,
     returns = []
     for stream_index, rows in enumerate(usable):
         observations = np.asarray([row["obs"] for row in rows], dtype=float)
-        actions = np.asarray([
-            float(np.asarray(row.get("history", (0.0,))).reshape(-1)[0])
+        histories = [
+            np.asarray(row.get("history", ()), dtype=float).reshape(-1)
             for row in rows
-        ], dtype=float)
+        ]
+        # The transition obs_t -> obs_{t+1} is caused by the oldest action
+        # still pending, not the action just issued at t.  NodeRuntime uses
+        # this same history[lag] alignment for its action-conditioned reads.
+        acting_lag = int(
+            getattr(agent, "lag", max(len(histories[0]) - 1, 0))
+        )
+        actions = np.asarray([
+            int(round(float(history[acting_lag])))
+            if history.size > acting_lag else -1
+            for history in histories
+        ], dtype=int)
         signals = np.asarray(
             [row.get("signals", (0.0, 0.0)) for row in rows], dtype=float
         )
@@ -1735,10 +1755,17 @@ def _transition_table(transitions, agent, min_support: int = 2):
         signals = np.asarray(
             [row.get("signals", (0.0, 0.0)) for row in rows], dtype=float
         )
-        actions = np.asarray([
-            float(np.asarray(row.get("history", (0.0,))).reshape(-1)[0])
+        histories = [
+            np.asarray(row.get("history", ()), dtype=float).reshape(-1)
             for row in rows
-        ], dtype=float)
+        ]
+        # Same delayed-action alignment used by NodeRuntime's action-conditioned
+        # transition/value updates: history[lag] acted on this transition.
+        actions = np.asarray([
+            int(round(float(history[agent.lag])))
+            if history.size > int(agent.lag) else -1
+            for history in histories
+        ], dtype=int)
         nodes = []
         for state in encoded:
             node_id, _distance = agent._nearest(state)
@@ -1748,28 +1775,38 @@ def _transition_table(transitions, agent, min_support: int = 2):
                 continue
             visits[node] = visits.get(node, 0) + 1
             pain[node] = pain.get(node, 0.0) + float(signals[index, 1] > 0.0)
-            action_totals[int(actions[index])] += 1
+            action = int(actions[index])
+            if action < 0:
+                continue
+            action_totals[action] += 1
+            if bool(rows[index].get("done", False)):
+                continue
             if index + 1 >= len(nodes):
                 continue
             target = nodes[index + 1]
             if target is None:
                 continue
             edge = raw.setdefault(node, {}).setdefault(
-                target, dict(count=0, actions=[])
+                target, dict(count=0, actions={})
             )
             edge["count"] += 1
-            edge["actions"].append(int(actions[index]))
+            edge["actions"][action] = edge["actions"].get(action, 0) + 1
     edges = {}
     for node, targets in raw.items():
         kept = {}
         for target, entry in targets.items():
             if entry["count"] < int(min_support):
                 continue
-            counts = np.bincount(
-                np.asarray(entry["actions"], dtype=int), minlength=2
+            action_counts = dict(
+                (int(action), int(count))
+                for action, count in entry["actions"].items()
             )
+            action = max(
+                action_counts, key=action_counts.get
+            ) if action_counts else 0
             kept[target] = dict(
-                count=int(entry["count"]), action=int(np.argmax(counts)),
+                count=int(entry["count"]), action=int(action),
+                actions=action_counts,
             )
         if kept:
             edges[node] = kept
@@ -1840,9 +1877,13 @@ def _transition_values(edges, risk, gamma: float = 0.95,
         for node, targets in edges.items():
             by_action = {}
             for target, entry in targets.items():
-                by_action.setdefault(int(entry["action"]), {})[
-                    target
-                ] = float(entry["count"])
+                action_counts = entry.get(
+                    "actions", {int(entry["action"]): int(entry["count"])}
+                )
+                for action, count in action_counts.items():
+                    by_action.setdefault(int(action), {})[target] = (
+                        float(count)
+                    )
             best_value = None
             best_action = None
             for action, distribution in by_action.items():
@@ -1959,6 +2000,43 @@ def _apply_margin_tiebreak(result, batches, previous_action, eps):
     return replace(result, actions=actions, score=scores[index])
 
 
+def make_node_demand_rank_step(agent, demand, heuristic):
+    """Adapt learned Runtime feature masks to the demand-only rank channel."""
+    from stage_demand_heuristic import make_demand_rank_step
+
+    all_features = list(getattr(agent, "_feature_all", ()))
+    roots = set(getattr(agent, "feature_ids", ()))
+    feature_columns = [
+        (index, feature_id)
+        for index, feature_id in enumerate(all_features)
+        if feature_id in roots
+    ]
+    obs_dim = int(agent.obs_dim)
+    scales = np.asarray(agent.scales[:obs_dim], dtype=float)
+
+    def extract_features(states, _sequences, _step):
+        observations = (
+            np.asarray(states, dtype=float)[:, :obs_dim] / scales
+        )
+        masks = agent._feature_mask_table(observations)
+        active_by_state = [[] for _ in range(len(observations))]
+        for column, feature_id in feature_columns:
+            if column >= len(masks) or masks[column] is None:
+                continue
+            active = np.asarray(masks[column], dtype=bool).reshape(-1)
+            if active.shape != (len(observations),):
+                raise ValueError(
+                    "feature mask must return one value per candidate"
+                )
+            for index in np.flatnonzero(active):
+                active_by_state[int(index)].append(feature_id)
+        return active_by_state
+
+    return make_demand_rank_step(
+        heuristic, demand, feature_extractor=extract_features,
+    )
+
+
 def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   step_stride=2, stride_includes_lag=False,
                   death_status_batch=None, unknown_penalty=0.0,
@@ -1967,9 +2045,25 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   risk_decay=1.0, beam_width=0, milestone_weight=0.0,
                   milestone_mode="off", milestone_rate=None,
                   milestone_goal=None, pain_weight=None, risk_lane="max",
-                  previous_action=None, margin_eps=0.0, veto_fraction=0.0):
+                  previous_action=None, margin_eps=0.0, veto_fraction=0.0,
+                  rank_step=None, stage_demand=None,
+                  demand_heuristic=None):
     initial = np.asarray(env.obs(), dtype=float)
     agent_obs_dim = int(agent.obs_dim)
+    if (stage_demand is None) != (demand_heuristic is None):
+        raise ValueError(
+            "stage_demand and demand_heuristic must be supplied together"
+        )
+    if stage_demand is not None:
+        if rank_step is not None:
+            raise ValueError(
+                "supply either rank_step or stage_demand, not both"
+            )
+        rank_step = make_node_demand_rank_step(
+            agent, stage_demand, demand_heuristic,
+        )
+    if rank_step is not None and int(beam_width) <= 0:
+        raise ValueError("rank_step requires beam search with positive beam_width")
 
     def agent_view(batch):
         """The agent's raw observation; a world may carry extra state dims."""
@@ -2439,6 +2533,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             evaluate_terminal=evaluate_terminal,
             beam_width=int(beam_width),
             score_combine="sum",
+            rank_step=rank_step,
         )
         return result
     result = exhaustive_search(
@@ -2670,7 +2765,9 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                     milestone_mode="off", milestone_rate=None,
                     milestone_goal=None, pain_weight=None, risk_lane="max",
                     plan_out=None, candidate_callback=None,
-                    previous_action=None, margin_eps=0.0, veto_fraction=0.0):
+                    previous_action=None, margin_eps=0.0, veto_fraction=0.0,
+                    rank_step=None, stage_demand=None,
+                    demand_heuristic=None):
     """Dispatch one decision to the searched or the cell-Q-only policy.
 
     With `ledger_out` (a list) and the search decision, the winning
@@ -2687,6 +2784,12 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
     matters, which buys a lookahead the per-frame search cannot afford at a
     fraction of its candidate count.
     """
+    if decision != "search" and (
+            rank_step is not None or stage_demand is not None
+            or demand_heuristic is not None):
+        raise ValueError(
+            "demand ranking is currently supported only by beam search"
+        )
     if decision == "search":
         result = policy_result(
             env, world, agent, prefix, horizon, lag=lag,
@@ -2705,6 +2808,9 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
             previous_action=previous_action,
             margin_eps=margin_eps,
             veto_fraction=veto_fraction,
+            rank_step=rank_step,
+            stage_demand=stage_demand,
+            demand_heuristic=demand_heuristic,
         )
         if ledger_out is not None:
             score = result.score
@@ -2839,7 +2945,8 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
              spacing=None, milestone_weight=0.0, milestone_mode="off",
              pain_weight=None, risk_lane="max", plan_out=None,
              candidate_out=None, margin_eps=0.0, veto_fraction=0.0,
-             env_factory=None):
+             env_factory=None, rank_step=None,
+             stage_demand_provider=None):
     """Run one deterministic evaluation episode.
 
     ``env_seed`` selects the world instance; when omitted the historical
@@ -2848,6 +2955,14 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
     (``obs``/``next_obs``/``history``/``signals``/``done``/``episode``), which
     is what the closed-loop (DAgger) path consumes.  No counterfactual
     prediction is recorded.
+
+    An internally constructed ``stage_demand_provider`` is called before each
+    decision with
+    the current observation, pending-action prefix, and actions already
+    executed. It returns ``(StageDemand, StageDemandHeuristic)`` or ``None``.
+    If it implements ``observe_transition`` / ``reset_episode``, those hooks
+    receive only actual episode transitions and boundaries.
+    It is not read from the task configuration.
     """
     if cap < 1:
         raise ValueError("cap must be positive")
@@ -2855,11 +2970,25 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
         raise ValueError("horizon must be positive")
     if step_stride < 1:
         raise ValueError("step_stride must be positive")
+    if rank_step is not None and stage_demand_provider is not None:
+        raise ValueError(
+            "supply either a fixed rank_step or stage_demand_provider"
+        )
+    if stage_demand_provider is not None and int(beam_width) <= 0:
+        raise ValueError(
+            "stage_demand_provider requires positive beam_width"
+        )
     lag = int(lag)
     env = (env_factory if env_factory is not None else latent[lag])(
         seed if env_seed is None else int(env_seed),
         spacing=None if spacing is None else float(spacing),
     )
+    reset_provider = getattr(stage_demand_provider, "reset_episode", None)
+    if reset_provider is not None:
+        reset_provider(
+            int(episode),
+            int(seed if env_seed is None else env_seed),
+        )
     prefix = np.zeros(lag, dtype=float)
     recent = [0.0] * lag
     actions = []
@@ -2898,6 +3027,19 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
                 active_goal = getattr(
                     agent, "milestone_goals_by_key", {}
                 ).get(tracker.key)
+        stage_demand = None
+        demand_heuristic = None
+        if stage_demand_provider is not None:
+            request = stage_demand_provider(
+                agent, agent_obs.copy(), prefix.copy(), tuple(actions),
+            )
+            if request is not None:
+                if not isinstance(request, tuple) or len(request) != 2:
+                    raise TypeError(
+                        "stage_demand_provider must return "
+                        "(StageDemand, StageDemandHeuristic) or None"
+                    )
+                stage_demand, demand_heuristic = request
         ledger: List[Tuple[float, float]] = []
         ledger_out = ledger if record else None
         collected = None
@@ -2926,6 +3068,9 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             previous_action=last_action,
             margin_eps=margin_eps,
             veto_fraction=veto_fraction,
+            rank_step=rank_step,
+            stage_demand=stage_demand,
+            demand_heuristic=demand_heuristic,
         )
         if candidate_out is not None:
             candidate_out.append(collected)
@@ -2940,15 +3085,19 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
         last_action = int(action)
         prefix = np.concatenate([[float(action)], prefix[:-1]])
         env.step(action)
+        observe_provider = getattr(
+            stage_demand_provider, "observe_transition", None
+        )
+        next_obs = None
+        if prediction_hook or record or observe_provider is not None:
+            next_obs = np.asarray(env.obs(), dtype=float)
         if prediction_hook:
-            agent.observe_prediction(
-                np.asarray(env.obs(), dtype=float)[:int(agent.obs_dim)]
-            )
-        if record:
+            agent.observe_prediction(next_obs[:int(agent.obs_dim)])
+        if record or observe_provider is not None:
             feedback = env.feedback()
-            transitions.append(dict(
+            transition_record = dict(
                 obs=obs,
-                next_obs=np.asarray(env.obs(), dtype=float),
+                next_obs=next_obs,
                 history=history,
                 signals=np.asarray(
                     [feedback["dopamine"], feedback["pain"]], dtype=float
@@ -2964,7 +3113,11 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
                 # remaining survival is the outcome these components must
                 # predict (P4 objective learning).
                 ledger=(ledger[0] if ledger else (0.0, 0.0)),
-            ))
+            )
+            if record:
+                transitions.append(transition_record)
+            if observe_provider is not None:
+                observe_provider(dict(transition_record))
         recent = [float(action)] + recent[:-1]
     if metrics_out is not None:
         # Task-level progress the world reports but the learner never sees:

@@ -18,7 +18,7 @@
 - **seed 101 的 10 个 miss 已定位到 plan/suffix 排序**：B0 只读诊断（85 决策）显示 8/10 在选中/最佳首动作的各自最佳后缀下真实存活并列，只有 2/10 存在正的首动作对比；动作级 coarse router 不是当前主杠杆。详见 `TODO.md` 实验 B0。
 - **plan-level miss 的 score 实际只有 risk 一列活跃**：B0.5 显示 8 个 plan-level miss 中 risk 差值为正且占 100%，value/curiosity/q 全为 0；去掉任何列都不能恢复 plan-level miss。B0.6 进一步显示 risk 的 step 部分全为 0、几乎全是 endpoint terminal hazard；预测 endpoint 把 selected 排得更安全（8/8），真实 terminal 在 7/8 判对。主因是 **world endpoint 漂移**，不是 risk 权重；下一步是 plan-level endpoint 校正/重排，而不是首动作 router。
 - **B1-plan endpoint 读数：seed 101 有 ranking 信号，但不迁移**：predicted endpoint（仅 7 维）在 seed 101 把 same-action top1 从 61/69 提到 **68/69**、B0 miss 从 2/10 提到 **9/10**，same-AUC **0.789**；但 3 种子门失败：seed 100 从 **62/62 退化到 60/62**（worsened 2, improved 0），seed 102 的 48 个可用决策 **terminal base rate 0.000**、模型退化；calibration 在所有 seed 上失败（Brier skill −0.09…−0.36）。OOD 距离/fine score 作为特征会打掉 within-decision 信号。**不接线**；只剩 OOD/UNKNOWN 门后的 rank-only 复测或 world endpoint 改善。
-- 8 帧帧级线（B0–B1-plan）已关闭；当前方向是**事件/阶段级 outcome transition 的粗层读数**（见下节），不是继续加帧级层或调帧级 score；历史结论见 [2026-11-23 归档](docs/archive/README-2026-11-23.md)。
+- 8 帧帧级线（B0–B1-plan）已关闭；全局 span 读数排序可用但阈值不迁移、决策内不跨种子。当前机制重设计为**动作对齐的经验转移测度 + 多视窗查询**，而不是独立 span hazard：训练只用真实状态转移；预测时用候选动作序列递推 successor/feedback/terminal 分布，缺少支持则 UNKNOWN。第一版 fine frame kernel 的 h8/h16 支撑仅 0.055–0.064/0.034–0.048；折内重建表示后，嵌套 16→4→1 backoff 在 seed100/101 五折的 h8/h16 支撑约 0.79–0.83，fine-only 约 0.05–0.08，但 mixed-resolution top1 不能单独证明预测力，逐层跨种子审计是当前门槛。默认 planner 尚未接入、默认栈不变；下一步及实验数字见 `TODO.md`「P0：多视窗状态转移机制重设计」和 [2026-11-23 归档](docs/archive/README-2026-11-23.md)。
 
 ### 事件/阶段层后续（Batch 8 follow-up，2026-11-23 晚）
 

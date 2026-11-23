@@ -7,3 +7,7 @@ venv/
 *.pkl
 consume-*.json
 span-decision-*.json
+multiview-*.json
+quotient-*.json
+hierarchical-*.json
+hierarchy-*.json
