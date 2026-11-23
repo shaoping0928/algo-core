@@ -283,9 +283,6 @@ benchmark 协议；offline tau 不可迁移，阈值必须在部署配置上校�
 - [ ] **P1 阶段数据规模**：结果分布身份已通过，但每局约 1 条转移；需要
       采集规模（~100 局/option）才能填 `(stage, option)` 单元。
       P0 time-in-state 已判零，不能靠 clock/phase 补这个规模。
-- [ ] **P1 阶段数据规模**：结果分布身份已通过，但每局约 1 条转移；需要
-      采集规模（~100 局/option）才能填 `(stage, option)` 单元。
-      P0 time-in-state 已判零，不能靠 clock/phase 补这个规模。
 - [ ] **P1 value 保持 opt-in**：状态级有效、计划级不差、局级 1/3；
       P0 表示层已判零；等 endpoint/world 读数修复后再重测。
 - [ ] 可复现探针：`milestone_retest_probe.py`、`stage_diag_probe.py`、
