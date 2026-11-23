@@ -24,6 +24,13 @@ import numpy as np
 
 from substrate_generic import collect
 from substrate_nodes import LAG, fit
+from query_graph import (
+    Applicability,
+    Query,
+    RuleBank,
+    Slot,
+    make_linear_rule,
+)
 
 
 def standardize(matrix):
@@ -245,6 +252,122 @@ def graph_statistics(agent):
     )
 
 
+def _key_indices(count):
+    """A deterministic key-node subset: vertical, horizontal, gap first."""
+    order = (0, 2, 3, 1, 4, 5, 6)
+    return order[:int(count)]
+
+
+def _slot_for(index, n_state):
+    if index < n_state:
+        return Slot("x%d" % index, 0)
+    return Slot("a%d" % (index - n_state), 0)
+
+
+def _global_rules(global_fit, n_state):
+    rules = []
+    for column, (selected, weights, r2) in global_fit.items():
+        inputs = tuple(_slot_for(index, n_state) for index in selected)
+        rules.append(make_linear_rule(
+            name="global-y%d" % column,
+            target_slot=Slot("y%d" % column, 1),
+            input_slots=inputs,
+            weights=weights,
+            confidence=float(r2),
+            support=1,
+            group=0,
+        ))
+    return rules
+
+
+def _cluster_rules(selected, weights, centers, sizes, n_state, k):
+    rules = []
+    all_slots = tuple(
+        [Slot("x%d" % index, 0) for index in range(n_state)]
+        + [Slot("a%d" % index, 0) for index in range(
+            centers.shape[1] - n_state
+        )]
+    )
+    distances = np.linalg.norm(
+        centers[:, None, :] - centers[None, :, :], axis=-1
+    )
+    distances[distances == 0.0] = np.inf
+    minimum = float(np.min(distances)) if k > 1 else 1.0
+    radius = max(1e-9, 0.45 * minimum)
+    for (cluster, column), inputs in selected.items():
+        rules.append(make_linear_rule(
+            name="c%d-y%d" % (cluster, column),
+            target_slot=Slot("y%d" % column, 1),
+            input_slots=tuple(
+                _slot_for(index, n_state) for index in inputs
+            ),
+            weights=weights[(cluster, column)],
+            confidence=1.0,
+            support=int(sizes[cluster]),
+            applicability=Applicability(
+                slots=all_slots,
+                center=centers[cluster],
+                radius=radius,
+                support=int(sizes[cluster]),
+            ),
+            group=int(cluster),
+        ))
+    return rules, all_slots, radius
+
+
+def _search_rows(global_fit, selected, weights, centers, sizes,
+                 n_state, k):
+    source = {
+        Slot("x%d" % index, 0): float(centers[0][index])
+        for index in range(n_state)
+    }
+    source.update({
+        Slot("a%d" % index, 0): float(centers[0][n_state + index])
+        for index in range(centers.shape[1] - n_state)
+    })
+    global_rules = _global_rules(global_fit, n_state)
+    global_bank = RuleBank(
+        global_rules,
+        shared_applicability=Applicability(support=1),
+    )
+    cluster, all_slots, radius = _cluster_rules(
+        selected, weights, centers, sizes, n_state, k,
+    )
+    shared_bank = RuleBank(
+        cluster,
+        shared_applicability=Applicability(
+            slots=all_slots,
+            center=centers[0],
+            radius=radius,
+            support=int(sizes[0]),
+        ),
+    )
+    independent_bank = RuleBank(cluster)
+    rows = []
+    for count in (1, 2, 3, 7):
+        targets = tuple(
+            Slot("y%d" % column, 1) for column in _key_indices(count)
+        )
+        for label, bank, group in (
+            ("global-shared", global_bank, None),
+            ("cluster-shared", shared_bank, 0),
+            ("independent", independent_bank, None),
+        ):
+            result = bank.query(Query(
+                target_slots=targets,
+                source=source,
+                budget=500,
+                group=group,
+            ))
+            rows.append(dict(
+                bank=label, key_nodes=count, visited=result.visited,
+                pruned=result.pruned, applied=result.applied,
+                unknown=result.unknown, conflicts=result.conflicts,
+                shared=result.shared_status,
+            ))
+    return rows
+
+
 def analyze_size(seed, steps, regime_values, min_support, r2_min, max_terms,
                  timing):
     transitions, _ = collect(seed=seed, steps=steps, lag=LAG)
@@ -368,6 +491,24 @@ def analyze_size(seed, steps, regime_values, min_support, r2_min, max_terms,
                     shared, "  ".join(combos),
                 )
             )
+            rows = _search_rows(
+                global_fit, selected, weights, centers, sizes,
+                observations.shape[1], k,
+            )
+            print()
+            print("-- actual search (one context, budget 500) --")
+            print(
+                "bank            keys  visited  pruned  applied  unknown  "
+                "conflicts  shared"
+            )
+            for row in rows:
+                print(
+                    "%-15s %4d %8d %7d %8d %8d %10d  %s" % (
+                        row["bank"], row["key_nodes"], row["visited"],
+                        row["pruned"], row["applied"], row["unknown"],
+                        row["conflicts"], row["shared"],
+                    )
+                )
 
     if timing:
         world, agent = fit(

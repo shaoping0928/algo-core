@@ -165,25 +165,63 @@
   （先 difference）。
 - 数据：seed 100、1500/5000 帧先跑；稳定后再 3 种子。
 
+### 本轮进度（2026-11-23）
+
+已落地（默认关/只读探针，不改默认栈）：
+
+- `query_graph.py`：`Slot` / `Pattern` / `DtSpec` / `Applicability` /
+  `Rule` / `Readout` / `Query` / `RuleBank`。精确查询只接受精确 `dt`
+  的规则；变长 `dt` 规则结构上填不进 `+1` 槽位。无输入、无规则、
+  同置信度冲突均返回 `UNKNOWN`。
+- `tests/test_query_graph.py`（14 条）：精确/变长 `dt`、共享门、
+  独立门、关键节点、递归解析、冲突、事件谓词、readout。
+- `sparse_rules.py`：每目标一条稀疏规则（BIC 前向选择 + raw OLS），
+  动作窗口只作候选；`fit_event_rule` 单槽阈值谓词（双向、balanced
+  accuracy、support 门）。
+- `tests/test_sparse_rules.py`（6 条）：稀疏 scope 恢复、规则查询、
+  事件高/低侧、纯标签 abstain。
+- `component_derivation.py`：`ThresholdSignRule` / `DifferenceSignRule` /
+  `ComponentDerivationBank`；缺输入/缺规则 → `UNKNOWN`。
+- `tests/test_component_derivation.py`（6 条）。
+- `component_free_run_probe.py`：seed 100 / 1500 帧，
+  `vy` 阈值规则 teacher 0.946 / free 0.987；difference teacher 1.000 /
+  free 0.927；说明“代码教、转移算”闭环可跑，但 free-run 会漂。
+  5000 帧复跑：`vy` teacher 0.929 / free 0.985；difference teacher
+  1.000 / free 0.912（漂移随数据量缩小）。
+- `graph_rewrite_scale_probe.py` 新增实际搜索表（1500 帧、k=16）：
+  `global-shared` 与 `cluster-shared` 的 visited = 1/2/3/7（m=1/2/3/7）；
+  `independent` = 16/32/48/112，pruned = 15/30/45/105；无 UNKNOWN/
+  conflict。**共享是 O(m)，独立是 O(k·m)。** 5000 帧同样成立。
+
+仍未做：
+
+- `fit_event_rule` 尚未在真实流上与 `death_rules` 对照
+  precision/recall/UNKNOWN；当前只有合成测试。
+- `ComponentDerivationBank` 尚未接进 `ComponentBank`/`NodeRuntime` 的
+  预测路径；当前是独立模块 + 探针，默认不生效。
+- 深度 >2 的递归、stage/interval 目标、UNKNOWN 传播的完整测试。
+- 3 种子复跑与决策侧质量门。
+
 ### 实施清单
 
-- [ ] schema：`Rule` / `Pattern` / `Query` / `Readout` /
+- [x] schema：`Rule` / `Pattern` / `Query` / `Readout` /
       `Applicability` 纯数据类 + 单测；不写 `FRAME/STAGE` 枚举，
       type 由 `pattern_out + dt` 派生。
-- [ ] 探针：shared/independent × full/key-node 的实际搜索节点数；
+- [x] 探针：shared/independent × full/key-node 的实际搜索节点数；
       记录预算、剪枝、`UNKNOWN`、冲突。
-- [ ] 拟合每目标一条稀疏规则（1500/5000），报告 scope 稳定性；
+- [x] 拟合每目标一条稀疏规则（1500/5000），报告 scope 稳定性；
       动作窗口只作为候选总线，scope 选 lag。
-- [ ] 共享 applicability：regime/context 节点；与独立选择对照，
-      只有 held-out 增益才分裂。
-- [ ] 事件谓词：碰撞/终止的 `required_slots` + 0/1/UNKNOWN；
-      与现有 `death_rules` 对照，不新增第二套死亡语义。
-- [ ] 关键节点查询：读侧 `required_slots`；full vs m=2–3 的实际
-      搜索/UNKNOWN/决策覆盖。
-- [ ] 派生概念：component label/free-run 模式；difference 规则；
-      teacher-forced vs free-run；默认关。
-- [ ] 测试：pattern/time 不匹配拒绝；UNKNOWN 传播；共享 O(k)；
-      关闭时逐位不变。
+- [x] 共享 applicability + 关键节点查询：engine 支持，探针给出
+      O(m) vs O(k·m) 的实际 visited/pruned。
+- [ ] 事件谓词：`fit_event_rule` 与现有 `death_rules` 在真实流上对照
+      precision/recall/UNKNOWN；不新增第二套死亡语义。
+- [ ] 关键节点查询接读侧：full vs m=2–3 的 UNKNOWN/决策覆盖；当前只在
+      探针里模拟。
+- [x] 派生概念：difference 规则 + label/free-run 探针；默认关。
+- [ ] 派生概念接 runtime：`ComponentDerivationBank` 接进
+      `ComponentBank`/预测路径，无规则 → UNKNOWN。
+- [x] 测试：pattern/time 不匹配拒绝；UNKNOWN 传播；共享 O(k)；
+      关闭时逐位不变（新模块独立；387 测试全过）。
 
 ### 质量门
 
