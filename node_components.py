@@ -18,6 +18,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from node_graph import CONCEPT, NodeGraph
+from query_graph import UNKNOWN as GRAPH_UNKNOWN
 
 
 SIGN_SUFFIX = {1: "+", 0: "0", -1: "-"}
@@ -224,6 +225,43 @@ class ComponentBank:
             for component_id, spec in self.specs.items()
             if spec.base_node == base_node
         ]
+
+    def free_run_step(self, derivation, state) -> Dict[str, object]:
+        """Set sign nodes from learned rules instead of the numeric filters.
+
+        This is the prediction path of the label/free-run split: the numeric
+        ``RuntimeComponent`` is not updated and no counts/associations are
+        written.  A missing rule or input deactivates all three sign nodes and
+        reports ``query_graph.UNKNOWN``; it never keeps a stale sign alive.
+        """
+        results: Dict[str, object] = {}
+        active: List[str] = []
+        for component_id, spec in self.specs.items():
+            prediction = derivation.predict(component_id, state)
+            if prediction is GRAPH_UNKNOWN:
+                for node_id in self.sign_nodes[component_id].values():
+                    self.graph.activate([node_id], [0.0])
+                self.previous_sign_node[component_id] = None
+                results[component_id] = GRAPH_UNKNOWN
+                continue
+            sign = int(prediction)
+            if sign not in (-1, 0, 1):
+                for node_id in self.sign_nodes[component_id].values():
+                    self.graph.activate([node_id], [0.0])
+                self.previous_sign_node[component_id] = None
+                results[component_id] = GRAPH_UNKNOWN
+                continue
+            node_id = self.sign_nodes[component_id][sign]
+            self.graph.activate([node_id], [1.0])
+            for other_sign, other in self.sign_nodes[component_id].items():
+                if other_sign != sign:
+                    self.graph.activate([other], [0.0])
+            self.previous_sign[component_id] = sign
+            self.previous_sign_node[component_id] = node_id
+            results[component_id] = sign
+            active.append(node_id)
+        self.last_active = active
+        return results
 
     def add_memory(self, component_ids: Optional[Iterable[str]] = None) -> str:
         ids = (

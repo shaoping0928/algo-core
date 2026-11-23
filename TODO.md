@@ -191,6 +191,17 @@
   `DeathRuleSet` 包装：precision 1.00 / recall 1.00 / balanced 1.00，
   3/210 UNKNOWN。**结论：最小事件谓词应包现有 death rules，不另造
   单槽死亡语义。**
+- `key_node_readout_probe.py`（seed 100）：
+  full 7 / fixed m=1/2/3 / vertical / horizontal 的 completion 均为
+  1.000，visited 均为目标数（每目标一条规则）；但标准化误差差异很大：
+  vertical 0.009（1500/5000 帧都稳），horizontal 0.31–0.38，
+  full 0.55。**关键节点查询本身是 O(m) 且能补全；但“补全”不等于
+  “正确”**——horizontal 目标在过柱/换管处仍有未建模事件，需要
+  `EVENT` 规则，而不是再加线性规则。
+- `ComponentBank.free_run_step(derivation, state)`：不更新数值
+  `RuntimeComponent`、不写计数/联想，只按学习规则激活/停用三个 sign
+  节点；无规则/无输入 → 三个 sign 全停用并返回 `UNKNOWN`。默认路径
+  不变；`NodeRuntime` 的预测路径尚未调用它。
 - `component_free_run_probe.py`：seed 100 / 1500 帧，
   `vy` 阈值规则 teacher 0.946 / free 0.987；difference teacher 1.000 /
   free 0.927；说明“代码教、转移算”闭环可跑，但 free-run 会漂。
@@ -224,13 +235,18 @@
 - [x] 事件谓词：`fit_event_rule` 与现有 `death_rules` 在真实流上对照
       precision/recall/UNKNOWN；结论是单槽阈值不足，生产事件谓词应包
       `DeathRuleSet`，不新增第二套死亡语义。
-- [ ] 关键节点查询接读侧：full vs m=2–3 的 UNKNOWN/决策覆盖；当前只在
-      探针里模拟。
+- [x] 关键节点查询接读侧：`key_node_readout_probe.py` 已比较 full /
+      fixed m=1..3 / vertical / horizontal；completion 均 1.0、visited
+      = m，但 horizontal 误差 0.31–0.38，说明过柱事件仍未建模。
+- [ ] 关键节点查询接 planner：把 readout 的 required_slots 接到决策
+      路径，比较 full vs m=2–3 的 UNKNOWN/决策覆盖；当前仍是探针。
 - [x] 派生概念：difference 规则 + label/free-run 探针；默认关。
-- [ ] 派生概念接 runtime：`ComponentDerivationBank` 接进
-      `ComponentBank`/预测路径，无规则 → UNKNOWN。
+- [x] 派生概念接 `ComponentBank`：`free_run_step` 不跑数值过滤器，
+      无规则/输入 → UNKNOWN；默认路径不变。
+- [ ] 派生概念接 `NodeRuntime` 预测路径：需要把 derivation bank 与
+      component id 绑定并在 rollout 中调用；当前只有 bank 方法。
 - [x] 测试：pattern/time 不匹配拒绝；UNKNOWN 传播；共享 O(k)；
-      关闭时逐位不变（新模块独立；387 测试全过）。
+      关闭时逐位不变（新模块独立；390+ 测试全过）。
 
 ### 质量门
 

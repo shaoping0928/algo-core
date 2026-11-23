@@ -2,6 +2,12 @@ import unittest
 
 from node_components import ComponentBank
 from node_graph import ASSOCIATION, CONCEPT, NodeGraph, TRANSITION_EDGE
+from component_derivation import (
+    ComponentDerivationBank,
+    ThresholdSignRule,
+    make_threshold_rule,
+)
+from query_graph import Slot, UNKNOWN
 
 
 class ComponentBankTests(unittest.TestCase):
@@ -137,6 +143,31 @@ class ComponentBankTests(unittest.TestCase):
         self.assertEqual(set(result), {capacitor, resistor})
         self.assertIn(result[capacitor], (-1, 0, 1))
         self.assertIn(result[resistor], (-1, 0, 1))
+
+    def test_free_run_step_uses_rules_and_abstains(self):
+        graph, base, bank = self.make()
+        component_id = bank.bind(base, "difference")
+        derivation = ComponentDerivationBank()
+        sign = ThresholdSignRule(
+            "sign", Slot("x", 0), threshold=0.0, support=10,
+            confidence=1.0,
+        )
+        derivation.bind(
+            component_id,
+            make_threshold_rule(
+                sign, Slot("x", 0), Slot("sign", 1)
+            ),
+        )
+        result = bank.free_run_step(derivation, {Slot("x", 0): 1.0})
+        self.assertEqual(result[component_id], 1)
+        self.assertEqual(bank.previous_sign[component_id], 1)
+        self.assertEqual(
+            bank.active_sign_nodes(),
+            [bank.sign_nodes[component_id][1]],
+        )
+        missing = bank.free_run_step(derivation, {})
+        self.assertIs(missing[component_id], UNKNOWN)
+        self.assertEqual(bank.active_sign_nodes(), [])
 
 
 if __name__ == "__main__":
