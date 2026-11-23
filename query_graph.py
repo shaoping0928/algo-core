@@ -101,6 +101,26 @@ class DtSpec:
         return True
 
 
+@dataclass(frozen=True)
+class TimeWindow:
+    """A coarse target: any outcome time in the inclusive interval."""
+
+    minimum: int
+    maximum: int
+
+    def __post_init__(self) -> None:
+        if int(self.minimum) > int(self.maximum):
+            raise ValueError("minimum must not exceed maximum")
+
+    def contains(self, time: int) -> bool:
+        return int(self.minimum) <= int(time) <= int(self.maximum)
+
+    def overlaps(self, minimum: int, maximum: int) -> bool:
+        return int(self.maximum) >= int(minimum) and (
+            int(self.minimum) <= int(maximum)
+        )
+
+
 @dataclass
 class Applicability:
     """A learned entry condition over source slots.
@@ -239,6 +259,7 @@ class Query:
     readout: Optional[Readout] = None
     budget: int = 1000
     group: Optional[int] = None
+    target_windows: Optional[Mapping[Slot, TimeWindow]] = None
 
 
 @dataclass
@@ -252,6 +273,8 @@ class QueryResult:
     shared_status: str
     readout: Any
     readout_unknown: bool
+    times: Dict[Slot, Optional[int]] = field(default_factory=dict)
+    coarse: Tuple[Slot, ...] = ()
 
 
 class RuleBank:
@@ -292,6 +315,39 @@ class RuleBank:
     def query(self, query: Query) -> QueryResult:
         return _Engine(self, query).run()
 
+    def candidates_for_window(self, slot: Slot,
+                              window: TimeWindow) -> List[tuple]:
+        """Candidates for a coarse target window.
+
+        Exact-dt rules fill the nominal ``slot.time`` if it lies in the
+        window.  A variable-dt rule is admitted only when its output slot is
+        relative time 0 and its duration interval overlaps the window; its
+        result is marked coarse and its actual time is unknown.
+        """
+        found = []
+        if not window.contains(slot.time):
+            return found
+        for rule in self._by_output.get(slot.name, ()):
+            if rule.dt.is_exact:
+                application_time = int(slot.time) - int(rule.dt.exact)
+                if application_time < 0:
+                    continue
+                if any(
+                    int(output.time) != int(rule.dt.exact)
+                    for output in rule.pattern_out.slots
+                ):
+                    continue
+                found.append((rule, int(slot.time), False, application_time))
+            else:
+                if rule.dt.minimum is None or rule.dt.maximum is None:
+                    continue
+                if any(int(output.time) != 0 for output in rule.pattern_out.slots):
+                    continue
+                if not window.overlaps(rule.dt.minimum, rule.dt.maximum):
+                    continue
+                found.append((rule, None, True, 0))
+        return found
+
 
 class _Engine:
     def __init__(self, bank: RuleBank, query: Query) -> None:
@@ -306,6 +362,12 @@ class _Engine:
         self._stack: set = set()
         self._resolved: Dict[Slot, Any] = {}
         self._checks: Dict[str, str] = {}
+        self.times: Dict[Slot, Optional[int]] = {
+            slot: slot.time for slot in query.source
+        }
+        self.coarse_slots: set = set()
+        self._resolved_times: Dict[Slot, Optional[int]] = {}
+        self._resolved_coarse: Dict[Slot, bool] = {}
 
     def run(self) -> QueryResult:
         if self.bank.shared_applicability is not None:
@@ -314,6 +376,7 @@ class _Engine:
             if status != ACTIVE:
                 for slot in self.query.target_slots:
                     self.values[slot] = UNKNOWN
+                    self.times[slot] = None
                 return self._result()
         for slot in self.query.target_slots:
             self._resolve(slot)
@@ -330,6 +393,10 @@ class _Engine:
             1 for slot in self.query.target_slots
             if self.values.get(slot, UNKNOWN) is UNKNOWN
         )
+        coarse = tuple(
+            slot for slot in self.query.target_slots
+            if slot in self.coarse_slots
+        )
         return QueryResult(
             values=dict(self.values),
             visited=self.visited,
@@ -340,52 +407,84 @@ class _Engine:
             shared_status=self.shared_status,
             readout=readout_value,
             readout_unknown=bool(readout_unknown),
+            times=dict(self.times),
+            coarse=coarse,
         )
+
+    def _window_for(self, slot: Slot) -> Optional[TimeWindow]:
+        if self.query.target_windows is None:
+            return None
+        return self.query.target_windows.get(slot)
 
     def _resolve(self, slot: Slot) -> Any:
         if slot in self.values and self.values[slot] is not UNKNOWN:
+            self.times.setdefault(slot, slot.time)
             return self.values[slot]
         if slot in self._resolved and self._resolved[slot] is not UNKNOWN:
-            self.values[slot] = self._resolved[slot]
-            return self._resolved[slot]
+            value = self._resolved[slot]
+            self.values[slot] = value
+            self.times[slot] = self._resolved_times.get(slot)
+            if self._resolved_coarse.get(slot, False):
+                self.coarse_slots.add(slot)
+            return value
         if self.visited >= int(self.query.budget):
             self.values[slot] = UNKNOWN
+            self.times[slot] = None
             return UNKNOWN
         if slot in self._stack:
             self.values[slot] = UNKNOWN
+            self.times[slot] = None
             return UNKNOWN
         self._stack.add(slot)
-        candidates = self.bank.candidates(slot)
+        window = self._window_for(slot)
+        if window is None:
+            candidates = [
+                (
+                    rule, int(slot.time), False,
+                    int(slot.time) - int(rule.dt.exact),
+                )
+                for rule in self.bank.candidates(slot)
+            ]
+        else:
+            candidates = self.bank.candidates_for_window(slot, window)
         if self.query.group is not None:
             candidates = [
-                rule for rule in candidates
-                if rule.group is None or int(rule.group) == int(self.query.group)
+                item for item in candidates
+                if item[0].group is None
+                or int(item[0].group) == int(self.query.group)
             ]
-        outcomes: List[Tuple[Rule, Any]] = []
-        for rule in candidates:
+        outcomes: List[Tuple[Rule, Any, bool, Optional[int]]] = []
+        for rule, output_time, is_coarse, application_time in candidates:
             status = self._applicability(rule)
             self.visited += 1
             if status != ACTIVE:
                 self.pruned += 1
                 continue
-            local_state = self._resolve_inputs(rule, slot)
+            local_state = self._resolve_inputs(rule, int(application_time))
             if local_state is None:
                 continue
             prediction = rule.predict(local_state)
             if prediction is UNKNOWN:
                 continue
-            outcomes.append((rule, prediction))
+            outcomes.append((rule, prediction, bool(is_coarse), output_time))
         self._stack.discard(slot)
         if not outcomes:
             self.values[slot] = UNKNOWN
+            self.times[slot] = None
             return UNKNOWN
-        chosen, conflict = self._choose(outcomes)
+        chosen, conflict, is_coarse, output_time = self._choose(outcomes)
         if conflict:
             self.values[slot] = UNKNOWN
+            self.times[slot] = None
             self.conflicts += 1
             return UNKNOWN
         self.values[slot] = chosen
+        self.times[slot] = output_time
+        if is_coarse:
+            self.coarse_slots.add(slot)
         self._resolved[slot] = chosen
+        self._resolved_times[slot] = output_time
+        self._resolved_coarse[slot] = bool(is_coarse)
         self.applied += 1
         return chosen
 
@@ -397,41 +496,49 @@ class _Engine:
         self._checks[rule.name] = status
         return status
 
-    def _resolve_inputs(self, rule: Rule, target: Slot) -> Optional[Dict[Slot, Any]]:
-        if not rule.dt.is_exact:
-            return None
-        application_time = int(target.time) - int(rule.dt.exact)
+    def _resolve_inputs(self, rule: Rule,
+                        application_time: int) -> Optional[Dict[Slot, Any]]:
         local: Dict[Slot, Any] = {}
         for slot in rule.pattern_in.slots:
-            absolute = Slot(slot.name, application_time + int(slot.time))
+            absolute = Slot(slot.name, int(application_time) + int(slot.time))
             value = self._resolve(absolute)
             if value is UNKNOWN:
                 return None
             local[slot] = value
         return local
 
-    def _choose(self, outcomes: List[Tuple[Rule, Any]]) -> Tuple[Any, bool]:
+    def _choose(self, outcomes: List[
+            Tuple[Rule, Any, bool, Optional[int]]]) -> Tuple[
+                Any, bool, bool, Optional[int]]:
         outcomes = sorted(
             outcomes,
             key=lambda item: (
+                bool(item[2]),
                 -float(item[0].confidence),
                 -int(item[0].support),
                 item[0].name,
             ),
         )
-        best_rule, best_value = outcomes[0]
+        best_rule, best_value, best_coarse, best_time = outcomes[0]
+        same_resolution = [
+            item for item in outcomes
+            if bool(item[2]) == bool(best_coarse)
+        ]
         conflicting = [
-            value for _, value in outcomes[1:]
-            if not _values_equal(value, best_value)
+            item[1] for item in same_resolution[1:]
+            if not _values_equal(item[1], best_value)
         ]
         if not conflicting:
-            return best_value, False
-        # A confidence gap resolves the conflict; a tie is UNKNOWN.
-        if len(outcomes) > 1:
-            gap = float(outcomes[0][0].confidence) - float(outcomes[1][0].confidence)
+            return best_value, False, bool(best_coarse), best_time
+        if len(same_resolution) > 1:
+            gap = float(same_resolution[0][0].confidence) - float(
+                same_resolution[1][0].confidence
+            )
             if gap > 1e-9:
-                return best_value, False
-        return UNKNOWN, True
+                return (
+                    best_value, False, bool(best_coarse), best_time,
+                )
+        return UNKNOWN, True, False, None
 
 
 def _values_equal(left: Any, right: Any) -> bool:

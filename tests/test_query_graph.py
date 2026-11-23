@@ -9,6 +9,7 @@ from query_graph import (
     INACTIVE,
     UNKNOWN,
     Applicability,
+    CallablePredictor,
     DtSpec,
     Pattern,
     Query,
@@ -16,6 +17,7 @@ from query_graph import (
     Rule,
     RuleBank,
     Slot,
+    TimeWindow,
     make_event_rule,
     make_linear_rule,
 )
@@ -291,6 +293,70 @@ class QueryGraphTest(unittest.TestCase):
         self.assertFalse(DtSpec.steps(1).allows(2))
         self.assertTrue(DtSpec.interval(5, 10).allows(7))
         self.assertFalse(DtSpec.interval(5, 10).allows(4))
+
+    def test_window_accepts_a_variable_dt_rule_and_marks_it_coarse(self):
+        stage = Rule(
+            name="stage",
+            pattern_in=Pattern((Slot("x", 0),)),
+            pattern_out=Pattern((Slot("stage", 0),)),
+            dt=DtSpec.interval(5, 10),
+            predictor=CallablePredictor(lambda state: 7.0),
+        )
+        bank = RuleBank([stage])
+        target = Slot("stage", 8)
+        result = bank.query(Query(
+            target_slots=(target,),
+            source={Slot("x", 0): 1.0},
+            target_windows={target: TimeWindow(5, 10)},
+        ))
+        self.assertEqual(result.values[target], 7.0)
+        self.assertEqual(result.coarse, (target,))
+        self.assertIsNone(result.times[target])
+        self.assertEqual(result.applied, 1)
+
+    def test_window_rejects_a_rule_outside_the_interval(self):
+        stage = Rule(
+            name="stage",
+            pattern_in=Pattern((Slot("x", 0),)),
+            pattern_out=Pattern((Slot("stage", 0),)),
+            dt=DtSpec.interval(5, 10),
+            predictor=CallablePredictor(lambda state: 7.0),
+        )
+        bank = RuleBank([stage])
+        target = Slot("stage", 8)
+        result = bank.query(Query(
+            target_slots=(target,),
+            source={Slot("x", 0): 1.0},
+            target_windows={target: TimeWindow(2, 4)},
+        ))
+        self.assertIs(result.values[target], UNKNOWN)
+        self.assertEqual(result.visited, 0)
+
+    def test_window_prefers_an_exact_rule_over_a_coarse_one(self):
+        exact = Rule(
+            name="exact",
+            pattern_in=Pattern(()),
+            pattern_out=Pattern((Slot("stage", 1),)),
+            dt=DtSpec.steps(1),
+            predictor=CallablePredictor(lambda state: 1.0),
+        )
+        coarse = Rule(
+            name="coarse",
+            pattern_in=Pattern(()),
+            pattern_out=Pattern((Slot("stage", 0),)),
+            dt=DtSpec.interval(5, 10),
+            predictor=CallablePredictor(lambda state: 2.0),
+        )
+        bank = RuleBank([coarse, exact])
+        target = Slot("stage", 8)
+        result = bank.query(Query(
+            target_slots=(target,),
+            source={},
+            target_windows={target: TimeWindow(5, 10)},
+        ))
+        self.assertEqual(result.values[target], 1.0)
+        self.assertEqual(result.coarse, ())
+        self.assertEqual(result.times[target], 8)
 
 
 if __name__ == "__main__":

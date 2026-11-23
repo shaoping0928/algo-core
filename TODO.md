@@ -197,6 +197,13 @@
   full 0.55。**关键节点查询本身是 O(m) 且能补全；但“补全”不等于
   “正确”**——horizontal 目标在过柱/换管处仍有未建模事件，需要
   `EVENT` 规则，而不是再加线性规则。
+- `query_graph.TimeWindow` + `Query.target_windows`：
+  - 精确目标仍只接受精确 `dt`；
+  - 变长 `dt` 规则只进入窗口目标，输出标记 `coarse=True`、
+    `times=None`；
+  - 同槽位同时有精确/粗规则时，精确优先；
+  - 变量规则约定 `pattern_out` 相对时间 0，查询从当前时刻起算；
+  - 3 条窗口测试。
 - `ComponentBank.free_run_step(derivation, state)`：不更新数值
   `RuntimeComponent`、不写计数/联想，只按学习规则激活/停用三个 sign
   节点；无规则/无输入 → 三个 sign 全停用并返回 `UNKNOWN`。默认路径
@@ -218,8 +225,6 @@
 
 - `ComponentDerivationBank` 尚未接进 `NodeRuntime` 的预测路径；当前是
   独立模块 + 探针 + `ComponentBank.free_run_step`，默认不生效。
-- stage/interval 目标（变长 `dt` 的粗查询）尚未实现；当前精确查询会
-  结构上拒绝变长规则。
 - 3 种子只跑了诊断探针（组件/读数/搜索），决策侧质量门尚未做。
 - 关键节点查询尚未接 planner；`required_slots` 仍由探针手动传入。
 
@@ -252,8 +257,8 @@
       393 测试全过）。
 - [x] 3 种子诊断复跑：组件 free-run、key-node readout、搜索表在
       100/101/102 上同向；这不是决策侧质量门。
-- [ ] stage/interval 目标：变长 `dt` 的粗查询尚未实现；当前精确查询
-      结构上拒绝变长规则。
+- [x] stage/interval 目标：`TimeWindow` + `target_windows` 已实现；
+      变长 `dt` 只进窗口目标、结果标 coarse，精确目标仍拒绝；3 条测试。
 
 ### 质量门
 
