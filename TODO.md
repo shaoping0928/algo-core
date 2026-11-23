@@ -5,6 +5,21 @@
 > 未完成事项、新方向设计**。更早的审计与解剖材料保留在文末
 > 「历史附录（只读）」，不再维护。
 
+## 方向校正（2026-11-23，用户）
+
+- **8 步帧级组合是默认栈的基线诊断，不是设计轴。** 它的 endpoint drift
+  是预期现象；不要用 B0.6/B1-plan 的帧级结论判断或调优事件/阶段级模型。
+- **目标架构**：fine executor 缩到 **6 步**；粗层是**事件/阶段级 outcome
+  transition**；跨度是停时分布，不是固定 6/8 帧；粗层只做方向/约束/
+  早期预警，fine-first。
+- **只依赖帧不能解决近视**：6 步只会让事件/阶段层更必要；不能把
+  terminal 判断继续压在帧级 endpoint 上。
+- **B0/B0.5/B0.6/B1-plan 的作用**：解释当前 frame-level 默认栈为何在
+  seed 101 失败；**不构成对事件/阶段级设计的否定**。事件/阶段级模型
+  尚未按新口径测试。
+- **P0-E（帧级 OOD-gated rank-only）删除，不做**；8 帧调试线
+  （B0–B1-plan）就此关闭，不再加帧级探针或帧级补丁。
+
 ## 最近更新（2026-11-23 晚）
 
 - **B0（`729aa24`）**：seed 101、85 决策、10 个 relevant miss；
@@ -35,6 +50,11 @@
   → **3 种子非退化门失败**：seed 101 的增益不迁移，seed 100 退化，
   seed 102 退化。不接线；下一步只考虑 OOD/UNKNOWN 门后的
   rank-only 复测，或回到 world endpoint 改善。
+
+> **范围说明**：以上 B0–B1-plan 全部是 **frame-level 默认栈** 的诊断
+> （8 步帧级 rollout / 帧级 endpoint risk）。它们回答“为什么不能继续
+> 调 8 步帧级 score”，**不是**对事件/阶段级 outcome transition 的测试，
+> 也不能用来否定 Batch 8。
 
 ## 里程碑 / 阶段 / 长程：2026-11-23 总结
 
@@ -106,11 +126,15 @@
       已完成；seed 101 有 ranking 增益但 calibration 失败；seed 100
       从 62/62 退化到 60/62（worsened 2, improved 0）；seed 102
       terminal base rate 0.000，模型退化。**非退化门失败**，不接线。
-- [ ] **P0-E OOD/UNKNOWN 门后的 rank-only 复测（可选，后做）**：
-      只在 fine 近并列且 endpoint 在训练密度内时允许重排；
-      否则 UNKNOWN/保持 fine。先做 3 种子只读，不得默认开。
-      若 OOD 门不能恢复 100/102，则停止 plan-level endpoint
-      correction，转回 world endpoint 改善。
+- [x] **帧级 8 帧调试线（B0–B1-plan）关闭**（2026-11-23）：只保留两条
+      基线证据（B0 决策分类、8 步组合终点不可靠）；不再加帧级探针、
+      不做帧级 endpoint re-ranker（原 P0-E 删除）。
+- [ ] **P0-F 6 步 fine executor 基线**：horizon 6 vs 8，3 种子、
+      120–124；记录 frames/passes、候选 gap、决策质量。6 步是
+      新目标，但先作为基线验证，不直接改默认。
+- [ ] **P1 事件/阶段结果转移审计（当前主线，只读）**：按 Batch 8 的
+      outcome predicate + stopping-time 设计做审计；不是旧的
+      context/stage 聚类。详见 Batch 8。
 - [ ] **P1 阶段数据规模**：结果分布身份已通过，但每局约 1 条转移；需要
       采集规模（~100 局/option）才能填 `(stage, option)` 单元。
       P0 time-in-state 已判零，不能靠 clock/phase 补这个规模。
@@ -695,31 +719,28 @@ Router：
 - 只在决策边际小的时候消费，避免改写强信号；
 - H=12 搜索不是默认，只由粗层风险触发、按状态局部扩展。
 
-### B0 后的修正（2026-11-23，当前有效）
+### B0 后的修正（2026-11-23，**仅 frame-level 基线**）
 
-B0/B0.5/B0.6/B1-plan 把 seed 101 的问题从“首动作/分数列”缩到
-**plan-level predicted endpoint**：
+B0/B0.5/B0.6/B1-plan 把**当前 8 步帧级默认栈**在 seed 101 的失败从
+“首动作/分数列”缩到 **frame-level predicted endpoint**：
 
 - 8/10 miss 的 selected 与 oracle-best 在各自最佳后缀下首动作等价，
   首动作 router 即使完美也修不了；
 - 8 个 plan-level miss 只有 risk 一列活跃，value/curiosity/q 为 0；
 - risk 的 step 部分为 0，几乎全是 endpoint terminal hazard；
   预测 terminal 反向 8/8，真实 terminal 7/8 正确；
-- predicted endpoint 的 leave-one-world-out 读数在 seed 101 把
-  same-action top1 从 61/69 提到 68/69、B0 miss 从 2/10 提到 9/10，
-  但 calibration 失败（Brier skill −0.092、within −0.793）。
+- frame-level endpoint 读数在 seed 101 有 ranking 信号，但 3seed
+  非退化失败、calibration 失败。
 
-当前最小可行版本改成：
+**这些是 frame-level 基线诊断，不是设计轴。** 不要用它们来：
 
-- 输入 = planner 的 **predicted endpoint**（7 维；不加 OOD/fine 特征）；
-- 标签 = 候选真实 terminal（within H）；leave-one-world-out；
-- 输出先只做 **rank-only**：同动作内最低预测风险；
-- OOD 距离只做排序后的 gate，不做特征；
-- **3seed 已失败**：seed 100 退化、seed 102 无 terminal 标签；
-  只剩 OOD/UNKNOWN 门后的 rank-only 复测，否则回到 world endpoint；
-- 过门后才考虑 opt-in plan-level near-tie assist；默认关。
-- 首动作 action-conditioned hazard / router 继续暂缓，除非未来出现
-  正首动作对比且支持足够的状态。
+- 判断事件/阶段级 outcome transition 是否可行；
+- 调 8 步帧级 endpoint / risk 权重；
+- 把首动作 router 或帧级 endpoint re-ranker 接进默认栈。
+
+当前设计方向改为 **Batch 8：6 步 fine executor + 事件/阶段级
+outcome transition**。帧级 endpoint 只作为基线和局部执行器，不承担
+长程 terminal 判断。
 
 ### 两份设计备忘录的合并结论（2026-11-23）
 
@@ -1054,6 +1075,68 @@ transition，重训 world/hazard；指标是候选端点 R² 和 plan-level 选�
 - 不在 3seed 非退化门和校准门未过时接 plan-level endpoint 重排；
 - 不用小 beam 长视界做贪心剪枝（w64 长视界 −22）；
 - 不把“再加一个 0.01–0.1 的项”当成候选分辨力的解。
+
+## Batch 8：6 步 fine executor + 事件/阶段结果转移（2026-11-23，用户方向）
+
+**一句话**：帧级 8 步只作为基线诊断；目标是把 fine executor 缩到
+**6 步**，由**事件/阶段级 outcome transition** 承担长程；跨度是
+**停时分布**，不是固定 6/8 帧；粗层只做方向/约束/早期预警，fine-first。
+
+### 为什么
+
+- 8 步帧级组合的 endpoint drift 是预期现象，**不作为设计轴**；
+- 6 步会降低 compounding error，但近视更严重；只依赖帧不能解决
+  长程 terminal 判断，必须由事件/阶段层补上；
+- 旧 stage graph 的失败点是 context 聚类身份不跨 episode、主断点常是
+  世界时钟；新口径的层 = **outcome predicate**，不是上下文簇。
+
+### 设计
+
+- fine：6 步帧级 MPC，只做局部执行；不在自身视界外做 terminal 判断；
+- 事件/阶段层：
+  - 层 = `(结果谓词 O, 结果字母表 A_O)`；
+  - 跨度 = `P(T | entry, option)` 的停时分布，持续时间是输出；
+  - 入口条件、action/option、target outcome、support、calibration、
+    validity；不足 → UNKNOWN；
+- router：fine-first；粗层只在 fine 近并列 / 失明 / OOD 时查询；
+  粗层不能覆盖有效 fine；默认关；UNKNOWN 不当安全；
+- 数据：被动数据可学事件/停时/入口/行为结果；长跨度 option 对比
+  需要定向配对采集（序列 propensity 乘积会塌）；
+- 评估：事件支持、动作特异性、非时钟性、事件后 regime 改变、
+  跨 episode 校准；**不是** 8 步 state MSE 或 frame endpoint drift。
+
+### 首批实验
+
+1. **事件/阶段 outcome audit（只读，第一优先）**：
+   从 feedback/terminal/pain/reset 与观测分位生成候选结果谓词；拟合
+   distributed-lag cause-specific hazard / stopping-time 模型；
+   过五测（支持、动作条件性、非时钟、事件后 regime 改变、
+   跨 episode 校准）；报告 event AUC/Brier、duration 分位数、
+   action contrast、support/UNKNOWN。
+   **口径自足**：B0 的“2/10 action contrast”是当前帧级候选集的性质，
+   不用来 gate 事件/阶段层；事件层的对比按自己的 option/事件口径测。
+2. **6 步 fine executor 基线 A/B（3 种子，120–124）**：
+   horizon 6 vs 8；记录 frames/passes、候选 first-action gap、
+   decision regret、selected survives；默认栈先不改。这是 executor
+   校准，不是方案本身。
+3. **事件级早期预警（只读）**：
+   用当前状态的事件 hazard 触发更早行动；与 frame-level baseline
+   比较 escape/regret；不是逐帧 cost。
+4. **只有 1–3 过门**才做 opt-in router：
+   6 步 fine executor + 事件/阶段 coarse 方向/约束；
+   3 种子配对、6 种子确认；默认关。
+
+### 非目标
+
+- 8 帧调试线已关闭：不再加帧级探针/补丁，不做帧级 endpoint
+  re-ranker（原 P0-E）；
+- 不继续调 8 步帧级 endpoint / risk 权重；
+- 不把 8 步帧级 endpoint drift 当作事件/阶段级设计的反证；
+- 不把 6 步或 8 步当“层”的定义；层由 outcome predicate 定义；
+- 不用 context 簇/stage 身份替代 outcome predicate；
+- 粗层不得覆盖有效 fine，不做全局逐帧 cost/veto。
+
+
 
 ## 历史状态（2026-11-21，只读）
 
