@@ -63,6 +63,10 @@
       探针、schema、每目标稀疏规则、共享 applicability、事件谓词、
       关键节点读数、stage/interval 目标、组件 free-run、查询图世界模型
       已落地；剩余 planner/NodeRuntime 接线与决策侧质量门。默认栈不变。
+- [ ] **P0-C 候选分辨力（Batch 7）**：先做候选存在性审计
+      （无逃生 / 有逃生但 score 排后 / 已选 oracle-best），再用
+      margin-gated、endpoint-only 的长 lead 信号只修可识别性；
+      不用全局逐帧 cost、不全局 veto。详见下方 Batch 7。
 - [ ] **P1 阶段数据规模**：结果分布身份已通过，但每局约 1 条转移；需要
       采集规模（~100 局/option）才能填 `(stage, option)` 单元。
 - [ ] **P1 value 保持 opt-in**：状态级有效、计划级不差、局级 1/3；等表示层
@@ -74,7 +78,11 @@
       `value_harm_probe.py`、`stage_option_probe.py`、
       `transition_policy_probe.py`、`hierarchy_ab.py`、`hierarchy_track_ab.py`、
       `margin_gate_ab.py`、`pain_horizon_probe.py`、`precursor_ab.py`、
-      `veto_ab.py`、`plan_level_probe.py`、`graph_rewrite_scale_probe.py`。
+      `veto_ab.py`、`plan_level_probe.py`、`graph_rewrite_scale_probe.py`、
+      `query_world_probe.py`、`event_predicate_probe.py`、
+      `component_free_run_probe.py`、`decision_event_probe.py`、
+      `time_in_state_probe.py`、`time_world_probe.py`、
+      `time_wiring_probe.py`、`age_residual_probe.py`。
 
 
 ## Batch 6：查询驱动图重写与最小规则库（2026-11-23）
@@ -533,6 +541,113 @@ decisions；`branches=8 + tail=4`、horizon 8、无 hard death veto；事件
 - 3 种子方向 + 6 种子确认（≥5/6 同向）；
 - 先看 frames/passes，再看候选第一动作 gap / decision regret；
 - 默认关，未过质量门不接默认。
+
+## Batch 7：候选分辨力（2026-11-23）
+
+**一句话**：候选分辨力不是“再加一个分数项”，而是四个不同问题：
+**存在性、可识别性、稳定性、实现性**。不同 seed / 状态落在不同问题
+上，不能用一个全局 cost 同时解决。
+
+### 四个子问题
+
+| 子问题 | 问题 | 当前证据 |
+|---|---|---|
+| **存在性** | 当前状态附近，H 帧内有没有更好的候选？ | `oracle@8 = policy@8`；H=8/10 内所有候选都死；H=12 有逃生，但默认策略走到的状态 12 帧内宏/随机方案存活率 0% |
+| **可识别性** | 有更好候选时，score/readout 能不能排上来？ | seed 101：oracle-best **10/10 feasible**，但 **10/10 被 score 排后**；seed 100/102：decision-relevant miss **0** |
+| **稳定性** | 顶端候选差距是否小于噪声/新项？ | 第一动作 gap 中位 **0.008–0.026**；**4–33%** 决策 <1e-3；顶端 margin p50 **1e-3** |
+| **实现性** | 第一动作选对后，后续重规划是否吃掉优势？ | 计划级 value 选对率 0.82/0.86 vs 0.73/0.79，几乎不分歧；伤害是分叉后的累积 |
+
+### 证据排序
+
+1. **seed 101：可识别性不足（最高优先）**
+   - 10 个 decision-relevant miss；
+   - oracle-best 10/10 feasible；
+   - 10/10 被 score 排后；
+   - death veto 0。
+   → 不是没候选、不是死亡规则没抓，而是 **score 没把更长存活计划排上来**。
+   需要 ≥10 帧 lead 的**可信排序信号**，不是再加一个逐帧项。
+
+2. **seed 100/102：存在性不足（晚期状态）**
+   - H=8 内所有候选都死；
+   - 再好的分类/score 也救不了；
+   - `oracle@8 = policy@8`。
+   → 需要更早行动 / 更长有效视界 / 不同状态分布，而不是更好的选择。
+
+3. **所有 seed：稳定性不足**
+   - 第一动作 gap 0.008–0.026，4–33% <1e-3；
+   - 价值项均值 0.022，是顶端 gap 的 10–60 倍，从第 3–11 帧就改写动作；
+   - 任何 0.01–0.1 的新项都会翻掉一部分近并列决策。
+   → 需要 **margin-aware 仲裁**，不是全局调权重。
+
+4. **实现性：分叉后的累积**
+   - 局部第一动作并不差；
+   - 伤害来自分叉后落在不同状态，再叠加同样的低 margin。
+   → 需要 commitment / 事件边界 / option，但当前数据/身份不足，后置。
+
+5. **探索/覆盖**
+   - 行为策略拍翅率 8–11%，强自相关；
+   - 世界模型在行为分布上 h1 R² 0.99，但 planner 候选是 off-policy；
+   - 同状态两个动作的真实结局样本很少（plan-level 仅 11–14 个可判定决策）。
+   → 候选评分在危险附近动作对比上数据不足。
+
+### 实验 A：候选存在性审计（只读，先做）
+
+在每个真实决策点，把决策分类：
+
+```text
+A. H=8 内无逃生            → 存在性（需要更早/更长视界）
+B. H=8 内有更好候选，但 score 排后 → 可识别性
+C. 已选中 oracle-best      → 正常
+```
+
+同时记录：
+
+- H=8 / 10 / 12 的 escape 数；
+- 第一动作 gap；
+- oracle-best 是否 feasible；
+- 是否存在「H=8 全死、H=12 有逃生」。
+
+复用：
+`doom_horizon_probe.py`、`causal_horizon_probe.py`、
+`planner_rollout_quality.py`、`decision_margin_probe.py`。
+
+**判据**：
+
+- seed 101 若主要是 B → 先修可识别性；
+- seed 100/102 晚期若主要是 A → 先修存在性/视界/状态分布；
+- 若 A 在所有 seed 占主导 → 不要再加 score 项，直接做更早行动/视界；
+- 只读，不改默认。
+
+### 实验 B：endpoint-only 长 lead 信号（opt-in）
+
+只针对 **可识别性**，不改逐帧 cost：
+
+- 候选端点用 `pain_gamma=0.9` 或长窗 hazard（h=12，precursor
+  窗口 10/16）打分；
+- **只在 baseline 第一动作 gap < ε 时启用**；
+- 只做**相对排序/下限比较**，不把绝对水平加进 cost；
+- 不全局 veto；新信号与 baseline 冲突且无足够 lead 时保留 baseline。
+
+质量门：
+
+- seed 101：decision-relevant miss / regret 下降；
+- seed 100/102：selected survives 不下降；
+- 3 种子配对；6 种子确认（≥5/6 同向）。
+- 默认关；未过门不接默认。
+
+### 实验 C：定向反事实覆盖（可选，后做）
+
+只在**高不确定/高危险候选端点**上尝试另一个动作，收集 paired
+transition，重训 world/hazard；指标是候选端点 R² 和 plan-level 选对率，
+不是全局覆盖率。现有全局 coverage / VOI 在 6 种子是 null，不再重复。
+
+### 非目标
+
+- 不再加 time-in-state / current-frame clock / phase（P0 已判零）；
+- 不做全局逐帧长窗罚项 / 全局端点 veto（已有 0/3、121.7 vs 152.9）；
+- 不在没有阶段数据/身份时继续 stage/option 消费；
+- 不用小 beam 长视界做贪心剪枝（w64 长视界 −22）；
+- 不把“再加一个 0.01–0.1 的项”当成候选分辨力的解。
 
 ## 当前状态（2026-11-21）
 
