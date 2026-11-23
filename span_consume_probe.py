@@ -11,13 +11,16 @@ then read on the h6 evaluation episodes (held-out worlds 120-124).
 
 Arms (span 8/12/16, primary 12):
 
-- ``table_dagger``: state-only two-level span table, fitted on h6 DAgger
-  episodes, tau from episode-fold predictions;
-- ``table_passive``: the same table fitted on the passive stream (the old
-  distribution control);
-- ``logistic_dagger``: the parametric state + lags + event-history hazard
-  fitted on h6 DAgger episodes (the E1-recommended parametric arm);
-- ``logistic_passive``: the same hazard fitted on the passive stream.
+- ``table_deploy``: state-only table fitted on a fresh 5000-frame stream
+  collected under the deployment configuration (curiosity off, same
+  horizon and decision rule) - the E2.1 test of the collection-policy
+  shift;
+- ``table_dagger``: the same table fitted on the training-time DAgger
+  stream (curiosity on);
+- ``table_passive``: the same table fitted on the passive stream;
+- ``logistic_deploy`` / ``logistic_dagger`` / ``logistic_passive``: the
+  parametric state + lags + event-history hazard on the same three
+  streams.
 
 Also measured on the eval stream: reliability bins of the table readout,
 and two online-usable uncertainty proxies (fine-node support and distance
@@ -47,7 +50,9 @@ from outcome_level_probe import (
 )
 from probe_cache import load_or_fit
 from substrate_generic import collect
-from substrate_nodes import LAG, _curiosity_off, evaluate
+from substrate_nodes import (
+    LAG, _curiosity_off, collect_planner, evaluate,
+)
 from tree_transition_probe import (
     HORIZON, _assign, _valid, calibration_transfer, evaluate_table,
     fit_tree, predict_tree,
@@ -68,6 +73,31 @@ def load_h6(seed, args):
         if int(row.get("episode", 0)) >= 50000
     ]
     return world, agent, rows
+
+
+def collect_deploy(seed, world, agent, args):
+    """The readout's training stream under the deployment configuration.
+
+    ``collect_planner`` is the training-time recorder; wrapping it in
+    ``_curiosity_off`` reproduces the evaluation policy exactly (curiosity
+    off, same horizon and decision rule, no death rules).  Episode ids use
+    a fresh offset so they cannot collide with the behaviour or DAgger
+    streams.
+    """
+    with _curiosity_off(agent):
+        rows, frames = collect_planner(
+            int(seed), world, agent,
+            episodes=int(args.deploy_frames),
+            cap=5000, horizon=6, lag=LAG, step_stride=2,
+            offset=int(args.deploy_offset),
+            max_frames=int(args.deploy_frames),
+        )
+    print(
+        "deploy stream: %d rows, %d episodes, frames %s" % (
+            len(rows), len(frames), "/".join(str(value) for value in frames[:6]),
+        )
+    )
+    return rows
 
 
 def eval_tables(seed, world, agent, eval_seeds):
@@ -272,6 +302,8 @@ def main():
     parser.add_argument("--l2", type=float, default=0.01)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--precision-target", type=float, default=0.5)
+    parser.add_argument("--deploy-frames", type=int, default=5000)
+    parser.add_argument("--deploy-offset", type=int, default=70000)
     parser.add_argument("--cache-prefix", default="consume")
     parser.add_argument("--refit", action="store_true")
     parser.add_argument("--report", default="")
@@ -283,9 +315,11 @@ def main():
     passive_rows, _counts = collect(
         seed=args.seed, steps=args.steps, coverage=args.coverage, lag=LAG,
     )
+    deploy_rows = collect_deploy(args.seed, world, agent, args)
     from outcome_level_probe import episode_tables
     dagger_tables = episode_tables(dagger_rows)
     passive_tables = episode_tables(passive_rows)
+    deploy_tables = episode_tables(deploy_rows)
     evaluation_tables = eval_tables(args.seed, world, agent, eval_seeds)
     if not dagger_tables or not evaluation_tables:
         raise SystemExit("missing streams")
@@ -301,10 +335,15 @@ def main():
         passive_tables, dims, EVENT_LEVELS, HORIZON, args.n_lags,
         args.stride,
     )
+    deploy = _stream(
+        deploy_tables, dims, EVENT_LEVELS, HORIZON, args.n_lags,
+        args.stride,
+    )
     print(
         "span consume probe: seed %d  h6 dagger %d ep / %d deaths  "
-        "passive %d ep  eval %d ep  dims %s" % (
+        "deploy %d ep / %d deaths  passive %d ep  eval %d ep  dims %s" % (
             args.seed, len(dagger_tables), dagger["n_deaths"],
+            len(deploy_tables), deploy["n_deaths"],
             len(passive_tables), len(evaluation_tables), dims,
         )
     )
@@ -315,7 +354,7 @@ def main():
     arms = {}
     diagnostics = {}
     for name, train_stream in (
-        ("dagger", dagger), ("passive", passive),
+        ("deploy", deploy), ("dagger", dagger), ("passive", passive),
     ):
         eval_stream = _stream(
             evaluation_tables, dims, EVENT_LEVELS, HORIZON, args.n_lags, 1,
@@ -343,11 +382,11 @@ def main():
             train_stream, eval_stream, args,
         )
 
-    for name in ("table_dagger", "table_passive", "logistic_dagger",
-                 "logistic_passive"):
+    for name in ("table_deploy", "table_dagger", "table_passive",
+                 "logistic_deploy", "logistic_dagger", "logistic_passive"):
         row = arms[name]["12"]
         print(
-            "  %-17s span12 AUC %s  band %s  base %s  tau %s  "
+            "  %-18s span12 AUC %s  band %s  base %s  tau %s  "
             "precision %s  coverage %s  recall %s" % (
                 name,
                 _fmt(row.get("auc")), _fmt(row.get("band_auc")),
@@ -356,7 +395,7 @@ def main():
                 _fmt(row.get("recall")),
             )
         )
-    for name in ("table_dagger", "table_passive"):
+    for name in ("table_deploy", "table_dagger", "table_passive"):
         uncertainty = diagnostics[name]["uncertainty"]
         print(
             "  %-17s uncertainty: support AUC %s  distance AUC %s  "
@@ -376,6 +415,17 @@ def main():
             for item in diagnostics[name]["reliability"]
         ))
 
+    for name in ("table_deploy", "table_dagger", "table_passive"):
+        row = arms[name]["16"]
+        print(
+            "  %-18s span16 AUC %s  band %s  precision %s  "
+            "coverage %s  recall %s" % (
+                name, _fmt(row.get("auc")), _fmt(row.get("band_auc")),
+                _fmt(row.get("precision")), _fmt(row.get("coverage")),
+                _fmt(row.get("recall")),
+            )
+        )
+
     def best(prefix, key):
         values = [
             arms[name]["12"].get(key) for name in arms
@@ -390,6 +440,16 @@ def main():
         >= args.precision_target
         and (arms[name]["12"].get("coverage") or 0.0) >= 0.05
     ]
+    deploy_gain = dict(
+        span_12=(
+            (arms["table_deploy"]["12"].get("precision") or 0.0)
+            - (arms["table_dagger"]["12"].get("precision") or 0.0)
+        ),
+        span_16=(
+            (arms["table_deploy"]["16"].get("precision") or 0.0)
+            - (arms["table_dagger"]["16"].get("precision") or 0.0)
+        ),
+    )
     checks = dict(
         eval_calibration=bool(calibrated),
         eval_ranking=bool(
@@ -402,6 +462,10 @@ def main():
             >= (best("table_passive", "auc") or 0.0) + 0.03
             or (best("logistic_dagger", "auc") or 0.0)
             >= (best("logistic_passive", "auc") or 0.0) + 0.03
+        ),
+        deploy_gain=bool(
+            deploy_gain["span_12"] >= 0.05
+            or deploy_gain["span_16"] >= 0.05
         ),
         uncertainty=bool(any(
             diagnostics[name]["uncertainty"]["auc_support"] is not None
@@ -422,18 +486,22 @@ def main():
         else "ranking_only" if checks["eval_ranking"] else "fail"
     )
     print(
-        "== E2 verdict: %s  (calibration %s, ranking %s, "
-        "consumption gain %s, uncertainty %s) ==" % (
+        "== E2.1 verdict: %s  (calibration %s, ranking %s, "
+        "consumption gain %s, deploy gain %s %.3f/%.3f, "
+        "uncertainty %s) ==" % (
             verdict,
             "pass" if checks["eval_calibration"] else "fail",
             "pass" if checks["eval_ranking"] else "fail",
             "pass" if checks["consumption_gain"] else "fail",
+            "pass" if checks["deploy_gain"] else "fail",
+            deploy_gain["span_12"], deploy_gain["span_16"],
             "pass" if checks["uncertainty"] else "fail",
         )
     )
     report = dict(
         seed=args.seed, dims=dims, arms=arms,
-        diagnostics=diagnostics, checks=checks, verdict=verdict,
+        diagnostics=diagnostics, checks=checks,
+        deploy_gain=deploy_gain, verdict=verdict,
     )
     if args.report:
         with open(args.report, "w", encoding="utf-8") as handle:
