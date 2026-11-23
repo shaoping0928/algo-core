@@ -183,6 +183,14 @@
 - `component_derivation.py`：`ThresholdSignRule` / `DifferenceSignRule` /
   `ComponentDerivationBank`；缺输入/缺规则 → `UNKNOWN`。
 - `tests/test_component_derivation.py`（6 条）。
+- `event_rules.py`：把现有 `DeathRuleSet` 包成 query-graph 的
+  `EVENT` 规则；缺槽位/规则集 `UNKNOWN` → 图 `UNKNOWN`，不当安全。
+- `tests/test_event_rules.py`（2 条）。
+- `event_predicate_probe.py`（seed 100 / 1500 帧，held-out 210 行）：
+  单槽阈值 `x0 < -0.38`：precision 0.30 / recall 0.50 / balanced 0.733；
+  `DeathRuleSet` 包装：precision 1.00 / recall 1.00 / balanced 1.00，
+  3/210 UNKNOWN。**结论：最小事件谓词应包现有 death rules，不另造
+  单槽死亡语义。**
 - `component_free_run_probe.py`：seed 100 / 1500 帧，
   `vy` 阈值规则 teacher 0.946 / free 0.987；difference teacher 1.000 /
   free 0.927；说明“代码教、转移算”闭环可跑，但 free-run 会漂。
@@ -213,8 +221,9 @@
       动作窗口只作为候选总线，scope 选 lag。
 - [x] 共享 applicability + 关键节点查询：engine 支持，探针给出
       O(m) vs O(k·m) 的实际 visited/pruned。
-- [ ] 事件谓词：`fit_event_rule` 与现有 `death_rules` 在真实流上对照
-      precision/recall/UNKNOWN；不新增第二套死亡语义。
+- [x] 事件谓词：`fit_event_rule` 与现有 `death_rules` 在真实流上对照
+      precision/recall/UNKNOWN；结论是单槽阈值不足，生产事件谓词应包
+      `DeathRuleSet`，不新增第二套死亡语义。
 - [ ] 关键节点查询接读侧：full vs m=2–3 的 UNKNOWN/决策覆盖；当前只在
       探针里模拟。
 - [x] 派生概念：difference 规则 + label/free-run 探针；默认关。
