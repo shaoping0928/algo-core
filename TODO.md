@@ -56,8 +56,9 @@
         （validation gain **-0.314**，residual_scale 0），行为与
         baseline 逐位相同 **312/6 → 312/6**；
       - phase period 12/14/14 vs ~80，当前流不可辨识。
-      → **中性/null，不采纳、不跑 3 种子**。详见下方
-      「P0 表示层：time-in-state」。
+      → **中性/null，不采纳、不跑 3 种子**。per-target、age-only
+      残差也已判零（无目标通过；candidate gap/regret 不变）。
+      详见下方「P0 表示层：time-in-state」。
 - [x] **P0-B 查询驱动图重写 / 最小规则库**（Batch 6，2026-11-23）：
       探针、schema、每目标稀疏规则、共享 applicability、事件谓词、
       关键节点读数、stage/interval 目标、组件 free-run、查询图世界模型
@@ -490,25 +491,41 @@ decisions；`branches=8 + tail=4`、horizon 8、无 hard death veto；事件
   - 垂直目标 0/1/3/5：3.2e-5 / 3.2e-3 / 3.2e-5 / 3.2e-5；
   - 水平/时间目标 2/4/6：1.6e-13 / 1.0e-12 / 4.5e-10。
   → 水平/时间上的“巨大相对增益”是机器精度噪声，不能当证据。
-- age 残差对垂直目标有**真实小信号**：MSE gain ≈ +0.15；
-  `corr(age, residual)` 在 y/vy 上是 **-0.398**，在 gap 上是
-  **+0.398** → 世界模型确实漏掉了“距上次拍翅”的状态依赖。
+- age 残差对垂直目标在 **`StandardizedRidge` 代理模型**上有
+  MSE gain ≈ +0.15、`corr(age, residual)` y/vy **-0.398**、
+  gap **+0.398**；但这是**代理模型**的结果，不是生产世界模型。
+- **同一流上换成 `LinearObservationModel`（生产同款，raw + ridge
+  1e-8）后，垂直目标 gain ≈ 0.000**；用 `fit` 出来的 DAgger 世界
+  做 per-target gate 时更是 `0 -0.0000 / 1 +0.0000 /
+  3 -0.2627 / 5 -0.2332` → **没有目标通过**。
+- per-target、age-only 残差（`age_residual_probe.py`，targets
+  0/1/3/5，episode-held-out，min_gain 1e-3）：
+  - enabled targets = `[]`；
+  - baseline / age / control 全部 **312 帧 / 6 过柱**；
+  - candidate 10 decisions：gap median 0.02314、oracle-best 10/10、
+    regret 0；changed actions **0**。
+- 结论修正：**此前“world model 漏掉 flap age”的正信号是标准化
+  代理模型的产物**；在生产线性世界模型上，age 没有可迁移的线性
+  残差增益，也不改变候选选择。P0 仍是中性/null。
 - **hazard 读出不应加 age**：
   - raw：point-pain AUC 0.785 / pain8 0.855；
   - raw+age：0.758 / 0.813（变差）；
   - age only：0.448 / 0.484（无信号）；
   - clock only：0.870 / 0.880，但这是**时间-死亡混淆**；
     raw+clock 与 raw 相同（clock 已由 alive 携带）。
-- **质量不足的位置不是特征计算，而是消费者/门控**：
-  1. conditioned gate 用“共享残差模型 + history + 全目标聚合 MSE”，
-     把垂直目标的小信号稀释，并被水平/时间噪声主导 → 判零；
-  2. 残差模型应 **per-target、age-only**，只对垂直目标 0/1/3/5 开；
+- **质量不足的位置不是特征计算，而是“诊断代理 vs 生产模型”的错配**：
+  1. `StandardizedRidge` 代理放松了 raw 精度，放大了可被 age 解释的
+     残差；生产 `LinearObservationModel` 已经把这些方差吃掉，
+     per-target age gain ≈ 0，gate 不启用任何目标；
+  2. 因此“per-target age-only 残差只修 0/1/3/5”的提议在真实流上
+     **没有可修的量**；candidate gap/regret 也不变；
   3. age 对 hazard 无益，clock 是冗余/混淆项；
-  4. 绝对误差已经很小，垂直改善约 1e-4–1e-3 量级，是否改变候选
-     第一动作仍需决策级探针（first-action gap / regret），不能只看 MSE。
+  4. 真正的质量缺口仍是**候选分辨力**：第一动作 gap 中位 0.023，
+     P0 的 age 修正不改变任何候选选择。
 
-**下一步（若继续 P0）**：per-target、age-only 的残差 gate，只修
-0/1/3/5；然后测候选第一动作 gap/regret。若仍无决策改变，关闭 P0。
+**下一步**：P0 关闭。per-target、age-only 残差已经证明没有可迁移
+增益，候选 gap/regret 不变；readout-only hazard conditioning 也
+不推荐（age 对 hazard AUC 是负增益）。回到候选分辨力的其他机制。
 **不要加 current-frame clock；不要用 age 进 hazard readout。**
 
 ### 判据（未变）

@@ -7,6 +7,7 @@ import numpy as np
 from time_in_state import (
     ConditionedTimeWorld,
     ControlFeatureEnv,
+    PerTargetAgeWorld,
     TimeInStateEnv,
     augment_observations,
     estimate_period,
@@ -238,6 +239,68 @@ class TimeInStateTest(unittest.TestCase):
         )
         self.assertLessEqual(world.validation_gain, 1e-6)
         self.assertEqual(world.residual_scale, 0.0)
+
+    def test_per_target_age_world_enables_only_a_predictive_target(self):
+        rng = np.random.RandomState(15)
+        raw = rng.normal(size=(300, 2))
+        histories = rng.randint(0, 2, size=(300, 1)).astype(float)
+        base_target = 0.4 * raw + 0.1
+        base = LinearObservationModel(2, 1).fit(
+            raw, histories, base_target,
+        )
+        features = rng.uniform(size=(300, 1))
+        target = base_target.copy()
+        target[:, 0] += 2.0 * features[:, 0]
+        observations = np.concatenate([raw, features], axis=1)
+        next_observations = np.concatenate(
+            [target, np.zeros((300, 1))], axis=1
+        )
+        episodes = np.arange(300) // 15
+        world = PerTargetAgeWorld.from_base(
+            base, observations, histories, next_observations,
+            episodes, max_age=16, age_actions=(1,), targets=(0, 1),
+        )
+        self.assertGreater(world.gains[0], 0.0)
+        self.assertIn(0, world.corrections)
+        self.assertNotIn(1, world.corrections)
+        prediction = world.predict(
+            np.concatenate([raw, features], axis=1), histories
+        )
+        self.assertEqual(prediction.shape, (300, 3))
+        np.testing.assert_allclose(
+            prediction[:, 1], base_target[:, 1], atol=1e-9,
+        )
+        expected_feature = (
+            np.minimum(np.rint(features[:, 0] * 16) + 1, 16) / 16.0
+        )
+        expected_feature[histories[:, 0] == 1] = 0.0
+        np.testing.assert_allclose(
+            prediction[:, 2], expected_feature, atol=1e-9,
+        )
+
+    def test_per_target_age_world_with_no_targets_is_the_base(self):
+        rng = np.random.RandomState(16)
+        raw = rng.normal(size=(200, 2))
+        histories = rng.randint(0, 2, size=(200, 1)).astype(float)
+        target = 0.4 * raw + 0.1
+        base = LinearObservationModel(2, 1).fit(raw, histories, target)
+        features = rng.uniform(size=(200, 1))
+        observations = np.concatenate([raw, features], axis=1)
+        next_observations = np.concatenate(
+            [target, np.zeros((200, 1))], axis=1
+        )
+        episodes = np.arange(200) // 10
+        world = PerTargetAgeWorld.from_base(
+            base, observations, histories, next_observations,
+            episodes, max_age=16, age_actions=(1,), targets=(),
+        )
+        self.assertFalse(world.corrections)
+        prediction = world.predict(
+            np.concatenate([raw, features], axis=1), histories
+        )
+        np.testing.assert_allclose(
+            prediction[:, :2], base.predict(raw, histories), atol=1e-12,
+        )
 
     def test_fit_and_evaluate_accept_the_time_env_factory(self):
         factory = make_env_factory(

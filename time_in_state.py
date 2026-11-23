@@ -314,6 +314,110 @@ class ConditionedTimeWorld:
         return np.concatenate([raw_next, next_features], axis=1)
 
 
+class PerTargetAgeWorld:
+    """Raw base world plus per-target, age-only residual corrections.
+
+    Only targets whose held-out residual gain passes the gate are corrected;
+    horizontal/time targets are excluded by the caller.  The auxiliary age is
+    advanced by the known rule and the agent still sees the raw prefix.
+    """
+
+    def __init__(self, base, raw_dim: int, feature_dim: int, max_age: int,
+                 age_actions: Tuple[int, ...],
+                 corrections: Optional[dict] = None,
+                 gains: Optional[dict] = None):
+        self.base = base
+        self.raw_dim = int(raw_dim)
+        self.feature_dim = int(feature_dim)
+        self.max_age = max(int(max_age), 1)
+        self.age_actions = tuple(int(value) for value in age_actions)
+        self.corrections = dict(corrections or {})
+        self.gains = dict(gains or {})
+
+    @property
+    def obs_dim(self) -> int:
+        return self.raw_dim + self.feature_dim
+
+    @classmethod
+    def from_base(cls, base, observations, histories, next_observations,
+                  episodes, max_age: int = 16,
+                  age_actions: Sequence[int] = (1,),
+                  targets: Sequence[int] = (0, 1, 3, 5),
+                  min_gain: float = 1e-3,
+                  ridge: float = 1e-6):
+        observations = np.asarray(observations, dtype=float)
+        histories = np.asarray(histories, dtype=float)
+        next_observations = np.asarray(next_observations, dtype=float)
+        episodes = np.asarray(episodes)
+        raw_dim = int(base.obs_dim)
+        raw = observations[:, :raw_dim]
+        features = observations[:, raw_dim:]
+        target = next_observations[:, :raw_dim]
+        residual = target - base.predict(raw, histories)
+        train = episodes % 5 != 4
+        test = ~train
+        corrections = {}
+        gains = {}
+        for column in targets:
+            column = int(column)
+            x_train = np.column_stack([
+                np.ones(int(train.sum())), features[train]
+            ])
+            x_test = np.column_stack([
+                np.ones(int(test.sum())), features[test]
+            ])
+            y_train = residual[train, column]
+            gram = x_train.T @ x_train + float(ridge) * np.eye(
+                x_train.shape[1]
+            )
+            weights = np.linalg.solve(gram, x_train.T @ y_train)
+            prediction = x_test @ weights
+            mse_zero = float(np.mean(residual[test, column] ** 2))
+            mse_model = float(np.mean(
+                (residual[test, column] - prediction) ** 2
+            ))
+            gain = (mse_zero - mse_model) / (mse_zero + 1e-12)
+            gains[column] = float(gain)
+            if gain > float(min_gain):
+                corrections[column] = weights
+        return cls(
+            base=base,
+            raw_dim=raw_dim,
+            feature_dim=features.shape[1],
+            max_age=max_age,
+            age_actions=age_actions,
+            corrections=corrections,
+            gains=gains,
+        )
+
+    def _advance(self, features: np.ndarray,
+                 histories: np.ndarray) -> np.ndarray:
+        ages = np.rint(
+            np.asarray(features, dtype=float) * float(self.max_age)
+        ).astype(int)
+        actions = np.asarray(histories, dtype=float)[:, 0].astype(int)
+        ages = np.minimum(ages + 1, self.max_age)
+        for column, action in enumerate(self.age_actions):
+            if column >= ages.shape[1]:
+                break
+            ages[actions == int(action), column] = 0
+        return ages / float(self.max_age)
+
+    def predict(self, states, histories) -> np.ndarray:
+        states = np.asarray(states, dtype=float)
+        histories = np.asarray(histories, dtype=float)
+        raw = states[:, :self.raw_dim]
+        features = states[:, self.raw_dim:]
+        raw_next = self.base.predict(raw, histories)
+        for column, weights in self.corrections.items():
+            design = np.column_stack([
+                np.ones(len(features)), features
+            ])
+            raw_next[:, column] += design @ weights
+        next_features = self._advance(features, histories)
+        return np.concatenate([raw_next, next_features], axis=1)
+
+
 def augment_observations(observations: np.ndarray,
                          actions: Optional[np.ndarray],
                          episodes: np.ndarray,
