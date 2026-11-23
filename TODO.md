@@ -55,8 +55,8 @@
       转化为决策改善。判据：3 种子方向 + 6 种子确认（≥5/6 同向）。
 - [x] **P0-B 查询驱动图重写 / 最小规则库**（Batch 6，2026-11-23）：
       探针、schema、每目标稀疏规则、共享 applicability、事件谓词、
-      关键节点读数、组件 free-run 已落地；剩余 stage/interval 目标、
-      planner/NodeRuntime 接线与决策侧质量门。默认栈不变。
+      关键节点读数、stage/interval 目标、组件 free-run、查询图世界模型
+      已落地；剩余 planner/NodeRuntime 接线与决策侧质量门。默认栈不变。
 - [ ] **P1 阶段数据规模**：结果分布身份已通过，但每局约 1 条转移；需要
       采集规模（~100 局/option）才能填 `(stage, option)` 单元。
 - [ ] **P1 value 保持 opt-in**：状态级有效、计划级不差、局级 1/3；等表示层
@@ -73,9 +73,15 @@
 
 ## Batch 6：查询驱动图重写与最小规则库（2026-11-23）
 
-> 本节是当前的结构性下一步；默认栈不变，所有新机制 opt-in。目标不是
-> 再加一层预测，而是把“转移的类型 / 适用条件 / 消费方式”从硬编码改成
-> **查询驱动 + 结构匹配**。
+> 结构性部分已完成（2026-11-23）；默认栈不变，所有新机制 opt-in。目标
+> 不是再加一层预测，而是把“转移的类型 / 适用条件 / 消费方式”从硬编码
+> 改成**查询驱动 + 结构匹配**。剩余是 planner/NodeRuntime 的决策侧接入
+> 与 3 种子质量门。
+
+**一句话结论**：查询图能复现线性世界模型（最大差 3×10⁻⁸），但慢
+18.7×；事件谓词应包现有 death rules；关键节点查询是 O(m) 且能补全，
+但 horizontal 仍被过柱事件卡住。因此它是**结构载体**，不是默认预测器
+或默认决策路径的替代品。
 
 ### 动机
 
@@ -152,7 +158,7 @@
 - 验证必须区分 **teacher-forced** 与 **free-running**；下游转移要用
   scheduled sampling / 自由运行验证，避免概念分布漂移。
 
-### 探针扩展（同一个探针）
+### 探针扩展（已实现）
 
 - 在 `graph_rewrite_scale_probe.py` 增加“实际搜索”而不只算组合上界：
   - 共享 applicability vs 每目标独立；
@@ -172,8 +178,9 @@
   `Rule` / `Readout` / `Query` / `RuleBank`。精确查询只接受精确 `dt`
   的规则；变长 `dt` 规则结构上填不进 `+1` 槽位。无输入、无规则、
   同置信度冲突均返回 `UNKNOWN`。
-- `tests/test_query_graph.py`（14 条）：精确/变长 `dt`、共享门、
-  独立门、关键节点、递归解析、冲突、事件谓词、readout。
+- `tests/test_query_graph.py`（19 条）：精确/变长 `dt`、窗口目标、
+  共享门、独立门、关键节点、递归解析（含 3 步）、冲突、事件谓词、
+  readout。
 - `sparse_rules.py`：每目标一条稀疏规则（BIC 前向选择 + raw OLS），
   动作窗口只作候选；`fit_event_rule` 单槽阈值谓词（双向、balanced
   accuracy、support 门）。
@@ -185,6 +192,8 @@
 - `event_rules.py`：把现有 `DeathRuleSet` 包成 query-graph 的
   `EVENT` 规则；缺槽位/规则集 `UNKNOWN` → 图 `UNKNOWN`，不当安全。
 - `tests/test_event_rules.py`（2 条）。
+- `tests/test_query_world.py`（2 条）：held-out 与线性模型一致、
+  无规则 → NaN 不回落。
 - `event_predicate_probe.py`（seed 100 / 1500 帧，held-out 210 行）：
   单槽阈值 `x0 < -0.38`：precision 0.30 / recall 0.50 / balanced 0.733；
   `DeathRuleSet` 包装：precision 1.00 / recall 1.00 / balanced 1.00，
@@ -266,16 +275,40 @@
 - [ ] 派生概念接 `NodeRuntime` 预测路径：需要把 derivation bank 与
       component id 绑定并在 rollout 中调用；当前只有 bank 方法。
 - [x] 测试：pattern/time 不匹配拒绝；UNKNOWN 传播；共享 O(k)；
-      深度 3 递归；精确 `dt` 不匹配；关闭时逐位不变（新模块独立；
-      393 测试全过）。
+      深度 3 递归；精确 `dt` 不匹配；stage/interval 窗口；关闭时逐位
+      不变（新模块独立；**398 测试全过**）。
 - [x] 3 种子诊断复跑：组件 free-run、key-node readout、搜索表在
       100/101/102 上同向；这不是决策侧质量门。
 - [x] stage/interval 目标：`TimeWindow` + `target_windows` 已实现；
       变长 `dt` 只进窗口目标、结果标 coarse，精确目标仍拒绝；3 条测试。
 
+### 本轮提交（2026-11-23）
+
+- `40d9ca9` 查询图内核 + 每目标稀疏规则 + 组件派生
+- `e541d30` death rules 事件包装 + 对照探针
+- `cad7989` key-node 读数探针 + `ComponentBank.free_run_step`
+- `3166215` 3 种子诊断 + 深递归测试
+- `18a6152` Batch 6 状态整理
+- `1fcbe30` stage/interval 粗查询目标
+- `b91f12e` 查询图世界模型适配器 + 线性模型对照
+
+### 下一步（Batch 7 候选）
+
+1. **P0 表示层（推荐，直接针对决策）**：状态加入“距上次拍翅帧数 /
+   相位变化率”，验证阶段转移坏段基率、图策略退化和长窗读数是否转化
+   为决策改善。判据：3 种子方向 + 6 种子确认（≥5/6 同向）。
+2. **决策侧探针（查询图线）**：把事件谓词/关键节点读数应用到候选
+   端点，测 seed 101 的 decision-relevant miss/regret；只做 opt-in，
+   不改默认。
+3. **NodeRuntime 组件接线**：把 derivation bank 绑到 runtime 的 slot
+   表示，做 opt-in free-run；价值偏概念验证。
+
+**不建议**：整体用查询图替换默认世界模型（等价但慢 18.7×）；在未过
+3 种子质量门前把 stage/事件项塞进逐帧 cost。
+
 ### 质量门
 
-- 关闭时决策路径逐位不变；362+ 测试全过。
+- 关闭时决策路径逐位不变；**398 测试全过**。
 - 帧规则：held-out R² 不低于全局线性模型；scope 跨 1500/5000 与
   3 种子稳定；动作 lag 选择一致。
 - 搜索：共享 applicability 的实际访问节点数 << 独立；key-node
