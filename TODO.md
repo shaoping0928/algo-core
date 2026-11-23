@@ -236,13 +236,55 @@
   conflict。**共享是 O(m)，独立是 O(k·m)。** 5000 帧与种子 101/102
   同样成立。
 
+### 决策侧探针：端点事件否决（2026-11-23）
+
+`decision_event_probe.py`：seed 100/101/102，eval 120–124，每个 55
+decisions；`branches=8 + tail=4`、horizon 8、无 hard death veto；事件
+谓词 = 现有 `DeathRuleSet` 的 query-graph 包装，作用在搜索的
+`final_states`（预测端点）。只做 opt-in，不改默认。
+
+| seed | arm | oracle-best | survives | relevant-miss | mean regret |
+|---|---|---:|---:|---:|---:|
+| 100 | baseline | 54/55 | 34/55 | 2 | 0.15 |
+| 100 | veto-death | 55/55 | 35/55 | 1 | 0.04 |
+| 100 | veto-death-or-unknown | 55/55 | 36/55 | **0** | **0.00** |
+| 101 | baseline | 52/55 | 35/55 | 3 | 0.33 |
+| 101 | veto-death | 53/55 | 36/55 | 2 | 0.22 |
+| 101 | veto-death-or-unknown | 53/55 | 36/55 | 2 | 0.22 |
+| 102 | baseline | 54/55 | 34/55 | 2 | 0.16 |
+| 102 | veto-death | 55/55 | 36/55 | **0** | **0.00** |
+
+端点事件质量：
+
+| seed | precision | recall | UNKNOWN |
+|---|---:|---:|---:|
+| 100 | 0.980 | 0.849 | 347/14080 |
+| 101 | **0.998** | **0.379** | 243/14080 |
+| 102 | 0.811 | 0.645 | 208/14080 |
+
+读法：
+
+1. **弱正向、无恶化**：veto 在 100/101/102 上 improved 1/1/2、
+   worsened 0/0/0；但 active 决策只有 45/51/45，收益是 1–2 个决策。
+2. **seed 101 仍是硬案例**：event recall 只有 0.379，relevant-miss
+   3→2、mean regret 0.33→0.22；precision 0.998 说明“报死基本对”，
+   但“该死没报”仍是主因。
+3. **fallback 频繁**：100/101/102 分别 10/4/10 个决策所有候选都被
+   veto，回退 baseline；veto 在这些点实际不生效。
+4. **oracle-best-vetoed 3/4/0**：多为“所有计划都死/并列最优”的
+   不可避免状态，regret 未恶化；不能只看这个计数。
+5. **协议差异**：这里的 baseline relevant-miss 是 2–3，不同于早先
+   10+8 协议的 10；不能直接跨协议比较。
+6. **结论**：端点事件否决是小幅、非恶化的信号，但不足以进默认栈；
+   若继续，下一步是真实 3 种子配对基准（opt-in），不是默认接入。
+   当前瓶颈仍是候选分辨力与事件覆盖，不是“再加一个 veto”。
+
 仍未做：
 
 - `ComponentDerivationBank` 尚未接进 `NodeRuntime` 的预测路径；当前是
   独立模块 + 探针 + `ComponentBank.free_run_step`，默认不生效。
-- 3 种子只跑了诊断探针（组件/读数/搜索/查询世界模型），决策侧质量门
-  尚未做。
 - 关键节点查询尚未接 planner；`required_slots` 仍由探针手动传入。
+- 端点事件否决只做了 55 决策/种子的探针；真实 3 种子配对基准尚未做。
 - 查询图世界模型与线性模型等价但慢 18.7×，因此 planner 接入只能是
   选择性/门控，不能整体替换；需要先定义接入点与质量门。
 
@@ -265,6 +307,11 @@
       = m，但 horizontal 误差 0.31–0.38，说明过柱事件仍未建模。
 - [ ] 关键节点查询接 planner：把 readout 的 required_slots 接到决策
       路径，比较 full vs m=2–3 的 UNKNOWN/决策覆盖；当前仍是探针。
+- [x] 决策侧端点事件探针：`decision_event_probe.py` 把 death rules 的
+      query-graph 包装作用到候选端点；seed 101 relevant-miss 3→2、
+      mean regret 0.33→0.22，improved 1 / worsened 0；弱正向。
+- [ ] 决策侧质量门：veto 端点事件只做 opt-in，需真实 3 种子配对
+      基准确认；当前 55 决策/种子，不能作为默认依据。
 - [x] 查询图世界模型：`query_world.py` 与线性模型逐目标一致
       （最大差 3e-8，8 步 RMSE 0.000000），但慢 18.7×。
 - [ ] planner 接入：不能整体替换线性世界模型；只考虑选择性/门控
@@ -276,7 +323,7 @@
       component id 绑定并在 rollout 中调用；当前只有 bank 方法。
 - [x] 测试：pattern/time 不匹配拒绝；UNKNOWN 传播；共享 O(k)；
       深度 3 递归；精确 `dt` 不匹配；stage/interval 窗口；关闭时逐位
-      不变（新模块独立；**398 测试全过**）。
+      不变（新模块独立；**402 测试全过**）。
 - [x] 3 种子诊断复跑：组件 free-run、key-node readout、搜索表在
       100/101/102 上同向；这不是决策侧质量门。
 - [x] stage/interval 目标：`TimeWindow` + `target_windows` 已实现；
@@ -297,9 +344,9 @@
 1. **P0 表示层（推荐，直接针对决策）**：状态加入“距上次拍翅帧数 /
    相位变化率”，验证阶段转移坏段基率、图策略退化和长窗读数是否转化
    为决策改善。判据：3 种子方向 + 6 种子确认（≥5/6 同向）。
-2. **决策侧探针（查询图线）**：把事件谓词/关键节点读数应用到候选
-   端点，测 seed 101 的 decision-relevant miss/regret；只做 opt-in，
-   不改默认。
+2. **决策侧端点事件（探针已完成，待质量门）**：seed 101
+   relevant-miss 3→2、mean regret 0.33→0.22；improved 1 / worsened 0。
+   弱正向；若继续，跑真实 3 种子配对，不先改默认。
 3. **NodeRuntime 组件接线**：把 derivation bank 绑到 runtime 的 slot
    表示，做 opt-in free-run；价值偏概念验证。
 
@@ -308,7 +355,7 @@
 
 ### 质量门
 
-- 关闭时决策路径逐位不变；**398 测试全过**。
+- 关闭时决策路径逐位不变；**402 测试全过**。
 - 帧规则：held-out R² 不低于全局线性模型；scope 跨 1500/5000 与
   3 种子稳定；动作 lag 选择一致。
 - 搜索：共享 applicability 的实际访问节点数 << 独立；key-node
