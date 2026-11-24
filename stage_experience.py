@@ -40,8 +40,21 @@ class _EpisodeFrame:
     actions: Tuple[int, ...]
     feedback: np.ndarray
     active_features: Tuple[Tuple[Hashable, ...], ...]
+    pending: Tuple[Tuple[int, ...], ...]
     terminal: bool
     censored: bool
+
+
+@dataclass(frozen=True)
+class StageTransition:
+    """One realized transition aligned to the stage that contains it."""
+
+    episode: Hashable
+    stage: StageOccurrence
+    observation: np.ndarray
+    pending: Tuple[int, ...]
+    action: int
+    offset: int
 
 
 def _native(value):
@@ -62,13 +75,17 @@ def _row_features(agent, obs) -> Tuple[Hashable, ...]:
     return tuple(dict.fromkeys(_native(feature) for feature in features))
 
 
-def _episode_frames(rows: Sequence[Mapping], agent, lag: int):
+def _episode_frames(rows: Sequence[Mapping], agent, lag: int,
+                    with_features: bool = True):
     """Group rows by episode and reject anything that cannot be attributed.
 
     Rows are consumed in the order given; the acting action is taken from
     ``history[lag]``.  An episode missing that slot is dropped rather than
     silently falling back to the newly issued action, and its row count is
-    reported as skipped.
+    reported as skipped.  ``pending`` is the oldest-first action window the
+    runtime's encoder pairs with the state.  Set ``with_features`` to False
+    when only stage alignment is needed; the feature masks are expensive and
+    are not required by the resolver.
     """
     grouped = OrderedDict()
     for row in rows:
@@ -85,6 +102,7 @@ def _episode_frames(rows: Sequence[Mapping], agent, lag: int):
         actions = []
         feedback = []
         features = []
+        pending = []
         usable = True
         for row in episode_rows:
             obs = np.asarray(row.get("obs", ()), dtype=float).reshape(-1)
@@ -110,7 +128,13 @@ def _episode_frames(rows: Sequence[Mapping], agent, lag: int):
             # history is newest-first; history[lag] acted on this transition.
             actions.append(int(round(float(history[int(lag)]))))
             feedback.append(signals[:2])
-            features.append(_row_features(agent, obs))
+            features.append(
+                _row_features(agent, obs) if with_features else ()
+            )
+            pending.append(tuple(
+                int(round(float(value)))
+                for value in history[1:int(lag) + 1][::-1]
+            ))
         if not usable:
             skipped_episodes += 1
             skipped_rows += len(episode_rows)
@@ -127,6 +151,7 @@ def _episode_frames(rows: Sequence[Mapping], agent, lag: int):
             actions=tuple(actions),
             feedback=np.asarray(feedback, dtype=float),
             active_features=tuple(features),
+            pending=tuple(pending),
             terminal=terminal,
             censored=not terminal,
         ))
@@ -265,6 +290,42 @@ class StageExperienceBatch:
     def outcome_episodes(self):
         """Stage sequences in the form ``StageOutcomeMemory.fit`` expects."""
         return [list(episode) for episode in self.episodes]
+
+    def stage_transitions(self, rows: Sequence[Mapping], agent):
+        """Yield every realized transition aligned to its stage and state.
+
+        The observation and oldest-first pending window are exactly the ones
+        the runtime's encoder pairs; no feature masks are recomputed.  A
+        mismatch between the batch's stage durations and the rows' transition
+        count raises instead of silently shifting the alignment.
+        """
+        frames, _skipped_episodes, _skipped_rows = _episode_frames(
+            rows, agent, self.lag, with_features=False,
+        )
+        by_episode = {frame.episode: frame for frame in frames}
+        for stages in self.episodes:
+            frame = by_episode.get(stages[0].episode)
+            if frame is None:
+                continue
+            expected = sum(int(round(float(stage.duration)))
+                           for stage in stages)
+            if expected != len(frame.actions):
+                raise ValueError(
+                    "stage durations do not cover the episode's transitions"
+                )
+            index = 0
+            for stage in stages:
+                length = int(round(float(stage.duration)))
+                for offset in range(length):
+                    yield StageTransition(
+                        episode=frame.episode,
+                        stage=stage,
+                        observation=frame.observations[index].copy(),
+                        pending=frame.pending[index],
+                        action=int(frame.actions[index]),
+                        offset=offset,
+                    )
+                    index += 1
 
     def snapshot(self):
         return dict(self.census)

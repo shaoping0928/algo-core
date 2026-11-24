@@ -194,14 +194,47 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
      （8 个 feature id，44/1500 行）**——内部 feature 根很稀疏，
      下一层不能把 demand 关联当主信号，resolver 应主要依赖状态/阶段，
      feature 只作可选证据。
-2. **P0：当前状态到历史阶段 resolver**。精确 signal-token key 不能覆盖连续
-   状态。需要 train-fold 拟合、held-out 冻结的状态/信号表示；未映射状态 → UNKNOWN。
-   （前置的自动管线已落地；下一步实现 resolver。fast smoke 显示 feature 根
-   覆盖仅 0.03，因此 resolver 以状态→阶段证据为主，feature 只作可选证据。）
-3. **P0：预测等价的多级阶段树**。当前是最近阶段历史的变阶后缀回退，不是阶段
-   类型的 merge/split 树。用 held-out successor、duration、feedback 预测等价
-   决定父子/兄弟关系；报告各层分辨率、support、UNKNOWN 和相对 base-rate 的增益，
-   不用 task geometry、纯欧氏相似或固定 K 定身份。
+2. **[x] P0：当前状态到历史阶段 resolver（`stage_state_resolver.py`，2026-11-24）**。
+   从 runtime 自己的 prototype（不是 task 几何/欧氏身份）学习
+   `state prototype -> 实际包含该状态的 stage key` 的分布；`fit_rows` 只吃
+   train episodes，`resolve` 用冻结表与半径，绝不更新。UNKNOWN 带原因：
+   `no_prototype / outside_radius / unseen_prototype / insufficient_support /
+   ambiguous`。半径取训练最近距离分位与 runtime `birth_threshold` 的较大者
+   （超出即 runtime 会新建 concept，不能冒领旧阶段）。
+   - episode-held-out 审计（`stage_resolver_probe.py`，fold-refit 表示，
+     seed 100，5 折，被动 5000 帧/128 局）：**coverage 0.468、supported
+     accuracy 0.740、同 supported 子集常量 key 基线 0.435 → +0.305**，
+     5/5 折同向（0.720–0.780 vs 0.476–0.541）。`min_episodes=1` 对照：
+     coverage 0.571、accuracy 0.735、基线 0.449 → +0.286。
+   - UNKNOWN 归因（min_episodes=2）：outside_radius 1400、
+     insufficient_support 829、ambiguous 426、unseen_prototype 7。
+     **约一半状态被 OOD 门拒绝**是当前主要限制；下一步预测等价阶段树
+     应把碎片化的 stage 类型/原型证据池化。
+3. **[x] P0：预测等价的多级阶段树（`predictive_stage_tree.py` +
+   `stage_tree_probe.py`，2026-11-24）**。叶节点是真实 stage key；每个节点的
+   档案由**真实** successor/terminal 分类分布、log-duration 高斯、
+   feedback 对角高斯组成，全部用经验贝叶斯收缩到全阶段 base。
+   merge 只在 validation episodes 上通过预测似然门才接受：pooled 的
+   joint log-lik 必须 ≥ 分开模型 − `tolerance`，且该对至少有
+   `min_validation_support` 个 validation stage；因此父节点是预测等价
+   决策，不是固定 K、task geometry 或原始状态欧氏相似。未知 stage key
+   没有叶节点，只能回退到全阶段 base（或 UNKNOWN），不会编造兄弟。
+   修过两个真实边界：`-inf - -inf → nan` 绕过 merge 门（现在非有限增量
+   不参与 merge），以及未见 outcome 的零概率（现在分类似然有 1e-6 下限）。
+   - episode-held-out 审计（60/20/20 episode split，被动 5000 帧；test
+     253/243/245 stages；3 seeds）：
+     - **阶段档案本身强于 base**：joint NLL 树/叶 −4.41/−3.87/−3.48 vs
+       base −5.89/−6.05/−5.43；top1 0.57–0.60 vs 0.37–0.38。
+     - **默认支撑门（2/2）下 merge 回退几乎不被触发**（252/253、242/243、
+       244/245 在叶层），树 vs 叶 joint Δ = **+0.015 / 0.000 / −0.005**
+       → 不稳定。
+     - **hi10 门（10/3）下树被真正使用**（level 1–3 有 9/9/7 个 test
+       stage），joint Δ = **+0.023 / +0.136 / +0.083（3/3 正）**，
+       top1 +0.000/+0.021/+0.012。
+   - 判定 `stage_tree_pools_when_support_is_thin`：merge 对象真实、阶段
+     档案有强 held-out 信号，但**树的增量只在低支撑门显形**，不是默认
+     收益；hi30 极端门（seed 100）反而略差。树只作为条件回退层，不作
+     决策门证据。
 4. **P0：内部高层需求选择器**。内部阶段搜索枚举有真实支持的 sibling /
    action-option 路径，再由世界交互反馈训练出的 outcome/value readout 选
    `StageDemand`。StageDemand 不能来自 task、CLI、人工目标或 modal-successor

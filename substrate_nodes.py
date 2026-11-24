@@ -55,6 +55,7 @@ from multiview_transitions import MultiViewTransitionModel
 from node_features import FeatureRuleBank
 from node_runtime import NodeRuntime, future_pain_labels, future_return_labels
 from stage_experience import StageExperienceBatch
+from stage_state_resolver import StageStateResolver
 from substrate_generic import (
     LinearObservationModel,
     collect,
@@ -1144,8 +1145,14 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             transitions, agent, lag=agent.lag,
             quantile=stage_memory_quantile,
         )
+        # State -> stage type resolution fitted on the same training fold.
+        # The resolver is a data-layer readout; no planner path calls it.
+        agent.stage_resolver = StageStateResolver.fit_rows(
+            transitions, agent, experience=agent.stage_experience,
+        )
     else:
         agent.stage_experience = None
+        agent.stage_resolver = None
     # The milestone layer, read off the agent's own stream.  All of it is
     # inert unless the planner is asked for one of its terms.
     model = _milestone_model_from_transitions(
@@ -3401,6 +3408,10 @@ def run_seed(task):
             agent.stage_experience.snapshot()
             if getattr(agent, "stage_experience", None) is not None else None
         ),
+        stage_resolver=(
+            agent.stage_resolver.snapshot()
+            if getattr(agent, "stage_resolver", None) is not None else None
+        ),
         dagger=getattr(agent, "dagger_log", []),
         death_rules=getattr(agent, "death_rule_summary", None),
         milestone=getattr(agent, "milestone_summary", None),
@@ -4132,6 +4143,20 @@ def main():
                     census["feature_coverage"], census["demand_samples"],
                 )
             )
+        resolver = rows[0].get("stage_resolver")
+        if resolver:
+            print(
+                "stage resolver (seed %d): %d prototypes, %d stage types, "
+                "%d training rows, radius %.3f, gates support>=%d / "
+                "episodes>=%d / p>=%.2f / margin>=%.2f"
+                % (
+                    rows[0]["seed"], resolver["prototypes"],
+                    resolver["stage_types"], resolver["training_rows"],
+                    resolver["radius"], resolver["min_support"],
+                    resolver["min_episodes"], resolver["min_probability"],
+                    resolver["min_margin"],
+                )
+            )
     if overall["clusters"] < 5:
         print("warning: fewer than 5 trained models; the interval is "
               "descriptive, not a significance test")
@@ -4200,6 +4225,11 @@ def main():
                 dict(seed=row["seed"], census=row["stage_memory"])
                 for row in rows
                 if row.get("stage_memory") is not None
+            ],
+            stage_resolver=[
+                dict(seed=row["seed"], census=row["stage_resolver"])
+                for row in rows
+                if row.get("stage_resolver") is not None
             ],
             per_train_seed=per_train,
             per_eval_seed=per_eval,
