@@ -54,6 +54,7 @@ from milestone_graph import (
 from multiview_transitions import MultiViewTransitionModel
 from node_features import FeatureRuleBank
 from node_runtime import NodeRuntime, future_pain_labels, future_return_labels
+from predictive_option_quotient import OptionQuotient
 from predictive_stage_tree import (
     PredictiveStageTree,
     collapse_stage_episodes,
@@ -841,6 +842,9 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         stage_memory_feature_source="branch",
         stage_demand_min_support=2,
         stage_demand_min_episodes=2,
+        option_tolerance=0.05,
+        option_min_support=1,
+        option_min_episodes=1,
         env_factory=None):
     """Collect transitions and train the node runtime on them.
 
@@ -1264,6 +1268,19 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             agent.stage_tree_heuristic = None
             agent.stage_root_heuristic = None
             agent.stage_prototype_roots = {}
+        # Predictive-equivalence classes over realized options.  Merging is a
+        # training-profile model-selection decision; the quotient as a whole is
+        # accepted or rejected on validation episodes.  Nothing here is read by
+        # the planner, and a rejected quotient is never used by the search.
+        if tree_train and tree_validation:
+            agent.option_quotient = OptionQuotient.fit(
+                tree_train, tree_validation,
+                prior=4.0, tolerance=float(option_tolerance),
+                min_support=int(option_min_support),
+                min_episodes=int(option_min_episodes),
+            )
+        else:
+            agent.option_quotient = None
         agent.stage_demand_feature_source = stage_memory_feature_source
     else:
         agent.stage_experience = None
@@ -1276,6 +1293,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         agent.stage_tree_heuristic = None
         agent.stage_root_heuristic = None
         agent.stage_prototype_roots = {}
+        agent.option_quotient = None
         agent.stage_demand_feature_source = None
     # The milestone layer, read off the agent's own stream.  All of it is
     # inert unless the planner is asked for one of its terms.

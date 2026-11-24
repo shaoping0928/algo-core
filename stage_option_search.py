@@ -14,6 +14,12 @@ convolution of those distributions (plus the caller's deterministic offset for
 the current stage).  ``survival_curve`` turns any such distribution into
 ``P(T > t)``.
 
+By default the action vocabulary is exact realized traces.  Passing a fitted
+``predictive_option_quotient.OptionQuotient`` switches to *class* mode: one
+branch per accepted predictive-equivalence class, with the class-pooled
+outcome distribution.  A quotient rejected by its held-out gate is refused
+instead of being silently used.
+
 Completeness and accuracy are the two hard requirements here:
 
 * no beam, no top-k and no score-based pruning: every option the fitted memory
@@ -79,6 +85,7 @@ class OptionStep:
     feedback_mean: Tuple[float, ...]
     context_depth: int
     resolution: Optional[int]
+    option_class: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +150,7 @@ class OptionSearchResult:
     max_transitions: int
     min_context_depth: int
     max_elapsed_support: int
+    option_mode: str
     leaves: Tuple[OptionLeaf, ...]
     unresolved: Tuple[UnresolvedNode, ...]
     counts: dict
@@ -241,6 +249,7 @@ class OptionSearchResult:
             max_transitions=int(self.max_transitions),
             min_context_depth=int(self.min_context_depth),
             max_elapsed_support=int(self.max_elapsed_support),
+            option_mode=self.option_mode,
             leaves=len(self.leaves),
             plans=len(plans),
             unresolved=int(len(self.unresolved)),
@@ -385,6 +394,7 @@ class StageOptionSearch:
                  max_leaves: int = 200000, tolerance: float = 1e-6,
                  min_context_depth: int = 1,
                  max_elapsed_support: int = 100000,
+                 option_quotient=None,
                  allow_truncation: bool = False):
         if memory is None:
             raise ValueError("a fitted StageOutcomeMemory is required")
@@ -398,12 +408,18 @@ class StageOptionSearch:
             raise ValueError("min_context_depth must be non-negative")
         if int(max_elapsed_support) < 1:
             raise ValueError("max_elapsed_support must be positive")
+        if option_quotient is not None and not getattr(
+                option_quotient, "accepted", True):
+            raise ValueError(
+                "option_quotient was rejected by its held-out gate"
+            )
         self.memory = memory
         self.max_transitions = int(max_transitions)
         self.max_leaves = int(max_leaves)
         self.tolerance = float(tolerance)
         self.min_context_depth = int(min_context_depth)
         self.max_elapsed_support = int(max_elapsed_support)
+        self.option_quotient = option_quotient
         self.allow_truncation = bool(allow_truncation)
 
     def search(self, stage_history: Sequence[StageKey],
@@ -437,47 +453,72 @@ class StageOptionSearch:
             stopped=False, complete=True, max_depth=0,
             max_edge_deviation=0.0, max_elapsed_support_seen=0,
         )
-        options = tuple(sorted(self.memory.action_options, key=repr))
-        counts["option_vocabulary"] = len(options)
+        quotient = self.option_quotient
+        options = (
+            () if quotient is not None
+            else tuple(sorted(self.memory.action_options, key=repr))
+        )
+        counts["option_vocabulary"] = (
+            len(quotient.classes) if quotient is not None else len(options)
+        )
         counts["queries"] = 0
+
+        def accept(node, prediction):
+            if prediction.get("status") != "supported":
+                counts["unknown_options"] += 1
+                return None
+            context_depth = int(prediction.get("context_depth") or 0)
+            if context_depth < self.min_context_depth:
+                # A root-only prediction pools unrelated source stages,
+                # so it is not a transition from this node.  Refusing it
+                # keeps the search from fabricating an edge.
+                counts["backoff_refused"] += 1
+                counts["unknown_options"] += 1
+                return None
+            mass = float(sum(
+                float(row["probability"])
+                for row in prediction.get("outcomes", ())
+            ))
+            deviation = abs(mass - 1.0)
+            counts["edge_mass_checks"] += 1
+            if deviation > state["max_edge_deviation"]:
+                state["max_edge_deviation"] = deviation
+            if deviation > self.tolerance:
+                raise ValueError(
+                    "option outcomes must sum to one; got %.12f at %r"
+                    % (mass, node)
+                )
+            if not prediction.get("outcomes"):
+                raise ValueError(
+                    "supported edge must report at least one outcome"
+                )
+            return prediction
 
         def supported_options(node):
             cached = cache.get(node)
             if cached is not None:
                 return cached
             supported = []
-            for option in options:
-                prediction = self.memory.predict(node, option)
-                counts["queries"] += 1
-                if prediction.get("status") != "supported":
-                    counts["unknown_options"] += 1
-                    continue
-                context_depth = int(prediction.get("context_depth") or 0)
-                if context_depth < self.min_context_depth:
-                    # A root-only prediction pools unrelated source stages,
-                    # so it is not a transition from this node.  Refusing it
-                    # keeps the search from fabricating an edge.
-                    counts["backoff_refused"] += 1
-                    counts["unknown_options"] += 1
-                    continue
-                mass = float(sum(
-                    float(row["probability"])
-                    for row in prediction.get("outcomes", ())
-                ))
-                deviation = abs(mass - 1.0)
-                counts["edge_mass_checks"] += 1
-                if deviation > state["max_edge_deviation"]:
-                    state["max_edge_deviation"] = deviation
-                if deviation > self.tolerance:
-                    raise ValueError(
-                        "option outcomes must sum to one; got %.12f at %r"
-                        % (mass, node)
-                    )
-                if not prediction.get("outcomes"):
-                    raise ValueError(
-                        "supported edge must report at least one outcome"
-                    )
-                supported.append((option, prediction))
+            if quotient is not None:
+                # Class mode: one branch per accepted option class.  A class
+                # is keyed by the current stage, so the retained context depth
+                # is exactly one stage.
+                stage_key = node[-1]
+                for class_id in quotient.classes_for(stage_key):
+                    counts["queries"] += 1
+                    prediction = quotient.predict_class(class_id)
+                    if accept(node, prediction) is None:
+                        continue
+                    supported.append((
+                        ("option_class", int(class_id)), prediction,
+                    ))
+            else:
+                for option in options:
+                    counts["queries"] += 1
+                    prediction = self.memory.predict(node, option)
+                    if accept(node, prediction) is None:
+                        continue
+                    supported.append((option, prediction))
             cache[node] = tuple(supported)
             counts["supported_options"] += len(supported)
             return cache[node]
@@ -565,6 +606,7 @@ class StageOptionSearch:
                         ),
                         context_depth=int(prediction.get("context_depth") or 0),
                         resolution=prediction.get("resolution"),
+                        option_class=prediction.get("class_id"),
                     )
                     probability_next = float(probability) * edge_probability
                     if step.terminal or step.censored:
@@ -647,6 +689,9 @@ class StageOptionSearch:
             max_transitions=int(self.max_transitions),
             min_context_depth=int(self.min_context_depth),
             max_elapsed_support=int(self.max_elapsed_support),
+            option_mode=(
+                "class" if self.option_quotient is not None else "trace"
+            ),
             leaves=tuple(leaves),
             unresolved=tuple(unresolved),
             counts=result_counts,

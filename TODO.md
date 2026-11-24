@@ -379,7 +379,25 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
      “8 帧视界 = 约 2 个阶段、且经常装不下”的判断。
    - 仍不做：competing risk / 删失校准、跨任务迁移；这些需要 held-out
      生存审计，后续单独开项。
-9. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
+9. **[x] P1：option 等价类（predictive option quotient，2026-11-24，已落地、门未通过）**。
+   新增 `predictive_option_quotient.py`：把同一源阶段下、后继分布/时长/反馈
+   可预测等价的 action trace 合并成类；类按源阶段作用域；合并是训练档案上
+   的模型选择（每样本最多损失 `tolerance` nats），整个商在 held-out episodes
+   上接受/拒绝。`StageOptionSearch(option_quotient=...)` 切换 class 模式：
+   每个类一条分支，使用类池化分布；被拒的商禁止使用。
+   - 结果（seed 100、1500 步、depth 2、86 traces）：tolerance 0.0/0.005/
+     0.01/0.02/0.05 → classes 65/63/63/63/63（reduction 24–27%），
+     **全部被 held-out 门拒绝**（Δ −0.126…−0.235，support 55）。
+   - 通道分解（tolerance 0.0）：categorical **+0.015**（类略好）、duration
+     −0.013、**feedback −0.128** → 拒绝几乎全部来自反馈通道：合并会丢失
+     trace 级反馈剖面（Gaussian 模型下方差/多峰惩罚）。
+   - 判定：`option_classes_rejected_by_feedback_channel`；class 模式保持
+     关闭，trace 模式仍是唯一可用动作词表。下一步可选：反馈改为直方图/
+     混合模型后重跑同一门，或只在 categorical+duration 上合并、反馈保留
+     per-trace。
+   - 仍不做：跨任务 option 归纳、unseen trace 到已有类的因果映射（当前
+     unseen trace 仍 UNKNOWN）。
+10. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
    episode-held-out 审计（5 折 / 3 seeds，fold-refit 表示），但仍无
    planner A/B、跨 seed 决策稳定性、在线 provider 校准或 shadow 运行；
    所有表示/阈值/identity/demand/heuristic 只在训练 episode 拟合；先 shadow，
@@ -396,9 +414,10 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
    和 held-out 预测等价的 stage-type merge 树。**仍未实现**：从连续状态直接
    合成新的 stage 身份（当前只会检索已见 key 或回退 base）、跨签名的 split、
    以及多任务流上的稳定 identity 校准。
-3. 选项 trace 目前严格精确匹配；尚无从真实行为中归纳可复用 option 的机制，
-   新 action trace 一律 UNKNOWN。这是诚实的 support 限制，不用动作直方图
-   或反事实补边掩盖。
+3. 选项 trace 目前严格精确匹配；已实现 predictive option quotient（按后继/
+   时长/反馈等价合并 trace），但 held-out 门在 seed 100 上因反馈通道拒绝
+   （Δ −0.128），class 模式未启用；仍无 unseen trace → 已有类的因果映射，
+   新 action trace 一律 UNKNOWN。
 4. duration 目前报告经验分位数与离散分布（`duration.distribution`），
    搜索按分布卷积；删失样本单独标记，但**尚未**实现 competing
    risk / survival likelihood 或 held-out 校准，不能把这些分布当作
