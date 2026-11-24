@@ -493,6 +493,13 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
       +0.202；0.20 → 3 层、+0.111。held-out 门只能验证“可达且有用”，
       不能单独决定层数；下一步需要跨 seed/折稳定性或下游决策目标来选
       tolerance。1 seed / 71 验证样本，方向性结论。
+      - **跨折稳定性门（`stage_layer_stability.py`、
+        `layer_stability_probe.py`）**：5 折 × 3 fold seeds。任一层数配置
+        在折间的 layer count 从 **2 到 137** 剧烈变化，agreement 仅
+        **0.20–0.40**；**没有一个候选达到 0.60**，3/3 fold seeds 均无
+        稳定候选，尽管 mean gain 仍为 0.13–0.39。
+        → 判定 `layer_count_not_stable`：当前数据量下相似度层级不可识别，
+        **C 不接线**。需要更多 episode，或最小层支撑/高相似度约束后重跑。
     - 约束：节点强度/权重只来自 runtime 自身，不引入任务常量；未知节点
       保持 0，不伪造边；默认只读，不替换 detector/segmentation/planner。
 11. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的

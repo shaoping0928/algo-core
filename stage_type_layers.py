@@ -88,6 +88,18 @@ class StageTypeLayers:
             model._select(validation)
         return model
 
+    def build(self, samples: Sequence[StageSample]):
+        """Build the merge tree without selecting a frontier yet."""
+        self.samples = tuple(samples)
+        self.nodes = {}
+        self.partitions = ()
+        self.partition = ()
+        self.layers = ()
+        self.accepted = False
+        if self.samples:
+            self._build_tree()
+        return self
+
     def _build_tree(self):
         profiles = [_normalize(sample.profile) for sample in self.samples]
         for index, sample in enumerate(self.samples):
@@ -245,6 +257,36 @@ class StageTypeLayers:
         self.mean_margin = float(chosen["margin"])
         self.predictive_gain = float(chosen["gain"])
         self.accepted = True
+
+    def reselect(self, validation, min_similarity=None, min_coverage=None,
+                 min_gain=None, tolerance=None, min_layer_support=None):
+        """Re-run frontier selection on an already built tree.
+
+        The tree over training profiles is fixed; only the assignment floor,
+        coverage/gain gates, parsimony tolerance or layer-support gate change.
+        This lets a stability sweep reuse one tree per fold.
+        """
+        if not self.nodes:
+            raise ValueError("build the tree before reselecting")
+        if min_similarity is not None:
+            self.min_similarity = float(min_similarity)
+        if min_coverage is not None:
+            self.min_coverage = float(min_coverage)
+        if min_gain is not None:
+            self.min_gain = float(min_gain)
+        if tolerance is not None:
+            self.tolerance = float(tolerance)
+        if min_layer_support is not None:
+            self.min_layer_support = int(min_layer_support)
+        self.accepted = False
+        self.coverage = 0.0
+        self.mean_margin = 0.0
+        self.predictive_gain = 0.0
+        self.level = 0.0
+        self.partition = ()
+        self.layers = ()
+        self._select(validation)
+        return self
 
     def assign(self, profile):
         """Best selected layer for a held-out profile, or UNKNOWN."""
