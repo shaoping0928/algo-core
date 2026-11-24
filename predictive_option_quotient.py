@@ -11,8 +11,9 @@ The fit roles follow the stage tree:
 
 * *training* episodes supply one outcome profile per ``(source stage, trace)``;
 * a merge is a model-selection decision on training profiles: pooling may cost
-  at most ``tolerance`` nats per sample, measured with the shrunk outcome,
-  duration and feedback likelihoods;
+  at most ``tolerance`` nats per sample, measured with MLE outcome and duration
+  likelihoods plus a per-dimension feedback histogram, so a clean mixture is
+  not punished for having a wide Gaussian variance;
 * *validation* episodes are untouched and decide whether the quotient as a
   whole is accepted over the exact-trace model.
 
@@ -109,6 +110,7 @@ class OptionProfile:
     duration_log_sq_sum: float = 0.0
     feedback_sum: Optional[np.ndarray] = None
     feedback_sq_sum: Optional[np.ndarray] = None
+    feedback_values: list = field(default_factory=list)
 
     def add(self, source: StageOccurrence,
             destination: Optional[StageOccurrence],
@@ -132,6 +134,7 @@ class OptionProfile:
             raise ValueError("feedback dimensions must be consistent")
         self.feedback_sum += feedback
         self.feedback_sq_sum += feedback * feedback
+        self.feedback_values.append(feedback.copy())
 
     def pooled(self, other: "OptionProfile") -> "OptionProfile":
         result = OptionProfile()
@@ -172,6 +175,9 @@ class OptionProfile:
             result.feedback_sq_sum = (
                 self.feedback_sq_sum + other.feedback_sq_sum
             )
+        result.feedback_values = list(self.feedback_values) + list(
+            other.feedback_values
+        )
         return result
 
     def duration_moments(self):
@@ -246,13 +252,121 @@ def _smoothed_probabilities(profile: OptionProfile, base: OptionProfile,
     return result
 
 
-def _profile_nll(profile: OptionProfile, base: OptionProfile) -> float:
+class FeedbackBins:
+    """Per-dimension quantile bins for a discrete feedback model.
+
+    Feedback is a continuous vector, but pooling options with tight yet
+    different feedback makes a single Gaussian look bad even when the pooled
+    values are a clean mixture.  A histogram keeps that mixture: it can assign
+    mass to both modes instead of inflating one variance.
+    """
+
+    def __init__(self, edges=()):
+        self.edges = tuple(
+            np.asarray(edge, dtype=float).reshape(-1) for edge in edges
+        )
+
+    @property
+    def dimensions(self):
+        return len(self.edges)
+
+    @classmethod
+    def fit(cls, values, bins: int = 8):
+        values = [
+            np.asarray(value, dtype=float).reshape(-1)
+            for value in values
+            if np.asarray(value).size
+        ]
+        if not values:
+            return cls(())
+        dimensions = min(len(value) for value in values)
+        edges = []
+        for dimension in range(dimensions):
+            column = np.asarray(
+                [value[dimension] for value in values
+                 if len(value) > dimension],
+                dtype=float,
+            )
+            unique = np.unique(column)
+            if unique.size <= 1:
+                center = float(unique[0]) if unique.size else 0.0
+                edges.append(np.asarray([center - 0.5, center + 0.5]))
+                continue
+            quantiles = np.quantile(
+                column, np.linspace(0.0, 1.0, int(bins) + 1),
+            )
+            edge = np.unique(quantiles)
+            if edge.size < 2:
+                edge = np.asarray([unique[0], unique[-1]])
+            edges.append(edge)
+        return cls(tuple(edges))
+
+    def index(self, value, dimension: int) -> int:
+        edge = self.edges[dimension]
+        position = int(np.searchsorted(edge, value, side="right") - 1)
+        return min(max(position, 0), len(edge) - 2)
+
+    def counts(self, values, dimension: int):
+        edge = self.edges[dimension]
+        counts = np.zeros(len(edge) - 1, dtype=float)
+        for value in values:
+            counts[self.index(value[dimension], dimension)] += 1.0
+        return counts
+
+
+def _feedback_nll_mle(profile: OptionProfile, bins: FeedbackBins) -> float:
+    if not bins.dimensions or not profile.feedback_values:
+        return 0.0
+    total = 0.0
+    for dimension in range(bins.dimensions):
+        counts = bins.counts(profile.feedback_values, dimension)
+        number = float(counts.sum())
+        if number <= 0.0:
+            continue
+        probabilities = counts / number
+        total -= float(np.sum(
+            counts * np.log(np.maximum(probabilities, 1e-12))
+        ))
+    return float(total)
+
+
+def _feedback_loglik(profile: OptionProfile, base: OptionProfile,
+                     bins: FeedbackBins, feedback, prior: float,
+                     unseen_probability: float) -> float:
+    if not bins.dimensions or not len(feedback):
+        return 0.0
+    total = 0.0
+    for dimension in range(bins.dimensions):
+        counts = bins.counts(profile.feedback_values, dimension)
+        base_counts = bins.counts(base.feedback_values, dimension)
+        number = float(counts.sum())
+        base_number = float(base_counts.sum())
+        if base_number > 0.0:
+            base_probability = base_counts / base_number
+        else:
+            base_probability = np.full(
+                len(counts), 1.0 / float(len(counts)),
+            )
+        smoothed = (
+            counts + prior * base_probability
+        ) / (number + prior)
+        index = bins.index(feedback[dimension], dimension)
+        total += float(np.log(max(
+            float(smoothed[index]), float(unseen_probability),
+        )))
+    return float(total)
+
+
+def _profile_nll(profile: OptionProfile, base: OptionProfile,
+                 bins: FeedbackBins) -> float:
     """MLE negative log-likelihood used only for the merge decision.
 
     Prediction uses the smoothed/Dirichlet form; the merge comparison must not,
     otherwise two identical empirical distributions would look different just
-    because the base profile adds other outcomes.  Variances are floored by the
-    base scale so a single-sample group cannot look infinitely likely.
+    because the base profile adds other outcomes.  Duration variances are
+    floored by the base scale so a single-sample group cannot look infinitely
+    likely.  Feedback is scored by a per-dimension histogram, not a Gaussian,
+    so a clean mixture is not punished for having a wide variance.
     """
     if profile.count <= 0:
         return 0.0
@@ -269,17 +383,7 @@ def _profile_nll(profile: OptionProfile, base: OptionProfile) -> float:
         profile.count * np.log(2.0 * np.pi * sigma2)
         + profile.count * float(variance) / sigma2
     )
-    if profile.feedback_sum is not None:
-        base_feedback_mean, base_feedback_var = base.feedback_moments()
-        mean, variance = profile.feedback_moments()
-        sigma2 = np.maximum(
-            np.asarray(variance, dtype=float),
-            np.maximum(0.1 * np.asarray(base_feedback_var, dtype=float), 1e-3),
-        )
-        total += 0.5 * float(np.sum(
-            profile.count * np.log(2.0 * np.pi * sigma2)
-            + profile.count * np.asarray(variance, dtype=float) / sigma2
-        ))
+    total += _feedback_nll_mle(profile, bins)
     return float(total)
 
 
@@ -304,6 +408,7 @@ class OptionQuotient:
     def __init__(self, prior: float = 4.0, tolerance: float = 0.05,
                  min_support: int = 2, min_episodes: int = 1,
                  acceptance_tolerance: float = 0.0,
+                 feedback_bins: int = 8,
                  unseen_probability: float = 1e-6):
         if float(prior) <= 0.0:
             raise ValueError("prior must be positive")
@@ -313,6 +418,8 @@ class OptionQuotient:
             raise ValueError("support thresholds must be positive")
         if float(acceptance_tolerance) < 0.0:
             raise ValueError("acceptance_tolerance must be non-negative")
+        if int(feedback_bins) < 2:
+            raise ValueError("feedback_bins must be at least two")
         if not 0.0 < float(unseen_probability) < 1.0:
             raise ValueError("unseen_probability must be in (0, 1)")
         self.prior = float(prior)
@@ -320,10 +427,12 @@ class OptionQuotient:
         self.min_support = int(min_support)
         self.min_episodes = int(min_episodes)
         self.acceptance_tolerance = float(acceptance_tolerance)
+        self.feedback_bin_count = int(feedback_bins)
         self.unseen_probability = float(unseen_probability)
         self.profiles = {}
         self.stage_base = {}
         self.global_profile = OptionProfile()
+        self.feedback_bins = FeedbackBins(())
         self.classes = {}
         self.class_of = {}
         self.by_stage = {}
@@ -336,6 +445,10 @@ class OptionQuotient:
     def fit(cls, train_episodes, validation_episodes=None, **kwargs):
         quotient = cls(**kwargs)
         quotient._fit_profiles(train_episodes)
+        quotient.feedback_bins = FeedbackBins.fit(
+            quotient.global_profile.feedback_values,
+            bins=quotient.feedback_bin_count,
+        )
         quotient._merge()
         quotient._assign_classes()
         if validation_episodes:
@@ -396,9 +509,11 @@ class OptionQuotient:
                         continue
                     pooled = left_profile.pooled(right_profile)
                     delta = (
-                        _profile_nll(pooled, base)
-                        - _profile_nll(left_profile, base)
-                        - _profile_nll(right_profile, base)
+                        _profile_nll(pooled, base, self.feedback_bins)
+                        - _profile_nll(left_profile, base, self.feedback_bins)
+                        - _profile_nll(
+                            right_profile, base, self.feedback_bins,
+                        )
                     ) / float(count)
                     if best is None or delta < best[0]:
                         best = (delta, left, right, pooled)
@@ -495,15 +610,11 @@ class OptionQuotient:
             + (_log(stats.duration) - mean) ** 2 / variance
         ))
         if profile.feedback_sum is not None:
-            mean, variance = _shrunk(
-                profile.feedback_moments(), base.feedback_moments(),
-                profile.count, self.prior,
-            )
             feedback = np.asarray(stats.feedback, dtype=float).reshape(-1)
-            score += float(np.sum(-0.5 * (
-                np.log(2.0 * np.pi * variance)
-                + (feedback - mean) ** 2 / variance
-            )))
+            score += _feedback_loglik(
+                profile, base, self.feedback_bins, feedback,
+                self.prior, self.unseen_probability,
+            )
         return float(score)
 
     def classes_for(self, stage_key):
@@ -573,6 +684,9 @@ class OptionQuotient:
             tolerance=float(self.tolerance),
             min_support=int(self.min_support),
             min_episodes=int(self.min_episodes),
+            feedback_model="histogram",
+            feedback_bins=int(self.feedback_bin_count),
+            feedback_dimensions=int(self.feedback_bins.dimensions),
             accepted=bool(self.accepted),
             acceptance_delta=(
                 None if self.acceptance_delta is None

@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from predictive_option_quotient import OptionQuotient
+from predictive_option_quotient import FeedbackBins, OptionQuotient
 from stage_option_search import StageOptionSearch
 from stage_outcome_memory import (
     StageOccurrence,
@@ -117,6 +117,62 @@ class IdenticalOptionMergeTests(unittest.TestCase):
                 self.memory, max_transitions=1,
                 option_quotient=rejected,
             )
+
+
+class FeedbackHistogramTests(unittest.TestCase):
+    def test_bins_partition_the_training_range(self):
+        values = [np.asarray([float(value)]) for value in range(10)]
+        bins = FeedbackBins.fit(values, bins=4)
+        self.assertEqual(bins.dimensions, 1)
+        self.assertEqual(bins.index(-1.0, 0), 0)
+        self.assertEqual(bins.index(100.0, 0), len(bins.edges[0]) - 2)
+        counts = bins.counts(values, 0)
+        self.assertEqual(float(counts.sum()), 10.0)
+        self.assertEqual(
+            counts[bins.index(9.0, 0)], counts.max(),
+        )
+
+    def test_histogram_measures_a_mixture_more_cheaply_than_a_gaussian(self):
+        o_a = encode_action_trace([0, 0])
+        o_b = encode_action_trace([1, 1])
+        episodes = [
+            [occurrence(0, ("S",), [0, 0], duration=2.0),
+             occurrence(0, ("A",), [3], duration=3.0,
+                        feedback=(0.0, 0.0), terminal=True)],
+            [occurrence(1, ("S",), [1, 1], duration=2.0),
+             occurrence(1, ("A",), [3], duration=3.0,
+                        feedback=(10.0, 0.0), terminal=True)],
+        ]
+        quotient = OptionQuotient.fit(
+            episodes, episodes,
+            prior=4.0, tolerance=0.7,
+            min_support=1, min_episodes=1,
+            acceptance_tolerance=1.0,
+        )
+        self.assertEqual(len(quotient.merge_log), 1)
+        # A 0-vs-10 feedback split costs ~log(2) per sample as a histogram;
+        # as a single Gaussian it would cost several nats.
+        self.assertGreater(quotient.merge_log[0]["delta"], 0.5)
+        self.assertLess(quotient.merge_log[0]["delta"], 0.8)
+        self.assertEqual(quotient.class_for(("S",), o_a),
+                         quotient.class_for(("S",), o_b))
+        self.assertTrue(quotient.accepted)
+
+    def test_snapshot_reports_the_feedback_model(self):
+        o_a = encode_action_trace([0])
+        episodes = [
+            [occurrence(0, ("S",), [0], duration=2.0),
+             occurrence(0, ("A",), [3], duration=3.0,
+                        feedback=(1.0, 0.0), terminal=True)],
+        ]
+        quotient = OptionQuotient.fit(
+            episodes, episodes, prior=4.0, tolerance=0.05,
+            min_support=1, min_episodes=1, feedback_bins=4,
+        )
+        snapshot = quotient.snapshot()
+        self.assertEqual(snapshot["feedback_model"], "histogram")
+        self.assertEqual(snapshot["feedback_bins"], 4)
+        self.assertEqual(snapshot["feedback_dimensions"], 2)
 
 
 class DivergentOptionTests(unittest.TestCase):
