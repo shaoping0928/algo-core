@@ -570,6 +570,24 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
       clearance 目标下做阶段级动作搜索或合成新 trace），而不是继续加门。
     - 约束：节点强度/权重只来自 runtime 自身，不引入任务常量；未知节点
       保持 0，不伪造边；默认只读，不替换 detector/segmentation/planner。
+    - **下一步（二选一，2026-11-24 收口）**：
+      1. **Option improvement（阶段级动作改进）**
+         - 目标：在“局部准确的转移记忆”之上，产生**不属于行为克隆**的
+           阶段级动作，使 gated consumer 在可靠门内真正改善 frames/passes；
+         - 候选实现：
+           a. 在 survival/clearance 目标下对 option 动作做**阶段级搜索**
+              （同一 start、同一 stop-time 约束下比较动作串）；
+           b. 从真实反馈中**合成新 trace**，而不是从行为流里选 trace；
+         - 门：可靠门（depth≥2 + support≥5）保持开启；门外回退 fine
+           planner；同预算 baseline vs improved-option，3-seed 筛选、
+           6-seed 确认（≥5/6 同向）；不通过则关闭 executor 线。
+      2. **把阶段层定格为只读基座**
+         - A/A2/B 只保留 readout：stage types、outcome memory、resolver、
+           stop-time、coverage/accuracy 曲线；
+         - 关闭并归档 rank、endpoint value、executor 三条决策侧线，保留
+           负结果与诊断（rank −56%、endpoint inert、executor safe-but-inert）；
+         - 默认栈、8 步基线、planner 路径保持不变；后续只在新机制
+           （不是本转移记忆）上重新开决策侧。
 11. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
    episode-held-out 审计（5 折 / 3 seeds，fold-refit 表示），但仍无
    planner A/B、跨 seed 决策稳定性、在线 provider 校准或 shadow 运行；
