@@ -19,6 +19,7 @@
 - **plan-level miss 的 score 实际只有 risk 一列活跃**：B0.5 显示 8 个 plan-level miss 中 risk 差值为正且占 100%，value/curiosity/q 全为 0；去掉任何列都不能恢复 plan-level miss。B0.6 进一步显示 risk 的 step 部分全为 0、几乎全是 endpoint terminal hazard；预测 endpoint 把 selected 排得更安全（8/8），真实 terminal 在 7/8 判对。主因是 **world endpoint 漂移**，不是 risk 权重；下一步是 plan-level endpoint 校正/重排，而不是首动作 router。
 - **B1-plan endpoint 读数：seed 101 有 ranking 信号，但不迁移**：predicted endpoint（仅 7 维）在 seed 101 把 same-action top1 从 61/69 提到 **68/69**、B0 miss 从 2/10 提到 **9/10**，same-AUC **0.789**；但 3 种子门失败：seed 100 从 **62/62 退化到 60/62**（worsened 2, improved 0），seed 102 的 48 个可用决策 **terminal base rate 0.000**、模型退化；calibration 在所有 seed 上失败（Brier skill −0.09…−0.36）。OOD 距离/fine score 作为特征会打掉 within-decision 信号。**不接线**；只剩 OOD/UNKNOWN 门后的 rank-only 复测或 world endpoint 改善。
 - 8 帧帧级线（B0–B1-plan）已关闭；全局 span 读数排序可用但阈值不迁移、决策内不跨种子。当前机制重设计为**动作对齐的经验转移测度 + 多视窗查询**，而不是独立 span hazard：训练只用真实状态转移；预测时用候选动作序列递推 successor/feedback/terminal 分布，缺少支持则 UNKNOWN。第一版 fine frame kernel 的 h8/h16 支撑仅 0.055–0.064/0.034–0.048；折内重建表示后，嵌套 16→4→1 backoff 在 seed100/101 五折的 h8/h16 支撑约 0.79–0.83，fine-only 约 0.05–0.08，但 mixed-resolution top1 不能单独证明预测力，逐层跨种子审计是当前门槛。默认 planner 尚未接入、默认栈不变；下一步及实验数字见 `TODO.md`「P0：多视窗状态转移机制重设计」和 [2026-11-23 归档](docs/archive/README-2026-11-23.md)。
+- **通用阶段记忆基座（2026-11-24，默认关闭、planner 未接线）**：目标从「更长的帧窗」改为通用决策近视基座——只用世界交互（观测、实际动作、反馈、终止）自监督地发现信号/阶段与非帧转移。已落地 `stage_outcome_memory.py`（变长阶段、变阶上下文回退、仅真实有向兄弟结果）、`stage_demand_heuristic.py`（需求只影响中间 frontier 排序，不改最终价值）、以及 `stage_experience.py` 自动管线（真实 rows → episode → 信号 → 阶段 → pointwise demand 样本；`--stage-memory` 默认关）。fast smoke（seed 100、1500 帧）：38/38 局、367 stages（9.66/局）、duration 中位 4（q90 6）、keyed 0.90、1257 demand samples；但**内部 feature 根覆盖率仅 0.03（44/1500 行）**，demand 关联当前不能当主信号。尚无状态→阶段 resolver、预测等价阶段树、内部需求选择器或决策收益证据；下一步与门见 `TODO.md`「通用阶段记忆基座」。
 
 ### 事件/阶段层后续（Batch 8 follow-up，2026-11-23 晚）
 
@@ -113,6 +114,10 @@ context_model.py          通用潜在上下文线性动力学（残差基 + 在
 memory_tree.py            有界扇出分层记忆：合并/分裂/关键词概括/展开
 variable_registry.py      变量属性与关系：support/credibility/learning_rate
 hierarchical_memory.py    帧→事件→阶段→世界→根的分层记忆
+stage_outcome_memory.py   通用阶段实例、变阶上下文与真实有向结果统计（纯数据层）
+stage_experience.py       自监督经验管线：真实 rows → 信号 → 阶段 → demand 样本
+stage_demand_heuristic.py 需求导向 feature 排序：只改中间 frontier，默认关闭
+multiview_transitions.py  动作对齐经验转移核 + 任意窗口查询（planner 未接入）
 generative_expansion.py    关键词提示 → 节点策略 + 上下文动力学 rollout
 branches.py                共享图上的多角色稀疏强度：current/recent/prediction/value
 generated_prior_probe.py   生成先验 vs 在线 vs 零先验的存活配对

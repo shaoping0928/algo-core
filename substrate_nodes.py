@@ -54,6 +54,7 @@ from milestone_graph import (
 from multiview_transitions import MultiViewTransitionModel
 from node_features import FeatureRuleBank
 from node_runtime import NodeRuntime, future_pain_labels, future_return_labels
+from stage_experience import StageExperienceBatch
 from substrate_generic import (
     LinearObservationModel,
     collect,
@@ -821,6 +822,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         milestone_boundary_k=3.0,
         hazard_readout="calibrated",
         value_readout="cells",
+        stage_memory=False,
+        stage_memory_quantile=0.98,
         env_factory=None):
     """Collect transitions and train the node runtime on them.
 
@@ -855,6 +858,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("epochs must be positive")
     if int(lag) < 0:
         raise ValueError("lag must be non-negative")
+    if not 0.5 < float(stage_memory_quantile) < 1.0:
+        raise ValueError("stage_memory_quantile must be between 0.5 and 1")
     if int(component_min_count) < 1:
         raise ValueError("component_min_count must be positive")
     if int(max_components) < 0:
@@ -1130,6 +1135,17 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
     agent.multiview_transitions = MultiViewTransitionModel.fit_rows(
         transitions, agent, lag=agent.lag,
     )
+    if stage_memory:
+        # Automatic self-supervised experience path.  The detector is fit on
+        # these episodes only; per-transition feature snapshots come from the
+        # runtime's frozen feature masks.  Nothing here is read by the
+        # planner, so enabling it cannot change a decision.
+        agent.stage_experience = StageExperienceBatch.fit(
+            transitions, agent, lag=agent.lag,
+            quantile=stage_memory_quantile,
+        )
+    else:
+        agent.stage_experience = None
     # The milestone layer, read off the agent's own stream.  All of it is
     # inert unless the planner is asked for one of its terms.
     model = _milestone_model_from_transitions(
@@ -3248,6 +3264,8 @@ def run_seed(task):
     dagger_frames = int(task.get("dagger_frames", 0))
 
     value_horizon = int(task.get("value_horizon", 0))
+    stage_memory = bool(task.get("stage_memory", False))
+    stage_memory_quantile = float(task.get("stage_memory_quantile", 0.98))
 
     world, agent = fit(
         seed, steps=steps, coverage=coverage,
@@ -3319,6 +3337,8 @@ def run_seed(task):
         readout_propagation_gain=readout_propagation_gain,
         readout_propagation_steps=readout_propagation_steps,
         readout_propagation_edges=readout_propagation_edges,
+        stage_memory=stage_memory,
+        stage_memory_quantile=stage_memory_quantile,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -3377,6 +3397,10 @@ def run_seed(task):
         evals=rows,
         graph=agent.snapshot(),
         prediction=agent.prediction_summary(),
+        stage_memory=(
+            agent.stage_experience.snapshot()
+            if getattr(agent, "stage_experience", None) is not None else None
+        ),
         dagger=getattr(agent, "dagger_log", []),
         death_rules=getattr(agent, "death_rule_summary", None),
         milestone=getattr(agent, "milestone_summary", None),
@@ -3725,6 +3749,12 @@ def main():
                         help="on-policy frame budget per DAgger round: stop "
                              "recording once this many executed frames were "
                              "collected (0 = use --dagger-episodes as-is)")
+    parser.add_argument("--stage-memory", action="store_true",
+                        help="build the self-supervised stage experience from "
+                             "the realized stream (read-only; planner unwired)")
+    parser.add_argument("--stage-memory-quantile", type=float, default=0.98,
+                        help="upper-tail quantile for the generic key-signal "
+                             "detector's channels")
     parser.add_argument("--benchmark", action="store_true",
                         help="standard ruler: 1500 offline frames replayed "
                              "once, then one 5000-frame free-control round "
@@ -3787,6 +3817,8 @@ def main():
         raise ValueError("--birth-threshold must be positive")
     if args.epochs < 1:
         raise ValueError("--epochs must be positive")
+    if not 0.5 < args.stage_memory_quantile < 1.0:
+        raise ValueError("--stage-memory-quantile must be in (0.5, 1)")
     if args.lag < 0:
         raise ValueError("--lag must be non-negative")
     if args.pain_horizon < 0:
@@ -3960,6 +3992,8 @@ def main():
             dagger_offset=args.dagger_offset,
             dagger_horizon=args.dagger_horizon,
             dagger_frames=args.dagger_frames,
+            stage_memory=args.stage_memory,
+            stage_memory_quantile=args.stage_memory_quantile,
         )
         for seed in seeds
     ]
@@ -4077,6 +4111,27 @@ def main():
               "identity the memory had seen)"
               % (coverages.mean(), float(np.median(coverages)),
                  coverages.min()))
+    if args.stage_memory:
+        census = rows[0].get("stage_memory")
+        if census:
+            # Read-only diagnostic: how many realized episodes produced
+            # stages, how many stages carry a signal key (the rest share the
+            # empty root key), and how often the internal feature masks fired.
+            print(
+                "stage experience (seed %d): %d/%d episodes, %d stages "
+                "(%.2f/episode), keyed %.2f, feature coverage %.2f, "
+                "%d demand samples"
+                % (
+                    rows[0]["seed"], census["episodes"],
+                    census["episodes"] + census["episodes_skipped"],
+                    census["stages"], census["mean_stages_per_episode"],
+                    (
+                        float(census["keyed_stages"]) / census["stages"]
+                        if census["stages"] else 0.0
+                    ),
+                    census["feature_coverage"], census["demand_samples"],
+                )
+            )
     if overall["clusters"] < 5:
         print("warning: fewer than 5 trained models; the interval is "
               "descriptive, not a significance test")
@@ -4129,6 +4184,8 @@ def main():
                 dagger_cap=args.dagger_cap,
                 dagger_offset=args.dagger_offset,
                 dagger_horizon=args.dagger_horizon,
+                stage_memory=args.stage_memory,
+                stage_memory_quantile=args.stage_memory_quantile,
             ),
             rows=eval_rows,
             milestones=[
@@ -4138,6 +4195,11 @@ def main():
             dagger=[
                 dict(seed=row["seed"], rounds=row["dagger"])
                 for row in rows
+            ],
+            stage_memory=[
+                dict(seed=row["seed"], census=row["stage_memory"])
+                for row in rows
+                if row.get("stage_memory") is not None
             ],
             per_train_seed=per_train,
             per_eval_seed=per_eval,

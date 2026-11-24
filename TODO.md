@@ -176,13 +176,28 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
 
 **重排后的 gap 与后续方向（严格自监督）**：
 
-1. **P0：自动经验管线**。唯一外部来源是世界交互产生的观测、实际作用动作、
-   反馈和 episode 终止。按 episode 先切分，再由内部 residual / novelty /
-   feedback-change 机制拟合信号阈值、切 stage、记录每个真实状态的
-   active-feature snapshots；actions 按 `history[lag]`。当前这些组件存在，
-   但 `fit()` 还没有自动把真实训练 rows 变成 stage / demand 样本。
+1. **[x] P0：自动经验管线（`stage_experience.py`，2026-11-24）**。
+   唯一外部来源仍是世界交互：按 episode 分组，acting action 取
+   `history[lag]`（缺失则整局丢弃，绝不退回 `history[0]`），feedback 取
+   真实 `signals[:2]`，active-feature 用 runtime 冻结的
+   `_branch_active_features` 只读快照；`GenericKeySignalDetector` 只在传入
+   rows 上拟合，`transform(rows, agent)` 复用冻结阈值，不更新阈值。
+   产出 `StageOccurrence` 序列与 pointwise `DemandAssociationSample`
+   （逐转移快照配真实下一阶段，不是只配阶段入口）。census 报告
+   episodes/stages/keyed share/duration/feature coverage/demand 数。
+   `substrate_nodes.py --stage-memory`（默认关）把 batch 挂到
+   `agent.stage_experience`，planner 不读取，默认决策逐位不变。
+   - 合成测试 7 条；全量 537 passed。
+   - fast 真实流 smoke（seed 100、1500 帧）：38/38 局、367 stages
+     （9.66/局）、duration 中位 4（q90 6）、keyed 0.90、9 个 signal
+     channel、1257 demand samples；**feature coverage 仅 0.03
+     （8 个 feature id，44/1500 行）**——内部 feature 根很稀疏，
+     下一层不能把 demand 关联当主信号，resolver 应主要依赖状态/阶段，
+     feature 只作可选证据。
 2. **P0：当前状态到历史阶段 resolver**。精确 signal-token key 不能覆盖连续
    状态。需要 train-fold 拟合、held-out 冻结的状态/信号表示；未映射状态 → UNKNOWN。
+   （前置的自动管线已落地；下一步实现 resolver。fast smoke 显示 feature 根
+   覆盖仅 0.03，因此 resolver 以状态→阶段证据为主，feature 只作可选证据。）
 3. **P0：预测等价的多级阶段树**。当前是最近阶段历史的变阶后缀回退，不是阶段
    类型的 merge/split 树。用 held-out successor、duration、feedback 预测等价
    决定父子/兄弟关系；报告各层分辨率、support、UNKNOWN 和相对 base-rate 的增益，
@@ -207,7 +222,8 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
 
 1. 当前 detector 只覆盖观测变化、反馈变化和调用方可提供的 prediction
    error；尚未加入新颖度、action-conditioned 转移分布变化或多信号边界
-   校准，现有 quantile detector 也尚未在真实任务流验证。
+   校准。quantile detector 已在 fast 真实流 smoke 上跑通（38 局/1500 帧，
+   9 个 channel），但尚无 held-out 阈值稳定性或边界质量校准。
 2. 当前 stage identity 是精确 key-signal token 组合；尚未实现从连续当前状态
    检索历史阶段，也没有基于 held-out predictive equivalence 的跨签名 merge /
    split。因此当前上下文树是阶段历史的变阶 backoff，不是完整的状态抽象树。
@@ -216,9 +232,9 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
    或反事实补边掩盖。
 4. duration 目前只报告经验分位数；删失样本单独标记，但尚未实现 competing
    risk / survival likelihood 或校准，不能把这些分位数当作生存预测。
-5. 尚未在真实多 episode / 多任务流验证阶段身份、duration likelihood、
-   feedback / terminal 校准、父级收益及 root 常数退化；合成测试只验证数据结构
-   和计数正确性。
+5. 尚未在真实多 episode / 多任务流做 episode-held-out 校准、duration
+   likelihood、feedback / terminal 校准、父级收益及 root 常数退化；
+   fast smoke 只验证管线可运行与计数，合成测试只验证数据结构和计数正确性。
 6. provider 与 rank-only 通道已接到 beam-search policy/evaluate；但还没有由
    自监督阶段记忆自动生成 provider / 训练数据桥接，也未接入默认路径。不存在
    阶段级行为收益证据，默认决策路径逐位不变。

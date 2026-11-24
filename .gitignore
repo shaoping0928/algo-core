@@ -11,3 +11,5 @@ multiview-*.json
 quotient-*.json
 hierarchical-*.json
 hierarchy-*.json
+stage-*.json
+stage-*.log
