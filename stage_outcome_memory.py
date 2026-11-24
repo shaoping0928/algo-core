@@ -11,10 +11,12 @@ It returns empirical successor, duration, feedback, terminal/censoring,
 support, and resolution statistics.  Outcome duration and feedback describe
 the destination stage that actually followed; a terminal/censored outcome has
 no destination, so it reports the source stage's own duration/feedback at the
-episode's end.  Unsupported queries return UNKNOWN.  Duration summaries are
-descriptive; censoring is flagged separately and is not yet a calibrated
-survival estimator. Stage keys are exact signal tokens; continuous-state
-predictive-equivalence merging is a later layer.
+episode's end.  Unsupported queries return UNKNOWN.  Each outcome reports a
+discrete empirical duration distribution (``duration.distribution``) in
+addition to mean/quantile summaries; it is still descriptive, censoring is
+flagged separately, and it is not a calibrated competing-risk survival model.
+Stage keys are exact signal tokens; continuous-state predictive-equivalence
+merging is a later layer.
 """
 from __future__ import annotations
 
@@ -510,6 +512,11 @@ class _OutcomeCounts:
             - feedback_mean ** 2,
             0.0,
         )
+        values, counts = np.unique(durations, return_counts=True)
+        distribution = tuple(
+            (float(round(float(value), 6)), float(count) / float(self.count))
+            for value, count in zip(values, counts)
+        )
         return dict(
             destination=destination,
             terminal=bool(terminal),
@@ -529,6 +536,8 @@ class _OutcomeCounts:
                 q90=float(np.quantile(durations, 0.9)),
                 minimum=float(durations.min()),
                 maximum=float(durations.max()),
+                count=int(self.count),
+                distribution=distribution,
             ),
             feedback_mean=feedback_mean.tolist(),
             feedback_variance=feedback_variance.tolist(),

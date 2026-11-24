@@ -352,7 +352,34 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
    仍缺（下一层，不在本项）：option 归纳（当前只支持 exact trace）、
    duration 的生存/竞争风险似然、阶段级价值、option 执行器与边界重规划。
    **未接 planner，默认路径逐位不变**。
-8. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
+8. **[x] P1：停时分布（stop-time distribution，2026-11-24，已完成、未接线）**。
+   目标：把 duration 从经验分位数升级为**离散停时分布**，并让搜索按分布
+   合成，而不是把均值相加。这是“概念级转移”的第一步：时间是输出，不是
+   帧计数。
+   - 数据层：`_OutcomeCounts.summary` 增加
+     `duration.distribution = ((t, p), ...)`（真实 duration 直方图归一化）
+     与 `duration.count`；mean/median/q90/min/max 保留为描述统计。
+   - 搜索层：`OptionStep.duration_distribution`、
+     `OptionLeaf.elapsed_distribution`；路径 elapsed = root 偏移 + 各
+     **后继边** duration 分布的离散卷积。terminal/censored 边仍不加时长
+     （它描述当前阶段，避免重复计数）。
+   - 契约：每个分布概率和为 1；缺失分布直接抛错（不用均值伪造点质量）；
+     卷积支持集超过 `max_elapsed_support` 抛
+     `StageOptionSearchCapacityError`，不静默截断。
+   - 提供 `distribution_mean` / `distribution_quantile` /
+     `survival_curve`（P(T > t)），供后续 value/executor 使用；
+     `PlanSummary` 增加按 outcome 质量加权的 elapsed 分布。
+   - 门：单测验证直方图、卷积、偏移、逐叶归一、plan 聚合与容量拒绝；
+     probe 增加 elapsed q90 与 P(elapsed ≤ horizon) 读数。
+   - 结果（seed 100、1500 步、depth 2）：offline 118 次搜索 elapsed
+     mean **8.0 帧**、q90 **14.6 帧**、**P(elapsed ≤ 8) = 0.703**；
+     online 40 决策 mean **7.8**、q90 **14.35**、within-8 **0.712**；
+     卷积支持集最大仅 18 个时间点。→ depth-2 阶段计划里约 **30%** 的
+     时长质量超出当前 8 帧视界，q90 约为视界的 1.8 倍：这从停时上确认了
+     “8 帧视界 = 约 2 个阶段、且经常装不下”的判断。
+   - 仍不做：competing risk / 删失校准、跨任务迁移；这些需要 held-out
+     生存审计，后续单独开项。
+9. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
    episode-held-out 审计（5 折 / 3 seeds，fold-refit 表示），但仍无
    planner A/B、跨 seed 决策稳定性、在线 provider 校准或 shadow 运行；
    所有表示/阈值/identity/demand/heuristic 只在训练 episode 拟合；先 shadow，
@@ -372,8 +399,10 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
 3. 选项 trace 目前严格精确匹配；尚无从真实行为中归纳可复用 option 的机制，
    新 action trace 一律 UNKNOWN。这是诚实的 support 限制，不用动作直方图
    或反事实补边掩盖。
-4. duration 目前只报告经验分位数；删失样本单独标记，但尚未实现 competing
-   risk / survival likelihood 或校准，不能把这些分位数当作生存预测。
+4. duration 目前报告经验分位数与离散分布（`duration.distribution`），
+   搜索按分布卷积；删失样本单独标记，但**尚未**实现 competing
+   risk / survival likelihood 或 held-out 校准，不能把这些分布当作
+   已验证的生存预测。
 5. 已在单任务真实被动流上做 episode-held-out resolver（5 折）与阶段树
    （3 seeds、60/20/20）审计；**仍未做**：duration 生存校准、feedback /
    terminal 的联合校准、父级收益的多种子显著性、root 常数退化检查，以及

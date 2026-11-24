@@ -6,7 +6,10 @@ import numpy as np
 from stage_option_search import (
     StageOptionSearch,
     StageOptionSearchCapacityError,
+    distribution_mean,
+    distribution_quantile,
     exhaustive_option_search,
+    survival_curve,
 )
 from stage_outcome_memory import (
     StageOccurrence,
@@ -92,7 +95,10 @@ def prediction(context, outcomes):
 
 
 def outcome(destination=None, terminal=False, censored=False,
-            probability=1.0, duration=2.0, feedback=(0.0, 0.0)):
+            probability=1.0, duration=2.0, feedback=(0.0, 0.0),
+            distribution=None):
+    if distribution is None:
+        distribution = ((float(duration), 1.0),)
     return dict(
         destination=destination,
         terminal=terminal,
@@ -100,7 +106,13 @@ def outcome(destination=None, terminal=False, censored=False,
         probability=float(probability),
         count=1,
         episode_support=1,
-        duration=dict(mean=float(duration)),
+        duration=dict(
+            mean=float(duration),
+            distribution=tuple(
+                (float(time), float(weight))
+                for time, weight in distribution
+            ),
+        ),
         feedback_mean=list(feedback),
     )
 
@@ -289,6 +301,105 @@ class OptionSearchModelTests(unittest.TestCase):
         self.assertIn("backoff_refused", snapshot["counts"])
 
 
+class StopTimeDistributionTests(unittest.TestCase):
+    def setUp(self):
+        o0 = encode_action_trace([0])
+        o2 = encode_action_trace([2])
+        self.o0, self.o2 = o0, o2
+        # S --o0--> A with A lasting 2 or 4 frames; A --o2--> terminal.
+        self.episodes = [
+            [occurrence(0, ("S",), [0], duration=1.0),
+             occurrence(0, ("A",), [2], duration=2.0, terminal=True)],
+            [occurrence(1, ("S",), [0], duration=1.0),
+             occurrence(1, ("A",), [2], duration=4.0, terminal=True)],
+        ]
+        self.memory = StageOutcomeMemory(
+            min_support=1, min_episodes=1,
+        ).fit(self.episodes)
+
+    def search(self, **kwargs):
+        return StageOptionSearch(
+            self.memory, max_transitions=2,
+        ).search([("S",)], **kwargs)
+
+    def test_memory_reports_the_realized_duration_histogram(self):
+        prediction = self.memory.predict([("S",)], self.o0)
+        row = next(
+            row for row in prediction["outcomes"]
+            if row["destination"] == ("A",)
+        )
+        self.assertEqual(
+            row["duration"]["distribution"],
+            ((2.0, 0.5), (4.0, 0.5)),
+        )
+        self.assertEqual(row["duration"]["count"], 2)
+        self.assertAlmostEqual(row["duration"]["mean"], 3.0)
+
+    def test_elapsed_is_a_convolution_not_a_mean(self):
+        result = self.search()
+        self.assertEqual(len(result.leaves), 1)
+        leaf = result.leaves[0]
+        self.assertEqual(leaf.options, (self.o0, self.o2))
+        self.assertEqual(
+            leaf.elapsed_distribution, ((2.0, 0.5), (4.0, 0.5)),
+        )
+        self.assertAlmostEqual(leaf.elapsed_mean, 3.0)
+        self.assertAlmostEqual(leaf.steps[0].duration_mean, 3.0)
+        self.assertEqual(
+            leaf.steps[0].duration_distribution,
+            ((2.0, 0.5), (4.0, 0.5)),
+        )
+
+    def test_root_offset_shifts_the_distribution(self):
+        result = self.search(root_elapsed=1.0)
+        distribution = result.leaves[0].elapsed_distribution
+        self.assertEqual(distribution, ((3.0, 0.5), (5.0, 0.5)))
+        self.assertAlmostEqual(distribution_mean(distribution), 4.0)
+        self.assertEqual(distribution_quantile(distribution, 0.5), 3.0)
+        self.assertEqual(distribution_quantile(distribution, 0.9), 5.0)
+
+    def test_survival_curve_reports_exceedance_mass(self):
+        self.assertEqual(
+            survival_curve(((2.0, 0.5), (4.0, 0.5))),
+            ((2.0, 0.5), (4.0, 0.0)),
+        )
+
+    def test_plan_elapsed_distribution_is_normalized(self):
+        plan = self.search().plans()[0]
+        self.assertAlmostEqual(
+            sum(probability for _time, probability
+                in plan.elapsed_distribution),
+            1.0,
+        )
+        self.assertAlmostEqual(plan.expected_elapsed, 3.0)
+
+    def test_multiple_outcomes_convolve_per_branch(self):
+        o0 = encode_action_trace([0])
+        memory = StubMemory(
+            {
+                ((("S",),), o0): prediction(
+                    (("S",),),
+                    [
+                        outcome(destination=("A",), probability=0.5,
+                                distribution=((1.0, 1.0),)),
+                        outcome(destination=("B",), probability=0.5,
+                                distribution=((2.0, 1.0),)),
+                    ],
+                ),
+            },
+            [o0],
+        )
+        result = exhaustive_option_search(
+            memory, [("S",)], max_transitions=1,
+        )
+        by_context = {
+            leaf.final_context: leaf.elapsed_distribution
+            for leaf in result.leaves
+        }
+        self.assertEqual(by_context[(("S",), ("A",))], ((1.0, 1.0),))
+        self.assertEqual(by_context[(("S",), ("B",))], ((2.0, 1.0),))
+
+
 class OptionSearchContractTests(unittest.TestCase):
     def test_unsupported_child_is_unresolved_and_not_renormalized(self):
         o0 = encode_action_trace([0])
@@ -374,6 +485,65 @@ class OptionSearchContractTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             exhaustive_option_search(memory, [("S",)], max_transitions=1)
+
+    def test_missing_duration_distribution_is_rejected(self):
+        o0 = encode_action_trace([0])
+        bare = dict(
+            destination=("A",),
+            terminal=False,
+            censored=False,
+            probability=1.0,
+            count=1,
+            episode_support=1,
+            duration=dict(mean=2.0),
+            feedback_mean=[0.0, 0.0],
+        )
+        memory = StubMemory(
+            {((("S",),), o0): prediction((("S",),), [bare])},
+            [o0],
+        )
+        with self.assertRaises(ValueError):
+            exhaustive_option_search(memory, [("S",)], max_transitions=1)
+
+    def test_duration_distribution_must_sum_to_one(self):
+        o0 = encode_action_trace([0])
+        memory = StubMemory(
+            {
+                ((("S",),), o0): prediction(
+                    (("S",),),
+                    [outcome(
+                        destination=("A",), probability=1.0,
+                        distribution=((2.0, 0.5), (4.0, 0.4)),
+                    )],
+                ),
+            },
+            [o0],
+        )
+        with self.assertRaises(ValueError):
+            exhaustive_option_search(memory, [("S",)], max_transitions=1)
+
+    def test_elapsed_support_capacity_is_not_truncated(self):
+        o0 = encode_action_trace([0])
+        distribution = tuple(
+            (float(time), 1.0 / 20.0) for time in range(1, 21)
+        )
+        memory = StubMemory(
+            {
+                ((("S",),), o0): prediction(
+                    (("S",),),
+                    [outcome(
+                        destination=("A",), probability=1.0,
+                        distribution=distribution,
+                    )],
+                ),
+            },
+            [o0],
+        )
+        with self.assertRaises(StageOptionSearchCapacityError):
+            exhaustive_option_search(
+                memory, [("S",)], max_transitions=1,
+                max_elapsed_support=5,
+            )
 
     def test_capacity_guard_raises_instead_of_dropping_branches(self):
         o0 = encode_action_trace([0])

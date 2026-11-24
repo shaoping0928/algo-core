@@ -15,11 +15,14 @@ import json
 import numpy as np
 
 from stage_online import OnlineStageTracker
-from stage_option_search import StageOptionSearch
+from stage_option_search import (
+    StageOptionSearch,
+    distribution_quantile,
+)
 from substrate_nodes import LAG, _curiosity_off, evaluate, fit
 
 
-def summarize(results):
+def summarize(results, horizon=None):
     if not results:
         return dict(searches=0)
     counts = {
@@ -28,8 +31,14 @@ def summarize(results):
             "queries", "supported_options", "unknown_options",
             "backoff_refused", "nodes", "unique_nodes", "edges", "leaves",
             "leaf_terminal", "leaf_censored", "leaf_open", "unresolved",
+            "elapsed_convolutions",
         )
     }
+    counts["max_elapsed_support_seen"] = max(
+        (int(result.counts.get("max_elapsed_support_seen", 0))
+         for result in results),
+        default=0,
+    )
     terminal_plans = sum(
         1 for result in results
         if any(leaf.outcome == "terminal" for leaf in result.leaves)
@@ -40,19 +49,41 @@ def summarize(results):
     )
     per_search_elapsed = []
     per_search_terminal = []
+    per_search_q90 = []
+    per_search_within = []
     for result in results:
         mass = sum(leaf.probability for leaf in result.leaves)
         per_search_terminal.append(sum(
             leaf.probability for leaf in result.leaves
             if leaf.outcome == "terminal"
         ))
+        aggregated = {}
+        for leaf in result.leaves:
+            for time, probability in leaf.elapsed_distribution:
+                aggregated[time] = (
+                    aggregated.get(time, 0.0)
+                    + float(probability) * float(leaf.probability)
+                )
         if mass > 0.0:
             per_search_elapsed.append(sum(
                 leaf.probability * leaf.elapsed_mean
                 for leaf in result.leaves
             ) / mass)
+            elapsed = tuple(sorted(
+                (time, probability / mass)
+                for time, probability in aggregated.items()
+            ))
+            per_search_q90.append(distribution_quantile(elapsed, 0.9))
+            if horizon is not None:
+                per_search_within.append(sum(
+                    probability for time, probability in elapsed
+                    if time <= float(horizon)
+                ))
         else:
             per_search_elapsed.append(0.0)
+            per_search_q90.append(0.0)
+            if horizon is not None:
+                per_search_within.append(0.0)
     nodes = max(counts["unique_nodes"], 1)
     return dict(
         searches=len(results),
@@ -66,6 +97,11 @@ def summarize(results):
         dead_end_searches=dead_end,
         terminal_mass_sum_mean=float(np.mean(per_search_terminal)),
         elapsed_mean=float(np.mean(per_search_elapsed)),
+        elapsed_q90=float(np.mean(per_search_q90)),
+        within_horizon=(
+            None if horizon is None
+            else float(np.mean(per_search_within))
+        ),
         unresolved_mass=float(np.mean([
             result.unresolved_mass for result in results
         ])),
@@ -162,7 +198,7 @@ def main():
                 offline.append(search.search(history))
             except ValueError:
                 continue
-    print("  offline: %s" % (summarize(offline),))
+    print("  offline: %s" % (summarize(offline, horizon=args.horizon),))
 
     provider = ProbeProvider(
         agent, args.online_depth, args.max_decisions, args.max_leaves,
@@ -186,7 +222,7 @@ def main():
         % (len(provider.results), provider.no_context,
            provider.errors, provider.skipped)
     )
-    online = summarize(provider.results)
+    online = summarize(provider.results, horizon=args.horizon)
     print("  online summary: %s" % (online,))
     if args.report:
         report = dict(
@@ -200,7 +236,7 @@ def main():
             ),
             memory=memory.snapshot(),
             option_vocabulary=len(memory.action_options),
-            offline=offline_summary(offline),
+            offline=offline_summary(offline, horizon=args.horizon),
             online=online,
             frames=frames,
         )
@@ -209,8 +245,8 @@ def main():
         print("report written to %s" % args.report)
 
 
-def offline_summary(results):
-    summary = summarize(results)
+def offline_summary(results, horizon=None):
+    summary = summarize(results, horizon=horizon)
     summary["searches"] = len(results)
     return summary
 

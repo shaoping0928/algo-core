@@ -7,8 +7,12 @@ memory predicts, for one realized action option,
         (destination stage, duration, feedback, terminal/censored)
 
 The search composes those non-frame transitions into complete paths.  A path
-advances one *stage* at a time, so its depth counts stages, not frames; elapsed
-time is the sum of the realized stage durations along the path.
+advances one *stage* at a time, so its depth counts stages, not frames.  Time
+is not a counter either: each edge carries the realized discrete stop-time
+distribution of the stage it enters, and a path's elapsed time is the exact
+convolution of those distributions (plus the caller's deterministic offset for
+the current stage).  ``survival_curve`` turns any such distribution into
+``P(T > t)``.
 
 Completeness and accuracy are the two hard requirements here:
 
@@ -71,6 +75,7 @@ class OptionStep:
     support: int
     episode_support: int
     duration_mean: float
+    duration_distribution: Tuple[Tuple[float, float], ...]
     feedback_mean: Tuple[float, ...]
     context_depth: int
     resolution: Optional[int]
@@ -89,6 +94,7 @@ class OptionLeaf:
     steps: Tuple[OptionStep, ...]
     probability: float
     elapsed_mean: float
+    elapsed_distribution: Tuple[Tuple[float, float], ...]
     feedback_mean: Tuple[float, ...]
     outcome: str
     final_context: Tuple[StageKey, ...]
@@ -118,6 +124,7 @@ class PlanSummary:
     outcome_mass: Tuple[Tuple[str, float], ...]
     known_mass: float
     expected_elapsed: float
+    elapsed_distribution: Tuple[Tuple[float, float], ...]
     expected_feedback: Tuple[float, ...]
     leaves: int
 
@@ -135,6 +142,7 @@ class OptionSearchResult:
     root_context: Tuple[StageKey, ...]
     max_transitions: int
     min_context_depth: int
+    max_elapsed_support: int
     leaves: Tuple[OptionLeaf, ...]
     unresolved: Tuple[UnresolvedNode, ...]
     counts: dict
@@ -168,6 +176,7 @@ class OptionSearchResult:
                 "leaves": [],
                 "outcomes": Counter(),
                 "elapsed": 0.0,
+                "elapsed_distribution": {},
                 "feedback": None,
             })
             group["leaves"].append(leaf)
@@ -175,6 +184,11 @@ class OptionSearchResult:
             group["elapsed"] += float(leaf.probability) * float(
                 leaf.elapsed_mean
             )
+            for time, probability in leaf.elapsed_distribution:
+                group["elapsed_distribution"][time] = (
+                    group["elapsed_distribution"].get(time, 0.0)
+                    + float(probability) * float(leaf.probability)
+                )
             if leaf.feedback_mean:
                 vector = np.asarray(leaf.feedback_mean, dtype=float)
                 if group["feedback"] is None:
@@ -189,6 +203,11 @@ class OptionSearchResult:
             known = float(sum(group["outcomes"].values()))
             if known > 0.0:
                 elapsed = group["elapsed"] / known
+                elapsed_distribution = tuple(sorted(
+                    (float(time), float(probability) / known)
+                    for time, probability
+                    in group["elapsed_distribution"].items()
+                ))
                 feedback = (
                     ()
                     if group["feedback"] is None
@@ -199,12 +218,14 @@ class OptionSearchResult:
                 )
             else:
                 elapsed = 0.0
+                elapsed_distribution = ()
                 feedback = ()
             summaries.append(PlanSummary(
                 options=options,
                 outcome_mass=tuple(sorted(group["outcomes"].items())),
                 known_mass=known,
                 expected_elapsed=float(elapsed),
+                elapsed_distribution=elapsed_distribution,
                 expected_feedback=feedback,
                 leaves=len(group["leaves"]),
             ))
@@ -219,6 +240,7 @@ class OptionSearchResult:
             root_depth=len(self.root_context),
             max_transitions=int(self.max_transitions),
             min_context_depth=int(self.min_context_depth),
+            max_elapsed_support=int(self.max_elapsed_support),
             leaves=len(self.leaves),
             plans=len(plans),
             unresolved=int(len(self.unresolved)),
@@ -254,6 +276,97 @@ def _add_feedback(current, row):
     return current + vector
 
 
+def _canonical_time(value):
+    return round(float(value), 6)
+
+
+def duration_distribution(row, tolerance: float = 1e-6):
+    """Return an outcome's discrete stop-time distribution as sorted pairs.
+
+    The memory reports the realized duration histogram per outcome.  A missing
+    distribution is an error: falling back to a point mass at the mean would
+    fabricate a timing shape the data never showed.
+    """
+    duration = row.get("duration") or {}
+    pairs = duration.get("distribution")
+    if not pairs:
+        raise ValueError(
+            "a supported outcome must report a duration distribution"
+        )
+    merged = {}
+    for time, probability in pairs:
+        time = _canonical_time(time)
+        probability = float(probability)
+        if not np.isfinite(time) or time < 0.0:
+            raise ValueError("duration values must be finite and non-negative")
+        if not np.isfinite(probability) or probability <= 0.0:
+            raise ValueError(
+                "duration probabilities must be positive and finite"
+            )
+        merged[time] = merged.get(time, 0.0) + probability
+    total = float(sum(merged.values()))
+    if abs(total - 1.0) > tolerance:
+        raise ValueError(
+            "duration distribution must sum to one; got %.12f" % total
+        )
+    return tuple(sorted(merged.items()))
+
+
+def convolve_distributions(left, right):
+    """Exact discrete convolution of two stop-time distributions."""
+    if not left or not right:
+        raise ValueError("cannot convolve an empty distribution")
+    merged = {}
+    for time_left, probability_left in left:
+        for time_right, probability_right in right:
+            time = _canonical_time(time_left + time_right)
+            merged[time] = (
+                merged.get(time, 0.0)
+                + float(probability_left) * float(probability_right)
+            )
+    return tuple(sorted(merged.items()))
+
+
+def shift_distribution(distribution, offset):
+    """Shift a stop-time distribution by a deterministic elapsed offset."""
+    offset = _canonical_time(offset)
+    if offset == 0.0:
+        return tuple(sorted(distribution))
+    return tuple(sorted(
+        (_canonical_time(time + offset), float(probability))
+        for time, probability in distribution
+    ))
+
+
+def distribution_mean(distribution):
+    return float(sum(
+        float(time) * float(probability)
+        for time, probability in distribution
+    ))
+
+
+def distribution_quantile(distribution, quantile):
+    """Smallest observed time whose cumulative mass reaches ``quantile``."""
+    if not 0.0 < float(quantile) <= 1.0:
+        raise ValueError("quantile must be in (0, 1]")
+    total = 0.0
+    for time, probability in sorted(distribution):
+        total += float(probability)
+        if total >= float(quantile) - 1e-12:
+            return float(time)
+    return float(sorted(distribution)[-1][0])
+
+
+def survival_curve(distribution):
+    """Return ``(t, P(T > t))`` for every observed time."""
+    total = 0.0
+    curve = []
+    for time, probability in sorted(distribution):
+        total += float(probability)
+        curve.append((float(time), 1.0 - total))
+    return tuple(curve)
+
+
 class StageOptionSearch:
     """Enumerate every stage-level path the fitted memory supports.
 
@@ -271,6 +384,7 @@ class StageOptionSearch:
     def __init__(self, memory, max_transitions: int = 2,
                  max_leaves: int = 200000, tolerance: float = 1e-6,
                  min_context_depth: int = 1,
+                 max_elapsed_support: int = 100000,
                  allow_truncation: bool = False):
         if memory is None:
             raise ValueError("a fitted StageOutcomeMemory is required")
@@ -282,11 +396,14 @@ class StageOptionSearch:
             raise ValueError("tolerance must be positive")
         if int(min_context_depth) < 0:
             raise ValueError("min_context_depth must be non-negative")
+        if int(max_elapsed_support) < 1:
+            raise ValueError("max_elapsed_support must be positive")
         self.memory = memory
         self.max_transitions = int(max_transitions)
         self.max_leaves = int(max_leaves)
         self.tolerance = float(tolerance)
         self.min_context_depth = int(min_context_depth)
+        self.max_elapsed_support = int(max_elapsed_support)
         self.allow_truncation = bool(allow_truncation)
 
     def search(self, stage_history: Sequence[StageKey],
@@ -318,7 +435,7 @@ class StageOptionSearch:
         cache = {}
         state = dict(
             stopped=False, complete=True, max_depth=0,
-            max_edge_deviation=0.0,
+            max_edge_deviation=0.0, max_elapsed_support_seen=0,
         )
         options = tuple(sorted(self.memory.action_options, key=repr))
         counts["option_vocabulary"] = len(options)
@@ -379,8 +496,8 @@ class StageOptionSearch:
                 state["complete"] = False
                 state["stopped"] = True
 
-        def visit(node, chosen, steps, probability, elapsed, feedback,
-                  remaining):
+        def visit(node, chosen, steps, probability, elapsed_distribution,
+                  feedback, remaining):
             if state["stopped"]:
                 return
             depth = len(steps)
@@ -391,7 +508,8 @@ class StageOptionSearch:
                     options=chosen,
                     steps=steps,
                     probability=float(probability),
-                    elapsed_mean=float(elapsed),
+                    elapsed_mean=distribution_mean(elapsed_distribution),
+                    elapsed_distribution=tuple(elapsed_distribution),
                     feedback_mean=(
                         () if feedback is None
                         else tuple(float(value) for value in feedback)
@@ -420,6 +538,9 @@ class StageOptionSearch:
                             "a supported outcome must have positive mass"
                         )
                     destination = row.get("destination")
+                    step_distribution = duration_distribution(
+                        row, self.tolerance,
+                    )
                     step = OptionStep(
                         context=node,
                         option=option,
@@ -437,6 +558,7 @@ class StageOptionSearch:
                         duration_mean=float(
                             (row.get("duration") or {}).get("mean", 0.0)
                         ),
+                        duration_distribution=step_distribution,
                         feedback_mean=tuple(
                             float(value)
                             for value in (row.get("feedback_mean") or ())
@@ -450,7 +572,12 @@ class StageOptionSearch:
                             options=chosen + (option,),
                             steps=steps + (step,),
                             probability=probability_next,
-                            elapsed_mean=float(elapsed),
+                            elapsed_mean=distribution_mean(
+                                elapsed_distribution
+                            ),
+                            elapsed_distribution=tuple(
+                                elapsed_distribution
+                            ),
                             feedback_mean=(
                                 () if feedback is None
                                 else tuple(float(value) for value in feedback)
@@ -469,18 +596,32 @@ class StageOptionSearch:
                     # Only a stage we actually enter contributes duration and
                     # feedback; a terminal/censored row describes the stage we
                     # are already in and would otherwise double count it.
+                    elapsed_next = convolve_distributions(
+                        elapsed_distribution, step_distribution,
+                    )
+                    counts["elapsed_convolutions"] += 1
+                    state["max_elapsed_support_seen"] = max(
+                        state["max_elapsed_support_seen"], len(elapsed_next),
+                    )
+                    if len(elapsed_next) > self.max_elapsed_support:
+                        raise StageOptionSearchCapacityError(
+                            "elapsed distribution support %d exceeds "
+                            "max_elapsed_support=%d"
+                            % (len(elapsed_next), self.max_elapsed_support)
+                        )
                     visit(
                         node + (step.destination,),
                         chosen + (option,),
                         steps + (step,),
                         probability_next,
-                        float(elapsed) + step.duration_mean,
+                        elapsed_next,
                         _add_feedback(feedback, row),
                         remaining - 1,
                     )
 
         visit(
-            context, (), (), 1.0, root_elapsed,
+            context, (), (), 1.0,
+            ((_canonical_time(root_elapsed), 1.0),),
             None if root_feedback is None else root_feedback.copy(),
             self.max_transitions,
         )
@@ -498,10 +639,14 @@ class StageOptionSearch:
         result_counts["max_edge_deviation"] = float(
             state["max_edge_deviation"]
         )
+        result_counts["max_elapsed_support_seen"] = int(
+            state["max_elapsed_support_seen"]
+        )
         return OptionSearchResult(
             root_context=context,
             max_transitions=int(self.max_transitions),
             min_context_depth=int(self.min_context_depth),
+            max_elapsed_support=int(self.max_elapsed_support),
             leaves=tuple(leaves),
             unresolved=tuple(unresolved),
             counts=result_counts,
