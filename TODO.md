@@ -542,6 +542,21 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
         不是决策相关量。clear/hit 分类在当前弱策略下退化（到达柱子的样本
         全是 clear；碰撞/落地提前死亡被截断），需要探索性/oracle 策略才能
         测 hit。→ **瓶颈不是信息精度，而是规划深度与决策接口**。
+    - 准确率–覆盖率曲线（`accuracy_coverage_probe.py`，2026-11-24，
+      31 train / 7 validation 局、71 个验证转移）：
+      - 整体：supported coverage **0.845**、top1 **0.817**、base 0.352、
+        lift **+0.465**；
+      - support 门：≥1/2 → 0.845 / 0.817；≥5 → 0.592 / **0.881**；
+        ≥10 → **0.549 / 0.923**；
+      - context depth 门：≥1 → 0.746 / 0.868（NLL 1.25）；≥2 →
+        0.549 / 0.897（NLL 0.87）；≥3 → **0.394 / 0.893（NLL 0.198）**；
+      - hazard 按 prototype 距离分桶：本 seed 的 AUC 0.53–0.74
+        （每桶正例 0–8），**不复现 fast smoke 的 0.94**；安全包络的距离门
+        还需要更多死亡事件。
+      → 判定 `accurate_subset_is_support_and_depth`：**可靠子集约
+      40–55%**（depth≥3 或 support≥10），top1 ~90%；depth 主要改善
+      **校准**（NLL 2.96→0.20），support 主要改善 top1。消费者应按
+      `depth≥2/3 + support≥5/10` 门行动，门外 abstain。
     - 约束：节点强度/权重只来自 runtime 自身，不引入任务常量；未知节点
       保持 0，不伪造边；默认只读，不替换 detector/segmentation/planner。
 11. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的

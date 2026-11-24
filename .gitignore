@@ -23,3 +23,5 @@ stage-type-value-gate-*.json
 stage-type-value-gate-*.log
 stage-executor-*.json
 stage-executor-*.log
+accuracy-coverage-*.json
+accuracy-coverage-*.log
