@@ -557,6 +557,17 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
       40–55%**（depth≥3 或 support≥10），top1 ~90%；depth 主要改善
       **校准**（NLL 2.96→0.20），support 主要改善 top1。消费者应按
       `depth≥2/3 + support≥5/10` 门行动，门外 abstain。
+    - 选择性消费者（`stage_executor.py` 的 `min_context_depth`/`min_support`/
+      `max_hazard`，2026-11-24）：只在可靠门内选 option，门外回退；
+      同预算（seed 100、3 worlds、cap 400、horizon 8）：
+      - 无门 / depth≥1+support≥2：**23.7**（fast，仍崩）；
+      - **depth≥2 + support≥5**：fast **101.3 = baseline**、full
+        **72.0 = 72.0**；gate rejects 25–53/局，option share 7%，
+        hazard aborts 0。
+      → 判定 `reliability_gate_safe_but_inert`：**门解决了安全，但没有收益**。
+      原因：option 词表是**行为克隆**的 trace，在行为 trace 里选不可能超过
+      行为策略本身。要收益必须做 **option improvement**（在 survival/
+      clearance 目标下做阶段级动作搜索或合成新 trace），而不是继续加门。
     - 约束：节点强度/权重只来自 runtime 自身，不引入任务常量；未知节点
       保持 0，不伪造边；默认只读，不替换 detector/segmentation/planner。
 11. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的

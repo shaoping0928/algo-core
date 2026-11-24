@@ -59,6 +59,9 @@ def run_executor(seed, world, agent, args):
                         int(args.max_option_actions)
                         if int(args.max_option_actions) > 0 else None
                     ),
+                    min_context_depth=int(args.min_context_depth),
+                    min_support=int(args.min_support),
+                    max_hazard=float(args.max_hazard),
                     option_quotient=(
                         agent.option_quotient
                         if args.class_mode
@@ -82,6 +85,12 @@ def run_executor(seed, world, agent, args):
         if stats else 0.0,
         aborted=float(np.mean([s["aborted"] for s in stats]))
         if stats else 0.0,
+        hazard_aborts=float(np.mean([
+            s.get("hazard_aborts", 0) for s in stats
+        ])) if stats else 0.0,
+        reliability_rejects=float(np.mean([
+            s.get("reliability_rejects", 0) for s in stats
+        ])) if stats else 0.0,
         option_share=float(np.mean([s["option_share"] for s in stats]))
         if stats else 0.0,
         option_length_mean=float(np.mean([
@@ -103,6 +112,9 @@ def main():
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--max-transitions", type=int, default=1)
     parser.add_argument("--max-option-actions", type=int, default=0)
+    parser.add_argument("--min-context-depth", type=int, default=0)
+    parser.add_argument("--min-support", type=int, default=0)
+    parser.add_argument("--max-hazard", type=float, default=1.0)
     parser.add_argument("--terminal-weight", type=float, default=1.0)
     parser.add_argument("--duration-weight", type=float, default=0.0)
     parser.add_argument("--class-mode", action="store_true")
@@ -131,12 +143,14 @@ def main():
     treatment = run_executor(args.seed, world, agent, args)
     print(
         "  executor: frames %.1f (median %.1f) passes %d | "
-        "options %.1f/ep, share %.2f, len %.1f, aborted %.1f"
+        "options %.1f/ep, share %.2f, len %.1f, aborted %.1f, "
+        "hazard aborts %.1f, gate rejects %.1f"
         % (
             treatment["mean_frames"], treatment["median_frames"],
             treatment["total_passes"], treatment["selected"],
             treatment["option_share"], treatment["option_length_mean"],
-            treatment["aborted"],
+            treatment["aborted"], treatment["hazard_aborts"],
+            treatment["reliability_rejects"],
         )
     )
     if args.report:
@@ -149,6 +163,9 @@ def main():
                 cap=int(args.cap), horizon=int(args.horizon),
                 max_transitions=int(args.max_transitions),
                 max_option_actions=int(args.max_option_actions),
+                min_context_depth=int(args.min_context_depth),
+                min_support=int(args.min_support),
+                max_hazard=float(args.max_hazard),
                 terminal_weight=float(args.terminal_weight),
                 duration_weight=float(args.duration_weight),
                 class_mode=bool(args.class_mode),

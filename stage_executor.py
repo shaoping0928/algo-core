@@ -81,6 +81,8 @@ class StageExecutor:
                  max_transitions: int = 1, terminal_weight: float = 1.0,
                  duration_weight: float = 0.0, max_terminal_mass: float = 0.0,
                  max_option_actions: Optional[int] = None,
+                 min_context_depth: int = 0, min_support: int = 0,
+                 max_hazard: float = 1.0,
                  option_quotient=None):
         experience = getattr(agent, "stage_experience", None)
         memory = getattr(agent, "stage_outcome_memory", None)
@@ -101,6 +103,15 @@ class StageExecutor:
         self.max_option_actions = (
             None if max_option_actions is None else int(max_option_actions)
         )
+        if int(min_context_depth) < 0 or int(min_support) < 0:
+            raise ValueError("reliability gates must be non-negative")
+        if not 0.0 <= float(max_hazard) <= 1.0:
+            raise ValueError("max_hazard must be in [0, 1]")
+        self.min_context_depth = int(min_context_depth)
+        self.min_support = int(min_support)
+        self.max_hazard = float(max_hazard)
+        self.hazard_aborts = 0
+        self.reliability_rejects = 0
         self.search = StageOptionSearch(
             memory, max_transitions=int(max_transitions),
             option_quotient=option_quotient, allow_truncation=True,
@@ -122,6 +133,8 @@ class StageExecutor:
         self.selected = 0
         self.fallback = 0
         self.aborted = 0
+        self.hazard_aborts = 0
+        self.reliability_rejects = 0
         self.option_lengths = []
         self.selected_values = []
         return self
@@ -129,7 +142,19 @@ class StageExecutor:
     def observe(self, transition):
         self.tracker.observe_transition(transition)
 
-    def maybe_plan(self):
+    def _hazard(self, env, prefix):
+        observation = np.asarray(env.obs(), dtype=float)[
+            :int(self.agent.obs_dim)
+        ]
+        pending = np.asarray(prefix, dtype=float).reshape(-1)[::-1]
+        encoded = np.concatenate([
+            observation, pending,
+        ]) / np.asarray(self.agent.scales, dtype=float)
+        return float(
+            self.agent.pain_signal_batch(encoded.reshape(1, -1))[0]
+        )
+
+    def maybe_plan(self, env=None, prefix=None):
         context = self.tracker.context()
         if context is None:
             return
@@ -142,6 +167,11 @@ class StageExecutor:
             self.stage_count = count
             if self.active:
                 return
+            if env is not None and prefix is not None:
+                if (self.max_hazard < 1.0
+                        and self._hazard(env, prefix) > self.max_hazard):
+                    self.hazard_aborts += 1
+                    return
             result = self.search.search(context["history"])
             rows = option_values(
                 result, self.terminal_weight, self.duration_weight,
@@ -150,9 +180,25 @@ class StageExecutor:
                 return
             chosen = None
             for row in rows:
-                if row[3] <= self.max_terminal_mass:
-                    chosen = row
-                    break
+                if row[3] > self.max_terminal_mass:
+                    continue
+                option = row[2]
+                leaf = next(
+                    (item for item in result.leaves
+                     if item.options and item.options[0] == option),
+                    None,
+                )
+                if leaf is None or not leaf.steps:
+                    continue
+                step = leaf.steps[0]
+                if int(step.context_depth) < self.min_context_depth:
+                    self.reliability_rejects += 1
+                    continue
+                if int(step.support) < self.min_support:
+                    self.reliability_rejects += 1
+                    continue
+                chosen = row
+                break
             if chosen is None:
                 return
             value, _mass, option, _terminal = chosen
@@ -175,9 +221,15 @@ class StageExecutor:
             self.selected += 1
 
     def act(self, env, world, agent, prefix, horizon, **kwargs):
-        self.maybe_plan()
+        self.maybe_plan(env, prefix)
         if self.active:
-            return int(self.active.pop(0)), "option"
+            if (self.max_hazard < 1.0
+                    and self._hazard(env, prefix) > self.max_hazard):
+                self.hazard_aborts += 1
+                self.aborted += 1
+                self.active = []
+            else:
+                return int(self.active.pop(0)), "option"
         self.fallback += 1
         action = decision_action(
             env, world, agent, prefix, horizon, **kwargs,
@@ -189,6 +241,8 @@ class StageExecutor:
             selected=int(self.selected),
             fallback=int(self.fallback),
             aborted=int(self.aborted),
+            hazard_aborts=int(self.hazard_aborts),
+            reliability_rejects=int(self.reliability_rejects),
             option_length_mean=(
                 float(np.mean(self.option_lengths))
                 if self.option_lengths else 0.0
@@ -208,6 +262,8 @@ def run_stage_executor(seed, world, agent, cap: int = 400,
                        duration_weight: float = 0.0,
                        max_transitions: int = 1,
                        max_option_actions=None,
+                       min_context_depth: int = 0, min_support: int = 0,
+                       max_hazard: float = 1.0,
                        option_quotient=None, metrics_out=None,
                        trace_out=None):
     """Run one episode with the stage-level option executor."""
@@ -223,6 +279,9 @@ def run_stage_executor(seed, world, agent, cap: int = 400,
         terminal_weight=float(terminal_weight),
         duration_weight=float(duration_weight),
         max_option_actions=max_option_actions,
+        min_context_depth=int(min_context_depth),
+        min_support=int(min_support),
+        max_hazard=float(max_hazard),
         option_quotient=option_quotient,
     ).reset(0)
     prefix = np.zeros(int(lag), dtype=float)
