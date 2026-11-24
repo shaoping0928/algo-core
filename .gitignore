@@ -13,3 +13,5 @@ hierarchical-*.json
 hierarchy-*.json
 stage-*.json
 stage-*.log
+option-quotient-*.json
+option-quotient-*.log
