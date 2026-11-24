@@ -21,3 +21,5 @@ layer-stability-*.json
 layer-stability-*.log
 stage-type-value-gate-*.json
 stage-type-value-gate-*.log
+stage-executor-*.json
+stage-executor-*.log

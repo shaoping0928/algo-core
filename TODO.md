@@ -511,6 +511,21 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
       → 判定 `stage_type_endpoint_value_inert`：终点项没有杠杆，**不接线**。
       下一步若继续，只能在中间 beam 逐步打分（更接近已失败的 rank hint），
       或改用 stage-level value 而非 frame endpoint。
+    - Stage-level value + executor（已完成首轮，`stage_executor.py` +
+      `stage_executor_probe.py`）：在阶段边界用 `StageOptionSearch` 选第一个
+      option，按期望净反馈 − terminal/duration 罚分排序并执行其动作 trace；
+      非边界/无 option 时回退帧级 planner。同预算（seed 100、3 worlds、
+      cap 400、horizon 8、exhaustive baseline）：
+      | 变体 | baseline | executor | passes |
+      |---|---:|---:|---:|
+      | full trace | 101.3 | **23.7** | 0 |
+      | one action | 101.3 | **33.3** | 0 |
+      | class mode | 101.3 | **34.7** | 0 |
+      → 判定 `stage_executor_unsafe_without_frame_safety`：被选 option 在
+      stage memory 里 terminal mass=0，但执行期间仍会死；阶段级安全不等于
+      帧级安全。**不接线**。下一步必须先有帧级安全包络（在 fine model 下
+      检查 option 动作的 hazard/feasibility，不安全即回退），或只允许 option
+      作为软约束。
     - 约束：节点强度/权重只来自 runtime 自身，不引入任务常量；未知节点
       保持 0，不伪造边；默认只读，不替换 detector/segmentation/planner。
 11. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
