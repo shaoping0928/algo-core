@@ -148,6 +148,34 @@ class StageDemandHeuristicTests(unittest.TestCase):
         self.assertEqual(result["context"], (("source",),))
         self.assertEqual(result["resolution"], 1)
 
+    def test_feature_starvation_backs_off_to_a_parent_context(self):
+        samples = []
+        for episode in range(2):
+            samples.append(DemandAssociationSample(
+                episode=episode,
+                stage_history=(("rare",), ("source",)),
+                active_features=("other",),
+                destination_stage=("target",),
+            ))
+        for episode in range(2, 4):
+            samples.append(DemandAssociationSample(
+                episode=episode,
+                stage_history=(("source",),),
+                active_features=("toward",),
+                destination_stage=("target",),
+            ))
+        memory = StageDemandHeuristic(
+            min_support=2, min_episodes=2, prior=1.0,
+        ).fit(samples)
+        demand = StageDemand(
+            target_stage=("target",),
+            stage_history=(("rare",), ("source",)),
+        )
+        result = memory.score(("toward",), demand)
+        self.assertEqual(result["status"], "supported")
+        self.assertEqual(result["context"], (("source",),))
+        self.assertEqual(result["resolution"], 1)
+
     def test_unseen_feature_or_option_returns_unknown(self):
         unseen_feature = self.memory.score(("unseen",), self.demand)
         self.assertEqual(unseen_feature["status"], "unknown")
@@ -222,6 +250,61 @@ class StageDemandHeuristicTests(unittest.TestCase):
             sample.destination_stage == (("destination",),)
             for sample in samples
         ))
+
+    def test_root_samples_use_the_source_stage_root_as_feature(self):
+        source = StageOccurrence(
+            episode=8,
+            key=(("source",),),
+            entry_state=np.zeros(1),
+            exit_state=np.ones(1),
+            action_trace=encode_action_trace([0, 1]),
+            duration=2.0,
+            feedback=np.zeros(1),
+            feature_snapshots=((("f0",),), (("f1",),)),
+            active_features=(("f0",),),
+        )
+        destination = StageOccurrence(
+            episode=8,
+            key=(("destination",),),
+            entry_state=np.ones(1),
+            exit_state=np.ones(1),
+            action_trace=encode_action_trace([1]),
+            duration=1.0,
+            feedback=np.zeros(1),
+            terminal=True,
+        )
+
+        def collapse(key):
+            return (("tree", key[0][0]),)
+
+        samples = DemandAssociationSample.from_stage_roots(
+            [[source, destination]], collapse,
+        )
+        self.assertEqual(len(samples), 2)
+        self.assertEqual(
+            samples[0].active_features,
+            (("tree", "source"),),
+        )
+        self.assertEqual(
+            samples[0].destination_stage,
+            (("tree", "destination"),),
+        )
+        self.assertEqual(
+            samples[0].stage_history,
+            ((("tree", "source"),),),
+        )
+        self.assertIsNone(samples[0].action_trace)
+        self.assertEqual(
+            samples[1].action_trace, encode_action_trace([0]),
+        )
+        pooled = DemandAssociationSample.from_stage_roots(
+            [[source, destination]], collapse, pooled=True,
+        )
+        self.assertEqual(len(pooled), 1)
+        self.assertIsNone(pooled[0].action_trace)
+        self.assertEqual(
+            pooled[0].active_features, (("tree", "source"),),
+        )
 
     def test_option_backoff_uses_a_shorter_known_prefix_suffix(self):
         samples = []

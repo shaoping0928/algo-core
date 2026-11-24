@@ -563,6 +563,7 @@ class StageOutcomeMemory:
             else int(max_context_depth)
         )
         self._counts = {}
+        self._pooled = {}
         self.stage_types = set()
         self.contexts = set()
         self.action_options = set()
@@ -571,6 +572,7 @@ class StageOutcomeMemory:
     def fit(self, episodes: Sequence[Sequence[StageOccurrence]]):
         """Fit only from realized, ordered stage occurrences."""
         self._counts = {}
+        self._pooled = {}
         self.stage_types = set()
         self.contexts = {()}
         self.action_options = set()
@@ -636,6 +638,10 @@ class StageOutcomeMemory:
                         outcome_key, _OutcomeCounts(),
                     )
                     counts.add(source, destination_stage)
+                    pooled_counts = self._pooled.setdefault(
+                        context, {}
+                    ).setdefault(outcome_key, _OutcomeCounts())
+                    pooled_counts.add(source, destination_stage)
                 self.realized_outcomes += 1
         return self
 
@@ -697,6 +703,7 @@ class StageOutcomeMemory:
                     if row["destination"] is not None
                 ),
                 outcomes=tuple(summaries),
+                option_pooled=False,
             )
         return dict(
             status=UNKNOWN,
@@ -710,6 +717,76 @@ class StageOutcomeMemory:
             censored_rate=None,
             siblings=(),
             outcomes=(),
+            option_pooled=False,
+        )
+
+    def predict_pooled(self, stage_history: Sequence[StageKey]):
+        """Predict the next stage over all realized action options.
+
+        At a decision where the future option is not known yet, the exact
+        trace cannot be queried.  This aggregates only transitions that
+        actually occurred under the same stage context, and applies the same
+        support and episode gates as :meth:`predict`.  It is still an
+        observational measure: no counterfactual option is added.
+        """
+        history = tuple(tuple(_native(token) for token in key)
+                        for key in stage_history)
+        path = stage_context_path(history, self.max_context_depth)
+        for context in path:
+            outcomes = self._pooled.get(context)
+            if not outcomes:
+                continue
+            total = sum(item.count for item in outcomes.values())
+            episode_support = set()
+            for item in outcomes.values():
+                episode_support.update(item.episodes)
+            if (total < self.min_support
+                    or len(episode_support) < self.min_episodes):
+                continue
+            summaries = [
+                item.summary(destination, terminal, censored, total)
+                for (destination, terminal, censored), item
+                in outcomes.items()
+            ]
+            summaries.sort(key=lambda row: repr((
+                row["destination"], row["terminal"], row["censored"],
+            )))
+            return dict(
+                status="supported",
+                context=context,
+                context_depth=int(len(context)),
+                resolution=int(len(context)),
+                support=int(total),
+                episode_support=int(len(episode_support)),
+                outcome_diversity=int(len(summaries)),
+                terminal_rate=float(sum(
+                    row["probability"] for row in summaries
+                    if row["terminal"]
+                )),
+                censored_rate=float(sum(
+                    row["probability"] for row in summaries
+                    if row["censored"]
+                )),
+                siblings=tuple(
+                    row["destination"] for row in summaries
+                    if row["destination"] is not None
+                ),
+                outcomes=tuple(summaries),
+                option_pooled=True,
+            )
+        return dict(
+            status=UNKNOWN,
+            context=(),
+            context_depth=None,
+            resolution=None,
+            support=0,
+            episode_support=0,
+            outcome_diversity=0,
+            terminal_rate=None,
+            censored_rate=None,
+            siblings=(),
+            outcomes=(),
+            option_pooled=True,
         )
 
     def snapshot(self):
@@ -722,4 +799,5 @@ class StageOutcomeMemory:
                 (len(context) for context in self.contexts), default=0
             ),
             supported_edges=len(self._counts),
+            pooled_contexts=len(self._pooled),
         )

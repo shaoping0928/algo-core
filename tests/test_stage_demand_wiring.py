@@ -10,6 +10,8 @@ from substrate_nodes import (
     decision_action,
     evaluate,
     make_node_demand_rank_step,
+    make_node_prototype_rank_step,
+    make_node_root_rank_step,
     policy_result,
 )
 
@@ -85,14 +87,94 @@ class StageDemandWiringTests(unittest.TestCase):
             target_stage=("target",),
             stage_history=(("source",),),
         )
+        stats = {}
         rank_step = make_node_demand_rank_step(
-            FakeRuntime(), demand, FakeHeuristic(),
+            FakeRuntime(), demand, FakeHeuristic(), stats=stats,
         )
         states = np.asarray([[0.0], [1.0], [0.25]])
         priorities = rank_step(
             states, np.zeros((3, 2)), step=0,
         )
         np.testing.assert_array_equal(priorities, [0.0, 1.5, 0.0])
+        self.assertEqual(stats["candidates"], 3)
+        self.assertEqual(stats["supported"], 1)
+        self.assertEqual(stats["nonzero"], 1)
+        self.assertEqual(stats["unknown"], 2)
+
+    def test_runtime_prototypes_feed_the_separate_rank_channel(self):
+        class PrototypeRuntime:
+            obs_dim = 1
+            lag = 1
+            scales = np.ones(2)
+
+            @staticmethod
+            def _nearest(state):
+                return (
+                    "p_aligned" if float(state[0]) >= 0.5 else "p_other",
+                    0.0,
+                )
+
+        class PrototypeHeuristic:
+            @staticmethod
+            def score(features, _demand):
+                if ("prototype", "p_aligned") in features:
+                    return dict(status="supported", priority=1.5)
+                return dict(status="unknown", priority=None)
+
+        demand = StageDemand(
+            target_stage=(("tree", "0"),),
+            stage_history=((("tree", "0"),),),
+            association_action_trace=((0, 1),),
+        )
+        rank_step = make_node_prototype_rank_step(
+            PrototypeRuntime(), demand, PrototypeHeuristic(),
+            pending_prefix=[0.0], lag=1,
+        )
+        states = np.asarray([[0.0], [1.0], [0.25]])
+        sequences = np.zeros((3, 2))
+        priorities = rank_step(states, sequences, step=0)
+        np.testing.assert_array_equal(priorities, [0.0, 1.5, 0.0])
+
+    def test_root_resolver_features_feed_the_rank_channel(self):
+        class RootResolver:
+            @staticmethod
+            def resolve(_agent, observation, _pending):
+                if float(observation[0]) >= 0.5:
+                    return dict(status="supported", key=(("stage",),))
+                return dict(status="unknown", key=None)
+
+        class RootTree:
+            @staticmethod
+            def chain(key):
+                return (7,) if key == (("stage",),) else ()
+
+        class RootHeuristic:
+            @staticmethod
+            def score(features, _demand):
+                if ("tree", "7") in features:
+                    return dict(status="supported", priority=2.0)
+                return dict(status="unknown", priority=None)
+
+        class RootRuntime:
+            obs_dim = 1
+            lag = 1
+            scales = np.ones(2)
+            stage_resolver = RootResolver()
+            stage_tree = RootTree()
+
+        demand = StageDemand(
+            target_stage=(("tree", "7"),),
+            stage_history=((("tree", "7"),),),
+            association_action_trace=((0, 1),),
+        )
+        rank_step = make_node_root_rank_step(
+            RootRuntime(), demand, RootHeuristic(),
+            pending_prefix=[0.0], lag=1,
+        )
+        states = np.asarray([[0.0], [1.0], [0.25]])
+        sequences = np.zeros((3, 2))
+        priorities = rank_step(states, sequences, step=0)
+        np.testing.assert_array_equal(priorities, [0.0, 2.0, 0.0])
 
     def test_policy_result_builds_ranker_from_demand_and_runtime_features(self):
         class Env:

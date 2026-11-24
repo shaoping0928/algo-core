@@ -219,6 +219,65 @@ class DemandAssociationSample:
         return tuple(samples)
 
     @classmethod
+    def from_stage_roots(cls, episodes, collapse, pooled=False):
+        """Build samples whose feature is the source stage's collapsed root.
+
+        ``collapse(stage_key)`` returns the predictive-stage-tree key for a
+        stage.  The feature is available for any candidate state through the
+        resolver, so this association is denser than a per-context prototype
+        token.  With ``pooled=False`` the option is the causal action prefix
+        before each transition; with ``pooled=True`` one sample per source
+        stage is emitted with no option, giving the root transition table a
+        dense option-free fallback.  No future action enters either mode.
+        """
+        samples = []
+        for episode in episodes:
+            stages = list(episode)
+            if any(
+                    stage.terminal or stage.censored
+                    for stage in stages[:-1]
+            ):
+                raise ValueError("no stage may follow a terminal/censored one")
+            collapsed_history = []
+            for index, source in enumerate(stages[:-1]):
+                source_root = collapse(source.key)
+                target_root = collapse(stages[index + 1].key)
+                collapsed_history.append(source_root)
+                if source.terminal or source.censored:
+                    continue
+                actions = []
+                for action, count in source.action_trace:
+                    actions.extend([action] * int(count))
+                snapshots = (
+                    source.feature_snapshots
+                    if source.feature_snapshots
+                    else (source.active_features,)
+                )
+                if pooled:
+                    samples.append(cls(
+                        episode=source.episode,
+                        stage_history=tuple(collapsed_history),
+                        active_features=(source_root[0],),
+                        destination_stage=target_root,
+                        action_trace=None,
+                    ))
+                    continue
+                for offset, _snapshot in enumerate(snapshots):
+                    if offset >= len(actions):
+                        break
+                    prefix = actions[:offset]
+                    samples.append(cls(
+                        episode=source.episode,
+                        stage_history=tuple(collapsed_history),
+                        active_features=(source_root[0],),
+                        destination_stage=target_root,
+                        action_trace=(
+                            encode_action_trace(prefix) if prefix else None
+                        ),
+                    ))
+        return tuple(samples)
+
+    @classmethod
     def from_stage_prefixes(cls, episodes):
         """Build samples with the causal action prefix known before each step.
 
@@ -374,7 +433,7 @@ class StageDemandHeuristic:
         features = _features_with_activation(active_features)
         trace = demand.association_action_trace
         traces = _option_backoff(trace)
-        selected = None
+        fallback = None
         for context in stage_context_path(demand.stage_history):
             for candidate_trace in traces:
                 context_key = (context, candidate_trace)
@@ -393,82 +452,88 @@ class StageDemandHeuristic:
                         or len(all_episodes) < self.min_episodes
                         or len(target_episodes) < self.min_episodes):
                     continue
-                selected = (
-                    context, context_key, base, total,
-                    len(all_episodes), target_count,
+                fallback = (
+                    context, len(context), total, len(all_episodes),
                 )
-                break
-            if selected is not None:
-                break
-
-        if selected is None:
-            return self._unknown()
-        context, context_key, base, total, episode_support, target_count = selected
-        outcome_count = len(base)
-        base_rate = (
-            (target_count + 1.0)
-            / (total + max(outcome_count, 1))
-        )
-        evidence = []
-        weighted_priority = 0.0
-        activation_total = 0.0
-        for feature, activation in features.items():
-            feature_key = (context_key, feature)
-            joint_key = (context_key, feature, demand.target_stage)
-            feature_count = int(self._feature_counts.get(feature_key, 0))
-            feature_episodes = self._feature_episodes.get(feature_key, set())
-            target_feature_episodes = self._feature_target_episodes.get(
-                joint_key, set(),
-            )
-            if (feature_count < self.min_support
-                    or len(feature_episodes) < self.min_episodes
-                    or len(target_feature_episodes) < self.min_episodes):
-                continue
-            joint_count = int(self._feature_target_counts.get(joint_key, 0))
-            conditional = (
-                joint_count + self.prior * base_rate
-            ) / (feature_count + self.prior)
-            lift = float(log(
-                max(conditional, 1e-12) / max(base_rate, 1e-12)
-            ))
-            confidence = feature_count / (feature_count + self.prior)
-            contribution = confidence * lift
-            weighted_priority += activation * contribution
-            activation_total += activation
-            evidence.append(dict(
-                feature=feature,
-                support=feature_count,
-                episode_support=len(feature_episodes),
-                target_support=joint_count,
-                conditional_probability=float(conditional),
-                base_rate=float(base_rate),
-                lift=lift,
-                contribution=float(contribution),
-                activation=float(activation),
-            ))
-
-        if activation_total <= 0.0:
+                outcome_count = len(base)
+                base_rate = (
+                    (target_count + 1.0)
+                    / (total + max(outcome_count, 1))
+                )
+                evidence = []
+                weighted_priority = 0.0
+                activation_total = 0.0
+                for feature, activation in features.items():
+                    feature_key = (context_key, feature)
+                    joint_key = (context_key, feature, demand.target_stage)
+                    feature_count = int(
+                        self._feature_counts.get(feature_key, 0)
+                    )
+                    feature_episodes = self._feature_episodes.get(
+                        feature_key, set(),
+                    )
+                    target_feature_episodes = (
+                        self._feature_target_episodes.get(joint_key, set())
+                    )
+                    if (feature_count < self.min_support
+                            or len(feature_episodes) < self.min_episodes
+                            or len(target_feature_episodes)
+                            < self.min_episodes):
+                        continue
+                    joint_count = int(
+                        self._feature_target_counts.get(joint_key, 0)
+                    )
+                    conditional = (
+                        joint_count + self.prior * base_rate
+                    ) / (feature_count + self.prior)
+                    lift = float(log(
+                        max(conditional, 1e-12) / max(base_rate, 1e-12)
+                    ))
+                    confidence = feature_count / (
+                        feature_count + self.prior
+                    )
+                    contribution = confidence * lift
+                    weighted_priority += activation * contribution
+                    activation_total += activation
+                    evidence.append(dict(
+                        feature=feature,
+                        support=feature_count,
+                        episode_support=len(feature_episodes),
+                        target_support=joint_count,
+                        conditional_probability=float(conditional),
+                        base_rate=float(base_rate),
+                        lift=lift,
+                        contribution=float(contribution),
+                        activation=float(activation),
+                    ))
+                if activation_total <= 0.0:
+                    # The context has base support but no feature evidence.
+                    # A parent context may pool enough evidence; do not stop.
+                    continue
+                return dict(
+                    status="supported",
+                    priority=float(
+                        weighted_priority / activation_total
+                    ),
+                    context=context,
+                    context_depth=int(len(context)),
+                    resolution=int(len(context)),
+                    support=int(total),
+                    episode_support=int(len(all_episodes)),
+                    outcome_diversity=int(outcome_count),
+                    target_base_rate=float(base_rate),
+                    action_conditioned=trace is not None,
+                    evidence=tuple(evidence),
+                    provenance="observed_cooccurrence",
+                    affects_value=False,
+                )
+        if fallback is not None:
+            context, depth, support, episode_support = fallback
             return self._unknown(
-                context=context,
-                context_depth=len(context),
-                support=total,
-                episode_support=episode_support,
+                context=context, context_depth=depth,
+                support=support, episode_support=episode_support,
             )
-        return dict(
-            status="supported",
-            priority=float(weighted_priority / activation_total),
-            context=context,
-            context_depth=int(len(context)),
-            resolution=int(len(context)),
-            support=int(total),
-            episode_support=int(episode_support),
-            outcome_diversity=int(outcome_count),
-            target_base_rate=float(base_rate),
-            action_conditioned=trace is not None,
-            evidence=tuple(evidence),
-            provenance="observed_cooccurrence",
-            affects_value=False,
-        )
+        return self._unknown()
 
     @staticmethod
     def _unknown(context=(), context_depth=None, support=0,
@@ -502,12 +567,13 @@ class StageDemandHeuristic:
 
 def make_demand_rank_step(heuristic: StageDemandHeuristic,
                           demand: StageDemand,
-                          feature_extractor):
+                          feature_extractor, stats=None):
     """Adapt feature associations to ``beam_search(rank_step=...)``.
 
     ``feature_extractor(states, sequences, step)`` is supplied by the runtime
     that owns the learned concept/node representation. UNKNOWN contributes a
-    neutral ordering hint, never a safety assertion or value score.
+    neutral ordering hint, never a safety assertion or value score.  ``stats``
+    is an optional diagnostic counter; it never changes the returned hints.
     """
     def rank_step(states, sequences, step):
         feature_sets = feature_extractor(states, sequences, step)
@@ -518,10 +584,25 @@ def make_demand_rank_step(heuristic: StageDemandHeuristic,
         priorities = []
         for features in feature_sets:
             result = heuristic.score(features, demand)
-            priorities.append(
-                float(result["priority"])
-                if result["status"] == "supported" else 0.0
+            supported = result["status"] == "supported"
+            priority = (
+                float(result["priority"]) if supported else 0.0
             )
+            if stats is not None:
+                stats["candidates"] = int(stats.get("candidates", 0)) + 1
+                if supported:
+                    stats["supported"] = (
+                        int(stats.get("supported", 0)) + 1
+                    )
+                    if priority != 0.0:
+                        stats["nonzero"] = (
+                            int(stats.get("nonzero", 0)) + 1
+                        )
+                else:
+                    stats["unknown"] = (
+                        int(stats.get("unknown", 0)) + 1
+                    )
+            priorities.append(priority)
         return np.asarray(priorities, dtype=float)
 
     return rank_step

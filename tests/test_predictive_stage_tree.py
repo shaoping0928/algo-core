@@ -3,7 +3,11 @@ import unittest
 
 import numpy as np
 
-from predictive_stage_tree import PredictiveStageTree, UNKNOWN
+from predictive_stage_tree import (
+    PredictiveStageTree,
+    UNKNOWN,
+    collapse_stage_episodes,
+)
 from stage_outcome_memory import StageOccurrence, encode_action_trace
 
 
@@ -146,6 +150,29 @@ class PredictiveStageTreeTests(unittest.TestCase):
         )
         self.assertIsNotNone(components)
         self.assertEqual(components["support"], 1)
+
+    def test_collapse_maps_types_to_component_roots(self):
+        collapsed = collapse_stage_episodes(
+            episodes(1), self.tree, mode="root",
+        )
+        keys = {
+            stage.key for stage_episodes in collapsed for stage in stage_episodes
+        }
+        self.assertTrue(keys)
+        self.assertTrue(all(
+            key and key[0][0] == "tree" for key in keys
+        ))
+        root_a = ("tree", str(self.tree.chain(("A",))[-1]))
+        root_b = ("tree", str(self.tree.chain(("B",))[-1]))
+        root_c = ("tree", str(self.tree.chain(("C",))[-1]))
+        self.assertEqual(root_a, root_b)
+        self.assertIn((root_a,), keys)
+        self.assertIn((root_c,), keys)
+        self.assertNotEqual(root_a, root_c)
+        self.assertTrue(all(
+            stage.signal_strengths == ()
+            for stage_episodes in collapsed for stage in stage_episodes
+        ))
 
     def test_unsupported_tree_returns_unknown(self):
         tree = PredictiveStageTree.fit(

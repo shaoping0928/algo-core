@@ -24,7 +24,7 @@ has no support), never to a fabricated sibling.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Sequence
 
 import numpy as np
@@ -548,3 +548,49 @@ class PredictiveStageTree:
             tolerance=float(self.tolerance),
             global_support=int(self.global_profile.count),
         )
+
+
+def collapse_stage_episodes(episodes, tree: PredictiveStageTree,
+                            mode: str = "root", min_support: int = 2,
+                            min_episodes: int = 2, level: int = 1):
+    """Map exact stage keys to a predictive-tree node key.
+
+    ``support`` follows the tree's own support gate, ``level`` climbs to the
+    first ancestor at least that deep, and ``root`` uses the highest accepted
+    ancestor of the stage's component.  Unknown keys map to an explicit base
+    token; they are never aliased to a sibling.  Signal strengths are dropped
+    because one collapsed token no longer corresponds to the original signal
+    pulses.
+    """
+    if mode not in ("support", "level", "root"):
+        raise ValueError("collapse mode must be support, level, or root")
+    collapsed_episodes = []
+    for stages in episodes:
+        collapsed = []
+        for stage in stages:
+            chain = tree.chain(stage.key)
+            node_id = None
+            if chain:
+                if mode == "root":
+                    node_id = chain[-1]
+                elif mode == "level":
+                    node_id = next(
+                        (
+                            node for node in chain
+                            if tree.level[node] >= int(level)
+                        ),
+                        chain[-1],
+                    )
+                else:
+                    node_id = tree.node_for(
+                        stage.key, min_support=min_support,
+                        min_episodes=min_episodes,
+                    )
+            token = (
+                "tree", "base"
+            ) if node_id is None else ("tree", str(node_id))
+            collapsed.append(replace(
+                stage, key=(token,), signal_strengths=(),
+            ))
+        collapsed_episodes.append(collapsed)
+    return collapsed_episodes

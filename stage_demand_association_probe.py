@@ -29,10 +29,9 @@ decision-time-known prefix, which this sample schema does not carry.
 import argparse
 import json
 from collections import Counter, OrderedDict
-from dataclasses import replace
 
 from multiview_transition_probe import fit_fold_representation
-from predictive_stage_tree import PredictiveStageTree
+from predictive_stage_tree import PredictiveStageTree, collapse_stage_episodes
 from stage_demand_heuristic import (
     DemandAssociationSample,
     StageDemand,
@@ -207,55 +206,16 @@ def demand_samples(episodes, mode):
     raise ValueError("association mode must be pooled or prefix")
 
 
-def collapse_episodes(episodes, tree, mode, support, episodes_min, level):
-    """Replace exact stage keys with a predictive-tree node key.
-
-    ``support`` follows the tree's own support gate, ``level`` climbs to the
-    first ancestor at least that deep, and ``root`` uses the highest accepted
-    ancestor of the stage's component.
-    """
-    collapsed_episodes = []
-    for stages in episodes:
-        collapsed = []
-        for stage in stages:
-            chain = tree.chain(stage.key)
-            node_id = None
-            if chain:
-                if mode == "root":
-                    node_id = chain[-1]
-                elif mode == "level":
-                    node_id = next(
-                        (
-                            node for node in chain
-                            if tree.level[node] >= int(level)
-                        ),
-                        chain[-1],
-                    )
-                else:
-                    node_id = tree.node_for(
-                        stage.key, min_support=support,
-                        min_episodes=episodes_min,
-                    )
-            token = (
-                "tree", "base"
-            ) if node_id is None else ("tree", str(node_id))
-            collapsed.append(replace(
-                stage, key=(token,), signal_strengths=(),
-            ))
-        collapsed_episodes.append(collapsed)
-    return collapsed_episodes
-
-
 def run_arm(train, test, args, mode, context_mode):
     if context_mode == "exact":
         train_episodes = train.episodes
         test_episodes = test.episodes
     else:
-        train_episodes = collapse_episodes(
+        train_episodes = collapse_stage_episodes(
             train.episodes, args._tree, args.tree_collapse,
             args.tree_support, args.tree_episodes, args.tree_level,
         )
-        test_episodes = collapse_episodes(
+        test_episodes = collapse_stage_episodes(
             test.episodes, args._tree, args.tree_collapse,
             args.tree_support, args.tree_episodes, args.tree_level,
         )

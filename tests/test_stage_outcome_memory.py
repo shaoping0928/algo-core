@@ -240,6 +240,37 @@ class StageOutcomeMemoryTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], UNKNOWN)
 
+    def test_pooled_prediction_aggregates_only_realized_options(self):
+        episodes = [
+            [
+                occurrence(0, ("A",), [0]),
+                occurrence(0, ("B",), [1], censored=True),
+            ],
+            [
+                occurrence(1, ("A",), [1]),
+                occurrence(1, ("C",), [1], censored=True),
+            ],
+        ]
+        memory = StageOutcomeMemory(
+            min_support=1, min_episodes=1,
+        ).fit(episodes)
+        exact_b = memory.predict(
+            [("A",)], encode_action_trace([0]),
+        )
+        self.assertEqual(exact_b["status"], "supported")
+        self.assertEqual(exact_b["siblings"], (("B",),))
+        self.assertFalse(exact_b["option_pooled"])
+        exact_c = memory.predict(
+            [("A",)], encode_action_trace([1]),
+        )
+        self.assertEqual(exact_c["siblings"], (("C",),))
+        pooled = memory.predict_pooled([("A",)])
+        self.assertEqual(pooled["status"], "supported")
+        self.assertTrue(pooled["option_pooled"])
+        self.assertEqual(set(pooled["siblings"]), {("B",), ("C",)})
+        self.assertEqual(pooled["support"], 2)
+        self.assertEqual(pooled["episode_support"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

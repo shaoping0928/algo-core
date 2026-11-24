@@ -280,10 +280,30 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
    前缀 + suffix backoff 是可行机制，但绝对增益只有 +1.3–2.5pp、覆盖
    18–24%（放宽后 41%）。**不能单独作为 rank hint 接线**；item 6 需要
    覆盖门和在线 prefix/context provider，且优先扩大覆盖而不是调 prior。
-6. **P1：rank-only 搜索质量门**。beam rank 会影响中间保留集合，可能剪掉高 value
-   路径。固定相同预算测目标阶段路径 recall、扩展量、UNKNOWN 与最终真实价值；
-   必须保持最终 selection 只用独立价值，rank priority 不写入 node value、反馈、
-   六列账本或 objective。需求必须有阶段边界/失效条件，不可成为全局逐帧吸引项。
+6. **[x] P1：rank-only 搜索质量门（已完成首轮，未通过）**。
+   新增 `stage_online.py`（在线因果阶段 context：每步重放冻结 detector/segmenter
+   到当前 prefix，不读未来动作）与 `OnlineStageDemandProvider`（option-pooled
+   memory 预测 → selector 选非终局目标 → 映射 stage-tree root → 当前 partial
+   stage 内有效，边界变化即重算；UNKNOWN 不注入）。同时补
+   `StageOutcomeMemory.predict_pooled`、`from_stage_roots` 根级样本、
+   `make_node_root_rank_step`、`rank_stats`/`plan_out.candidate_count` 诊断。
+   固定预算 gate（`stage_rank_gate_probe.py`：同 beam/horizon/cap，seed 100，
+   3 worlds，beam 4，horizon 8，cap 400）：
+   - 默认 2/2 门：provider 57/75 决策产出 demand，但 heuristic 只支持
+     **0–2 / 3078** 候选状态 → rank 空转，frames 25.0 = 25.0，
+     扩展 54/决策不变。
+   - 根级 1/1 门：feature present **1990/2322**、heuristic supported
+     **1608**、nonzero **1442**、target present **440** → rank 真正激活；
+     但 **frames 25.0 → 18.3**（仍 3 worlds、beam 4），候选/决策 54 不变。
+   - target-path recall：已加候选级 `target_present` 计数（见报告）；
+     完整的 stage-tagged frontier recall 仍未实现。
+   - 修掉两个实现 bug：根级 adapter 对状态**双重缩放**导致 0 特征；
+     feature 无证据时未继续向父 context 回退（现在会回退）。
+   → 判定 `rank_hint_activates_only_under_weak_support_and_hurts`：
+   **质量门未通过，不接线**。下一步不是调 heuristic 权重，而是：
+   ① 用 stage-tagged frontier 日志做真正的目标路径 recall；
+   ② 在更多世界/更大 beam 上复验；③ 先提升 demand target 质量与支持校准，
+   再重跑同预算 A/B。
 7. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
    episode-held-out 审计（5 折 / 3 seeds，fold-refit 表示），但仍无
    planner A/B、跨 seed 决策稳定性、在线 provider 校准或 shadow 运行；

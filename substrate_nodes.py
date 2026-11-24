@@ -54,7 +54,14 @@ from milestone_graph import (
 from multiview_transitions import MultiViewTransitionModel
 from node_features import FeatureRuleBank
 from node_runtime import NodeRuntime, future_pain_labels, future_return_labels
-from stage_demand_heuristic import StageDemandHeuristic
+from predictive_stage_tree import (
+    PredictiveStageTree,
+    collapse_stage_episodes,
+)
+from stage_demand_heuristic import (
+    DemandAssociationSample,
+    StageDemandHeuristic,
+)
 from stage_demand_selector import (
     StageDemandSelector,
     StageOutcomeReadout,
@@ -832,6 +839,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         stage_memory=False,
         stage_memory_quantile=0.98,
         stage_memory_feature_source="branch",
+        stage_demand_min_support=2,
+        stage_demand_min_episodes=2,
         env_factory=None):
     """Collect transitions and train the node runtime on them.
 
@@ -872,6 +881,10 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError(
             "stage_memory_feature_source must be branch or prototype"
         )
+    if int(stage_demand_min_support) < 1:
+        raise ValueError("stage_demand_min_support must be positive")
+    if int(stage_demand_min_episodes) < 1:
+        raise ValueError("stage_demand_min_episodes must be positive")
     if int(component_min_count) < 1:
         raise ValueError("component_min_count must be positive")
     if int(max_components) < 0:
@@ -1173,9 +1186,85 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         agent.stage_demand_selector = StageDemandSelector(
             agent.stage_demand_readout
         )
-        agent.stage_demand_heuristic = StageDemandHeuristic().fit(
-            agent.stage_experience.demand_samples
-        )
+        agent.stage_demand_heuristic = StageDemandHeuristic(
+            min_support=stage_demand_min_support,
+            min_episodes=stage_demand_min_episodes,
+        ).fit(agent.stage_experience.demand_samples)
+        episodes = list(agent.stage_experience.episodes)
+        tree_train = [
+            episode for index, episode in enumerate(episodes)
+            if index % 5 != 4
+        ]
+        tree_validation = [
+            episode for index, episode in enumerate(episodes)
+            if index % 5 == 4
+        ]
+        if tree_train and tree_validation:
+            agent.stage_tree = PredictiveStageTree.fit(
+                tree_train, tree_validation,
+                prior=4.0, tolerance=0.0,
+                min_validation_support=4,
+                min_support=2, min_episodes=2,
+            )
+            collapsed = collapse_stage_episodes(
+                tree_train, agent.stage_tree, mode="root",
+            )
+            agent.stage_tree_heuristic = StageDemandHeuristic(
+                min_support=stage_demand_min_support,
+                min_episodes=stage_demand_min_episodes,
+            ).fit(
+                DemandAssociationSample.from_stage_prefixes(collapsed)
+            )
+
+            def collapse_key(key):
+                chain = agent.stage_tree.chain(key)
+                return (
+                    (("tree", "base"),)
+                    if not chain
+                    else (("tree", str(chain[-1])),)
+                )
+
+            agent.stage_root_heuristic = StageDemandHeuristic(
+                min_support=stage_demand_min_support,
+                min_episodes=stage_demand_min_episodes,
+            ).fit(
+                DemandAssociationSample.from_stage_roots(
+                    tree_train, collapse_key, pooled=True,
+                )
+            )
+            prototype_roots = {}
+            try:
+                transitions_for_roots = agent.stage_experience.stage_transitions(
+                    transitions, agent,
+                )
+                for transition in transitions_for_roots:
+                    state = np.concatenate([
+                        np.asarray(transition.observation, dtype=float),
+                        np.asarray(transition.pending, dtype=float),
+                    ]) / np.asarray(agent.scales, dtype=float)
+                    prototype, _distance = agent._nearest(state)
+                    if prototype is None:
+                        continue
+                    token = collapse_key(transition.stage.key)[0]
+                    counts = prototype_roots.setdefault(
+                        str(prototype), {}
+                    )
+                    counts[token] = int(counts.get(token, 0)) + 1
+            except ValueError:
+                prototype_roots = {}
+            agent.stage_prototype_roots = {
+                prototype: max(
+                    counts,
+                    key=lambda token: (counts[token], repr(token)),
+                )
+                for prototype, counts in prototype_roots.items()
+            }
+        else:
+            agent.stage_tree = None
+            agent.stage_tree_heuristic = None
+            agent.stage_root_heuristic = None
+            agent.stage_prototype_roots = {}
+        agent.stage_demand_feature_source = stage_memory_feature_source
     else:
         agent.stage_experience = None
         agent.stage_resolver = None
@@ -1183,6 +1272,11 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         agent.stage_demand_readout = None
         agent.stage_demand_selector = None
         agent.stage_demand_heuristic = None
+        agent.stage_tree = None
+        agent.stage_tree_heuristic = None
+        agent.stage_root_heuristic = None
+        agent.stage_prototype_roots = {}
+        agent.stage_demand_feature_source = None
     # The milestone layer, read off the agent's own stream.  All of it is
     # inert unless the planner is asked for one of its terms.
     model = _milestone_model_from_transitions(
@@ -2053,7 +2147,7 @@ def _apply_margin_tiebreak(result, batches, previous_action, eps):
     return replace(result, actions=actions, score=scores[index])
 
 
-def make_node_demand_rank_step(agent, demand, heuristic):
+def make_node_demand_rank_step(agent, demand, heuristic, stats=None):
     """Adapt learned Runtime feature masks to the demand-only rank channel."""
     from stage_demand_heuristic import make_demand_rank_step
 
@@ -2087,6 +2181,137 @@ def make_node_demand_rank_step(agent, demand, heuristic):
 
     return make_demand_rank_step(
         heuristic, demand, feature_extractor=extract_features,
+        stats=stats,
+    )
+
+
+def make_node_prototype_rank_step(agent, demand, heuristic,
+                                  pending_prefix, lag, stats=None):
+    """Adapt runtime prototype features to the demand-only rank channel.
+
+    Candidate states are encoded with their pending action window exactly as
+    the runtime's state encoder does, then mapped to the nearest learned
+    prototype.  This is the same token the experience pipeline used when it
+    fit a prototype-conditioned association; no task geometry enters.
+    """
+    from stage_demand_heuristic import make_demand_rank_step
+
+    obs_dim = int(agent.obs_dim)
+    lag = int(lag)
+    scales = np.asarray(agent.scales, dtype=float)
+    prefix = np.asarray(pending_prefix, dtype=float).reshape(-1)
+
+    def extract_features(states, sequences, step):
+        history = history_features(
+            sequences, step + 1, prefix, action_dim=lag + 1,
+        )
+        pending = history[:, :lag][:, ::-1] if lag else np.zeros(
+            (len(states), 0)
+        )
+        encoded = np.concatenate(
+            [np.asarray(states, dtype=float)[:, :obs_dim], pending], axis=1,
+        )
+        if encoded.shape[1] != scales.size:
+            raise ValueError(
+                "candidate state dimension does not match the agent scales"
+            )
+        encoded = encoded / scales
+        features = []
+        for state in encoded:
+            node, distance = agent._nearest(state)
+            if node is None or not np.isfinite(distance):
+                features.append(())
+            else:
+                features.append((("prototype", str(node)),))
+        return features
+
+    return make_demand_rank_step(
+        heuristic, demand, feature_extractor=extract_features,
+        stats=stats,
+    )
+
+
+def make_node_root_rank_step(agent, demand, heuristic,
+                             pending_prefix, lag, stats=None):
+    """Rank candidate states by their resolved stage root.
+
+    The resolver maps the candidate state to a realized stage type and the
+    predictive tree collapses that type to its accepted component root; the
+    resulting token is the same feature used in ``from_stage_roots`` samples.
+    A candidate the resolver cannot map (or a key with no tree node) gets a
+    neutral empty feature, never a fabricated root.
+    """
+    from stage_demand_heuristic import make_demand_rank_step
+
+    resolver = getattr(agent, "stage_resolver", None)
+    tree = getattr(agent, "stage_tree", None)
+    if resolver is None or tree is None:
+        raise ValueError("root rank requires a fitted resolver and stage tree")
+    obs_dim = int(agent.obs_dim)
+    lag = int(lag)
+    scales = np.asarray(agent.scales, dtype=float)
+    prefix = np.asarray(pending_prefix, dtype=float).reshape(-1)
+
+    def extract_features(states, sequences, step):
+        history = history_features(
+            sequences, step + 1, prefix, action_dim=lag + 1,
+        )
+        pending = history[:, :lag][:, ::-1] if lag else np.zeros(
+            (len(states), 0)
+        )
+        encoded = np.concatenate(
+            [np.asarray(states, dtype=float)[:, :obs_dim], pending], axis=1,
+        )
+        if encoded.shape[1] != scales.size:
+            raise ValueError(
+                "candidate state dimension does not match the agent scales"
+            )
+        raw_observations = np.asarray(states, dtype=float)[:, :obs_dim]
+        scaled = encoded / scales
+        features = []
+        for observation, queue, encoded_state in zip(
+            raw_observations, pending, scaled,
+        ):
+            resolved = resolver.resolve(agent, observation, queue)
+            node_token = None
+            if resolved["status"] == "supported":
+                chain = tree.chain(resolved["key"])
+                if chain:
+                    node_token = ("tree", str(chain[-1]))
+            if node_token is None:
+                # Rank ordering may see predicted states outside the
+                # resolver's OOD radius.  Fall back to the root most often
+                # observed on the nearest training prototype; this is a
+                # read-only rank hint, never a stage assertion.
+                prototype_roots = getattr(
+                    agent, "stage_prototype_roots", {},
+                )
+                nearest = getattr(agent, "_nearest", None)
+                if nearest is not None and prototype_roots:
+                    prototype, _distance = nearest(encoded_state)
+                    if prototype is not None:
+                        node_token = prototype_roots.get(str(prototype))
+            if node_token is None:
+                if stats is not None:
+                    stats["feature_empty"] = (
+                        int(stats.get("feature_empty", 0)) + 1
+                    )
+                features.append(())
+                continue
+            if stats is not None:
+                stats["feature_present"] = (
+                    int(stats.get("feature_present", 0)) + 1
+                )
+                if (node_token,) == demand.target_stage:
+                    stats["target_present"] = (
+                        int(stats.get("target_present", 0)) + 1
+                    )
+            features.append((node_token,))
+        return features
+
+    return make_demand_rank_step(
+        heuristic, demand, feature_extractor=extract_features,
+        stats=stats,
     )
 
 
@@ -2100,7 +2325,7 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   milestone_goal=None, pain_weight=None, risk_lane="max",
                   previous_action=None, margin_eps=0.0, veto_fraction=0.0,
                   rank_step=None, stage_demand=None,
-                  demand_heuristic=None):
+                  demand_heuristic=None, rank_stats=None):
     initial = np.asarray(env.obs(), dtype=float)
     agent_obs_dim = int(agent.obs_dim)
     if (stage_demand is None) != (demand_heuristic is None):
@@ -2112,9 +2337,24 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             raise ValueError(
                 "supply either rank_step or stage_demand, not both"
             )
-        rank_step = make_node_demand_rank_step(
-            agent, stage_demand, demand_heuristic,
-        )
+        mode = getattr(agent, "stage_rank_feature_source", None)
+        if mode == "root":
+            rank_step = make_node_root_rank_step(
+                agent, stage_demand, demand_heuristic, prefix, lag,
+                stats=rank_stats,
+            )
+        elif getattr(
+                agent, "stage_demand_feature_source", "branch",
+        ) == "prototype":
+            rank_step = make_node_prototype_rank_step(
+                agent, stage_demand, demand_heuristic, prefix, lag,
+                stats=rank_stats,
+            )
+        else:
+            rank_step = make_node_demand_rank_step(
+                agent, stage_demand, demand_heuristic,
+                stats=rank_stats,
+            )
     if rank_step is not None and int(beam_width) <= 0:
         raise ValueError("rank_step requires beam search with positive beam_width")
 
@@ -2820,7 +3060,7 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                     plan_out=None, candidate_callback=None,
                     previous_action=None, margin_eps=0.0, veto_fraction=0.0,
                     rank_step=None, stage_demand=None,
-                    demand_heuristic=None):
+                    demand_heuristic=None, rank_stats=None):
     """Dispatch one decision to the searched or the cell-Q-only policy.
 
     With `ledger_out` (a list) and the search decision, the winning
@@ -2864,6 +3104,7 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
             rank_step=rank_step,
             stage_demand=stage_demand,
             demand_heuristic=demand_heuristic,
+            rank_stats=rank_stats,
         )
         if ledger_out is not None:
             score = result.score
@@ -2879,6 +3120,9 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                 final=np.asarray(result.final_state, dtype=float),
                 actions=np.asarray(result.actions, dtype=float),
                 cost=float(np.asarray(result.score).reshape(-1)[0]),
+                candidate_count=int(
+                    getattr(result, "candidate_count", 0)
+                ),
             ))
         return int(result.actions[0])
     if decision == "stage":
@@ -2999,7 +3243,7 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
              pain_weight=None, risk_lane="max", plan_out=None,
              candidate_out=None, margin_eps=0.0, veto_fraction=0.0,
              env_factory=None, rank_step=None,
-             stage_demand_provider=None):
+             stage_demand_provider=None, rank_stats=None):
     """Run one deterministic evaluation episode.
 
     ``env_seed`` selects the world instance; when omitted the historical
@@ -3124,6 +3368,7 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             rank_step=rank_step,
             stage_demand=stage_demand,
             demand_heuristic=demand_heuristic,
+            rank_stats=rank_stats,
         )
         if candidate_out is not None:
             candidate_out.append(collected)
@@ -3454,6 +3699,15 @@ def run_seed(task):
         stage_demand_heuristic=(
             agent.stage_demand_heuristic.snapshot()
             if getattr(agent, "stage_demand_heuristic", None) is not None
+            else None
+        ),
+        stage_tree=(
+            agent.stage_tree.snapshot()
+            if getattr(agent, "stage_tree", None) is not None else None
+        ),
+        stage_tree_heuristic=(
+            agent.stage_tree_heuristic.snapshot()
+            if getattr(agent, "stage_tree_heuristic", None) is not None
             else None
         ),
         dagger=getattr(agent, "dagger_log", []),
@@ -4233,6 +4487,27 @@ def main():
                     rows[0].get("stage_memory", {}).get("feature_source"),
                 )
             )
+        tree = rows[0].get("stage_tree")
+        if tree:
+            print(
+                "stage tree (seed %d): %d types, %d merges, %d roots, "
+                "max level %d"
+                % (
+                    rows[0]["seed"], tree["stage_types"], tree["merges"],
+                    tree["roots"], tree["max_level"],
+                )
+            )
+        tree_heuristic = rows[0].get("stage_tree_heuristic")
+        if tree_heuristic:
+            print(
+                "stage tree heuristic (seed %d): %d samples, "
+                "%d context-feature pairs, %d context outcomes"
+                % (
+                    rows[0]["seed"], tree_heuristic["samples"],
+                    tree_heuristic["context_feature_pairs"],
+                    tree_heuristic["context_outcomes"],
+                )
+            )
     if overall["clusters"] < 5:
         print("warning: fewer than 5 trained models; the interval is "
               "descriptive, not a significance test")
@@ -4317,6 +4592,16 @@ def main():
                 dict(seed=row["seed"], census=row["stage_demand_heuristic"])
                 for row in rows
                 if row.get("stage_demand_heuristic") is not None
+            ],
+            stage_tree=[
+                dict(seed=row["seed"], census=row["stage_tree"])
+                for row in rows
+                if row.get("stage_tree") is not None
+            ],
+            stage_tree_heuristic=[
+                dict(seed=row["seed"], census=row["stage_tree_heuristic"])
+                for row in rows
+                if row.get("stage_tree_heuristic") is not None
             ],
             per_train_seed=per_train,
             per_eval_seed=per_eval,
