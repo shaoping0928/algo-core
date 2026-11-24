@@ -15,3 +15,5 @@ stage-*.json
 stage-*.log
 option-quotient-*.json
 option-quotient-*.log
+static-transition-*.json
+static-transition-*.log
