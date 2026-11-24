@@ -2333,6 +2333,66 @@ def make_node_root_rank_step(agent, demand, heuristic,
     )
 
 
+def make_stage_value_penalty(agent, root_penalties, prefix, lag,
+                             neutral: float = 0.5):
+    """Map final plan states to a soft stage-type value penalty.
+
+    ``root_penalties`` maps predictive-tree root tokens to ``1 - value``.
+    The callable resolves each final state through the same resolver the root
+    rank adapter uses, then reads its tree root.  Unknown states get the
+    neutral penalty, never a fabricated value.
+    """
+    resolver = getattr(agent, "stage_resolver", None)
+    tree = getattr(agent, "stage_tree", None)
+    if resolver is None or tree is None:
+        raise ValueError("stage value needs a fitted resolver and stage tree")
+    obs_dim = int(agent.obs_dim)
+    lag = int(lag)
+    pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
+    penalties = dict(root_penalties)
+    scales = np.asarray(agent.scales, dtype=float)
+    prototype_roots = getattr(agent, "stage_prototype_roots", {})
+    nearest = getattr(agent, "_nearest", None)
+
+    def penalty(states, sequences):
+        states = np.asarray(states, dtype=float)
+        sequences = np.asarray(sequences, dtype=float)
+        history = history_features(
+            sequences, sequences.shape[1], pending_prefix,
+            action_dim=lag + 1,
+        )
+        pending = history[:, :lag][:, ::-1] if lag else np.zeros(
+            (len(states), 0)
+        )
+        values = np.full(len(states), float(neutral), dtype=float)
+        for index, (state, queue) in enumerate(zip(states, pending)):
+            observation = np.asarray(state[:obs_dim], dtype=float)
+            resolved = resolver.resolve(agent, observation, queue)
+            token = None
+            if resolved.get("status") == "supported":
+                chain = tree.chain(resolved["key"])
+                token = (
+                    ("tree", "base") if not chain
+                    else ("tree", str(chain[-1]))
+                )
+            if token is None and nearest is not None and prototype_roots:
+                # The predicted state may sit outside the resolver's OOD
+                # radius.  Fall back to the root most often seen on the
+                # nearest training prototype; this is a value hint, never a
+                # stage assertion.
+                encoded = np.concatenate([
+                    observation, np.asarray(queue, dtype=float),
+                ]) / scales
+                prototype, _distance = nearest(encoded)
+                if prototype is not None:
+                    token = prototype_roots.get(str(prototype))
+            if token is not None:
+                values[index] = float(penalties.get(token, neutral))
+        return values
+
+    return penalty
+
+
 def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   step_stride=2, stride_includes_lag=False,
                   death_status_batch=None, unknown_penalty=0.0,
@@ -2344,7 +2404,8 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   previous_action=None, margin_eps=0.0, veto_fraction=0.0,
                   rank_step=None, stage_demand=None,
                   demand_heuristic=None, rank_stats=None,
-                  rank_mode="order", rank_margin=0.0):
+                  rank_mode="order", rank_margin=0.0,
+                  stage_value=None, stage_value_weight=0.0):
     initial = np.asarray(env.obs(), dtype=float)
     agent_obs_dim = int(agent.obs_dim)
     if (stage_demand is None) != (demand_heuristic is None):
@@ -2811,6 +2872,19 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 cost = cost + np.where(
                     signal >= cutoff, 10.0 * margin, 0.0
                 )
+            if stage_value is not None and float(stage_value_weight) > 0.0:
+                penalties = np.asarray(
+                    stage_value(states, sequences), dtype=float,
+                ).reshape(-1)
+                if penalties.shape != (len(states),):
+                    raise ValueError(
+                        "stage_value must return one penalty per candidate"
+                    )
+                if not np.isfinite(penalties).all():
+                    raise ValueError(
+                        "stage_value penalties must be finite"
+                    )
+                cost = cost + float(stage_value_weight) * penalties
             return (
                 np.column_stack([
                     cost, -dopamine, risk, value_term,
@@ -3082,7 +3156,8 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                     previous_action=None, margin_eps=0.0, veto_fraction=0.0,
                     rank_step=None, stage_demand=None,
                     demand_heuristic=None, rank_stats=None,
-                    rank_mode="order", rank_margin=0.0):
+                    rank_mode="order", rank_margin=0.0,
+                    stage_value=None, stage_value_weight=0.0):
     """Dispatch one decision to the searched or the cell-Q-only policy.
 
     With `ledger_out` (a list) and the search decision, the winning
@@ -3129,6 +3204,8 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
             rank_stats=rank_stats,
             rank_mode=rank_mode,
             rank_margin=rank_margin,
+            stage_value=stage_value,
+            stage_value_weight=stage_value_weight,
         )
         if ledger_out is not None:
             score = result.score
@@ -3268,7 +3345,8 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
              candidate_out=None, margin_eps=0.0, veto_fraction=0.0,
              env_factory=None, rank_step=None,
              stage_demand_provider=None, rank_stats=None,
-             rank_mode="order", rank_margin=0.0):
+             rank_mode="order", rank_margin=0.0,
+             stage_value=None, stage_value_weight=0.0):
     """Run one deterministic evaluation episode.
 
     ``env_seed`` selects the world instance; when omitted the historical
@@ -3396,6 +3474,8 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             rank_stats=rank_stats,
             rank_mode=rank_mode,
             rank_margin=rank_margin,
+            stage_value=stage_value,
+            stage_value_weight=stage_value_weight,
         )
         if candidate_out is not None:
             candidate_out.append(collected)

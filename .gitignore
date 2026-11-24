@@ -19,3 +19,5 @@ static-transition-*.json
 static-transition-*.log
 layer-stability-*.json
 layer-stability-*.log
+stage-type-value-gate-*.json
+stage-type-value-gate-*.log

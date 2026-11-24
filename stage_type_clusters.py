@@ -36,6 +36,10 @@ class StageSample:
     outcome: Tuple
     start: int = 0
     end: int = 0
+    value: float = 0.0
+    terminal: bool = False
+    censored: bool = False
+    key: Tuple = ()
 
     def __post_init__(self):
         profile = np.asarray(self.profile, dtype=float).reshape(-1)
@@ -98,6 +102,7 @@ class StageTypeClusters:
         self.prior = float(prior)
         self.types = {}
         self.samples = ()
+        self.sample_types = {}
         self.outcome_vocabulary = ()
         self.global_outcomes = Counter()
         self.accepted = False
@@ -137,7 +142,10 @@ class StageTypeClusters:
             clusters[left] = clusters[left] + clusters[right]
             del clusters[right]
         clusters.sort(key=lambda members: tuple(sorted(members)))
+        self.sample_types = {}
         for type_id, members in enumerate(clusters):
+            for index in members:
+                self.sample_types[int(index)] = int(type_id)
             centroid = _normalize(np.mean(
                 [profiles[index] for index in members], axis=0,
             ))

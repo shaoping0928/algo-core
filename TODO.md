@@ -500,6 +500,17 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
         稳定候选，尽管 mean gain 仍为 0.13–0.39。
         → 判定 `layer_count_not_stable`：当前数据量下相似度层级不可识别，
         **C 不接线**。需要更多 episode，或最小层支撑/高相似度约束后重跑。
+    - B 决策侧（已完成首轮，`stage_type_value.py` +
+      `make_stage_value_penalty` + `stage_type_value_gate_probe.py`）：把类型
+      值作为**软终点项**加到 terminal cost（`stage_value_weight`，默认 0），
+      同预算 gate（seed 100、beam 4、3 worlds、cap 400）：
+      - 类型值模型：43 types、coverage 1.0、gain +0.232（B 的已过门模型）；
+      - weight 0 / 0.1 / 0.5 → frames **25.0 / 25.0 / 25.0**，完全相同；
+      - 终点候选的 penalty 在单次决策内 distinct 平均 **1.29/4**（max 2），
+        即预测终态几乎总是落到同一个 tree root/type。
+      → 判定 `stage_type_endpoint_value_inert`：终点项没有杠杆，**不接线**。
+      下一步若继续，只能在中间 beam 逐步打分（更接近已失败的 rank hint），
+      或改用 stage-level value 而非 frame endpoint。
     - 约束：节点强度/权重只来自 runtime 自身，不引入任务常量；未知节点
       保持 0，不伪造边；默认只读，不替换 detector/segmentation/planner。
 11. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
