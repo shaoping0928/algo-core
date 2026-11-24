@@ -435,6 +435,28 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
     - 旁证（`stage_change_bundle_probe.py`，prototype 快照源）：57 个 bundle，
       全部 size-2 的 prototype 交接 `(concept_i,-1)/(concept_{i+1},+1)`，
       3.6 边界/局——说明二值 prototype 源本身不足以表达多节点协同。
+    - A2（已完成，`static_graph_strengths.py`，2026-11-24）：
+      - 从真实共激活学习 association 的 Jaccard 强度（支撑门）、membership
+        的结构绑定强度；**只读 overlay，不写 runtime 图**。
+      - `endogenous_transition(strengths=...)` 用 overlay 替换原始边权，
+        支持多跳；新增可选**度归一化**（每节点出边质量归一），防止 hub
+        淹没状态。
+      - 结果（seed 100、1500 步、367 状态、30 个独立节点）：
+
+        | 变体 | 节点/状态 | 边 | bundles | size-3 | 边界/局 |
+        |---|---:|---|---:|---:|---:|
+        | graph d1 | 11.31 | derivation 2352 | 122 | 44 | 7.13 |
+        | learned d1 | 21.83 | assoc 54565 | 112 | 43 | 6.16 |
+        | learned d2 | 24.59 | assoc 253349 | 87 | 33 | 5.05 |
+        | normalized d1 | 12.62 | assoc 54565 | 119 | 43 | 7.13 |
+        | normalized d2 | **12.98** | assoc 83597 | **128** | **50** | 7.03 |
+
+      - 判定：原始强度会**过度整合**（d2 覆盖 24.6/30 节点，bundle 反降到
+        87）；**度归一化**把整合控制在 12.6→13.0 节点、闭包到 d2–d3，且
+        bundle / size-3 最高（128 / 50）。→ 可用变体是 **normalized**。
+        membership 有 63 条结构绑定，但当前 feature seed 不是 memory
+        member，实际未触发（association 是主通道）。
+      - 下一步 B：在 normalized `E(s)` 剖面上做相似度聚类与 held-out 门。
     - B（未做）：区间剖面的关键节点加权相似度 → 阶段类型聚类；需要
       held-out 稳定性/预测门，不能用固定 K。
     - C（未做）：阶段类型按相似度分层，层数由门选择；与

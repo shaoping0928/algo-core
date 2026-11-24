@@ -12,25 +12,41 @@ from collections import Counter
 import numpy as np
 
 from stage_change_bundles import StageChangeBundles, StaticExpansion
+from static_graph_strengths import learn_static_strengths
 from static_transition import endogenous_transition
 from substrate_nodes import fit
 
 
-def integrated_states(agent, episodes, max_steps):
-    per_episode = []
+def seed_sets(agent, episodes):
+    result = []
     for episode in episodes:
-        states = []
+        sets = []
         for stage in episode:
             state = np.asarray(stage.entry_state, dtype=float).reshape(-1)
             if state.size >= int(agent.obs_dim):
-                states.append(endogenous_transition(
-                    agent, state=state[:int(agent.obs_dim)],
-                    max_steps=max_steps,
+                sets.append(tuple(
+                    agent._active_feature_ids(
+                        state[:int(agent.obs_dim)]
+                        / np.asarray(agent.scales)[:int(agent.obs_dim)]
+                    )
                 ))
             else:
-                states.append(endogenous_transition(
-                    agent, seeds=(), max_steps=max_steps,
-                ))
+                sets.append(())
+        result.append(sets)
+    return result
+
+
+def integrated_states(agent, seeds_per_episode, max_steps, strengths=None,
+                      decay=0.5, min_strength=0.05):
+    per_episode = []
+    for seeds in seeds_per_episode:
+        states = []
+        for episode_seeds in seeds:
+            states.append(endogenous_transition(
+                agent, seeds=episode_seeds, max_steps=max_steps,
+                decay=decay, min_strength=min_strength,
+                strengths=strengths,
+            ))
         per_episode.append(states)
     return per_episode
 
@@ -117,6 +133,7 @@ def main():
     parser.add_argument("--decay", type=float, default=0.5)
     parser.add_argument("--min-strength", type=float, default=0.05)
     parser.add_argument("--min-support", type=int, default=2)
+    parser.add_argument("--strength-min-support", type=int, default=2)
     parser.add_argument("--max-candidates", type=int, default=200000)
     parser.add_argument("--report", default="")
     args = parser.parse_args()
@@ -130,20 +147,47 @@ def main():
     if experience is None:
         raise SystemExit("the stage layer did not fit")
     episodes = list(experience.episodes)
+    seeds = seed_sets(agent, episodes)
+    flat = [state for episode in seeds for state in episode]
+    strengths = learn_static_strengths(
+        flat, graph=getattr(agent, "graph", None),
+        min_support=int(args.strength_min_support),
+        membership_strength=1.0,
+    )
+    normalized = learn_static_strengths(
+        flat, graph=getattr(agent, "graph", None),
+        min_support=int(args.strength_min_support),
+        membership_strength=1.0, normalized=True,
+    )
     print(
-        "static transition probe: seed %d | episodes %d"
-        % (args.seed, len(episodes))
+        "static transition probe: seed %d | episodes %d | strengths %s"
+        % (args.seed, len(episodes), strengths.snapshot())
     )
     results = []
-    for depth in args.depths:
-        per_episode = integrated_states(agent, episodes, int(depth))
-        states = summarize_states(per_episode)
-        bundles = bundle_summary(
-            per_episode, args.min_support, args.max_candidates,
-        )
-        row = dict(depth=int(depth), states=states, bundles=bundles)
-        results.append(row)
-        print("  depth %d: %s | %s" % (depth, states, bundles))
+    variants = (
+        ("graph", None),
+        ("learned", strengths),
+        ("normalized", normalized),
+    )
+    for variant, overlay in variants:
+        for depth in args.depths:
+            per_episode = integrated_states(
+                agent, seeds, int(depth), strengths=overlay,
+                decay=float(args.decay),
+                min_strength=float(args.min_strength),
+            )
+            states = summarize_states(per_episode)
+            bundles = bundle_summary(
+                per_episode, args.min_support, args.max_candidates,
+            )
+            row = dict(
+                variant=variant, depth=int(depth),
+                states=states, bundles=bundles,
+            )
+            results.append(row)
+            print("  %s depth %d: %s | %s" % (
+                variant, depth, states, bundles,
+            ))
     if args.report:
         report = dict(
             seed=int(args.seed),
@@ -152,9 +196,12 @@ def main():
                 max_nodes=int(args.max_nodes), decay=float(args.decay),
                 min_strength=float(args.min_strength),
                 min_support=int(args.min_support),
+                strength_min_support=int(args.strength_min_support),
                 max_candidates=int(args.max_candidates),
                 depths=[int(value) for value in args.depths],
             ),
+            strengths=strengths.snapshot(),
+            normalized_strengths=normalized.snapshot(),
             rows=results,
         )
         with open(args.report, "w", encoding="utf-8") as handle:

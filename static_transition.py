@@ -18,6 +18,10 @@ The operator is a representation step, not a boundary detector.  It can be
 applied at any state, and its output is the integrated state that stage-change
 bundles, similarity typing and layering consume.  Unknown nodes stay at zero
 strength; no node is fabricated from a counterfactual edge.
+
+Optional read-only ``StaticGraphStrengths`` overlays replace the graph's raw
+association and membership weights, so learned continuous strengths can drive
+the closure without writing them into the runtime graph.
 """
 from __future__ import annotations
 
@@ -122,8 +126,29 @@ def _binding_strength(weight: float) -> float:
     return min(1.0, max(0.0, float(weight)))
 
 
-def _neighbours(graph, node_id):
-    """Yield ``(edge_kind, neighbour, strength)`` over non-temporal edges."""
+def _neighbours(graph, node_id, strengths=None):
+    """Yield ``(edge_kind, neighbour, strength)`` over non-temporal edges.
+
+    When a ``StaticGraphStrengths`` overlay is supplied, its learned
+    associations replace the graph's association weights entirely and its
+    membership strengths replace the graph's binding weights.
+    """
+    if strengths is not None:
+        for other, value in strengths.associations_of(node_id):
+            if other in graph.nodes:
+                yield ASSOCIATION, other, float(value)
+        for key in graph.incoming.get(node_id, ()):
+            kind = key[2]
+            edge = graph.edges[key]
+            if kind == MEMBERSHIP:
+                value = strengths.member_strength(key[0], node_id)
+                if value > 0.0:
+                    yield MEMBERSHIP, key[0], float(value)
+            elif kind == DERIVATION:
+                yield DERIVATION, key[0], _binding_strength(edge.weight)
+            elif kind == TRANSITION_EDGE:
+                continue
+        return
     for key in graph.outgoing.get(node_id, ()):
         kind = key[2]
         if kind != ASSOCIATION:
@@ -145,13 +170,17 @@ def _neighbours(graph, node_id):
 
 def endogenous_transition(agent, state=None, seeds=None,
                           max_steps: int = 2, decay: float = 0.5,
-                          min_strength: float = 0.05) -> StaticState:
+                          min_strength: float = 0.05,
+                          strengths=None) -> StaticState:
     """Integrate the current state over non-temporal node edges.
 
     ``seeds`` are active node ids; when omitted they are read from the runtime
     with ``state`` encoded the same way its feature rules expect.  ``max_steps``
     bounds the closure depth, ``decay`` scales each hop and ``min_strength``
-    drops weak activations.  Transition edges are never followed.
+    drops weak activations.  Transition edges are never followed.  An optional
+    ``StaticGraphStrengths`` overlay replaces the graph's association and
+    membership weights, so learned continuous strengths can be used without
+    writing them into the runtime graph.
     """
     if int(max_steps) < 0:
         raise ValueError("max_steps must be non-negative")
@@ -178,7 +207,8 @@ def endogenous_transition(agent, state=None, seeds=None,
         node, strength, depth = queue.popleft()
         if depth >= int(max_steps):
             continue
-        for kind, child, edge_strength in _neighbours(graph, node):
+        for kind, child, edge_strength in _neighbours(
+                graph, node, strengths=strengths):
             edge_counts[kind] += 1
             value = float(strength) * float(edge_strength) * float(decay)
             if value < float(min_strength):
@@ -228,21 +258,23 @@ def _seed_features(agent, state):
 
 
 def seed_state(agent, state=None, seeds=None,
-               max_steps: int = 0) -> StaticState:
+               max_steps: int = 0, strengths=None) -> StaticState:
     """The one-step expansion, useful as the ablation baseline."""
     return endogenous_transition(
         agent, state=state, seeds=seeds, max_steps=max_steps,
+        strengths=strengths,
     )
 
 
 def integrate_episode(agent, seeds_per_state: Iterable[Iterable[str]],
                       max_steps: int = 2, decay: float = 0.5,
-                      min_strength: float = 0.05) -> Tuple[StaticState, ...]:
+                      min_strength: float = 0.05,
+                      strengths=None) -> Tuple[StaticState, ...]:
     """Apply the static transition to every state of an episode."""
     return tuple(
         endogenous_transition(
             agent, seeds=seeds, max_steps=max_steps, decay=decay,
-            min_strength=min_strength,
+            min_strength=min_strength, strengths=strengths,
         )
         for seeds in seeds_per_state
     )
