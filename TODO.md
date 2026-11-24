@@ -402,33 +402,45 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
      或给 class 模式加 value 以处理翻倍的分支。
    - 仍不做：跨任务 option 归纳、unseen trace 到已有类的因果映射（当前
      unseen trace 仍 UNKNOWN）。
-10. **[~] P1：阶段定义扩充（静态扩展 / 共变 bundle / 相似度分层，2026-11-24，A 已落地）**。
-    用户方向：阶段变化不是单通道 onset，而是**一次转移后在结束状态做静态扩展**
-    （对单帧提取特征节点强度），一组节点强度**经常一同变化**才构成一次阶段
-    变化；记忆里一段时间内**转移相似度高**的区间是同类阶段；分层用**状态转移
-    节点 + 特征节点强度的相似度、关键节点加权**来做，不预设层数。
-    - A（已完成，`stage_change_bundles.py`）：`static_expansion` 把
-      `_feature_mask_table` 变成 frame×node 强度矩阵；`StageChangeBundles`
-      从 `Δstrength` 的离散 token 中挖掘频繁共变项集（episode 支撑、
-      最小 bundle 大小、lift 门），并给出关键节点权重（逆变化频率）；
-      `boundaries` 用 bundle 匹配生成阶段边界；`segments` 输出区间与
-      加权强度剖面（供 B 使用）。默认只读，不替换现有 detector/segmentation。
+10. **[~] P1：阶段定义扩充（内生静态转移 / 共变 bundle / 相似度分层，2026-11-24）**。
+    用户方向（修正理解）：**静态扩展的本质是一次特征提取，也就是内生的、
+    非时间性的状态转移**——用系统已学到的状态特征、节点关联等，在**同一
+    时刻**把当前状态整合成更丰富的表示，功能是“整合当前状态信息”；它应当
+    广泛存在于每个状态。这与**外延的、向后推进的时间转移**相反：后者是
+    `(s,a) -> s'`，推进时间；前者是 `s -> E(s)`，不推进时间。
+    - A（已完成）：
+      - `static_transition.py`：`endogenous_transition` 只沿**非时间边**
+        做闭包：association（对称共现）、membership（member→memory，反向
+        不展开）、derivation（source→derived，反向不回填）；**绝不跟随
+        transition 边**。强度按 hop 衰减、`min_strength` 截断、`max_steps`
+        限制；`StaticState` 暴露节点强度/kind/depth、`vector` 与 `change`。
+      - `stage_change_bundles.py`：消费 `E(s)` 序列，按 `ΔE` 的符号 token
+        挖掘反复共变的 bundle（episode 支撑、bundle 大小、lift 门），
+        关键节点权重=逆变化频率；bundle 匹配生成边界，`segments` 输出区间
+        与加权剖面（供 B）。
+      - `static_transition_probe.py`：对比 depth 0/1/2/3 的整合规模、kind
+        分布、边类型计数，以及整合后共变 bundle 的丰富度。
+    - 结果（seed 100、1500 步、38 局、367 个状态）：
+      - depth 0（仅 seed）：7.51 节点/状态、26 个独立节点、76 个 bundle
+        （47 个 size-2、29 个 size-3）、边界 4.95/局；
+      - depth 1：11.31 节点/状态（+50.6%）、30 个节点、122 个 bundle
+        （78 size-2、44 size-3）、边界 7.13/局；边计数只有
+        **derivation 2352**（association/membership 为 0）；
+      - depth 2/3 与 depth 1 完全相同、converged=1.0 → 当前图上的内生闭包
+        **一跳饱和**。
+      → 机制成立，且整合后共变 bundle 更丰富（size-3 从 29 增到 44）；
+      但当前 runtime 图的非时间结构主要是 derivation 边，association/
+      membership 几乎未参与，闭包深度只有 1。要得到真正多跳的“状态整合”，
+      需要更密的关联/记忆边，或把 membership/association 的强度学习接上。
+    - 旁证（`stage_change_bundle_probe.py`，prototype 快照源）：57 个 bundle，
+      全部 size-2 的 prototype 交接 `(concept_i,-1)/(concept_{i+1},+1)`，
+      3.6 边界/局——说明二值 prototype 源本身不足以表达多节点协同。
     - B（未做）：区间剖面的关键节点加权相似度 → 阶段类型聚类；需要
       held-out 稳定性/预测门，不能用固定 K。
-    - C（未做）：阶段类型按相似度分层，层数由门选择；与现有
+    - C（未做）：阶段类型按相似度分层，层数由门选择；与
       `PredictiveStageTree` 的 outcome 似然门互补（相似度提议、似然接受）。
-    - 结果（seed 100、1500 步）：38 局、717 个 prototype 节点、1500 次转移、
-      367 个 detector 阶段（9.7/局）。support 1 触发 20 万候选上限（截断，
-      不可用）；support 2 → **57 个 bundle、边界 3.6/局**；support 3 →
-      19 个、边界 1.6/局。全部 bundle 都是 size-2，形态为
-      `(concept_i, -1) / (concept_{i+1}, +1)`——即 **prototype 交接**，
-      不是多节点协同；关键权重按逆变化频率。区间 4.6/局、duration 中位 3。
-    - 限制：当前稠密 `prototype` 特征源下共变退化成 prototype 链交接；
-      `branch` 特征覆盖仅 0.3%，无法提供更丰富的多节点 bundle。B/C 之前
-      需要更密/连续的特征节点强度，或把 bundle 定义从“节点集合”扩展到
-      “交界 + 上下文”。
-    - 约束：节点强度/权重只来自 runtime 自身，不引入任务常量；无法支持的
-      bundle/区间保持 UNKNOWN，不做反事实补边。
+    - 约束：节点强度/权重只来自 runtime 自身，不引入任务常量；未知节点
+      保持 0，不伪造边；默认只读，不替换 detector/segmentation/planner。
 11. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
    episode-held-out 审计（5 折 / 3 seeds，fold-refit 表示），但仍无
    planner A/B、跨 seed 决策稳定性、在线 provider 校准或 shadow 运行；
