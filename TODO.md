@@ -321,7 +321,38 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
       下一步应转向可验证的 value target，而不是继续改 priority 排序；
    ③ demand target 质量与支持/置信度校准完成后再重跑同预算 A/B，
       3/6-seed 通过前不进入 shadow。
-7. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
+7. **[x] P1：非帧级 option 搜索（完整枚举基础层，2026-11-24，已落地、未接线）**。
+   新增 `stage_option_search.py`：把 `StageOutcomeMemory` 的阶段→阶段转移
+   组合成**完整路径**。这是非帧转移的第一个决策侧消费者，目标先正确性、
+   不做剪枝：
+    - 节点 = 阶段上下文，边 = 真实执行过的 option，边结果 =
+      `(destination, terminal/censored, duration, feedback)` 的完整分布；
+    - **无 beam / top-k / 分数剪枝**：每个节点展开 memory 支持的全部 option，
+      每条边的全部 outcome 都被跟随；
+    - 每条边展开前校验 outcome 概率和为 1（`max_edge_deviation` 记录），
+      不满足即抛错；
+    - terminal/censored 立即终止；到 `max_transitions` 记 `open`（深度截断，
+      不是未知转移）；无支持 option 的节点记 `unresolved`，**不重归一化**；
+    - `min_context_depth=1` 拒绝只靠 root 池化的预测：root 是跨源阶段的
+      边际，不是本阶段的转移，不能拿来编造边；
+    - 超过 `max_leaves` 默认抛 `StageOptionSearchCapacityError`，只有显式
+      `allow_truncation=True` 才允许截断并标 `complete=False`，不会静默丢分支。
+   探针 `stage_option_search_probe.py`（seed 100、1500 步、depth 2）：
+    - memory 9 类 / 71 个 option / 1059 条支持边；
+    - 离线 118 次搜索：13361 leaves（terminal 2775、open 10586、censored 0）、
+      单次最多 166 leaves / 128 plans、**terminal 可达 106/118**、
+      unresolved 30 节点（平均未解析质量 0.11）；
+    - 在线 40 个真实决策：5220 leaves（terminal 1036、open 4184）、
+      最多 163 / 127、**terminal 可达 38/40**、unresolved 4（0.04）；
+      33086 次 option 查询中 4106 supported、28980 unknown、8476 次 root
+      回退被拒；**每个阶段上下文平均 8.8–9.9 个 option 受支持**
+      （词表 71、约 62 个 unknown/节点），说明阶段级搜索空间是稀疏但可枚举的；
+    - 2 次阶段转移的期望 elapsed ≈ **8.0 帧**（单阶段中位 4），说明当前
+      8 帧视界只能容纳约 2 个阶段——粗层的自然单位是“阶段”，不是“帧”。
+   仍缺（下一层，不在本项）：option 归纳（当前只支持 exact trace）、
+   duration 的生存/竞争风险似然、阶段级价值、option 执行器与边界重规划。
+   **未接 planner，默认路径逐位不变**。
+8. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
    episode-held-out 审计（5 折 / 3 seeds，fold-refit 表示），但仍无
    planner A/B、跨 seed 决策稳定性、在线 provider 校准或 shadow 运行；
    所有表示/阈值/identity/demand/heuristic 只在训练 episode 拟合；先 shadow，

@@ -789,6 +789,30 @@ class StageOutcomeMemory:
             option_pooled=True,
         )
 
+    def supported_options(self, stage_history: Sequence[StageKey],
+                          min_context_depth: int = 1):
+        """Return every realized option this history can condition on.
+
+        The order is deterministic.  An option is included only when
+        :meth:`predict` returns a supported edge for it whose chosen backoff
+        context still contains the current stage (``min_context_depth``).
+        The root context pools every source stage, so it is excluded by
+        default: it is a marginal, not a transition from this stage.
+        """
+        if int(min_context_depth) < 0:
+            raise ValueError("min_context_depth must be non-negative")
+        options = sorted(self.action_options, key=repr)
+        result = []
+        for option in options:
+            prediction = self.predict(stage_history, option)
+            if prediction["status"] != "supported":
+                continue
+            if int(prediction.get("context_depth") or 0) < int(
+                    min_context_depth):
+                continue
+            result.append(option)
+        return tuple(result)
+
     def snapshot(self):
         return dict(
             stage_types=len(self.stage_types),
