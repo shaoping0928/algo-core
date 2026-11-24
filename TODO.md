@@ -402,7 +402,34 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
      或给 class 模式加 value 以处理翻倍的分支。
    - 仍不做：跨任务 option 归纳、unseen trace 到已有类的因果映射（当前
      unseen trace 仍 UNKNOWN）。
-10. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
+10. **[~] P1：阶段定义扩充（静态扩展 / 共变 bundle / 相似度分层，2026-11-24，A 已落地）**。
+    用户方向：阶段变化不是单通道 onset，而是**一次转移后在结束状态做静态扩展**
+    （对单帧提取特征节点强度），一组节点强度**经常一同变化**才构成一次阶段
+    变化；记忆里一段时间内**转移相似度高**的区间是同类阶段；分层用**状态转移
+    节点 + 特征节点强度的相似度、关键节点加权**来做，不预设层数。
+    - A（已完成，`stage_change_bundles.py`）：`static_expansion` 把
+      `_feature_mask_table` 变成 frame×node 强度矩阵；`StageChangeBundles`
+      从 `Δstrength` 的离散 token 中挖掘频繁共变项集（episode 支撑、
+      最小 bundle 大小、lift 门），并给出关键节点权重（逆变化频率）；
+      `boundaries` 用 bundle 匹配生成阶段边界；`segments` 输出区间与
+      加权强度剖面（供 B 使用）。默认只读，不替换现有 detector/segmentation。
+    - B（未做）：区间剖面的关键节点加权相似度 → 阶段类型聚类；需要
+      held-out 稳定性/预测门，不能用固定 K。
+    - C（未做）：阶段类型按相似度分层，层数由门选择；与现有
+      `PredictiveStageTree` 的 outcome 似然门互补（相似度提议、似然接受）。
+    - 结果（seed 100、1500 步）：38 局、717 个 prototype 节点、1500 次转移、
+      367 个 detector 阶段（9.7/局）。support 1 触发 20 万候选上限（截断，
+      不可用）；support 2 → **57 个 bundle、边界 3.6/局**；support 3 →
+      19 个、边界 1.6/局。全部 bundle 都是 size-2，形态为
+      `(concept_i, -1) / (concept_{i+1}, +1)`——即 **prototype 交接**，
+      不是多节点协同；关键权重按逆变化频率。区间 4.6/局、duration 中位 3。
+    - 限制：当前稠密 `prototype` 特征源下共变退化成 prototype 链交接；
+      `branch` 特征覆盖仅 0.3%，无法提供更丰富的多节点 bundle。B/C 之前
+      需要更密/连续的特征节点强度，或把 bundle 定义从“节点集合”扩展到
+      “交界 + 上下文”。
+    - 约束：节点强度/权重只来自 runtime 自身，不引入任务常量；无法支持的
+      bundle/区间保持 UNKNOWN，不做反事实补边。
+11. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
    episode-held-out 审计（5 折 / 3 seeds，fold-refit 表示），但仍无
    planner A/B、跨 seed 决策稳定性、在线 provider 校准或 shadow 运行；
    所有表示/阈值/identity/demand/heuristic 只在训练 episode 拟合；先 shadow，
