@@ -208,7 +208,8 @@ def run_stage_executor(seed, world, agent, cap: int = 400,
                        duration_weight: float = 0.0,
                        max_transitions: int = 1,
                        max_option_actions=None,
-                       option_quotient=None, metrics_out=None):
+                       option_quotient=None, metrics_out=None,
+                       trace_out=None):
     """Run one episode with the stage-level option executor."""
     if int(cap) < 1:
         raise ValueError("cap must be positive")
@@ -235,8 +236,25 @@ def run_stage_executor(seed, world, agent, cap: int = 400,
             lag=int(lag), step_stride=2,
             previous_action=last_action,
         )
+        if trace_out is not None:
+            pending = np.asarray(prefix, dtype=float).reshape(-1)[::-1]
+            encoded = np.concatenate([
+                obs[:int(agent.obs_dim)], pending,
+            ]) / np.asarray(agent.scales, dtype=float)
+            prototype, distance = agent._nearest(encoded)
+            resolved = agent.stage_resolver.resolve(
+                agent, obs[:int(agent.obs_dim)], pending,
+            ) if getattr(agent, "stage_resolver", None) is not None else {}
+            trace_out.append(dict(
+                source=source,
+                distance=float(distance) if prototype is not None else None,
+                resolved=str(resolved.get("status")),
+                action=int(action),
+            ))
         history = np.asarray([float(action)] + recent[:int(lag)], dtype=float)
         env.step(action)
+        if trace_out is not None:
+            trace_out[-1]["death"] = bool(env.dead)
         feedback = env.feedback()
         next_obs = np.asarray(env.obs(), dtype=float)
         executor.observe(dict(
