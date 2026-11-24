@@ -264,9 +264,11 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
    路径。固定相同预算测目标阶段路径 recall、扩展量、UNKNOWN 与最终真实价值；
    必须保持最终 selection 只用独立价值，rank priority 不写入 node value、反馈、
    六列账本或 objective。需求必须有阶段边界/失效条件，不可成为全局逐帧吸引项。
-7. **P1：真实数据与决策验收**。目前只有合成测试，无 episode-held-out 校准、
-   跨 seed 稳定性或 planner A/B。所有表示/阈值/identity/demand/heuristic 只在
-   训练 episode 拟合；先 shadow，再 3-seed 筛选、6-seed 确认。UNKNOWN 不作安全结论。
+7. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
+   episode-held-out 审计（5 折 / 3 seeds，fold-refit 表示），但仍无
+   planner A/B、跨 seed 决策稳定性、在线 provider 校准或 shadow 运行；
+   所有表示/阈值/identity/demand/heuristic 只在训练 episode 拟合；先 shadow，
+   再 3-seed 筛选、6-seed 确认。UNKNOWN 不作安全结论。
 
 **阶段记忆本身的未完成项（此模块目前不宣称已经学到任务阶段）**：
 
