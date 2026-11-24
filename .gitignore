@@ -17,3 +17,5 @@ option-quotient-*.json
 option-quotient-*.log
 static-transition-*.json
 static-transition-*.log
+layer-stability-*.json
+layer-stability-*.log
