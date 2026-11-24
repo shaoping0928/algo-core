@@ -2,9 +2,9 @@
 
 The selector is the consumer the high-level stage layer was missing.  It does
 not read a task goal, a CLI field, or the modal successor.  It enumerates the
-siblings that the stage outcome memory actually supports for the current
-context and exact ordered action option, then scores each one with a readout
-fit from realized world feedback.
+siblings supported by the stage outcome memory for the current context,
+pooled over realized action options because the next option is not yet known,
+then scores each one with a readout fit from realized world feedback.
 
 Training is episode-held-out: the memory used to produce a candidate's
 features is fit on the other episodes of the fold, so the readout never sees
@@ -126,9 +126,7 @@ class StageOutcomeReadout:
                     if source.terminal or source.censored:
                         continue
                     history = [stage.key for stage in stages[:index + 1]]
-                    prediction = memory.predict(
-                        history, source.action_trace,
-                    )
+                    prediction = memory.predict_pooled(history)
                     if prediction.get("status") != "supported":
                         continue
                     realized = stages[index + 1].key

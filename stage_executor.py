@@ -9,9 +9,10 @@ the trace ends, the loop falls back to the ordinary frame planner.
 
 The value is observational: it uses the memory's outcome rows, never a task goal
 or a counterfactual.  Options are only started at a stage entry; the boundary
-transition's own action is treated as the first action of the stage, so the
-executed trace drops that one action.  An unknown or unsupported stage falls
-back instead of fabricating a plan.
+option is recorded in acting-action coordinates. The executor only follows a
+trace when its already-acted prefix and pending delayed-action queue match;
+otherwise it falls back rather than executing a different option than the one
+the memory evaluated.
 """
 from __future__ import annotations
 
@@ -20,7 +21,10 @@ from typing import Optional
 import numpy as np
 
 from stage_online import OnlineStageTracker
-from stage_option_search import StageOptionSearch
+from stage_option_search import (
+    StageOptionSearch,
+    StageOptionSearchCapacityError,
+)
 from substrate_nodes import LAG, decision_action, latent
 
 
@@ -31,16 +35,60 @@ def expand_trace(trace):
     return actions
 
 
+def executable_option_suffix(trace, acted_prefix, issued_prefix, lag: int):
+    """Return the unissued tail if a learned trace matches committed actions.
+
+    Stage memory records actions that acted on transitions. ``issued_prefix``
+    is newest-first; its reverse is the already-committed order that will act
+    next. Those actions cannot be replaced by the executor.
+    """
+    lag = int(lag)
+    if lag < 0:
+        raise ValueError("lag must be non-negative")
+    if issued_prefix is None:
+        if lag:
+            return None
+        pending = []
+    else:
+        values = np.asarray(issued_prefix, dtype=float).reshape(-1)
+        if values.size != lag or not np.isfinite(values).all():
+            return None
+        pending = [
+            int(round(float(value))) for value in values[::-1]
+        ]
+    committed = [
+        int(action) for action in acted_prefix
+    ] + pending
+    actions = expand_trace(trace)
+    if (len(actions) < len(committed)
+            or actions[:len(committed)] != committed):
+        return None
+    return actions[len(committed):]
+
+
 def option_values(result, terminal_weight: float = 1.0,
                   duration_weight: float = 0.0):
-    """Expected first-option value from complete option-search leaves."""
+    """Expected single-stage option value from a complete enumeration.
+
+    Multi-stage leaves condition each future transition on a later option.
+    Combining them by their first option would require an explicit
+    continuation policy, so this scorer refuses that result. The final tuple
+    field is the combined terminal/censored risk mass.
+    """
+    if int(getattr(result, "max_transitions", 1)) != 1:
+        raise ValueError(
+            "first-option scoring requires max_transitions=1"
+        )
+    if (not bool(getattr(result, "complete", True))
+            or getattr(result, "unresolved", ())):
+        return []
     groups = {}
     for leaf in result.leaves:
         if not leaf.options:
             continue
         option = leaf.options[0]
         group = groups.setdefault(option, dict(
-            mass=0.0, feedback=0.0, terminal=0.0, duration=0.0,
+            mass=0.0, feedback=0.0, risk=0.0, duration=0.0,
         ))
         probability = float(leaf.probability)
         group["mass"] += probability
@@ -52,8 +100,8 @@ def option_values(result, terminal_weight: float = 1.0,
         else:
             net = 0.0
         group["feedback"] += probability * net
-        group["terminal"] += probability * (
-            1.0 if leaf.outcome == "terminal" else 0.0
+        group["risk"] += probability * (
+            1.0 if leaf.outcome in ("terminal", "censored") else 0.0
         )
         group["duration"] += probability * float(leaf.elapsed_mean)
     rows = []
@@ -63,19 +111,24 @@ def option_values(result, terminal_weight: float = 1.0,
             continue
         value = (
             group["feedback"] / mass
-            - float(terminal_weight) * group["terminal"] / mass
+            - float(terminal_weight) * group["risk"] / mass
             - float(duration_weight) * group["duration"] / mass
         )
         rows.append((
             float(value), mass, option,
-            float(group["terminal"] / mass),
+            float(group["risk"] / mass),
         ))
     rows.sort(key=lambda row: (-row[0], -row[1], repr(row[2])))
     return rows
 
 
 class StageExecutor:
-    """Select a stage option at boundaries and execute it frame by frame."""
+    """Select a stage option at boundaries and execute it frame by frame.
+
+    ``max_terminal_mass`` is retained as the public setting name, but gates
+    both terminal and censored mass. Any unresolved or incomplete search is
+    rejected outright and falls back to the frame planner.
+    """
 
     def __init__(self, agent, horizon: int = 8, lag: int = LAG,
                  max_transitions: int = 1, terminal_weight: float = 1.0,
@@ -88,8 +141,11 @@ class StageExecutor:
         memory = getattr(agent, "stage_outcome_memory", None)
         if experience is None or memory is None:
             raise ValueError("the agent has no fitted stage experience/memory")
-        if int(max_transitions) < 1:
-            raise ValueError("max_transitions must be positive")
+        if int(max_transitions) != 1:
+            raise ValueError(
+                "StageExecutor requires max_transitions=1 until a "
+                "continuation policy is defined"
+            )
         self.agent = agent
         self.horizon = int(horizon)
         self.lag = int(lag)
@@ -112,9 +168,12 @@ class StageExecutor:
         self.max_hazard = float(max_hazard)
         self.hazard_aborts = 0
         self.reliability_rejects = 0
+        self.search_rejects = 0
+        self.alignment_rejects = 0
+        self.exhausted_options = 0
         self.search = StageOptionSearch(
-            memory, max_transitions=int(max_transitions),
-            option_quotient=option_quotient, allow_truncation=True,
+            memory, max_transitions=1,
+            option_quotient=option_quotient, allow_truncation=False,
         )
         self.option_quotient = option_quotient
         self.tracker = OnlineStageTracker(experience.detector, lag)
@@ -135,6 +194,9 @@ class StageExecutor:
         self.aborted = 0
         self.hazard_aborts = 0
         self.reliability_rejects = 0
+        self.search_rejects = 0
+        self.alignment_rejects = 0
+        self.exhausted_options = 0
         self.option_lengths = []
         self.selected_values = []
         return self
@@ -172,15 +234,28 @@ class StageExecutor:
                         and self._hazard(env, prefix) > self.max_hazard):
                     self.hazard_aborts += 1
                     return
-            result = self.search.search(context["history"])
+            try:
+                result = self.search.search(context["history"])
+            except StageOptionSearchCapacityError:
+                self.search_rejects += 1
+                return
+            if not result.complete or result.unresolved:
+                self.search_rejects += 1
+                return
             rows = option_values(
                 result, self.terminal_weight, self.duration_weight,
             )
             if not rows:
                 return
+            current = context.get("current")
+            if current is None or not hasattr(current, "action_trace"):
+                self.alignment_rejects += 1
+                return
+            acted_prefix = expand_trace(current.action_trace)
             chosen = None
             for row in rows:
-                if row[3] > self.max_terminal_mass:
+                unsafe_mass = row[3]
+                if unsafe_mass > self.max_terminal_mass:
                     continue
                 option = row[2]
                 leaf = next(
@@ -197,26 +272,45 @@ class StageExecutor:
                 if int(step.support) < self.min_support:
                     self.reliability_rejects += 1
                     continue
-                chosen = row
+                if option and option[0] == "option_class":
+                    class_id = int(option[1])
+                    if self.option_quotient is None:
+                        self.alignment_rejects += 1
+                        continue
+                    option_class = self.option_quotient.classes[class_id]
+                    trace = option_class.representative
+                    members = option_class.members
+                else:
+                    trace = option
+                    members = (trace,)
+                suffix = executable_option_suffix(
+                    trace, acted_prefix, prefix, self.lag,
+                )
+                if suffix is None or not suffix:
+                    if suffix is None:
+                        self.alignment_rejects += 1
+                    else:
+                        self.exhausted_options += 1
+                    continue
+                if any(
+                        executable_option_suffix(
+                            member, acted_prefix, prefix, self.lag,
+                        ) is None
+                        for member in members):
+                    # A pooled class cannot represent members that disagree
+                    # with actions already committed in this episode.
+                    self.alignment_rejects += 1
+                    continue
+                chosen = (row, suffix, len(expand_trace(trace)))
                 break
             if chosen is None:
                 return
-            value, _mass, option, _terminal = chosen
-            if option and option[0] == "option_class":
-                class_id = int(option[1])
-                if self.option_quotient is None:
-                    return
-                trace = self.option_quotient.classes[class_id].representative
-            else:
-                trace = option
-            actions = expand_trace(trace)
-            if len(actions) <= 1:
-                return
-            # The boundary transition's own action already started this stage.
-            self.active = actions[1:]
+            row, suffix, option_length = chosen
+            value = row[0]
+            self.active = suffix
             if self.max_option_actions is not None:
                 self.active = self.active[:self.max_option_actions]
-            self.option_lengths.append(len(actions))
+            self.option_lengths.append(option_length)
             self.selected_values.append(float(value))
             self.selected += 1
 
@@ -243,6 +337,9 @@ class StageExecutor:
             aborted=int(self.aborted),
             hazard_aborts=int(self.hazard_aborts),
             reliability_rejects=int(self.reliability_rejects),
+            search_rejects=int(self.search_rejects),
+            alignment_rejects=int(self.alignment_rejects),
+            exhausted_options=int(self.exhausted_options),
             option_length_mean=(
                 float(np.mean(self.option_lengths))
                 if self.option_lengths else 0.0

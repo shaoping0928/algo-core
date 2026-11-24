@@ -1169,7 +1169,11 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         # these episodes only; per-transition feature snapshots come from the
         # runtime's frozen feature masks.  Nothing here is read by the
         # planner, so enabling it cannot change a decision.
-        agent.stage_experience = StageExperienceBatch.fit(
+        (
+            agent.stage_experience,
+            stage_train,
+            stage_validation,
+        ) = StageExperienceBatch.fit_with_validation(
             transitions, agent, lag=agent.lag,
             quantile=stage_memory_quantile,
             feature_source=stage_memory_feature_source,
@@ -1194,15 +1198,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             min_support=stage_demand_min_support,
             min_episodes=stage_demand_min_episodes,
         ).fit(agent.stage_experience.demand_samples)
-        episodes = list(agent.stage_experience.episodes)
-        tree_train = [
-            episode for index, episode in enumerate(episodes)
-            if index % 5 != 4
-        ]
-        tree_validation = [
-            episode for index, episode in enumerate(episodes)
-            if index % 5 == 4
-        ]
+        tree_train = list(stage_train.episodes)
+        tree_validation = list(stage_validation.episodes)
         if tree_train and tree_validation:
             agent.stage_tree = PredictiveStageTree.fit(
                 tree_train, tree_validation,
@@ -1236,38 +1233,10 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
                     tree_train, collapse_key, pooled=True,
                 )
             )
-            prototype_roots = {}
-            try:
-                transitions_for_roots = agent.stage_experience.stage_transitions(
-                    transitions, agent,
-                )
-                for transition in transitions_for_roots:
-                    state = np.concatenate([
-                        np.asarray(transition.observation, dtype=float),
-                        np.asarray(transition.pending, dtype=float),
-                    ]) / np.asarray(agent.scales, dtype=float)
-                    prototype, _distance = agent._nearest(state)
-                    if prototype is None:
-                        continue
-                    token = collapse_key(transition.stage.key)[0]
-                    counts = prototype_roots.setdefault(
-                        str(prototype), {}
-                    )
-                    counts[token] = int(counts.get(token, 0)) + 1
-            except ValueError:
-                prototype_roots = {}
-            agent.stage_prototype_roots = {
-                prototype: max(
-                    counts,
-                    key=lambda token: (counts[token], repr(token)),
-                )
-                for prototype, counts in prototype_roots.items()
-            }
         else:
             agent.stage_tree = None
             agent.stage_tree_heuristic = None
             agent.stage_root_heuristic = None
-            agent.stage_prototype_roots = {}
         # Predictive-equivalence classes over realized options.  Merging is a
         # training-profile model-selection decision; the quotient as a whole is
         # accepted or rejected on validation episodes.  Nothing here is read by
@@ -1292,7 +1261,6 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         agent.stage_tree = None
         agent.stage_tree_heuristic = None
         agent.stage_root_heuristic = None
-        agent.stage_prototype_roots = {}
         agent.option_quotient = None
         agent.stage_demand_feature_source = None
     # The milestone layer, read off the agent's own stream.  All of it is
@@ -2285,30 +2253,14 @@ def make_node_root_rank_step(agent, demand, heuristic,
                 "candidate state dimension does not match the agent scales"
             )
         raw_observations = np.asarray(states, dtype=float)[:, :obs_dim]
-        scaled = encoded / scales
         features = []
-        for observation, queue, encoded_state in zip(
-            raw_observations, pending, scaled,
-        ):
+        for observation, queue in zip(raw_observations, pending):
             resolved = resolver.resolve(agent, observation, queue)
             node_token = None
             if resolved["status"] == "supported":
                 chain = tree.chain(resolved["key"])
                 if chain:
                     node_token = ("tree", str(chain[-1]))
-            if node_token is None:
-                # Rank ordering may see predicted states outside the
-                # resolver's OOD radius.  Fall back to the root most often
-                # observed on the nearest training prototype; this is a
-                # read-only rank hint, never a stage assertion.
-                prototype_roots = getattr(
-                    agent, "stage_prototype_roots", {},
-                )
-                nearest = getattr(agent, "_nearest", None)
-                if nearest is not None and prototype_roots:
-                    prototype, _distance = nearest(encoded_state)
-                    if prototype is not None:
-                        node_token = prototype_roots.get(str(prototype))
             if node_token is None:
                 if stats is not None:
                     stats["feature_empty"] = (
@@ -2350,9 +2302,6 @@ def make_stage_value_penalty(agent, root_penalties, prefix, lag,
     lag = int(lag)
     pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
     penalties = dict(root_penalties)
-    scales = np.asarray(agent.scales, dtype=float)
-    prototype_roots = getattr(agent, "stage_prototype_roots", {})
-    nearest = getattr(agent, "_nearest", None)
 
     def penalty(states, sequences):
         states = np.asarray(states, dtype=float)
@@ -2375,17 +2324,6 @@ def make_stage_value_penalty(agent, root_penalties, prefix, lag,
                     ("tree", "base") if not chain
                     else ("tree", str(chain[-1]))
                 )
-            if token is None and nearest is not None and prototype_roots:
-                # The predicted state may sit outside the resolver's OOD
-                # radius.  Fall back to the root most often seen on the
-                # nearest training prototype; this is a value hint, never a
-                # stage assertion.
-                encoded = np.concatenate([
-                    observation, np.asarray(queue, dtype=float),
-                ]) / scales
-                prototype, _distance = nearest(encoded)
-                if prototype is not None:
-                    token = prototype_roots.get(str(prototype))
             if token is not None:
                 values[index] = float(penalties.get(token, neutral))
         return values
@@ -2405,7 +2343,8 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   rank_step=None, stage_demand=None,
                   demand_heuristic=None, rank_stats=None,
                   rank_mode="order", rank_margin=0.0,
-                  stage_value=None, stage_value_weight=0.0):
+                  stage_value=None, stage_value_weight=0.0,
+                  frontier_callback=None):
     initial = np.asarray(env.obs(), dtype=float)
     agent_obs_dim = int(agent.obs_dim)
     if (stage_demand is None) != (demand_heuristic is None):
@@ -2910,6 +2849,17 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 "beam search does not take a death callback; disable the "
                 "death rules or leave --beam-width at 0"
             )
+        def trace_frontier(batch):
+            if frontier_callback is None:
+                return
+            payload = dict(batch)
+            payload.update(
+                frame=int(getattr(env, "t", 0)),
+                demand=stage_demand,
+                pending_prefix=pending_prefix.copy(),
+            )
+            frontier_callback(payload)
+
         result = beam_search(
             initial_state=initial,
             action_space=tuple(getattr(agent, "action_space", (0, 1))),
@@ -2922,6 +2872,9 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             rank_step=rank_step,
             rank_mode=rank_mode,
             rank_margin=rank_margin,
+            frontier_callback=(
+                trace_frontier if frontier_callback is not None else None
+            ),
         )
         return result
     result = exhaustive_search(
@@ -3157,7 +3110,8 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                     rank_step=None, stage_demand=None,
                     demand_heuristic=None, rank_stats=None,
                     rank_mode="order", rank_margin=0.0,
-                    stage_value=None, stage_value_weight=0.0):
+                    stage_value=None, stage_value_weight=0.0,
+                    frontier_callback=None):
     """Dispatch one decision to the searched or the cell-Q-only policy.
 
     With `ledger_out` (a list) and the search decision, the winning
@@ -3176,7 +3130,8 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
     """
     if decision != "search" and (
             rank_step is not None or stage_demand is not None
-            or demand_heuristic is not None):
+            or demand_heuristic is not None
+            or frontier_callback is not None):
         raise ValueError(
             "demand ranking is currently supported only by beam search"
         )
@@ -3206,6 +3161,7 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
             rank_margin=rank_margin,
             stage_value=stage_value,
             stage_value_weight=stage_value_weight,
+            frontier_callback=frontier_callback,
         )
         if ledger_out is not None:
             score = result.score
@@ -3346,7 +3302,8 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
              env_factory=None, rank_step=None,
              stage_demand_provider=None, rank_stats=None,
              rank_mode="order", rank_margin=0.0,
-             stage_value=None, stage_value_weight=0.0):
+             stage_value=None, stage_value_weight=0.0,
+             frontier_callback=None):
     """Run one deterministic evaluation episode.
 
     ``env_seed`` selects the world instance; when omitted the historical
@@ -3476,6 +3433,7 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             rank_margin=rank_margin,
             stage_value=stage_value,
             stage_value_weight=stage_value_weight,
+            frontier_callback=frontier_callback,
         )
         if candidate_out is not None:
             candidate_out.append(collected)

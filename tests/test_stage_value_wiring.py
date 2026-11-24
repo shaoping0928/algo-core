@@ -25,8 +25,11 @@ class StubAgent:
     scales = np.asarray([1.0])
     stage_resolver = StubResolver()
     stage_tree = StubTree()
-    stage_prototype_roots = {}
-    _nearest = None
+    stage_prototype_roots = {"p0": ("tree", "7")}
+
+    @staticmethod
+    def _nearest(_state):
+        return "p0", 0.0
 
 
 class StageValuePenaltyTests(unittest.TestCase):

@@ -332,6 +332,52 @@ class StageExperienceBatch:
             feature_source=feature_source,
         )
 
+    @classmethod
+    def fit_with_validation(cls, rows: Sequence[Mapping], agent,
+                            lag: Optional[int] = None,
+                            quantile: float = 0.98,
+                            build_demand: bool = True,
+                            feature_source: str = "branch",
+                            folds: int = 5,
+                            validation_fold: int = 4):
+        """Fit the detector on train episodes and freeze it for validation.
+
+        Returns ``(all_data, train, validation)`` batches.  ``all_data`` is
+        transformed with the train-fitted detector for downstream models that
+        consume the full stream; only ``train`` and ``validation`` are used
+        for held-out model selection.
+        """
+        folds = int(folds)
+        validation_fold = int(validation_fold)
+        if folds < 2 or not 0 <= validation_fold < folds:
+            raise ValueError("validation_fold must identify a fold in folds")
+        grouped = OrderedDict()
+        for row in rows:
+            episode = _native(row.get("episode", 0))
+            grouped.setdefault(episode, []).append(row)
+        train_rows = []
+        validation_rows = []
+        for index, episode_rows in enumerate(grouped.values()):
+            target = (
+                validation_rows
+                if index % folds == validation_fold
+                else train_rows
+            )
+            target.extend(episode_rows)
+        if not train_rows:
+            raise ValueError("validation split leaves no training episodes")
+        train = cls.fit(
+            train_rows, agent, lag=lag, quantile=quantile,
+            build_demand=build_demand, feature_source=feature_source,
+        )
+        validation = train.transform(
+            validation_rows, agent, build_demand=build_demand,
+        )
+        all_data = train.transform(
+            rows, agent, build_demand=build_demand,
+        )
+        return all_data, train, validation
+
     def transform(self, rows: Sequence[Mapping], agent,
                   build_demand: bool = True) -> "StageExperienceBatch":
         """Segment other episodes with the already-fitted detector."""

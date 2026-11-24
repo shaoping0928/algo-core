@@ -182,6 +182,46 @@ class StageExperienceTests(unittest.TestCase):
             [(), (OBS_TOKEN,), (FEEDBACK_TOKEN,)],
         )
 
+    def test_validation_split_freezes_detector_before_heldout_transform(self):
+        zero = np.zeros(2)
+        rows = []
+        for episode in range(4):
+            rows.extend(make_episode(
+                episode, ys=[0.0, 1.0, 1.0], actions=[0, 0],
+                feedback=[zero, zero],
+            ))
+        rows.extend(make_episode(
+            4, ys=[0.0, 100.0, 100.0], actions=[0, 0],
+            feedback=[zero, zero],
+        ))
+        all_data, train, validation = (
+            StageExperienceBatch.fit_with_validation(
+                rows, self.agent, lag=2, quantile=0.8,
+            )
+        )
+        self.assertIs(all_data.detector, train.detector)
+        self.assertIs(validation.detector, train.detector)
+        self.assertEqual(
+            {stage.episode for episode in train.episodes for stage in episode},
+            {0, 1, 2, 3},
+        )
+        self.assertEqual(
+            {
+                stage.episode for episode in validation.episodes
+                for stage in episode
+            },
+            {4},
+        )
+        channel = ("observation_change", 0)
+        self.assertEqual(train.detector.thresholds[channel], 1.0)
+        full_fit = StageExperienceBatch.fit(
+            rows, self.agent, lag=2, quantile=0.8,
+        )
+        self.assertGreater(
+            full_fit.detector.thresholds[channel],
+            train.detector.thresholds[channel],
+        )
+
     def test_outcome_memory_consumes_the_pipeline_output(self):
         memory = StageOutcomeMemory(min_support=1, min_episodes=1).fit(
             self.batch.outcome_episodes()

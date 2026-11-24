@@ -1,5 +1,6 @@
 """Tests for the world-feedback stage-demand selector."""
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -18,13 +19,14 @@ from stage_outcome_memory import (
 OPTION = encode_action_trace([0, 0])
 
 
-def stage(episode, key, feedback, duration=2.0, terminal=False):
+def stage(episode, key, feedback, duration=2.0, terminal=False,
+          action_trace=OPTION):
     return StageOccurrence(
         episode=episode,
         key=(key,),
         entry_state=np.zeros(2),
         exit_state=np.ones(2),
-        action_trace=OPTION,
+        action_trace=action_trace,
         duration=duration,
         feedback=np.asarray(feedback, dtype=float),
         terminal=terminal,
@@ -67,6 +69,43 @@ class StageDemandSelectorTests(unittest.TestCase):
     def test_readout_is_fit_on_fold_out_candidates(self):
         self.assertGreaterEqual(self.readout.samples, 4)
         self.assertGreater(self.readout.target_std, 0.0)
+
+    def test_readout_training_uses_the_online_pooled_query(self):
+        option_a = encode_action_trace([0, 0])
+        option_b = encode_action_trace([1, 1])
+        episodes = []
+        for episode in range(8):
+            destination = "A" if episode < 4 else "B"
+            option = option_a if episode < 4 else option_b
+            reward = (2.0, 0.0) if destination == "A" else (0.0, 2.0)
+            episodes.append([
+                stage(episode, "S", (0.0, 0.0), action_trace=option),
+                stage(episode, destination, reward),
+                stage(
+                    episode, "TAIL", (0.0, 0.0), terminal=True,
+                ),
+            ])
+        with patch.object(
+            StageOutcomeMemory, "predict",
+            side_effect=AssertionError("readout must use pooled queries"),
+        ):
+            readout = StageOutcomeReadout.fit(episodes, folds=2)
+        self.assertEqual(readout.samples, 16)
+
+        memory = StageOutcomeMemory(
+            min_support=2, min_episodes=2,
+        ).fit(episodes)
+        pooled = memory.predict_pooled([("S",)])
+        exact = memory.predict([("S",)], option_a)
+        self.assertTrue(pooled["option_pooled"])
+        self.assertFalse(exact["option_pooled"])
+        self.assertGreater(pooled["support"], exact["support"])
+        selector = StageDemandSelector(
+            readout, min_outcome_episodes=2, min_samples=4,
+        )
+        demand, report = selector.select(pooled, [("S",)])
+        self.assertIsNotNone(demand)
+        self.assertEqual(report["status"], "supported")
 
     def test_selector_picks_the_higher_learned_feedback_sibling(self):
         prediction = self.memory.predict(

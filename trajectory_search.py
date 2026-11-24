@@ -528,6 +528,7 @@ def beam_search(
     ]] = None,
     rank_mode: str = "order",
     rank_margin: float = 0.0,
+    frontier_callback: Optional[Callable[[dict], None]] = None,
 ) -> SearchResult:
     """Beam-limited version of exhaustive_search for long horizons.
 
@@ -540,7 +541,9 @@ def beam_search(
     before the objective score.  ``rank_mode="tie"`` applies it only inside the
     near-tie band ``score[0] <= best + rank_margin``; paths with a clearly
     better objective score keep their order, so the hint can break close calls
-    without discarding a stronger plan.
+    without discarding a stronger plan. ``frontier_callback``, when supplied,
+    observes each expanded candidate batch and its retained mask after pruning;
+    it cannot modify the search arrays or selection.
     """
     state0 = np.asarray(initial_state, dtype=float)
     if state0.ndim == 0:
@@ -670,6 +673,25 @@ def beam_search(
                         int(index),
                     ),
                 )[:beam_width], dtype=int)
+        if frontier_callback is not None:
+            retained = np.zeros(count * width, dtype=bool)
+            retained[keep] = True
+            frontier_callback(dict(
+                step=int(step),
+                states=next_states.copy(),
+                sequences=next_sequences.copy(),
+                scores=candidate_scores.copy(),
+                priorities=(
+                    None if next_priorities is None
+                    else next_priorities.copy()
+                ),
+                feasible=candidate_feasible.copy(),
+                selectable=np.isin(
+                    np.arange(count * width), selectable
+                ),
+                retained=retained,
+                retained_indices=keep.copy(),
+            ))
         states = next_states[keep]
         sequences = next_sequences[keep]
         scores = candidate_scores[keep]

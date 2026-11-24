@@ -23,6 +23,12 @@ from substrate_nodes import LAG, _curiosity_off, evaluate, fit
 
 
 def summarize(results, horizon=None):
+    """Summarize each option sequence conditionally, without mixing choices.
+
+    Outcome probabilities are conditional on the selected option sequence;
+    the per-option figures below are uniform macro averages, not a policy
+    expectation over decisions.
+    """
     if not results:
         return dict(searches=0)
     counts = {
@@ -47,47 +53,40 @@ def summarize(results, horizon=None):
         1 for result in results
         if result.leaves == () and result.unresolved
     )
-    per_search_elapsed = []
-    per_search_terminal = []
-    per_search_q90 = []
-    per_search_within = []
+    option_terminal_rates = []
+    option_known_mass = []
+    option_elapsed_means = []
+    option_elapsed_q90 = []
+    option_within = []
+    unresolved_path_masses = []
     for result in results:
-        mass = sum(leaf.probability for leaf in result.leaves)
-        per_search_terminal.append(sum(
-            leaf.probability for leaf in result.leaves
-            if leaf.outcome == "terminal"
-        ))
-        aggregated = {}
-        for leaf in result.leaves:
-            for time, probability in leaf.elapsed_distribution:
-                aggregated[time] = (
-                    aggregated.get(time, 0.0)
-                    + float(probability) * float(leaf.probability)
-                )
-        if mass > 0.0:
-            per_search_elapsed.append(sum(
-                leaf.probability * leaf.elapsed_mean
-                for leaf in result.leaves
-            ) / mass)
-            elapsed = tuple(sorted(
-                (time, probability / mass)
-                for time, probability in aggregated.items()
-            ))
-            per_search_q90.append(distribution_quantile(elapsed, 0.9))
+        for plan in result.plans():
+            mass = float(plan.known_mass)
+            if mass <= 0.0:
+                continue
+            outcomes = dict(plan.outcome_mass)
+            option_terminal_rates.append(
+                float(outcomes.get("terminal", 0.0)) / mass
+            )
+            option_known_mass.append(mass)
+            option_elapsed_means.append(float(plan.expected_elapsed))
+            elapsed = tuple(plan.elapsed_distribution)
+            option_elapsed_q90.append(
+                distribution_quantile(elapsed, 0.9) if elapsed else 0.0
+            )
             if horizon is not None:
-                per_search_within.append(sum(
-                    probability for time, probability in elapsed
+                option_within.append(sum(
+                    float(probability) for time, probability in elapsed
                     if time <= float(horizon)
                 ))
-        else:
-            per_search_elapsed.append(0.0)
-            per_search_q90.append(0.0)
-            if horizon is not None:
-                per_search_within.append(0.0)
+        unresolved_path_masses.extend(
+            float(node.probability) for node in result.unresolved
+        )
     nodes = max(counts["unique_nodes"], 1)
     return dict(
         searches=len(results),
         counts=counts,
+        option_metric_weighting="uniform_over_option_sequences",
         incomplete=sum(1 for result in results if not result.complete),
         max_leaves=max((len(result.leaves) for result in results), default=0),
         max_plans=max((len(result.plans()) for result in results), default=0),
@@ -95,16 +94,30 @@ def summarize(results, horizon=None):
         unknown_per_node=float(counts["unknown_options"]) / nodes,
         terminal_reachable=terminal_plans,
         dead_end_searches=dead_end,
-        terminal_mass_sum_mean=float(np.mean(per_search_terminal)),
-        elapsed_mean=float(np.mean(per_search_elapsed)),
-        elapsed_q90=float(np.mean(per_search_q90)),
-        within_horizon=(
-            None if horizon is None
-            else float(np.mean(per_search_within))
+        option_sequences=len(option_known_mass),
+        option_known_mass_mean=(
+            float(np.mean(option_known_mass)) if option_known_mass else None
         ),
-        unresolved_mass=float(np.mean([
-            result.unresolved_mass for result in results
-        ])),
+        option_terminal_rate_mean=(
+            float(np.mean(option_terminal_rates))
+            if option_terminal_rates else None
+        ),
+        option_elapsed_mean=(
+            float(np.mean(option_elapsed_means))
+            if option_elapsed_means else None
+        ),
+        option_elapsed_q90_mean=(
+            float(np.mean(option_elapsed_q90))
+            if option_elapsed_q90 else None
+        ),
+        within_horizon=(
+            None if horizon is None or not option_within
+            else float(np.mean(option_within))
+        ),
+        unresolved_paths=len(unresolved_path_masses),
+        max_unresolved_path_mass=(
+            max(unresolved_path_masses) if unresolved_path_masses else 0.0
+        ),
     )
 
 

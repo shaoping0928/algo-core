@@ -309,8 +309,9 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
      根级下，margin **0.0 → 32.4**、**0.05 → 32.2**（baseline 73.8）。
      仍严重伤害 → 不是 priority 覆盖了明显更优 score，而是中间分数并列/
      目标语义本身；tie 模式不能救。
-   - target-path recall：已加候选级 `target_present` 计数（见报告）；
-     完整的 stage-tagged frontier recall 仍未实现。
+   - target-path recall（该次历史评测）：当时仅有候选级
+     `target_present` 计数，完整 frontier trace 尚未实现；后续已加入只读
+     stage-tagged frontier 统计，DAgger 对照结果见本节后文。
    - 修掉两个实现 bug：根级 adapter 对状态**双重缩放**导致 0 特征；
      feature 无证据时未继续向父 context 回退（现在会回退）。
    → 判定 `rank_hint_activates_only_under_weak_support_and_hurts`：
@@ -619,16 +620,124 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
    terminal 的联合校准、父级收益的多种子显著性、root 常数退化检查，以及
    跨任务流验证。fast smoke 只验证管线可运行与计数。
 6. 自动管线已把真实 rows 变成 stage / demand 样本，resolver / tree /
-   demand readout 也都在 `--stage-memory` 下自动生成；但**还没有在线
-   provider**（在线切 stage、拼当前 context、把需求送入 rank-only frontier），
-   也未接入默认路径。不存在阶段级行为收益证据，默认决策路径逐位不变。
+   demand readout 也都在 `--stage-memory` 下生成。`OnlineStageDemandProvider`
+   与 `evaluate(stage_demand_provider=...)` 已实现，但必须由调用方显式构造
+   和传入；标准默认路径仍不消费 stage memory。provider 接线可运行不代表
+   目标路径召回或行为收益已过门。
 
-**实施顺序（2026-11-24 更新）**：自动经验管线、episode-held-out current-state
-resolver、预测等价阶段树、内部 demand 选择器均已落地并通过单任务 held-out
-审计；**下一步是在线 provider**（在线切 stage、拼 context、把 StageDemand
-送入 rank-only frontier），再验证目标路径 recall / 扩展效率 / 真实价值。
-中间任何阶段身份、信号、目标或选项都不能由 task 标签补入。质量门和
-3/6-seed 配对实验通过前不默认启用，不做帧级长视界搜索。
+**审查修复（2026-11-24）**：阶段树 validation detector 现在只在训练
+episodes 上拟合，held-out episodes 用冻结阈值 transform；readout 的 OOF
+训练和线上查询统一使用 pooled outcome memory。`StageExecutor` 仅接受单阶段
+评分（多阶段续策尚无定义），把 terminal/censored mass 纳入风险门；任何
+unresolved 或不完整/超容量搜索都弃权并回退。Resolver UNKNOWN/OOD 不再通过
+最近 prototype 映射成阶段提示或价值。新增组合边界回归测试；全量
+`unittest` **690 passed**。以上均保留 opt-in，不改变默认 planner。
+
+**决策近视目标诊断（2026-11-24，6 帧 screening）**：
+
+- 同一评估世界配对，训练 seed 100/101/102，各测 eval seed 120/121/122；
+  1500 train steps、400-frame cap、horizon 6，executor 使用
+  `context_depth >= 2 + support >= 5` 门。三个训练 seed 的 baseline →
+  executor 平均 survival 分别为 **93.7→93.7、70.3→42.0、113.7→117.0**；
+  9 个配对结果为 **5 平、3 退化、1 改善**（最大退化 45 帧），总体均值
+  **92.6→84.2**。Option share 仅 **5%–18%**。结论：当前 executor 没有
+  可靠地解决近视；可靠性门仍不能把行为克隆 option 变成改进行动。
+- 深度 2 的 stage-search 只读审计（seed 100）显示 option-sequence
+  条件分布的等权 macro：elapsed mean **8.30 帧**、q90 **10.32 帧**、
+  已知路径的 `P(elapsed <= 6)` macro **0.477**；40 个在线 context 中，
+  深度 1 时 terminal outcome 至少对一个已见 option 可达的有 **36** 个。
+  这证明阶段时间尺度能越过 6 帧，但不是“无可行解”的校准预测，也不证明
+  存在可执行的更优 option。
+- 诊断中发现旧 `stage_option_search_probe.summarize` 把不同 action option
+  的条件概率相加（terminal mass 可超过 1）；现已改成逐 option sequence
+  独立统计并显式标为等权 macro，增加回归测试。当前全量
+  `unittest` **691 passed**。
+- 额外做了 eval-only exact-world 分支抽查：3 个训练 seed × 3 个 held-out
+  世界，共 72 个靠近首个通行点的状态（距事件约 8–78 帧）。64/72 个状态
+  中，两种首动作的所有 6 帧续串均存活；62/72 个状态的 6 帧存活比例几乎
+  相同（差 <0.05），而 15 帧续串存活比例已相差 ≥0.05。柱子事件本身仍约
+  78 帧外，因此 15 帧只是动作敏感性的早期代理，不是事件通过率。被冻结的
+  pooled stage outcome 在距事件约 64–69 帧时通常支持但 `terminal_rate=0`；
+  风险多在约 19–29 帧才上升，部分支撑仅 2–11 episodes。分支计数是均匀
+  枚举动作串的评估指标，不是策略概率或学习标签。→ 进一步确认：短帧域的
+  死亡可行性饱和，而现阶段 outcome memory 没有提供足够早且动作条件化的
+  区分；粗层需要对更远事件建模并有可改进 option，不能只堆叠当前短阶段。
+- **[x] P0 executor option trace 与实际动作坐标对齐（2026-11-24）**：
+  新增 `executable_option_suffix`，按“已作用的 stage 前缀 + newest-first
+  issued queue 的 oldest-first 顺序”校验候选 option；只把尚未提交的 tail
+  作为新 issued actions。Option quotient 还要求全部 class member 都匹配已
+  提交前缀，否则 UNKNOWN/回退。lag=0/3、边界动作错配、pending 错配和
+  class 成员不兼容均有回归测试。定向 **58**、全量 **697** tests 通过。
+  修复前后同 seed 100 / 3 eval worlds：survival 均值都为 **93.7**；
+  option 选择由 **4.7 次/局、share 5.4%** 降至 **1.3 次/局、share 1.4%**，
+  新 alignment rejects 为 **3–5/局**。这验证了旧路径确有不兼容候选、修复后
+  安全回退；尚无收益证据，需与正确 action schedule 下的新实验区分。
+- 前缀修复后的门限敏感性筛查（seed 100、eval 120/121/122、horizon 6）：
+  `depth>=2 + support>=5` 时 option share **1.4%**，survival 与 baseline 持平；
+  放宽为 depth/support=0 后 share **8.9%–17.4%**、alignment rejects
+  **31–47/局**，三世界 baseline→executor 分别 **72→135、137→46、72→72**
+  帧，均值 **93.7→84.3**。执行 option 状态 OOD rate **0.944**，fallback
+  OOD rate **0.973**。→ 严格门把系统压成近似 inert；宽松门放出高方差、无一致
+  收益的动作。仍是 1 个训练 seed/3 个 eval world；需先解决候选 option 的
+  支撑与长提前量，不能靠继续放宽门解决。
+- 复跑当前 online rank gate（训练 seed 100、eval 120/121/122、horizon 6、
+  beam 4）：root 模式 provider 需求 **73/87** 次可用，但候选阶段特征只有
+  **21/2774**、目标特征 **5/2774**；prototype 模式启发式仅支持
+  **26/2736** 个候选状态。三世界平均 survival：baseline 25，root rank 29，
+  prototype rank 25；passes 都为 0。样本不足以作显著性判断，但明确显示
+  provider 产出率远高于候选状态可识别率；rank hints 没有足够 frontier
+  覆盖，目标路径 recall 仍未测。
+- **DAgger 数据上的 rank 正向 screening**（`stage_rank_gate_probe.py` 已支持
+  同样的 DAgger 参数，prototype feature，3 train seeds × eval 120/121/122，
+  horizon 6/beam 4）：每个训练 seed 的 baseline 都是 `[25,25,25]` 帧；rank arm：
+  seed100 `[37,135,25]`、seed101 `[56,71,34]`、seed102 `[69,41,72]`，**8/9
+  增长、1/9 持平**，均值 **25→60 帧**，仅出现 **1 次 pass**。候选 rank 支持仍
+  只有 **4.8%–8.4%**；provider 有 demand 的决策为 108/197、86/161、150/182。
+  seed100 加 `target probability>=0.6 + support>=4` 后，provider 输出降至
+  60/197、绝对 rank hints 333→329，survival 与 ungated 同为65.7 帧/1 pass；
+  tie-only margin 0.05 也与 order arm 持平。→ 是“更多事件经验让稀疏 rank hint
+  开始影响行为”的正向信号，但3个 train seed、重复 eval worlds 仍是 screening；
+  新增 default-off frontier trace 后，**134/344** 个有效 demand 的 selectable
+  候选在至少一层命中 target root，且这134个目标均至少一次被保留；
+  **75/344** 个 demand 的 target root 留在最终 beam frontier。selected plan
+  endpoint 只有 **19/344** 命中目标 root（53/344 endpoint 可被 resolver 支持）；
+  candidate root 映射共 **2831/13072**。→ rank 能把目标带进搜索，但当前 frame
+  objective 很少最终选择该目标，符合“需求排序与最终价值分离”，也暴露了短程
+  objective 缺少可验证的长程 option value。frontier trace 是默认关闭的只读
+  callback，回归测试确认开启前后搜索结果一致；本轮全量 **698** tests 通过。
+  仍不能判为宏观决策质量门通过。
+- **等预算自监督采集筛查（1500 passive + 5000 planner frames，seed 100/101/102）**：
+  passive 6500-frame arm 共 499 局，其中 **11 局 ≥78 帧**（2.2%/局）；
+  DAgger arm 共 293 局，其中 **35 局 ≥78 帧**（11.9%/局，约 5.4 倍/局、
+  3.2 倍/总帧）。三个 seed 的 reach-event 计数均同向：passive
+  3/166、6/161、2/172；DAgger 8/101、11/96、16/96。DAgger 还把 stage q90
+  从 passive 的约 6 帧提高到 seed100 的 13 帧，但仍远短于约 78 帧事件。
+  → planner 引导的真实交互值得作为事件覆盖采集臂继续筛查；这只是数据支持
+  改善，不证明 outcome calibration、动作因果效应或最终决策收益。下一步须做
+  episode-held-out 转移质量评估，并保持不同采集臂严格隔离。
+- **中间训练/决策 trace（seed 100 单次诊断）**：用固定最后 8 局作 held-out，
+  对前 8/16/24/30 局逐步重训 detector + pooled outcome memory。test pooled
+  top1 为 **0.692/0.766/0.808/0.773**，全局 base 为 **0.346/0.351/0.370/0.360**；
+  pooled 查询的 context depth>0 占 supported 样本 **0.897/0.948/0.986/0.960**，
+  并非只有 root 覆盖造成的 top1 提升；
+  但 pooled NLL **3.264/2.864/2.189/2.564** 均差于 base
+  **3.116/1.950/2.103/1.904**。这显示阶段上下文提高了最常见 successor 的
+  命中率，却没有改善概率校准，且末档不单调。精确完整 option trace 的 top1
+  更高，但使用了测试 episode 的未来动作，只能作 oracle-conditioned 上界，
+  不能当作线上成绩。
+  - 同一训练模型在 eval seed 120、horizon 6/beam 4 的 25 决策 trace 中，
+    provider **24/25** 次产出 demand；但 rank adapter 对 **912/912** 个候选
+    都返回 UNKNOWN/零优先级。episode 死亡前最后一决策的 terminal risk 仅
+    **0.0476**（support 21）。故中间链路是“memory 有预测 → selector 有需求
+    → candidate resolver 全 UNKNOWN → demand 没进入 beam 排序”，不是 provider
+    缺请求。该 trace 为 1 seed/1 world，作为接线诊断，不作为收益评测。
+
+**实施顺序（更新）**：delayed-action/option-prefix 对齐、DAgger 事件覆盖筛查、
+stage-tagged frontier trace 均已落地。当前 DAgger rank 筛查显示目标 root 能进入
+beam，但只有约 5.5% 的 demand 最终被 frame objective 选为目标终点；下一步是
+对真实微转移做 episode-held-out 校准，并定义只在受支持 option 上递推的阶段级
+长程 value/continuation。provider 和 trace 均保持 opt-in/default-off；不把 task
+标签用于阶段身份、目标或选项，也不把 heuristic rank 当成最终价值。
 
 ## 方向校正（2026-11-23，用户）
 

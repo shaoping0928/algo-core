@@ -176,6 +176,53 @@ class StageDemandWiringTests(unittest.TestCase):
         priorities = rank_step(states, sequences, step=0)
         np.testing.assert_array_equal(priorities, [0.0, 2.0, 0.0])
 
+    def test_unknown_root_rank_does_not_use_nearest_prototype_fallback(self):
+        class UnknownResolver:
+            @staticmethod
+            def resolve(_agent, _observation, _pending):
+                return dict(status="unknown", key=None)
+
+        class RootTree:
+            @staticmethod
+            def chain(_key):
+                return (7,)
+
+        class RootHeuristic:
+            @staticmethod
+            def score(features, _demand):
+                return dict(
+                    status="supported" if ("tree", "7") in features
+                    else "unknown",
+                    priority=5.0 if ("tree", "7") in features else None,
+                )
+
+        class RootRuntime:
+            obs_dim = 1
+            lag = 1
+            scales = np.ones(2)
+            stage_resolver = UnknownResolver()
+            stage_tree = RootTree()
+            stage_prototype_roots = {"p0": ("tree", "7")}
+
+            @staticmethod
+            def _nearest(_state):
+                return "p0", 0.0
+
+        demand = StageDemand(
+            target_stage=(("tree", "7"),),
+            stage_history=((("tree", "7"),),),
+        )
+        rank_step = make_node_root_rank_step(
+            RootRuntime(), demand, RootHeuristic(),
+            pending_prefix=[0.0], lag=1,
+        )
+        priorities = rank_step(
+            np.asarray([[1.0], [2.0]]),
+            np.zeros((2, 2)),
+            step=0,
+        )
+        np.testing.assert_array_equal(priorities, [0.0, 0.0])
+
     def test_policy_result_builds_ranker_from_demand_and_runtime_features(self):
         class Env:
             @staticmethod

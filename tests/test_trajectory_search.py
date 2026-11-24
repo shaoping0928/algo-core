@@ -148,6 +148,50 @@ class TrajectorySearchTests(unittest.TestCase):
         self.assertEqual(result.final_state[0], 2.0)
         self.assertGreater(result.candidate_count, 0)
 
+    def test_frontier_callback_is_observational_only(self):
+        def evaluate_step(states, _actions, _step):
+            return np.abs(states[:, 0] - 2.0), np.ones(
+                len(states), dtype=bool
+            )
+
+        kwargs = dict(
+            initial_state=np.array([0.0]),
+            action_space=(0, 1),
+            horizon=3,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            beam_width=2,
+            rank_step=lambda states, _sequences, _step: states[:, 0],
+        )
+        baseline = beam_search(**kwargs)
+        trace = []
+        observed = beam_search(**kwargs, frontier_callback=trace.append)
+        np.testing.assert_array_equal(observed.actions, baseline.actions)
+        np.testing.assert_array_equal(
+            observed.final_state, baseline.final_state
+        )
+        self.assertEqual(observed.score, baseline.score)
+        self.assertEqual(observed.candidate_count, baseline.candidate_count)
+        self.assertEqual(len(trace), kwargs["horizon"])
+        for step, batch in enumerate(trace):
+            self.assertEqual(batch["step"], step)
+            self.assertEqual(
+                batch["states"].shape[0],
+                batch["sequences"].shape[0],
+            )
+            self.assertEqual(
+                batch["priorities"].shape,
+                (batch["states"].shape[0],),
+            )
+            self.assertEqual(
+                int(batch["retained"].sum()),
+                len(batch["retained_indices"]),
+            )
+            np.testing.assert_array_equal(
+                np.flatnonzero(batch["retained"]),
+                np.sort(batch["retained_indices"]),
+            )
+
     def test_beam_rank_hint_orders_frontier_but_not_final_value(self):
         def evaluate_step(states, _sequences, _step):
             return np.zeros(len(states)), np.ones(len(states), dtype=bool)

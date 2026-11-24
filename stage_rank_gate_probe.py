@@ -9,8 +9,9 @@ that ordering changed behaviour (frames, progress) and how often the provider
 could speak (supported / UNKNOWN reasons), plus the search's candidate
 expansion.
 
-Target-stage path recall needs a stage-tagged frontier log; this first gate
-records its absence explicitly instead of inferring it from frames.
+The optional frontier trace tags candidate states with the fitted stage
+resolver and reports whether the demanded root appears in candidates retained
+by the beam.  It is diagnostic only and does not affect ranking or scoring.
 """
 import argparse
 import json
@@ -19,7 +20,9 @@ import numpy as np
 
 from stage_demand_heuristic import StageDemand
 from stage_online import OnlineStageDemandProvider
-from substrate_nodes import LAG, _curiosity_off, evaluate, fit
+from substrate_nodes import (
+    LAG, _curiosity_off, evaluate, fit, history_features,
+)
 
 
 def run_arm(seed, world, agent, args, provider=None, rank_stats=None):
@@ -27,11 +30,108 @@ def run_arm(seed, world, agent, args, provider=None, rank_stats=None):
     passes = []
     candidates = []
     decisions = []
+    target_frontier = dict(
+        demands=0,
+        candidate_decisions=0,
+        retained_decisions=0,
+        final_candidate_decisions=0,
+        final_retained_decisions=0,
+        selected_supported_decisions=0,
+        selected_target_decisions=0,
+        candidate_states=0,
+        resolver_supported_states=0,
+        target_states=0,
+        retained_target_states=0,
+        final_target_states=0,
+        final_retained_target_states=0,
+    )
     for eval_seed in args.eval_seeds:
         for episode in range(int(args.episodes)):
             env_seed = int(eval_seed) * 10000 + episode
             plans = []
             metrics = {}
+            decision_frontiers = {}
+
+            def trace_frontier(batch):
+                demand = batch.get("demand")
+                resolver = getattr(agent, "stage_resolver", None)
+                tree = getattr(agent, "stage_tree", None)
+                if demand is None or resolver is None or tree is None:
+                    return
+                step = int(batch["step"])
+                states = np.asarray(batch["states"], dtype=float)
+                sequences = np.asarray(batch["sequences"], dtype=float)
+                prefix = np.asarray(
+                    batch["pending_prefix"], dtype=float
+                ).reshape(-1)
+                history = history_features(
+                    sequences, step + 1, prefix,
+                    action_dim=LAG + 1,
+                )
+                pending = history[:, :LAG][:, ::-1] if LAG else np.zeros(
+                    (len(states), 0)
+                )
+                target = tuple(demand.target_stage)
+                target_mask = np.zeros(len(states), dtype=bool)
+                supported_mask = np.zeros(len(states), dtype=bool)
+                selectable = np.asarray(batch["selectable"], dtype=bool)
+                for index, (state, queue) in enumerate(zip(states, pending)):
+                    resolved = resolver.resolve(
+                        agent, state[:int(agent.obs_dim)], queue,
+                    )
+                    if resolved.get("status") != "supported":
+                        continue
+                    chain = tree.chain(resolved["key"])
+                    if not chain:
+                        continue
+                    supported_mask[index] = True
+                    feature = (("tree", str(chain[-1])),)
+                    target_mask[index] = feature == target
+                retained = np.asarray(batch["retained"], dtype=bool)
+                selectable_target = target_mask & selectable
+                key = (int(batch["frame"]), target)
+                row = decision_frontiers.setdefault(
+                    key,
+                    dict(
+                        candidate_any=False,
+                        retained_any=False,
+                        candidate_final=False,
+                        retained_final=False,
+                        selected_supported=False,
+                        selected_target=False,
+                        pending_prefix=prefix.copy(),
+                        candidate_states=0,
+                        resolver_supported_states=0,
+                        target_states=0,
+                        retained_target_states=0,
+                        final_target_states=0,
+                        final_retained_target_states=0,
+                    ),
+                )
+                has_target = bool(selectable_target.any())
+                has_retained_target = bool(
+                    (selectable_target & retained).any()
+                )
+                row["candidate_any"] |= has_target
+                row["retained_any"] |= has_retained_target
+                row["candidate_states"] += len(states)
+                row["resolver_supported_states"] += int(
+                    supported_mask.sum()
+                )
+                row["target_states"] += int(selectable_target.sum())
+                row["retained_target_states"] += int(
+                    (selectable_target & retained).sum()
+                )
+                if step == int(args.horizon) - 1:
+                    row["candidate_final"] = has_target
+                    row["retained_final"] = has_retained_target
+                    row["final_target_states"] += int(
+                        selectable_target.sum()
+                    )
+                    row["final_retained_target_states"] += int(
+                        (selectable_target & retained).sum()
+                    )
+
             with _curiosity_off(agent):
                 length, _actions, _rows = evaluate(
                     seed, world, agent, cap=int(args.cap),
@@ -43,7 +143,70 @@ def run_arm(seed, world, agent, args, provider=None, rank_stats=None):
                     rank_stats=rank_stats,
                     rank_mode=args.rank_mode,
                     rank_margin=args.rank_margin,
+                    frontier_callback=(
+                        trace_frontier if provider is not None else None
+                    ),
                 )
+            plans_by_frame = {
+                int(plan["frame"]): plan for plan in plans
+            }
+            for (frame, target), row in decision_frontiers.items():
+                plan = plans_by_frame.get(int(frame))
+                if plan is None:
+                    continue
+                selected_actions = np.asarray(
+                    plan["actions"], dtype=float
+                ).reshape(1, -1)
+                selected_history = history_features(
+                    selected_actions, int(args.horizon),
+                    row["pending_prefix"], action_dim=LAG + 1,
+                )
+                selected_pending = (
+                    selected_history[:, :LAG][:, ::-1][0]
+                    if LAG else np.zeros(0, dtype=float)
+                )
+                resolved = agent.stage_resolver.resolve(
+                    agent,
+                    np.asarray(plan["final"], dtype=float)[
+                        :int(agent.obs_dim)
+                    ],
+                    selected_pending,
+                )
+                if resolved.get("status") != "supported":
+                    continue
+                chain = agent.stage_tree.chain(resolved["key"])
+                if not chain:
+                    continue
+                row["selected_supported"] = True
+                row["selected_target"] = (
+                    (("tree", str(chain[-1])),) == target
+                )
+            for row in decision_frontiers.values():
+                target_frontier["demands"] += 1
+                target_frontier["candidate_decisions"] += int(
+                    row["candidate_any"]
+                )
+                target_frontier["retained_decisions"] += int(
+                    row["retained_any"]
+                )
+                target_frontier["final_candidate_decisions"] += int(
+                    row["candidate_final"]
+                )
+                target_frontier["final_retained_decisions"] += int(
+                    row["retained_final"]
+                )
+                target_frontier["selected_supported_decisions"] += int(
+                    row["selected_supported"]
+                )
+                target_frontier["selected_target_decisions"] += int(
+                    row["selected_target"]
+                )
+                for key in (
+                    "candidate_states", "resolver_supported_states",
+                    "target_states", "retained_target_states",
+                    "final_target_states", "final_retained_target_states",
+                ):
+                    target_frontier[key] += int(row[key])
             frames.append(int(length))
             passes.append(int(metrics.get("passes", 0)))
             if plans:
@@ -63,6 +226,7 @@ def run_arm(seed, world, agent, args, provider=None, rank_stats=None):
             float(np.mean(candidates)) if candidates else 0.0
         ),
         decisions=int(sum(decisions)),
+        target_frontier=target_frontier,
     )
 
 
@@ -75,6 +239,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-nodes", type=int, default=1000)
     parser.add_argument("--coverage", type=float, default=0.1)
+    parser.add_argument("--dagger-rounds", type=int, default=0)
+    parser.add_argument("--dagger-episodes", type=int, default=2)
+    parser.add_argument("--dagger-cap", type=int, default=1200)
+    parser.add_argument("--dagger-frames", type=int, default=0)
+    parser.add_argument("--dagger-horizon", type=int, default=10)
     parser.add_argument("--stage-min-support", type=int, default=2)
     parser.add_argument("--stage-min-episodes", type=int, default=2)
     parser.add_argument("--cap", type=int, default=400)
@@ -98,6 +267,11 @@ def main():
     world, agent = fit(
         args.seed, steps=int(args.steps), coverage=float(args.coverage),
         epochs=int(args.epochs), max_nodes=int(args.max_nodes),
+        dagger_rounds=int(args.dagger_rounds),
+        dagger_episodes=int(args.dagger_episodes),
+        dagger_cap=int(args.dagger_cap),
+        dagger_frames=int(args.dagger_frames),
+        dagger_horizon=int(args.dagger_horizon),
         stage_memory=True, stage_memory_feature_source="prototype",
         stage_demand_min_support=int(args.stage_min_support),
         stage_demand_min_episodes=int(args.stage_min_episodes),
@@ -212,8 +386,21 @@ def main():
                     ),
                 )
             )
+    frontier = ranked["target_frontier"]
+    demand_count = max(int(frontier["demands"]), 1)
     print(
-        "  target-path recall: not measured (needs a stage-tagged frontier log)"
+        "  target frontier: candidate %d/%d, retained %d/%d, "
+        "final-retained %d/%d, selected endpoint %d/%d "
+        "(%d supported); mapped %d/%d candidate states"
+        % (
+            frontier["candidate_decisions"], frontier["demands"],
+            frontier["retained_decisions"], frontier["demands"],
+            frontier["final_retained_decisions"], frontier["demands"],
+            frontier["selected_target_decisions"], frontier["demands"],
+            frontier["selected_supported_decisions"],
+            frontier["resolver_supported_states"],
+            frontier["candidate_states"],
+        )
     )
     if args.report:
         report = dict(
@@ -223,6 +410,11 @@ def main():
                 episodes=int(args.episodes), steps=int(args.steps),
                 epochs=int(args.epochs), max_nodes=int(args.max_nodes),
                 coverage=float(args.coverage), cap=int(args.cap),
+                dagger_rounds=int(args.dagger_rounds),
+                dagger_episodes=int(args.dagger_episodes),
+                dagger_cap=int(args.dagger_cap),
+                dagger_frames=int(args.dagger_frames),
+                dagger_horizon=int(args.dagger_horizon),
                 horizon=int(args.horizon), lag=LAG, beam_width=int(
                     args.beam_width
                 ),
@@ -254,12 +446,8 @@ def main():
                 str(key): int(value)
                 for key, value in sorted(rank_stats.items())
             },
+            target_frontier=ranked["target_frontier"],
             stage_tree=agent.stage_tree.snapshot(),
-            target_path_recall=None,
-            target_path_recall_note=(
-                "requires a stage-tagged frontier log; not inferred from "
-                "frames"
-            ),
         )
         with open(args.report, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, sort_keys=True)
