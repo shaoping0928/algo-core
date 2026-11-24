@@ -526,6 +526,16 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
       帧级安全。**不接线**。下一步必须先有帧级安全包络（在 fine model 下
       检查 option 动作的 hazard/feasibility，不安全即回退），或只允许 option
       作为软约束。
+    - 视野诊断（`lookahead_diagnosis.py`，2026-11-24）：Flappy 的下一根柱子
+      在 **~80 帧**外（spacing 0.8 / speed 0.01）。world model rollout 的
+      **next_dy MAE**：1 帧 0.001、8 帧 0.009、32 帧 **0.046**、64 帧
+      **0.101**（gap 0.34 的 13% / 30%）；next_dx：0.009 / 0.075 /
+      0.114 / 0.234。阶段类型对 next_dx / next_dy 的 **eta² = 0.672 /
+      0.885**，raw R² ≈ 1.0 → **信息没有丢**。但 8 帧 planner 和 depth-2
+      阶段搜索（≈8 帧）只覆盖柱间距的 **~10%**；exhaustive 深度 20 需要
+      9^20，不可行。弱策略没有 pipe collision，柱前 hazard 未测到。
+      → 判定 `lookahead_insufficient`：**分层没有延长视野，只降低了决策
+      频率**；长程外推误差在下一根柱子处约为 gap 的 30%。
     - 约束：节点强度/权重只来自 runtime 自身，不引入任务常量；未知节点
       保持 0，不伪造边；默认只读，不替换 detector/segmentation/planner。
 11. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
