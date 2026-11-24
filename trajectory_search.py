@@ -526,6 +526,8 @@ def beam_search(
     rank_step: Optional[Callable[
         [np.ndarray, np.ndarray, int], np.ndarray
     ]] = None,
+    rank_mode: str = "order",
+    rank_margin: float = 0.0,
 ) -> SearchResult:
     """Beam-limited version of exhaustive_search for long horizons.
 
@@ -534,7 +536,11 @@ def beam_search(
     optional terminal evaluator. ``rank_step`` is an optional, higher-is-better
     ordering hint used only when pruning intermediate beams. Its increments do
     not change feasibility, accumulated objective scores, or final selection
-    among the surviving candidates.
+    among the surviving candidates.  ``rank_mode="order"`` applies the hint
+    before the objective score.  ``rank_mode="tie"`` applies it only inside the
+    near-tie band ``score[0] <= best + rank_margin``; paths with a clearly
+    better objective score keep their order, so the hint can break close calls
+    without discarding a stronger plan.
     """
     state0 = np.asarray(initial_state, dtype=float)
     if state0.ndim == 0:
@@ -546,6 +552,10 @@ def beam_search(
         raise ValueError("horizon must be a positive integer")
     if beam_width < 1:
         raise ValueError("beam_width must be a positive integer")
+    if rank_mode not in ("order", "tie"):
+        raise ValueError("rank_mode must be order or tie")
+    if float(rank_margin) < 0.0:
+        raise ValueError("rank_margin must be non-negative")
 
     states = state0.reshape(1, -1)
     sequences = np.zeros((1, horizon), dtype=float)
@@ -622,14 +632,44 @@ def beam_search(
             next_priorities = increments_priority.copy()
             if priorities is not None:
                 next_priorities += np.repeat(priorities, width)
-            keep = np.asarray(sorted(
-                selectable.tolist(),
-                key=lambda index: (
-                    -float(next_priorities[index]),
-                    tuple(float(value) for value in candidate_scores[index]),
-                    int(index),
-                ),
-            )[:beam_width], dtype=int)
+            if rank_mode == "tie":
+                # Priority only reorders candidates whose primary objective is
+                # within a near-tie band of the best candidate.  A clearly
+                # better-scoring path is never displaced by the hint.
+                primary = np.asarray(candidate_scores[:, 0], dtype=float)
+                best = float(primary[selectable].min())
+                near = [
+                    index for index in selectable
+                    if float(primary[index]) <= best + float(rank_margin)
+                ]
+                near_set = set(near)
+                far = [
+                    index for index in selectable if index not in near_set
+                ]
+                ordered = sorted(
+                    near,
+                    key=lambda index: (
+                        -float(next_priorities[index]),
+                        tuple(float(value) for value in candidate_scores[index]),
+                        int(index),
+                    ),
+                ) + sorted(
+                    far,
+                    key=lambda index: (
+                        tuple(float(value) for value in candidate_scores[index]),
+                        int(index),
+                    ),
+                )
+                keep = np.asarray(ordered[:beam_width], dtype=int)
+            else:
+                keep = np.asarray(sorted(
+                    selectable.tolist(),
+                    key=lambda index: (
+                        -float(next_priorities[index]),
+                        tuple(float(value) for value in candidate_scores[index]),
+                        int(index),
+                    ),
+                )[:beam_width], dtype=int)
         states = next_states[keep]
         sequences = next_sequences[keep]
         scores = candidate_scores[keep]

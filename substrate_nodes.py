@@ -2325,7 +2325,8 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   milestone_goal=None, pain_weight=None, risk_lane="max",
                   previous_action=None, margin_eps=0.0, veto_fraction=0.0,
                   rank_step=None, stage_demand=None,
-                  demand_heuristic=None, rank_stats=None):
+                  demand_heuristic=None, rank_stats=None,
+                  rank_mode="order", rank_margin=0.0):
     initial = np.asarray(env.obs(), dtype=float)
     agent_obs_dim = int(agent.obs_dim)
     if (stage_demand is None) != (demand_heuristic is None):
@@ -2827,6 +2828,8 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             beam_width=int(beam_width),
             score_combine="sum",
             rank_step=rank_step,
+            rank_mode=rank_mode,
+            rank_margin=rank_margin,
         )
         return result
     result = exhaustive_search(
@@ -3060,7 +3063,8 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                     plan_out=None, candidate_callback=None,
                     previous_action=None, margin_eps=0.0, veto_fraction=0.0,
                     rank_step=None, stage_demand=None,
-                    demand_heuristic=None, rank_stats=None):
+                    demand_heuristic=None, rank_stats=None,
+                    rank_mode="order", rank_margin=0.0):
     """Dispatch one decision to the searched or the cell-Q-only policy.
 
     With `ledger_out` (a list) and the search decision, the winning
@@ -3105,6 +3109,8 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
             stage_demand=stage_demand,
             demand_heuristic=demand_heuristic,
             rank_stats=rank_stats,
+            rank_mode=rank_mode,
+            rank_margin=rank_margin,
         )
         if ledger_out is not None:
             score = result.score
@@ -3243,7 +3249,8 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
              pain_weight=None, risk_lane="max", plan_out=None,
              candidate_out=None, margin_eps=0.0, veto_fraction=0.0,
              env_factory=None, rank_step=None,
-             stage_demand_provider=None, rank_stats=None):
+             stage_demand_provider=None, rank_stats=None,
+             rank_mode="order", rank_margin=0.0):
     """Run one deterministic evaluation episode.
 
     ``env_seed`` selects the world instance; when omitted the historical
@@ -3369,6 +3376,8 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             stage_demand=stage_demand,
             demand_heuristic=demand_heuristic,
             rank_stats=rank_stats,
+            rank_mode=rank_mode,
+            rank_margin=rank_margin,
         )
         if candidate_out is not None:
             candidate_out.append(collected)

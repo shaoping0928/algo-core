@@ -199,6 +199,32 @@ class TrajectorySearchTests(unittest.TestCase):
         self.assertEqual(int(maxed.actions[0]), 1)
         self.assertEqual(maxed.score, 5.0)
 
+    def test_beam_rank_tie_mode_keeps_a_clearly_better_score(self):
+        def evaluate_step(states, sequences, _step):
+            # Action 0 has a much worse objective than action 1.
+            score = np.where(sequences[:, 0] > 0.5, 0.0, 10.0)
+            return score, np.ones(len(states), dtype=bool)
+
+        def evaluate_terminal(states, _sequences):
+            return np.zeros(len(states)), np.ones(len(states), dtype=bool)
+
+        kwargs = dict(
+            initial_state=np.asarray([0.0]),
+            action_space=(0, 1),
+            horizon=1,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            evaluate_terminal=evaluate_terminal,
+            beam_width=1,
+        )
+        hint = lambda _states, sequences, _step: 1.0 - sequences[:, 0]
+        ordered = beam_search(**kwargs, rank_step=hint, rank_mode="order")
+        tied = beam_search(**kwargs, rank_step=hint, rank_mode="tie")
+        self.assertEqual(int(ordered.actions[0]), 0)
+        self.assertEqual(int(tied.actions[0]), 1)
+        self.assertEqual(float(ordered.score), 10.0)
+        self.assertEqual(float(tied.score), 0.0)
+
     def test_beam_search_matches_exhaustive_when_width_is_large(self):
         def evaluate_step(states, sequences, step):
             score = np.abs(states[:, 0] - 2.0) + 0.01 * sequences[:, 0]

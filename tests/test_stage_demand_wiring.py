@@ -213,6 +213,28 @@ class StageDemandWiringTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(priorities, [0.0, 2.0])
 
+    def test_policy_result_passes_rank_mode_and_margin(self):
+        class Env:
+            @staticmethod
+            def obs():
+                return np.asarray([0.0])
+
+        captured = {}
+
+        def fake_beam_search(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+        callback = lambda _states, _sequences, _step: np.zeros(1)
+        with patch("substrate_nodes.beam_search", side_effect=fake_beam_search):
+            policy_result(
+                Env(), None, FakeRuntime(), prefix=[0.0],
+                horizon=1, lag=1, beam_width=2,
+                rank_step=callback, rank_mode="tie", rank_margin=0.05,
+            )
+        self.assertEqual(captured["rank_mode"], "tie")
+        self.assertEqual(captured["rank_margin"], 0.05)
+
     def test_policy_result_requires_beam_for_demand_ranking(self):
         class Env:
             @staticmethod

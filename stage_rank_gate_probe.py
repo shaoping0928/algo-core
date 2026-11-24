@@ -41,6 +41,8 @@ def run_arm(seed, world, agent, args, provider=None, rank_stats=None):
                     plan_out=plans, metrics_out=metrics,
                     stage_demand_provider=provider,
                     rank_stats=rank_stats,
+                    rank_mode=args.rank_mode,
+                    rank_margin=args.rank_margin,
                 )
             frames.append(int(length))
             passes.append(int(metrics.get("passes", 0)))
@@ -86,6 +88,9 @@ def main():
     )
     parser.add_argument("--min-target-probability", type=float, default=0.0)
     parser.add_argument("--min-prediction-support", type=int, default=0)
+    parser.add_argument("--rank-mode", choices=("order", "tie"),
+                        default="order")
+    parser.add_argument("--rank-margin", type=float, default=0.0)
     parser.add_argument("--report", default="")
     args = parser.parse_args()
     if args.beam_width < 1:
@@ -226,6 +231,8 @@ def main():
                 rank_feature_source=args.rank_feature_source,
                 min_target_probability=float(args.min_target_probability),
                 min_prediction_support=int(args.min_prediction_support),
+                rank_mode=args.rank_mode,
+                rank_margin=float(args.rank_margin),
             ),
             baseline=baseline,
             ranked=ranked,

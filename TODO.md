@@ -304,6 +304,11 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
      heuristic 8456/11376 支持，但 ranked frames **仍为 32.2**（baseline 73.8）。
      → 不是低置信 demand 的问题，而是 rank 目标/排序语义本身会把 beam
      带离高价值路径。
+   - **近并列 rank 语义（`rank_mode=tie`）**：只让 priority 在
+     `score[0] ≤ best + rank_margin` 的带宽内重排。beam16/5 worlds、1/1
+     根级下，margin **0.0 → 32.4**、**0.05 → 32.2**（baseline 73.8）。
+     仍严重伤害 → 不是 priority 覆盖了明显更优 score，而是中间分数并列/
+     目标语义本身；tie 模式不能救。
    - target-path recall：已加候选级 `target_present` 计数（见报告）；
      完整的 stage-tagged frontier recall 仍未实现。
    - 修掉两个实现 bug：根级 adapter 对状态**双重缩放**导致 0 特征；
@@ -312,8 +317,8 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
    **质量门未通过，不接线**；5 worlds/beam 16 的复核进一步把负向幅度放大到
    −56%，置信/覆盖门也没有改善。下一步不是调 heuristic 权重，而是：
    ① 用 stage-tagged frontier 日志做真正的目标路径 recall；
-   ② 重新设计 rank 语义（例如只在近并列分数内重排，或先把 demand 变成
-      可验证的 value target），避免覆盖掉明显更高分的路径；
+   ② rank 语义重设计：近并列（tie）已试并失败（32.2–32.4 vs 73.8），
+      下一步应转向可验证的 value target，而不是继续改 priority 排序；
    ③ demand target 质量与支持/置信度校准完成后再重跑同预算 A/B，
       3/6-seed 通过前不进入 shadow。
 7. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
