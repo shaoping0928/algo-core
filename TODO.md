@@ -536,6 +536,12 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
       9^20，不可行。弱策略没有 pipe collision，柱前 hazard 未测到。
       → 判定 `lookahead_insufficient`：**分层没有延长视野，只降低了决策
       频率**；长程外推误差在下一根柱子处约为 gap 的 30%。
+      - 关键信息口径（`clearance_lookahead.py`）：32 帧 **next_dy 误差
+        0.046 = gap 的 13%**，类型 eta² **0.885** → 按“关键信息保持一定
+        准确率”的标准，**信息层是够的**；30% 是全状态 MAE（含 dx/next_dx），
+        不是决策相关量。clear/hit 分类在当前弱策略下退化（到达柱子的样本
+        全是 clear；碰撞/落地提前死亡被截断），需要探索性/oracle 策略才能
+        测 hit。→ **瓶颈不是信息精度，而是规划深度与决策接口**。
     - 约束：节点强度/权重只来自 runtime 自身，不引入任务常量；未知节点
       保持 0，不伪造边；默认只读，不替换 detector/segmentation/planner。
 11. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
