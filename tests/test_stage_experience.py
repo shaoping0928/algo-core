@@ -16,10 +16,16 @@ class FakeAgent:
 
     def __init__(self, lag=2):
         self.lag = int(lag)
-        self.scales = np.ones(2)
+        self.scales = np.ones(2 + self.lag)
 
     def _branch_active_features(self, obs):
         return ("f_high",) if float(obs[0]) > 5.0 else ("f_low",)
+
+    def _nearest(self, state):
+        return (
+            "p_high" if float(state[0]) > 5.0 else "p_low",
+            0.0,
+        )
 
 
 def make_episode(episode, ys, actions, feedback, done=False, lag=2,
@@ -97,6 +103,25 @@ class StageExperienceTests(unittest.TestCase):
         self.assertEqual(census["feature_ids"], 2)
         self.assertAlmostEqual(census["feature_coverage"], 1.0)
         self.assertGreater(census["signal_channels"], 0)
+
+    def test_prototype_feature_source_is_dense_and_frozen(self):
+        batch = StageExperienceBatch.fit(
+            training_rows(), self.agent, lag=2, quantile=0.6,
+            feature_source="prototype",
+        )
+        self.assertEqual(batch.feature_source, "prototype")
+        self.assertEqual(batch.census["feature_source"], "prototype")
+        self.assertAlmostEqual(batch.census["feature_coverage"], 1.0)
+        heldout = make_episode(
+            300,
+            ys=[0.0, 30.0, 30.0, 30.0],
+            actions=[1, 1, 0],
+            feedback=[np.zeros(2), np.zeros(2), np.zeros(2)],
+            done=True,
+        )
+        transformed = batch.transform(heldout, self.agent)
+        self.assertEqual(transformed.feature_source, "prototype")
+        self.assertAlmostEqual(transformed.census["feature_coverage"], 1.0)
 
     def test_stage_boundaries_come_from_generic_change_channels(self):
         first, second = self.batch.episodes

@@ -54,6 +54,7 @@ from milestone_graph import (
 from multiview_transitions import MultiViewTransitionModel
 from node_features import FeatureRuleBank
 from node_runtime import NodeRuntime, future_pain_labels, future_return_labels
+from stage_demand_heuristic import StageDemandHeuristic
 from stage_demand_selector import (
     StageDemandSelector,
     StageOutcomeReadout,
@@ -830,6 +831,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         value_readout="cells",
         stage_memory=False,
         stage_memory_quantile=0.98,
+        stage_memory_feature_source="branch",
         env_factory=None):
     """Collect transitions and train the node runtime on them.
 
@@ -866,6 +868,10 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("lag must be non-negative")
     if not 0.5 < float(stage_memory_quantile) < 1.0:
         raise ValueError("stage_memory_quantile must be between 0.5 and 1")
+    if str(stage_memory_feature_source) not in ("branch", "prototype"):
+        raise ValueError(
+            "stage_memory_feature_source must be branch or prototype"
+        )
     if int(component_min_count) < 1:
         raise ValueError("component_min_count must be positive")
     if int(max_components) < 0:
@@ -1149,6 +1155,7 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         agent.stage_experience = StageExperienceBatch.fit(
             transitions, agent, lag=agent.lag,
             quantile=stage_memory_quantile,
+            feature_source=stage_memory_feature_source,
         )
         # State -> stage type resolution fitted on the same training fold.
         # The resolver is a data-layer readout; no planner path calls it.
@@ -1166,12 +1173,16 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         agent.stage_demand_selector = StageDemandSelector(
             agent.stage_demand_readout
         )
+        agent.stage_demand_heuristic = StageDemandHeuristic().fit(
+            agent.stage_experience.demand_samples
+        )
     else:
         agent.stage_experience = None
         agent.stage_resolver = None
         agent.stage_outcome_memory = None
         agent.stage_demand_readout = None
         agent.stage_demand_selector = None
+        agent.stage_demand_heuristic = None
     # The milestone layer, read off the agent's own stream.  All of it is
     # inert unless the planner is asked for one of its terms.
     model = _milestone_model_from_transitions(
@@ -3292,6 +3303,9 @@ def run_seed(task):
     value_horizon = int(task.get("value_horizon", 0))
     stage_memory = bool(task.get("stage_memory", False))
     stage_memory_quantile = float(task.get("stage_memory_quantile", 0.98))
+    stage_memory_feature_source = str(
+        task.get("stage_memory_feature_source", "branch")
+    )
 
     world, agent = fit(
         seed, steps=steps, coverage=coverage,
@@ -3365,6 +3379,7 @@ def run_seed(task):
         readout_propagation_edges=readout_propagation_edges,
         stage_memory=stage_memory,
         stage_memory_quantile=stage_memory_quantile,
+        stage_memory_feature_source=stage_memory_feature_source,
     )
     explicit_eval = bool(eval_seeds)
     if not explicit_eval:
@@ -3434,6 +3449,11 @@ def run_seed(task):
         stage_demand=(
             agent.stage_demand_selector.snapshot()
             if getattr(agent, "stage_demand_selector", None) is not None
+            else None
+        ),
+        stage_demand_heuristic=(
+            agent.stage_demand_heuristic.snapshot()
+            if getattr(agent, "stage_demand_heuristic", None) is not None
             else None
         ),
         dagger=getattr(agent, "dagger_log", []),
@@ -3790,6 +3810,11 @@ def main():
     parser.add_argument("--stage-memory-quantile", type=float, default=0.98,
                         help="upper-tail quantile for the generic key-signal "
                              "detector's channels")
+    parser.add_argument("--stage-feature-source",
+                        choices=("branch", "prototype"), default="branch",
+                        help="read-only feature source for stage demand "
+                             "samples: induced feature roots (sparse) or the "
+                             "runtime's nearest prototype (dense)")
     parser.add_argument("--benchmark", action="store_true",
                         help="standard ruler: 1500 offline frames replayed "
                              "once, then one 5000-frame free-control round "
@@ -4029,6 +4054,7 @@ def main():
             dagger_frames=args.dagger_frames,
             stage_memory=args.stage_memory,
             stage_memory_quantile=args.stage_memory_quantile,
+            stage_memory_feature_source=args.stage_feature_source,
         )
         for seed in seeds
     ]
@@ -4194,6 +4220,19 @@ def main():
                     selector["min_outcome_episodes"],
                 )
             )
+        heuristic = rows[0].get("stage_demand_heuristic")
+        if heuristic:
+            print(
+                "stage demand heuristic (seed %d): %d samples, "
+                "%d context-feature pairs, %d context outcomes, "
+                "feature source %s"
+                % (
+                    rows[0]["seed"], heuristic["samples"],
+                    heuristic["context_feature_pairs"],
+                    heuristic["context_outcomes"],
+                    rows[0].get("stage_memory", {}).get("feature_source"),
+                )
+            )
     if overall["clusters"] < 5:
         print("warning: fewer than 5 trained models; the interval is "
               "descriptive, not a significance test")
@@ -4248,6 +4287,7 @@ def main():
                 dagger_horizon=args.dagger_horizon,
                 stage_memory=args.stage_memory,
                 stage_memory_quantile=args.stage_memory_quantile,
+                stage_feature_source=args.stage_feature_source,
             ),
             rows=eval_rows,
             milestones=[
@@ -4272,6 +4312,11 @@ def main():
                 dict(seed=row["seed"], census=row["stage_demand"])
                 for row in rows
                 if row.get("stage_demand") is not None
+            ],
+            stage_demand_heuristic=[
+                dict(seed=row["seed"], census=row["stage_demand_heuristic"])
+                for row in rows
+                if row.get("stage_demand_heuristic") is not None
             ],
             per_train_seed=per_train,
             per_eval_seed=per_eval,

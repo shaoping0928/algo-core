@@ -10,6 +10,7 @@ from stage_demand_heuristic import (
 )
 from stage_outcome_memory import (
     KeySignal,
+    StageOccurrence,
     encode_action_trace,
     segment_episode,
 )
@@ -176,6 +177,83 @@ class StageDemandHeuristicTests(unittest.TestCase):
         ).fit(samples)
         result = memory.score(("toward-target",), self.demand)
         self.assertEqual(result["status"], "unknown")
+
+    def test_prefix_samples_contain_only_actions_seen_so_far(self):
+        source = StageOccurrence(
+            episode=7,
+            key=(("source",),),
+            entry_state=np.zeros(1),
+            exit_state=np.ones(1),
+            action_trace=encode_action_trace([0, 1, 0]),
+            duration=3.0,
+            feedback=np.zeros(1),
+            feature_snapshots=(
+                (("f0",),), (("f1",),), (("f2",),),
+            ),
+            active_features=(("f0",),),
+        )
+        destination = StageOccurrence(
+            episode=7,
+            key=(("destination",),),
+            entry_state=np.ones(1),
+            exit_state=np.ones(1),
+            action_trace=encode_action_trace([1]),
+            duration=1.0,
+            feedback=np.zeros(1),
+            terminal=True,
+        )
+        samples = DemandAssociationSample.from_stage_prefixes(
+            [[source, destination]]
+        )
+        self.assertEqual(len(samples), 3)
+        self.assertEqual(
+            [sample.action_trace for sample in samples],
+            [
+                None,
+                encode_action_trace([0]),
+                encode_action_trace([0, 1]),
+            ],
+        )
+        self.assertEqual(
+            [sample.active_features for sample in samples],
+            [(("f0",),), (("f1",),), (("f2",),)],
+        )
+        self.assertTrue(all(
+            sample.destination_stage == (("destination",),)
+            for sample in samples
+        ))
+
+    def test_option_backoff_uses_a_shorter_known_prefix_suffix(self):
+        samples = []
+        for trace in (encode_action_trace([1]), encode_action_trace([0, 1])):
+            for episode in range(3):
+                samples.append(DemandAssociationSample(
+                    episode=episode,
+                    stage_history=(("source",),),
+                    active_features=("feature",),
+                    destination_stage=("target",),
+                    action_trace=trace,
+                ))
+        memory = StageDemandHeuristic(
+            min_support=1, min_episodes=1, prior=1.0,
+        ).fit(samples)
+        demand = StageDemand(
+            target_stage=("target",),
+            stage_history=(("source",),),
+            association_action_trace=encode_action_trace([0, 0, 1]),
+        )
+        result = memory.score(("feature",), demand)
+        self.assertEqual(result["status"], "supported")
+        self.assertTrue(result["action_conditioned"])
+        unknown = StageDemand(
+            target_stage=("target",),
+            stage_history=(("source",),),
+            association_action_trace=encode_action_trace([0, 0, 0]),
+        )
+        # The pooled table is never used for an option-conditioned query.
+        self.assertNotEqual(
+            memory.score(("feature",), unknown)["status"], "supported",
+        )
 
 
 if __name__ == "__main__":

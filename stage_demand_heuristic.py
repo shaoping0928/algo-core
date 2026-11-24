@@ -18,6 +18,7 @@ import numpy as np
 from stage_outcome_memory import (
     ActionTrace,
     StageKey,
+    encode_action_trace,
     stage_context_path,
 )
 
@@ -217,6 +218,71 @@ class DemandAssociationSample:
                     ))
         return tuple(samples)
 
+    @classmethod
+    def from_stage_prefixes(cls, episodes):
+        """Build samples with the causal action prefix known before each step.
+
+        For every transition inside a source stage, the option is the
+        run-length encoding of the actions executed **before** that
+        transition.  The action that will act on the scored transition, and
+        every later action, are excluded, so a decision-time caller can use
+        the same option.  Offset zero has no prior action and is pooled.
+        """
+        samples = []
+        for episode in episodes:
+            stages = list(episode)
+            if any(
+                    stage.terminal or stage.censored
+                    for stage in stages[:-1]
+            ):
+                raise ValueError("no stage may follow a terminal/censored one")
+            for index, source in enumerate(stages[:-1]):
+                if source.terminal or source.censored:
+                    continue
+                actions = []
+                for action, count in source.action_trace:
+                    actions.extend([action] * int(count))
+                snapshots = (
+                    source.feature_snapshots
+                    if source.feature_snapshots
+                    else (source.active_features,)
+                )
+                history = tuple(stage.key for stage in stages[:index + 1])
+                for offset, active_features in enumerate(snapshots):
+                    if offset >= len(actions):
+                        break
+                    prefix = actions[:offset]
+                    samples.append(cls(
+                        episode=source.episode,
+                        stage_history=history,
+                        active_features=active_features,
+                        destination_stage=stages[index + 1].key,
+                        action_trace=(
+                            encode_action_trace(prefix) if prefix else None
+                        ),
+                    ))
+        return tuple(samples)
+
+
+def _option_backoff(trace):
+    """Causal option backoff: the exact prefix, then its recent suffixes.
+
+    A query with an option never falls back to the pooled table; that would
+    silently mix different action options.  Only shorter suffixes of the same
+    executed prefix are tried, and every one of them is known at decision time.
+    """
+    if trace is None:
+        return (None,)
+    actions = []
+    for action, count in trace:
+        actions.extend([action] * int(count))
+    result = []
+    for length in range(len(actions), 0, -1):
+        candidate = encode_action_trace(actions[-length:])
+        if candidate not in result:
+            result.append(candidate)
+    return tuple(result)
+
 
 class StageDemandHeuristic:
     """Episode-supported feature associations for search ordering only.
@@ -226,6 +292,9 @@ class StageDemandHeuristic:
     and distinct-episode support shrink the contribution. This is associative
     evidence, not a causal value function; callers must keep it separate from
     final objective scores.
+
+    An option-conditioned query tries the exact causal prefix and then shorter
+    suffixes of that same prefix; it never falls back to the pooled table.
     """
 
     def __init__(self, min_support: int = 2, min_episodes: int = 2,
@@ -304,29 +373,33 @@ class StageDemandHeuristic:
         """Return a separate heuristic priority; higher means more relevant."""
         features = _features_with_activation(active_features)
         trace = demand.association_action_trace
+        traces = _option_backoff(trace)
         selected = None
         for context in stage_context_path(demand.stage_history):
-            context_key = (context, trace)
-            base = self._base.get(context_key)
-            if not base:
-                continue
-            total = int(sum(base.values()))
-            all_episodes = set()
-            for episode_ids in self._base_episodes[context_key].values():
-                all_episodes.update(episode_ids)
-            target_count = int(base.get(demand.target_stage, 0))
-            target_episodes = self._base_episodes[context_key].get(
-                demand.target_stage, set(),
-            )
-            if (total < self.min_support
-                    or len(all_episodes) < self.min_episodes
-                    or len(target_episodes) < self.min_episodes):
-                continue
-            selected = (
-                context, context_key, base, total,
-                len(all_episodes), target_count,
-            )
-            break
+            for candidate_trace in traces:
+                context_key = (context, candidate_trace)
+                base = self._base.get(context_key)
+                if not base:
+                    continue
+                total = int(sum(base.values()))
+                all_episodes = set()
+                for episode_ids in self._base_episodes[context_key].values():
+                    all_episodes.update(episode_ids)
+                target_count = int(base.get(demand.target_stage, 0))
+                target_episodes = self._base_episodes[context_key].get(
+                    demand.target_stage, set(),
+                )
+                if (total < self.min_support
+                        or len(all_episodes) < self.min_episodes
+                        or len(target_episodes) < self.min_episodes):
+                    continue
+                selected = (
+                    context, context_key, base, total,
+                    len(all_episodes), target_count,
+                )
+                break
+            if selected is not None:
+                break
 
         if selected is None:
             return self._unknown()

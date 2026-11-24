@@ -68,15 +68,37 @@ def _native(value):
     return value
 
 
-def _row_features(agent, obs) -> Tuple[Hashable, ...]:
-    """Internal feature roots active at one observation (read-only)."""
+def _row_features(agent, obs, pending, source: str = "branch"):
+    """Internal features active at one transition, read-only.
+
+    ``branch`` returns the runtime's induced feature roots (sparse masks).
+    ``prototype`` returns the runtime's own nearest node for the encoded
+    state, which is available for any candidate state and therefore gives the
+    demand association a dense feature source without task geometry.
+    """
+    if source == "prototype":
+        nearest = getattr(agent, "_nearest", None)
+        if nearest is None:
+            return ()
+        scales = np.asarray(agent.scales, dtype=float)
+        state = np.concatenate([
+            np.asarray(obs, dtype=float).reshape(-1),
+            np.asarray(pending, dtype=float).reshape(-1),
+        ])
+        if state.size != scales.size:
+            return ()
+        node, distance = nearest(state / scales)
+        if node is None or not np.isfinite(distance):
+            return ()
+        return (("prototype", str(node)),)
     branch = getattr(agent, "_branch_active_features", None)
     features = branch(obs) if branch is not None else ()
     return tuple(dict.fromkeys(_native(feature) for feature in features))
 
 
 def _episode_frames(rows: Sequence[Mapping], agent, lag: int,
-                    with_features: bool = True):
+                    with_features: bool = True,
+                    feature_source: str = "branch"):
     """Group rows by episode and reject anything that cannot be attributed.
 
     Rows are consumed in the order given; the acting action is taken from
@@ -87,6 +109,8 @@ def _episode_frames(rows: Sequence[Mapping], agent, lag: int,
     when only stage alignment is needed; the feature masks are expensive and
     are not required by the resolver.
     """
+    if feature_source not in ("branch", "prototype"):
+        raise ValueError("feature_source must be branch or prototype")
     grouped = OrderedDict()
     contiguous = {}
     previous = None
@@ -154,13 +178,15 @@ def _episode_frames(rows: Sequence[Mapping], agent, lag: int,
             # history is newest-first; history[lag] acted on this transition.
             actions.append(int(round(float(history[int(lag)]))))
             feedback.append(signals[:2])
-            features.append(
-                _row_features(agent, obs) if with_features else ()
-            )
-            pending.append(tuple(
+            pending_row = tuple(
                 int(round(float(value)))
                 for value in history[1:int(lag) + 1][::-1]
-            ))
+            )
+            pending.append(pending_row)
+            features.append(
+                _row_features(agent, obs, pending_row, feature_source)
+                if with_features else ()
+            )
         if not usable:
             skipped_episodes += 1
             skipped_rows += len(episode_rows)
@@ -266,10 +292,12 @@ class StageExperienceBatch:
     episodes: Tuple[Tuple[StageOccurrence, ...], ...]
     demand_samples: Tuple[DemandAssociationSample, ...]
     census: dict = field(default_factory=dict)
+    feature_source: str = "branch"
 
     @classmethod
     def fit(cls, rows: Sequence[Mapping], agent, lag: Optional[int] = None,
-            quantile: float = 0.98, build_demand: bool = True):
+            quantile: float = 0.98, build_demand: bool = True,
+            feature_source: str = "branch"):
         """Fit the key-signal detector on these rows and segment them.
 
         Held-out episodes should go through :meth:`transform`, which reuses
@@ -279,7 +307,7 @@ class StageExperienceBatch:
         if lag < 0:
             raise ValueError("lag must be non-negative")
         frames, skipped_episodes, skipped_rows = _episode_frames(
-            rows, agent, lag,
+            rows, agent, lag, feature_source=feature_source,
         )
         if not frames:
             raise ValueError("no usable episodes in the training rows")
@@ -294,19 +322,21 @@ class StageExperienceBatch:
             episodes, samples, skipped_episodes, skipped_rows,
         )
         census["signal_channels"] = int(len(detector.thresholds))
+        census["feature_source"] = feature_source
         return cls(
             detector=detector,
             lag=lag,
             episodes=episodes,
             demand_samples=samples,
             census=census,
+            feature_source=feature_source,
         )
 
     def transform(self, rows: Sequence[Mapping], agent,
                   build_demand: bool = True) -> "StageExperienceBatch":
         """Segment other episodes with the already-fitted detector."""
         frames, skipped_episodes, skipped_rows = _episode_frames(
-            rows, agent, self.lag,
+            rows, agent, self.lag, feature_source=self.feature_source,
         )
         episodes, samples = _segment_frames(
             frames, self.detector, build_demand=build_demand,
@@ -315,12 +345,14 @@ class StageExperienceBatch:
             episodes, samples, skipped_episodes, skipped_rows,
         )
         census["signal_channels"] = int(len(self.detector.thresholds))
+        census["feature_source"] = self.feature_source
         return StageExperienceBatch(
             detector=self.detector,
             lag=self.lag,
             episodes=episodes,
             demand_samples=samples,
             census=census,
+            feature_source=self.feature_source,
         )
 
     def outcome_episodes(self):

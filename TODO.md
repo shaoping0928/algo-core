@@ -254,12 +254,32 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
    - 合成测试 7 条；**在线 provider / planner 接线未做**：选择器是纯函数，
      需要等状态→阶段 resolver + 在线阶段上下文 provider 接上后再走
      rank-only 质量门（item 6）。
-5. **P1：需求关联及 option 口径**。当前启发值是 observational log-lift，不是因果
-   value。默认样本跨 option 池化以避免用未来完整动作 trace 泄漏；若要
-   option-conditional priority，option 必须在决策时已知且有跨 episode 实际支持，
-   否则 UNKNOWN。真实 demand 样本已存在（fast smoke 1257 条/1500 帧），但
-   active-feature 覆盖仅 0.03，且 `StageDemandHeuristic` 尚未在真实样本上
-   拟合或校准——当前只验证了结构与计数。
+5. **[x] P1：需求关联及 option 口径（`stage_demand_association_probe.py`，
+   2026-11-24，机制审计完成；可作条件信号，覆盖仍低）**。
+   - 新增 `feature_source`：`branch`（诱导 feature roots，稀疏）或
+     `prototype`（runtime 最近原型，稠密且对任意候选状态可用）；
+     `--stage-feature-source`，census 记录来源。
+   - 新增 `DemandAssociationSample.from_stage_prefixes`：每个 transition 的
+     option 只取**该 transition 之前**已执行的动作（不含即将作用/后续动作），
+     offset 0 无历史按 pooled；`StageDemandHeuristic` 的 option 查询只做
+     同一前缀的 suffix backoff，**绝不回退到 pooled 表**。
+   - episode-held-out 审计（train-only representation；3 seeds；exact vs
+     tree-root context，pooled vs causal prefix option）：
+     - `branch` 覆盖率 **0.003** → 不可用；`prototype` 覆盖 1.000。
+     - exact+pooled：realized 覆盖 0.33–0.36，top1 0.78–0.84 vs chance
+       0.85–0.89 → **低于 chance**。
+     - exact+prefix：覆盖 0.18–0.24，top1 0.72–0.76，仍低于 chance。
+     - tree-root+pooled：top1 ≈ chance（−0.006/+0.002/+0.009）。
+     - **tree-root+prefix：3/3 高于 chance**——coverage
+       0.178/0.187/0.236，top1 **0.861/0.838/0.837** vs chance
+       0.836/0.825/0.817，majority 0.703/0.641/0.704；realized priority
+       +0.016/+0.021/+0.013 vs others −0.119/+0.008/−0.055。
+       放宽到 1/1 门（seed 100）：coverage 0.409，top1 0.902 vs chance
+       0.883。
+   → 判定 `tree_root_prefix_association_above_chance`：阶段树根池化 + 因果
+   前缀 + suffix backoff 是可行机制，但绝对增益只有 +1.3–2.5pp、覆盖
+   18–24%（放宽后 41%）。**不能单独作为 rank hint 接线**；item 6 需要
+   覆盖门和在线 prefix/context provider，且优先扩大覆盖而不是调 prior。
 6. **P1：rank-only 搜索质量门**。beam rank 会影响中间保留集合，可能剪掉高 value
    路径。固定相同预算测目标阶段路径 recall、扩展量、UNKNOWN 与最终真实价值；
    必须保持最终 selection 只用独立价值，rank priority 不写入 node value、反馈、
