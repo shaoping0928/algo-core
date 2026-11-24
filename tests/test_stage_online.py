@@ -147,6 +147,39 @@ class OnlineStageTests(unittest.TestCase):
         self.assertIsNone(demand.action_trace)
         self.assertGreaterEqual(provider.snapshot()["counts"]["supported"], 1)
 
+    def test_provider_confidence_gate_returns_unknown(self):
+        self.agent.stage_experience = self.experience
+        self.agent.stage_outcome_memory = StubMemory()
+        self.agent.stage_demand_selector = StubSelector()
+        self.agent.stage_tree = StubTree()
+        self.agent.stage_tree_heuristic = StubHeuristic()
+        self.agent.stage_demand_feature_source = "prototype"
+        provider = OnlineStageDemandProvider(
+            self.agent, min_target_probability=0.7,
+        )
+        for row in self.rows:
+            provider.observe_transition(row)
+        self.assertIsNone(provider(
+            agent=self.agent, observation=None, prefix=(), actions=(),
+        ))
+        self.assertEqual(
+            provider.snapshot()["counts"]["low_target_probability"], 1,
+        )
+        support_provider = OnlineStageDemandProvider(
+            self.agent, min_prediction_support=5,
+        )
+        for row in self.rows:
+            support_provider.observe_transition(row)
+        self.assertIsNone(support_provider(
+            agent=self.agent, observation=None, prefix=(), actions=(),
+        ))
+        self.assertEqual(
+            support_provider.snapshot()["counts"][
+                "low_prediction_support"
+            ],
+            1,
+        )
+
     def test_provider_requires_fitted_components(self):
         self.agent.stage_experience = self.experience
         with self.assertRaises(ValueError):

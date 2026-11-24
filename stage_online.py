@@ -109,10 +109,16 @@ class OnlineStageDemandProvider:
     """Produce a tree-root StageDemand from the current online context."""
 
     def __init__(self, agent, feature_source: Optional[str] = None,
-                 rank_feature_source: Optional[str] = None):
+                 rank_feature_source: Optional[str] = None,
+                 min_target_probability: float = 0.0,
+                 min_prediction_support: int = 0):
         experience = getattr(agent, "stage_experience", None)
         if experience is None:
             raise ValueError("agent has no fitted stage experience")
+        if not 0.0 <= float(min_target_probability) <= 1.0:
+            raise ValueError("min_target_probability must be in [0, 1]")
+        if int(min_prediction_support) < 0:
+            raise ValueError("min_prediction_support must be non-negative")
         self.tracker = OnlineStageTracker(experience.detector, agent.lag)
         self.memory = getattr(agent, "stage_outcome_memory", None)
         self.selector = getattr(agent, "stage_demand_selector", None)
@@ -120,6 +126,8 @@ class OnlineStageDemandProvider:
         self.rank_feature_source = (
             rank_feature_source or "prototype"
         )
+        self.min_target_probability = float(min_target_probability)
+        self.min_prediction_support = int(min_prediction_support)
         if self.rank_feature_source == "root":
             self.heuristic = getattr(agent, "stage_root_heuristic", None)
         else:
@@ -160,6 +168,10 @@ class OnlineStageDemandProvider:
         if prediction.get("status") != "supported":
             self.counts["no_prediction"] += 1
             return None
+        if (int(prediction.get("support", 0))
+                < self.min_prediction_support):
+            self.counts["low_prediction_support"] += 1
+            return None
         association_trace = (
             None if self.rank_feature_source == "root"
             else context["prefix"]
@@ -172,6 +184,11 @@ class OnlineStageDemandProvider:
         )
         if demand is None:
             self.counts["no_demand"] += 1
+            return None
+        if (demand.transition_probability is None
+                or float(demand.transition_probability)
+                < self.min_target_probability):
+            self.counts["low_target_probability"] += 1
             return None
         exact_target = demand.target_stage
         chain = self.tree.chain(exact_target)
@@ -209,4 +226,6 @@ class OnlineStageDemandProvider:
             },
             feature_source=self.feature_source,
             rank_feature_source=self.rank_feature_source,
+            min_target_probability=self.min_target_probability,
+            min_prediction_support=self.min_prediction_support,
         )

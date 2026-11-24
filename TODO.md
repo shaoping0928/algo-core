@@ -299,16 +299,22 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
      ranked **32.2**（−41.6，−56%）；provider 78/161 决策有 demand，
      heuristic 8853/12324 支持、target present 2214，扩展仍 158/决策。
      → 负向结论不是小样本/窄 beam 的偶然。
+   - **置信/覆盖门（target probability ≥0.6、prediction support ≥4）**：
+     provider 仍有 72/161 决策产出 demand（low_support 26、low_probability 6），
+     heuristic 8456/11376 支持，但 ranked frames **仍为 32.2**（baseline 73.8）。
+     → 不是低置信 demand 的问题，而是 rank 目标/排序语义本身会把 beam
+     带离高价值路径。
    - target-path recall：已加候选级 `target_present` 计数（见报告）；
      完整的 stage-tagged frontier recall 仍未实现。
    - 修掉两个实现 bug：根级 adapter 对状态**双重缩放**导致 0 特征；
      feature 无证据时未继续向父 context 回退（现在会回退）。
    → 判定 `rank_hint_activates_only_under_weak_support_and_hurts`：
    **质量门未通过，不接线**；5 worlds/beam 16 的复核进一步把负向幅度放大到
-   −56%。下一步不是调 heuristic 权重，而是：
+   −56%，置信/覆盖门也没有改善。下一步不是调 heuristic 权重，而是：
    ① 用 stage-tagged frontier 日志做真正的目标路径 recall；
-   ② 先提升 demand target 质量与支持/置信度校准（当前只按 pooled 预测 +
-      outcome readout 选目标）；③ 加覆盖/置信门后再重跑同预算 A/B，
+   ② 重新设计 rank 语义（例如只在近并列分数内重排，或先把 demand 变成
+      可验证的 value target），避免覆盖掉明显更高分的路径；
+   ③ demand target 质量与支持/置信度校准完成后再重跑同预算 A/B，
       3/6-seed 通过前不进入 shadow。
 7. **P1：真实数据与决策验收**。resolver / stage tree 已有单任务被动流的
    episode-held-out 审计（5 折 / 3 seeds，fold-refit 表示），但仍无

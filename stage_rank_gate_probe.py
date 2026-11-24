@@ -84,6 +84,8 @@ def main():
         help="candidate feature used by the rank hint: resolved stage root "
              "or the runtime prototype",
     )
+    parser.add_argument("--min-target-probability", type=float, default=0.0)
+    parser.add_argument("--min-prediction-support", type=int, default=0)
     parser.add_argument("--report", default="")
     args = parser.parse_args()
     if args.beam_width < 1:
@@ -100,6 +102,8 @@ def main():
     agent.stage_rank_feature_source = args.rank_feature_source
     provider = OnlineStageDemandProvider(
         agent, rank_feature_source=args.rank_feature_source,
+        min_target_probability=args.min_target_probability,
+        min_prediction_support=args.min_prediction_support,
     )
     print(
         "stage rank gate probe: seed %d  beam %d  horizon %d  cap %d  "
@@ -220,6 +224,8 @@ def main():
                 stage_min_support=int(args.stage_min_support),
                 stage_min_episodes=int(args.stage_min_episodes),
                 rank_feature_source=args.rank_feature_source,
+                min_target_probability=float(args.min_target_probability),
+                min_prediction_support=int(args.min_prediction_support),
             ),
             baseline=baseline,
             ranked=ranked,
@@ -229,6 +235,12 @@ def main():
                 feature_source=provider.snapshot()["feature_source"],
                 rank_feature_source=provider.snapshot()[
                     "rank_feature_source"
+                ],
+                min_target_probability=provider.snapshot()[
+                    "min_target_probability"
+                ],
+                min_prediction_support=provider.snapshot()[
+                    "min_prediction_support"
                 ],
             ),
             rank_stats={
