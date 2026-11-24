@@ -8,10 +8,13 @@ This first slice deliberately separates:
 
 The memory does not name task events or infer that an outcome is good/safe.
 It returns empirical successor, duration, feedback, terminal/censoring,
-support, and resolution statistics. Unsupported queries return UNKNOWN.
-Duration summaries are descriptive; censoring is flagged separately and is
-not yet a calibrated survival estimator. Stage keys are exact signal tokens;
-continuous-state predictive-equivalence merging is a later layer.
+support, and resolution statistics.  Outcome duration and feedback describe
+the destination stage that actually followed; a terminal/censored outcome has
+no destination, so it reports the source stage's own duration/feedback at the
+episode's end.  Unsupported queries return UNKNOWN.  Duration summaries are
+descriptive; censoring is flagged separately and is not yet a calibrated
+survival estimator. Stage keys are exact signal tokens; continuous-state
+predictive-equivalence merging is a later layer.
 """
 from __future__ import annotations
 
@@ -465,18 +468,39 @@ class _OutcomeCounts:
     durations: list = field(default_factory=list)
     feedback_sum: Optional[np.ndarray] = None
     feedback_sq_sum: Optional[np.ndarray] = None
+    destination_terminal_count: int = 0
+    destination_censored_count: int = 0
 
-    def add(self, occurrence: StageOccurrence):
+    def add(self, occurrence: StageOccurrence,
+            destination_stage: Optional[StageOccurrence] = None):
+        """Accumulate the realized outcome's statistics.
+
+        For a successor outcome the duration and feedback come from the
+        destination stage - the part of the episode the transition leads to.
+        A terminal/censored outcome has no destination, so the source stage's
+        own duration/feedback describe the episode's end.
+        """
         self.count += 1
         self.episodes.add(occurrence.episode)
-        self.durations.append(float(occurrence.duration))
+        stats_stage = (
+            occurrence if destination_stage is None else destination_stage
+        )
+        self.durations.append(float(stats_stage.duration))
+        feedback = np.asarray(stats_stage.feedback, dtype=float).reshape(-1)
         if self.feedback_sum is None:
-            self.feedback_sum = np.zeros_like(occurrence.feedback)
-            self.feedback_sq_sum = np.zeros_like(occurrence.feedback)
-        if self.feedback_sum.shape != occurrence.feedback.shape:
+            self.feedback_sum = np.zeros_like(feedback)
+            self.feedback_sq_sum = np.zeros_like(feedback)
+        if self.feedback_sum.shape != feedback.shape:
             raise ValueError("feedback dimensions must be consistent")
-        self.feedback_sum += occurrence.feedback
-        self.feedback_sq_sum += occurrence.feedback ** 2
+        self.feedback_sum += feedback
+        self.feedback_sq_sum += feedback ** 2
+        if destination_stage is not None:
+            self.destination_terminal_count += int(
+                bool(destination_stage.terminal)
+            )
+            self.destination_censored_count += int(
+                bool(destination_stage.censored)
+            )
 
     def summary(self, destination, terminal, censored, total):
         durations = np.asarray(self.durations, dtype=float)
@@ -490,6 +514,12 @@ class _OutcomeCounts:
             destination=destination,
             terminal=bool(terminal),
             censored=bool(censored),
+            destination_terminal_rate=(
+                float(self.destination_terminal_count) / float(self.count)
+            ),
+            destination_censored_rate=(
+                float(self.destination_censored_count) / float(self.count)
+            ),
             count=int(self.count),
             episode_support=int(len(self.episodes)),
             probability=float(self.count) / float(total),
@@ -591,6 +621,9 @@ class StageOutcomeMemory:
                     max_depth = min(max_depth, self.max_context_depth)
                 action_trace = source.action_trace
                 self.action_options.add(action_trace)
+                destination_stage = (
+                    stages[index + 1] if destination is not None else None
+                )
                 outcome_key = (destination, terminal, censored)
                 for depth in range(max_depth, -1, -1):
                     context = (
@@ -602,7 +635,7 @@ class StageOutcomeMemory:
                     counts = outcomes.setdefault(
                         outcome_key, _OutcomeCounts(),
                     )
-                    counts.add(source)
+                    counts.add(source, destination_stage)
                 self.realized_outcomes += 1
         return self
 

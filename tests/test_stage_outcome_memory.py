@@ -168,8 +168,16 @@ class StageOutcomeMemoryTests(unittest.TestCase):
         }
         self.assertAlmostEqual(by_destination[("B",)]["probability"], 2 / 3)
         self.assertAlmostEqual(by_destination[("C",)]["probability"], 1 / 3)
-        self.assertAlmostEqual(by_destination[("B",)]["duration"]["mean"], 5.0)
-        self.assertEqual(by_destination[("B",)]["feedback_mean"], [0.5, 0.5])
+        self.assertAlmostEqual(by_destination[("B",)]["duration"]["mean"], 2.0)
+        self.assertEqual(by_destination[("B",)]["feedback_mean"], [0.0, 0.0])
+        # Outcome statistics describe the destination stage; B and C are
+        # censored destinations, so the selector must be able to see that.
+        self.assertEqual(
+            by_destination[("B",)]["destination_censored_rate"], 1.0,
+        )
+        self.assertEqual(
+            by_destination[("B",)]["destination_terminal_rate"], 0.0,
+        )
 
     def test_action_order_is_preserved_and_unsupported_option_is_unknown(self):
         memory = StageOutcomeMemory(

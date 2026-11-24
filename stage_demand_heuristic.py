@@ -128,6 +128,8 @@ class StageDemand:
             if outcome.get("destination") == target
             and not outcome.get("terminal", False)
             and not outcome.get("censored", False)
+            and not outcome.get("destination_terminal_rate", 0.0)
+            and not outcome.get("destination_censored_rate", 0.0)
         ]
         if not matching:
             raise ValueError("target is not a supported sibling outcome")

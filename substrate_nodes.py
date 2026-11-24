@@ -54,7 +54,12 @@ from milestone_graph import (
 from multiview_transitions import MultiViewTransitionModel
 from node_features import FeatureRuleBank
 from node_runtime import NodeRuntime, future_pain_labels, future_return_labels
+from stage_demand_selector import (
+    StageDemandSelector,
+    StageOutcomeReadout,
+)
 from stage_experience import StageExperienceBatch
+from stage_outcome_memory import StageOutcomeMemory
 from stage_state_resolver import StageStateResolver
 from substrate_generic import (
     LinearObservationModel,
@@ -1150,9 +1155,23 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         agent.stage_resolver = StageStateResolver.fit_rows(
             transitions, agent, experience=agent.stage_experience,
         )
+        # Stage-level outcome memory and the demand selector's readout, all
+        # from realized stages.  The planner does not read either object.
+        agent.stage_outcome_memory = StageOutcomeMemory().fit(
+            agent.stage_experience.outcome_episodes()
+        )
+        agent.stage_demand_readout = StageOutcomeReadout.fit(
+            agent.stage_experience.episodes
+        )
+        agent.stage_demand_selector = StageDemandSelector(
+            agent.stage_demand_readout
+        )
     else:
         agent.stage_experience = None
         agent.stage_resolver = None
+        agent.stage_outcome_memory = None
+        agent.stage_demand_readout = None
+        agent.stage_demand_selector = None
     # The milestone layer, read off the agent's own stream.  All of it is
     # inert unless the planner is asked for one of its terms.
     model = _milestone_model_from_transitions(
@@ -3412,6 +3431,11 @@ def run_seed(task):
             agent.stage_resolver.snapshot()
             if getattr(agent, "stage_resolver", None) is not None else None
         ),
+        stage_demand=(
+            agent.stage_demand_selector.snapshot()
+            if getattr(agent, "stage_demand_selector", None) is not None
+            else None
+        ),
         dagger=getattr(agent, "dagger_log", []),
         death_rules=getattr(agent, "death_rule_summary", None),
         milestone=getattr(agent, "milestone_summary", None),
@@ -4157,6 +4181,19 @@ def main():
                     resolver["min_margin"],
                 )
             )
+        selector = rows[0].get("stage_demand")
+        if selector:
+            readout = selector["readout"]
+            print(
+                "stage demand selector (seed %d): readout samples %d, "
+                "target mean %+.3f std %.3f, min outcome episodes %d, "
+                "planner unwired"
+                % (
+                    rows[0]["seed"], readout["samples"],
+                    readout["target_mean"], readout["target_std"],
+                    selector["min_outcome_episodes"],
+                )
+            )
     if overall["clusters"] < 5:
         print("warning: fewer than 5 trained models; the interval is "
               "descriptive, not a significance test")
@@ -4230,6 +4267,11 @@ def main():
                 dict(seed=row["seed"], census=row["stage_resolver"])
                 for row in rows
                 if row.get("stage_resolver") is not None
+            ],
+            stage_demand=[
+                dict(seed=row["seed"], census=row["stage_demand"])
+                for row in rows
+                if row.get("stage_demand") is not None
             ],
             per_train_seed=per_train,
             per_eval_seed=per_eval,

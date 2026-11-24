@@ -235,14 +235,31 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
      档案有强 held-out 信号，但**树的增量只在低支撑门显形**，不是默认
      收益；hi30 极端门（seed 100）反而略差。树只作为条件回退层，不作
      决策门证据。
-4. **P0：内部高层需求选择器**。内部阶段搜索枚举有真实支持的 sibling /
-   action-option 路径，再由世界交互反馈训练出的 outcome/value readout 选
-   `StageDemand`。StageDemand 不能来自 task、CLI、人工目标或 modal-successor
-   规则。
+4. **[x] P0：内部高层需求选择器（`stage_demand_selector.py`，2026-11-24）**。
+   `StageOutcomeReadout` 只用真实阶段结果训练：按 episode 折外拟合
+   `StageOutcomeMemory`，对每个真实 source 阶段取它实际走到的 sibling 的
+   预测特征，目标是**之后的真实净反馈和**（dopamine − pain，逐阶段累加；
+   不是反事实）。特征包括概率、目标阶段 log-duration、feedback 均值/方差、
+   terminal/censored、目标阶段 terminal/censored rate、support；岭回归，
+   截距不惩罚。`StageDemandSelector` 枚举 memory 支持的 sibling，过滤
+   terminal/censored（含目标阶段曾 terminal/censored 的 outcome），按学到的
+   value 取最大者生成 `StageDemand`；无支持 / readout 样本不足 / 只有终局
+   兄弟 → None。报告 value、runner-up、margin、candidates 与
+   `provenance=world_feedback_outcome_readout`，`affects_value=False`。
+   - 同时修正了 `StageOutcomeMemory` 的一个真实语义缺陷：outcome 的
+     duration/feedback 原来取**源阶段**，现在取**目标阶段**（terminal/
+     censored 无目标时取源阶段收尾），并新增
+     `destination_terminal_rate / destination_censored_rate`；选择器与
+     `StageDemand.from_transition_prediction` 都会拒绝曾终局的目标。
+   - 合成测试 7 条；**在线 provider / planner 接线未做**：选择器是纯函数，
+     需要等状态→阶段 resolver + 在线阶段上下文 provider 接上后再走
+     rank-only 质量门（item 6）。
 5. **P1：需求关联及 option 口径**。当前启发值是 observational log-lift，不是因果
    value。默认样本跨 option 池化以避免用未来完整动作 trace 泄漏；若要
    option-conditional priority，option 必须在决策时已知且有跨 episode 实际支持，
-   否则 UNKNOWN。当前没有真实 feature/stage 样本及关联校准。
+   否则 UNKNOWN。真实 demand 样本已存在（fast smoke 1257 条/1500 帧），但
+   active-feature 覆盖仅 0.03，且 `StageDemandHeuristic` 尚未在真实样本上
+   拟合或校准——当前只验证了结构与计数。
 6. **P1：rank-only 搜索质量门**。beam rank 会影响中间保留集合，可能剪掉高 value
    路径。固定相同预算测目标阶段路径 recall、扩展量、UNKNOWN 与最终真实价值；
    必须保持最终 selection 只用独立价值，rank priority 不写入 node value、反馈、
@@ -257,27 +274,31 @@ held-out 预测似然与支撑选择，不设固定节点数/层数。候选动�
    error；尚未加入新颖度、action-conditioned 转移分布变化或多信号边界
    校准。quantile detector 已在 fast 真实流 smoke 上跑通（38 局/1500 帧，
    9 个 channel），但尚无 held-out 阈值稳定性或边界质量校准。
-2. 当前 stage identity 是精确 key-signal token 组合；尚未实现从连续当前状态
-   检索历史阶段，也没有基于 held-out predictive equivalence 的跨签名 merge /
-   split。因此当前上下文树是阶段历史的变阶 backoff，不是完整的状态抽象树。
+2. stage identity 仍是精确 key-signal token 组合，但已补两层：连续状态→历史
+   stage type 的 resolver（fold-refit 表示、held-out 冻结、UNKNOWN 带原因）
+   和 held-out 预测等价的 stage-type merge 树。**仍未实现**：从连续状态直接
+   合成新的 stage 身份（当前只会检索已见 key 或回退 base）、跨签名的 split、
+   以及多任务流上的稳定 identity 校准。
 3. 选项 trace 目前严格精确匹配；尚无从真实行为中归纳可复用 option 的机制，
    新 action trace 一律 UNKNOWN。这是诚实的 support 限制，不用动作直方图
    或反事实补边掩盖。
 4. duration 目前只报告经验分位数；删失样本单独标记，但尚未实现 competing
    risk / survival likelihood 或校准，不能把这些分位数当作生存预测。
-5. 尚未在真实多 episode / 多任务流做 episode-held-out 校准、duration
-   likelihood、feedback / terminal 校准、父级收益及 root 常数退化；
-   fast smoke 只验证管线可运行与计数，合成测试只验证数据结构和计数正确性。
-6. provider 与 rank-only 通道已接到 beam-search policy/evaluate；但还没有由
-   自监督阶段记忆自动生成 provider / 训练数据桥接，也未接入默认路径。不存在
-   阶段级行为收益证据，默认决策路径逐位不变。
+5. 已在单任务真实被动流上做 episode-held-out resolver（5 折）与阶段树
+   （3 seeds、60/20/20）审计；**仍未做**：duration 生存校准、feedback /
+   terminal 的联合校准、父级收益的多种子显著性、root 常数退化检查，以及
+   跨任务流验证。fast smoke 只验证管线可运行与计数。
+6. 自动管线已把真实 rows 变成 stage / demand 样本，resolver / tree /
+   demand readout 也都在 `--stage-memory` 下自动生成；但**还没有在线
+   provider**（在线切 stage、拼当前 context、把需求送入 rank-only frontier），
+   也未接入默认路径。不存在阶段级行为收益证据，默认决策路径逐位不变。
 
-**实施顺序**：先自动化世界交互数据→内部信号→stage occurrences→pointwise
-feature snapshots；再做 episode-held-out current-state resolver 和预测等价阶段树；
-然后让内部阶段 outcome/value search 产生 StageDemand；最后接上 rank-only
-frontier，并验证目标路径 recall / 扩展效率 / 真实价值。中间任何阶段身份、
-信号、目标或选项都不能由 task 标签补入。质量门和 3/6-seed 配对实验通过前不
-默认启用，不做帧级长视界搜索。
+**实施顺序（2026-11-24 更新）**：自动经验管线、episode-held-out current-state
+resolver、预测等价阶段树、内部 demand 选择器均已落地并通过单任务 held-out
+审计；**下一步是在线 provider**（在线切 stage、拼 context、把 StageDemand
+送入 rank-only frontier），再验证目标路径 recall / 扩展效率 / 真实价值。
+中间任何阶段身份、信号、目标或选项都不能由 task 标签补入。质量门和
+3/6-seed 配对实验通过前不默认启用，不做帧级长视界搜索。
 
 ## 方向校正（2026-11-23，用户）
 
