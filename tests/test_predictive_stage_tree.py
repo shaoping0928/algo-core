@@ -131,6 +131,22 @@ class PredictiveStageTreeTests(unittest.TestCase):
         self.assertIsNotNone(value)
         self.assertTrue(np.isfinite(value))
 
+    def test_looser_caller_support_can_score_a_thin_leaf(self):
+        tree = PredictiveStageTree.fit(
+            [[
+                stage(1, "A", 2.0, (1.0, 0.0)),
+                stage(1, "D", 3.0, (0.0, 0.0), terminal=True),
+            ]],
+            [], min_support=2, min_episodes=1,
+        )
+        components = tree.components(
+            stage(2, "A", 2.0, (1.0, 0.0)),
+            (("D",), False, False),
+            min_support=1, min_episodes=1, ancestors=False,
+        )
+        self.assertIsNotNone(components)
+        self.assertEqual(components["support"], 1)
+
     def test_unsupported_tree_returns_unknown(self):
         tree = PredictiveStageTree.fit(
             [], [], min_support=2, min_episodes=2,

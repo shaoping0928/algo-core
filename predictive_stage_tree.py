@@ -491,12 +491,15 @@ class PredictiveStageTree:
             node_id = self.leaf_node(
                 stage.key, min_support, min_episodes,
             )
-        profile = (
-            self.profiles[node_id] if node_id is not None
-            else self.global_profile
-        )
-        if profile.count < self.min_support:
-            return None
+        if node_id is None:
+            # The all-stage base is a coarse baseline, not an ancestor that
+            # the caller's node gate selected; it is available whenever the
+            # tree itself has enough base support.
+            profile = self.global_profile
+            if profile.count < self.min_support:
+                return None
+        else:
+            profile = self.profiles[node_id]
         probabilities = _categorical_probabilities(
             profile, self.global_profile, self.prior,
         )

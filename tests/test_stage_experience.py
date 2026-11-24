@@ -173,6 +173,64 @@ class StageExperienceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             StageExperienceBatch.fit(broken, self.agent, lag=2)
 
+    def test_terminal_row_before_the_end_drops_the_episode(self):
+        zero = np.zeros(2)
+        bad = make_episode(
+            500, ys=[0.0, 1.0, 2.0], actions=[0, 1],
+            feedback=[zero, zero],
+        )
+        bad[0]["terminal"] = True
+        bad[0]["done"] = True
+        batch = StageExperienceBatch.fit(
+            training_rows() + bad, self.agent, lag=2, quantile=0.6,
+        )
+        self.assertEqual(batch.census["episodes"], 2)
+        self.assertEqual(batch.census["episodes_skipped"], 2)
+        self.assertEqual(batch.census["rows_skipped"], 4)
+
+    def test_noncontiguous_episode_ids_are_dropped(self):
+        zero = np.zeros(2)
+        first = make_episode(
+            100, ys=[0.0, 1.0, 2.0], actions=[0, 1],
+            feedback=[zero, zero],
+        )
+        second = make_episode(
+            101, ys=[0.0, 1.0, 2.0], actions=[0, 1],
+            feedback=[zero, zero],
+        )
+        clean = make_episode(
+            103, ys=[0.0, 1.0, 2.0], actions=[0, 1],
+            feedback=[zero, zero],
+        )
+        rows = []
+        for position in range(2):
+            rows.append(first[position])
+            rows.append(second[position])
+        batch = StageExperienceBatch.fit(
+            rows + clean, self.agent, lag=2, quantile=0.6,
+        )
+        self.assertEqual(batch.census["episodes"], 1)
+        self.assertEqual(batch.census["episodes_skipped"], 2)
+        self.assertEqual(batch.census["rows_skipped"], 4)
+
+    def test_mixed_observation_dimensions_are_dropped(self):
+        zero = np.zeros(2)
+        bad = make_episode(
+            500, ys=[0.0, 1.0, 2.0], actions=[0, 1],
+            feedback=[zero, zero],
+        )
+        bad[1]["obs"] = np.asarray([1.0, 0.0, 0.0])
+        clean = make_episode(
+            103, ys=[0.0, 1.0, 2.0], actions=[0, 1],
+            feedback=[zero, zero],
+        )
+        batch = StageExperienceBatch.fit(
+            bad + clean, self.agent, lag=2, quantile=0.6,
+        )
+        self.assertEqual(batch.census["episodes"], 1)
+        self.assertEqual(batch.census["episodes_skipped"], 1)
+        self.assertEqual(batch.census["rows_skipped"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

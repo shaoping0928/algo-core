@@ -139,6 +139,42 @@ class StageDemandSelectorTests(unittest.TestCase):
         self.assertIsNone(demand)
         self.assertEqual(report["reason"], "readout_unsupported")
 
+    def test_demand_uses_the_exact_scored_candidate_row(self):
+        def outcome(probability, feedback):
+            return dict(
+                destination=("A",),
+                terminal=False,
+                censored=False,
+                destination_terminal_rate=0.0,
+                destination_censored_rate=0.0,
+                probability=probability,
+                support=4,
+                episode_support=2,
+                duration=dict(mean=2.0, q90=2.0),
+                feedback_mean=list(feedback),
+                feedback_variance=[0.0, 0.0],
+            )
+
+        prediction = dict(
+            status="supported",
+            support=8,
+            resolution=1,
+            outcomes=(
+                outcome(0.1, (0.0, 0.0)),
+                outcome(0.9, (2.0, 0.0)),
+            ),
+        )
+        demand, report = self.selector.select(
+            prediction, [("S",)], OPTION,
+        )
+        self.assertIsNotNone(demand)
+        self.assertEqual(
+            demand.transition_probability,
+            report["candidates"][0]["probability"],
+        )
+        self.assertEqual(demand.stage_history, (("S",),))
+        self.assertEqual(demand.action_trace, OPTION)
+
     def test_selection_does_not_mutate_the_fitted_objects(self):
         before = self.selector.snapshot()
         prediction = self.memory.predict([("S",)], OPTION)

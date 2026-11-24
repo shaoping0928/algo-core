@@ -253,12 +253,17 @@ class StageDemandSelector:
             report["reason"] = "no_supported_nonterminal_sibling"
             return None, report
         best = candidates[0]
-        demand = StageDemand.from_transition_prediction(
-            prediction,
+        # Build from the exact row that was scored.  Re-matching by target
+        # could pick another outcome row with the same destination but a
+        # different probability when the memory reports duplicates.
+        demand = StageDemand(
             target_stage=best["destination"],
-            stage_history=stage_history,
+            stage_history=tuple(stage_history),
             action_trace=action_trace,
             association_action_trace=association_action_trace,
+            transition_probability=best["probability"],
+            transition_support=int(prediction.get("support", 0)),
+            transition_resolution=prediction.get("resolution"),
         )
         report.update(
             status="supported",

@@ -88,15 +88,25 @@ def _episode_frames(rows: Sequence[Mapping], agent, lag: int,
     are not required by the resolver.
     """
     grouped = OrderedDict()
+    contiguous = {}
+    previous = None
     for row in rows:
-        grouped.setdefault(_native(row.get("episode", 0)), []).append(row)
+        episode = _native(row.get("episode", 0))
+        if episode != previous and episode in grouped:
+            # The same episode id resumed after another episode: splicing the
+            # two blocks would invent a transition across unrelated rows.
+            contiguous[episode] = False
+        previous = episode
+        grouped.setdefault(episode, []).append(row)
+        contiguous.setdefault(episode, True)
 
     frames = []
     skipped_episodes = 0
     skipped_rows = 0
     for episode, episode_rows in grouped.items():
-        if not episode_rows:
+        if not episode_rows or not contiguous.get(episode, True):
             skipped_episodes += 1
+            skipped_rows += len(episode_rows)
             continue
         observations = []
         actions = []
@@ -104,18 +114,34 @@ def _episode_frames(rows: Sequence[Mapping], agent, lag: int,
         features = []
         pending = []
         usable = True
-        for row in episode_rows:
-            obs = np.asarray(row.get("obs", ()), dtype=float).reshape(-1)
-            next_obs = np.asarray(
-                row.get("next_obs", ()), dtype=float
-            ).reshape(-1)
-            history = np.asarray(
-                row.get("history", ()), dtype=float
-            ).reshape(-1)
-            signals = np.asarray(
-                row.get("signals", ()), dtype=float
-            ).reshape(-1)
-            if (not obs.size or next_obs.size != obs.size
+        obs_dim = None
+        for position, row in enumerate(episode_rows):
+            if (position < len(episode_rows) - 1
+                    and bool(row.get(
+                        "terminal", row.get("done", False)
+                    ))):
+                # A terminal row must be the episode's last row; anything
+                # after it cannot be attributed to the same stage sequence.
+                usable = False
+                break
+            try:
+                obs = np.asarray(row.get("obs", ()), dtype=float).reshape(-1)
+                next_obs = np.asarray(
+                    row.get("next_obs", ()), dtype=float
+                ).reshape(-1)
+                history = np.asarray(
+                    row.get("history", ()), dtype=float
+                ).reshape(-1)
+                signals = np.asarray(
+                    row.get("signals", ()), dtype=float
+                ).reshape(-1)
+            except (TypeError, ValueError):
+                usable = False
+                break
+            if obs_dim is None:
+                obs_dim = int(obs.size)
+            if (not obs.size or obs.size != obs_dim
+                    or next_obs.size != obs.size
                     or history.size <= int(lag)
                     or signals.size < 2
                     or not np.isfinite(obs).all()
@@ -139,9 +165,19 @@ def _episode_frames(rows: Sequence[Mapping], agent, lag: int,
             skipped_episodes += 1
             skipped_rows += len(episode_rows)
             continue
-        observations.append(np.asarray(
-            episode_rows[-1]["next_obs"], dtype=float
-        ).reshape(-1))
+        try:
+            final_obs = np.asarray(
+                episode_rows[-1]["next_obs"], dtype=float
+            ).reshape(-1)
+        except (KeyError, TypeError, ValueError):
+            skipped_episodes += 1
+            skipped_rows += len(episode_rows)
+            continue
+        if final_obs.size != obs_dim:
+            skipped_episodes += 1
+            skipped_rows += len(episode_rows)
+            continue
+        observations.append(final_obs)
         terminal = bool(
             episode_rows[-1].get("terminal", episode_rows[-1].get("done", False))
         )
