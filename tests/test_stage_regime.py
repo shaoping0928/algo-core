@@ -1107,6 +1107,69 @@ class TestAdaptiveSearchControllerAndPlanner(unittest.TestCase):
         self.assertEqual(d_online.shape, (3,))
         self.assertLess(float(d_online[0]), float(d_online[2]))
 
+    def test_online_world_refit_gate_selective_and_task_agnostic(self):
+        from pathlib import Path
+        from substrate_generic import fit as fit_linear_world
+        from world_refit import OnlineWorldRefitGate
+
+        # Task-agnostic check on world_refit.py
+        src = (
+            Path(__file__).resolve().parents[1] / "core" / "runner" / "world_refit.py"
+        ).read_text(encoding="utf-8").lower()
+        for tok in ("flappy", "bird_x", "pipe", "gap", "flap", "gravity"):
+            self.assertNotIn(tok, src)
+
+        # Build synthetic linear system x_{t+1} = 0.8 * x_t + 0.5 * a_t
+        rng = np.random.default_rng(11)
+        def _make_rows(n_ep, ep_len, noisy=False):
+            out = []
+            for ep in range(n_ep):
+                x = np.zeros(2, dtype=float)
+                for t in range(ep_len):
+                    a = float(rng.integers(0, 2))
+                    hist = np.asarray([a, 0.0, 0.0, 0.0], dtype=float)
+                    nxt = 0.8 * x + np.asarray([0.5 * a, -0.3 * a])
+                    if noisy:
+                        nxt = nxt + rng.normal(0.0, 0.25, size=2)
+                    out.append(dict(
+                        episode=ep,
+                        obs=x.copy(),
+                        next_obs=nxt.copy(),
+                        history=hist,
+                        signals=np.asarray([1.0, 0.0]),
+                        terminal=(t == ep_len - 1),
+                        done=(t == ep_len - 1),
+                    ))
+                    x = nxt
+            return out
+
+        clean_rows = _make_rows(4, 25, noisy=False)
+        noisy_rows = _make_rows(2, 20, noisy=True)
+        w_exact = fit_linear_world(clean_rows, seed=0)[0]
+        w_noisy = fit_linear_world(noisy_rows, seed=0)[0]
+
+        # 1. Already-accurate world stays untouched (refitted=False)
+        gate_exact = OnlineWorldRefitGate(
+            w_exact, clean_rows, seed=0, min_rel_gain=0.30, min_frames=60, update_every=2,
+        )
+        for ep in range(4):
+            self.assertFalse(gate_exact.record_episode_rows(clean_rows[ep * 25:(ep + 1) * 25]))
+        self.assertFalse(gate_exact.refitted)
+        self.assertIs(gate_exact.world, w_exact)
+
+        # 2. High-error cold-start world refits once held-out clean MSE drops >= 30%
+        gate_heal = OnlineWorldRefitGate(
+            w_noisy, noisy_rows, seed=0, min_rel_gain=0.30, min_frames=60, update_every=2,
+        )
+        refitted = False
+        for ep in range(4):
+            if gate_heal.record_episode_rows(clean_rows[ep * 25:(ep + 1) * 25]):
+                refitted = True
+        self.assertTrue(refitted)
+        self.assertTrue(gate_heal.refitted)
+        self.assertGreaterEqual(gate_heal.last_rel_gain, 0.30)
+        self.assertIsNot(gate_heal.world, w_noisy)
+
 
 if __name__ == "__main__":
     unittest.main()

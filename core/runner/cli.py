@@ -501,6 +501,14 @@ def main():
                         help="opt-in Wilson-LCB threshold for causal 1-step "
                              "out-of-sample self-monitoring of world-variable "
                              "predictions (0 = off; e.g. 0.55)")
+    parser.add_argument("--world-online-refit-gain", type=float, default=0.0,
+                        help="minimum held-out clean MSE relative improvement "
+                             "(0 = disabled, recommended 0.30) to accept an online "
+                             "world-model refit and refresh demand/relational pairs")
+    parser.add_argument("--world-online-min-frames", type=int, default=1500,
+                        help="minimum online frames before checking world refit")
+    parser.add_argument("--world-online-every", type=int, default=5,
+                        help="episode cadence for checking online world refit")
     parser.add_argument("--benchmark", action="store_true",
                         help="standard ruler: 1500 offline frames replayed "
                              "once, then one 5000-frame free-control round "
@@ -619,6 +627,12 @@ def main():
         raise ValueError("--chain-demand-rel-pairs must be non-negative")
     if args.chain_demand_min_terminal < 0:
         raise ValueError("--chain-demand-min-terminal must be non-negative")
+    if not 0.0 <= args.world_online_refit_gain < 1.0:
+        raise ValueError("--world-online-refit-gain must be in [0, 1)")
+    if args.world_online_min_frames < 50:
+        raise ValueError("--world-online-min-frames must be at least 50")
+    if args.world_online_every < 1:
+        raise ValueError("--world-online-every must be positive")
     if args.lag < 0:
         raise ValueError("--lag must be non-negative")
     if args.pain_horizon < 0:
@@ -827,6 +841,9 @@ def main():
             chain_demand_min_frames=args.chain_demand_min_frames,
             chain_demand_rel_pairs=args.chain_demand_rel_pairs,
             chain_demand_min_terminal=args.chain_demand_min_terminal,
+            world_online_refit_gain=args.world_online_refit_gain,
+            world_online_min_frames=args.world_online_min_frames,
+            world_online_every=args.world_online_every,
             chain_adaptive=args.chain_adaptive,
             chain_max_hops=args.chain_max_hops,
             chain_wide_beam_width=args.chain_wide_beam_width,
@@ -1162,6 +1179,9 @@ def main():
                 chain_demand_min_frames=args.chain_demand_min_frames,
                 chain_demand_rel_pairs=args.chain_demand_rel_pairs,
                 chain_demand_min_terminal=args.chain_demand_min_terminal,
+                world_online_refit_gain=args.world_online_refit_gain,
+                world_online_min_frames=args.world_online_min_frames,
+                world_online_every=args.world_online_every,
             ),
             rows=eval_rows,
             milestones=[

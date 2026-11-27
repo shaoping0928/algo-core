@@ -224,6 +224,15 @@
     - **全程未碰 240 局（`eval 260–299`）**：`base_p12_mt12` **`634.1`（`1683p`）** → **`a1_rel_demand` `1399.2`（`+765.1` / `+120.7%`!, med `989.0`, p90 `2800.8`, `3982p` `+136.6%`, `150W/53T/37L`）**（`seed 100: 1695.2, 101: 2064.9, 103: 2726.1, 104: 1277.6`）；
     - 负对照归档：按叶局部中心混合 `a2_regime_demand`（`518.0 vs 518.8`, `-0.8`）与额外修改划分树 `a3_rel_tree_and_dem`（`765.5` 弱于 `1031.5`）均已否决，仅保留纯关系差需求增强；
   - **回归测试**：[tests/test_stage_regime.py](file:///c:/workspace/code/algo_core/tests/test_stage_regime.py) 新增平移不变关系对发现与透明需求增强单测，全量单元测试通过。
+- [x] **Phase 17 — 方向 B：残差门控在线世界模型重拟合 + 需求重检（2026-11-27 完成）**：
+  - **机制（严格任务无关，默认关闭、默认栈逐位不变）**：
+    - 新增 [core/runner/world_refit.py](file:///c:/workspace/code/algo_core/core/runner/world_refit.py) `OnlineWorldRefitGate`：在线收集满 `min_frames=1500` 帧后，按 `update_every=5` 局在留出干净（非跳变、非终局）转移上检验重拟合 `LinearObservationModel` 的 MSE 相对降幅；仅当降幅 `>= 0.30` 时替换世界模型并同步刷新 `ControllableFeatureDemand(max_rel_pairs=2)` / `OnlineFeatureDemandUpdater`，对已精准世界模型零触碰；
+    - [core/runner/evaluator.py](file:///c:/workspace/code/algo_core/core/runner/evaluator.py) 与 [core/runner/cli.py](file:///c:/workspace/code/algo_core/core/runner/cli.py) 新增 opt-in 参数 `--world-online-refit-gain`（默认 `0.0`，推荐 `0.30`）、`--world-online-min-frames`（默认 `1500`）、`--world-online-every`（默认 `5`）。
+  - **600 局 `cap=5000` 全口径最终确认（6 种子 × 100 世界 `eval 200–299`，另切出从未碰过的 240 局 `eval 260–299`）**：
+    - **全量 600 局（`eval 200–299`）**：Phase 16 冠军 `1178.6`（med `718.5`, p90 `2632.4`, `8299p`）→ **`b3_world_and_recheck` `1996.0`（`+817.4` / `+69.4%`！p90 打满 `5000.0`, `14486p` `+6187` / `+74.6%`, `226W/286T/88L`）**（`seed 100: 1656→2492.5, 101: 1525→3756.6, 103: 2154.4, 104: 1259→3200.9`）；
+    - **全程未碰 240 局（`eval 260–299`）**：Phase 16 冠军 `1399.2`（med `989.0`, `3982p`）→ **`b3_world_and_recheck` `2512.3`（`+1113.1` / `+79.6%`！med `2289.0` `+1300.0`, p90 打满 `5000.0`, `7350p` `+3368` / `+84.6%`, `122W/82T/36L`）**（`seed 100: 3365.9, 101: 4736.8, 103: 2726.1, 104: 3771.8`）；
+  - **负对照归档（方向 C `H=14..18` 宏块前瞻，360 局）**：`c3_macro_always14` 虽在单个 `seed 101` 上拉升均值（`1031.5→1097.2`），但仅 `1/6` 种子正收益且 `H=18` 外推掉分（`-5.9`），未过合并门槛，不合入 `core/`；
+  - **回归测试**：[tests/test_stage_regime.py](file:///c:/workspace/code/algo_core/tests/test_stage_regime.py) 新增 `OnlineWorldRefitGate` 选择性重拟合与任务无关性单测。
 
 ## P0：多视窗状态转移机制重设计（当前主线）
 

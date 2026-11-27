@@ -481,6 +481,9 @@ def run_seed(task):
     chain_demand_min_frames = int(task.get("chain_demand_min_frames", 600))
     chain_demand_rel_pairs = int(task.get("chain_demand_rel_pairs", 0))
     chain_demand_min_terminal = int(task.get("chain_demand_min_terminal", 0))
+    world_online_refit_gain = float(task.get("world_online_refit_gain", 0.0))
+    world_online_min_frames = int(task.get("world_online_min_frames", 1500))
+    world_online_every = int(task.get("world_online_every", 5))
     chain_adaptive = bool(task.get("chain_adaptive", False))
     chain_max_hops = int(task.get("chain_max_hops", 5))
     chain_wide_beam_width = int(task.get("chain_wide_beam_width", 6))
@@ -578,6 +581,19 @@ def run_seed(task):
                 abstain_lcb=world_var_abstain_lcb,
             )
             eval_world = world_var_node
+    world_refit_gate = None
+    if world_online_refit_gain > 0.0 and world_var_node is None:
+        from world_refit import OnlineWorldRefitGate
+        base_rows_refit = getattr(agent, "milestone_training_rows", ())
+        if base_rows_refit:
+            world_refit_gate = OnlineWorldRefitGate(
+                eval_world,
+                base_rows_refit,
+                seed=seed,
+                min_rel_gain=world_online_refit_gain,
+                min_frames=world_online_min_frames,
+                update_every=world_online_every,
+            )
     regime_evaluator = None
     regime_online_updater = None
     regime_stage_value = None
@@ -731,6 +747,7 @@ def run_seed(task):
                 record_online = (
                     regime_online_updater is not None
                     or online_feature_demand is not None
+                    or world_refit_gate is not None
                 )
                 frames, actions, ep_rows = evaluate(
                     seed, eval_world, agent, cap=cap, horizon=horizon, lag=lag,
@@ -780,6 +797,33 @@ def run_seed(task):
                         regime_evaluator = regime_online_updater.evaluator
                     if online_feature_demand is not None:
                         online_feature_demand.record_episode_rows(ep_rows)
+                    if world_refit_gate is not None and world_refit_gate.record_episode_rows(ep_rows):
+                        eval_world = world_refit_gate.world
+                        if (
+                            decision == "chained"
+                            and chain_demand_weight > 0.0
+                            and feature_demand is not None
+                        ):
+                            from stage_regime import ControllableFeatureDemand, OnlineFeatureDemandUpdater
+                            feature_demand = ControllableFeatureDemand(
+                                max_rel_pairs=chain_demand_rel_pairs,
+                            ).fit_rows(
+                                eval_world, agent, world_refit_gate.combined_rows(), lag=lag,
+                            )
+                            if chain_demand_online_every > 0:
+                                online_feature_demand = OnlineFeatureDemandUpdater(
+                                    feature_demand,
+                                    update_every=chain_demand_online_every,
+                                    ema_alpha=chain_demand_ema,
+                                    max_online_frames=chain_demand_online_frames,
+                                    min_online_frames=chain_demand_min_frames,
+                                    min_terminal_episodes=chain_demand_min_terminal,
+                                    var_sigma=world_var_sigma,
+                                )
+                                online_feature_demand.record_episode_rows(ep_rows)
+                                heuristic_demand_cb = online_feature_demand.distance_batch
+                            else:
+                                heuristic_demand_cb = feature_demand.distance_batch
                 rows.append(dict(
                     train_seed=seed,
                     eval_seed=int(eval_seed),
@@ -851,6 +895,10 @@ def run_seed(task):
         world_variables=(
             world_var_node.snapshot()
             if world_var_node is not None else None
+        ),
+        world_refit=(
+            world_refit_gate.snapshot()
+            if world_refit_gate is not None else None
         ),
         stage_tree_heuristic=(
             agent.stage_tree_heuristic.snapshot()
