@@ -207,8 +207,11 @@
     - **零改动首跑全线大胜（`6/6` 种子全正）**：`random_policy` **`20.5`** → `base_search_h6` **`108.3`** → `frozen_chain_2x3` **`184.7` (`20/300` 满 500)** → **`phase12_full_online` `369.3`（`18.0×` 随机、`3.41×` 穷举 `H=6`、`2.00×` 冻结分节，中位 `477.5`，`140/300` 满 `cap=500` 彻底通关！）**；
     - 自监督内部诊断确认：`ControllableFeatureDemand` 在 6/6 种子上自动剥离单调时钟维并精准识别可控维 `(0,1,2,3)`，`OnlineFeatureDemandUpdater` 自发收敛到物理平衡点 `theta ≈ 0.000 ± 0.004 rad`，`AdaptiveSearchController` 自动放行 `88–97%`（零误拦 `blk=0`）；
     - 新增 [tests/test_cartpole_cross_task.py](file:///c:/workspace/code/algo_core/tests/test_cartpole_cross_task.py) 锁定跨任务兼容性。
-- [ ] **Phase 14 — 后续可选方向（默认栈仍不变，按需推进）**：
-  - 将 `OnlineFeatureDemandUpdater` 扩展 `var_signature` 作用域，与 `DynamicsClassNode` + `adaptive_chained_result` 在交替变物理多世界上合体验证（方向 3）；
+- [x] **Phase 14 — 方向 3：多世界变物理 + 自适应搜索 + 在线需求全栈合体验证（2026-11-27 完成）**：
+  - 为 `OnlineFeatureDemandUpdater` 增加可选 `var_signature` 作用域绑定（默认 `None` 保持几何包络跨物理共享），并在 2,400 局变物理双门基准上验证统一全栈（`DynamicsClassNode(abstain_lcb=0.55)` + 变量作用域阶段/失败记忆 + `stage_abstain_lcb=0.45` + `adaptive_chained_result` + `OnlineFeatureDemandUpdater`）：
+    - **Gate A（轻 `0.55×g` / 重 `1.65×g` 交替 4 块防遗忘，240 局/组）**：`static_p10` **`214.6` (`427p`, Return `204.2`)** → `p10_var_scoped` **`268.8` (`588p`, Return `225.5`)** → `full_var_scoped_dem` **`298.7` (`675p`, Return `302.9`)** → **`full_unscoped_dem` `324.1`（`+55.3` vs P10 / `+109.5` vs static，`752p`，Return `B3+B4 = 347.1` `+121.6` vs P10，`B4 Heavy` 达 `487.8`！）**——证实安全几何走廊包络跨重力不变，池化更新优于频繁重置；
+    - **Gate B（6 变物理 + 局中 `t=60` 切重力，120 局/场景）**：**5/6 场景大幅胜过 Phase 10 冠军**（6 场景总均分 **`290.6 → 337.2, +46.6`**）：`default_1.00x +69.4 (339.3→408.8)`、`heavy_1.38x +56.2 (303.6→359.8)`、`ultra_1.75x +90.6 (284.8→375.4)`、`multi_light +13.5 (263.7→277.2)`、`mid_switch_g +84.5 (285.1→369.6)`，仅 `light_0.50x -34.4`。
+- [ ] **Phase 15 — 后续可选方向（默认栈仍不变，按需推进）**：
   - 拆解 `core/memory/node_runtime.py` 与 `core/substrate_nodes.py` 剩余大文件（方向 4）。
 
 ## P0：多视窗状态转移机制重设计（当前主线）

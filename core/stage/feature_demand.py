@@ -227,6 +227,8 @@ class OnlineFeatureDemandUpdater:
         max_online_frames: int = 12000,
         min_online_frames: int = 600,
         min_terminal_episodes: int = 0,
+        var_sigma: float = 0.75,
+        min_var_similarity: float = 0.50,
     ):
         if not base_demand.fitted:
             raise ValueError("base_demand must be fitted")
@@ -240,28 +242,39 @@ class OnlineFeatureDemandUpdater:
             raise ValueError("min_online_frames must be positive")
         if int(min_terminal_episodes) < 0:
             raise ValueError("min_terminal_episodes must be non-negative")
+        if float(var_sigma) <= 0.0:
+            raise ValueError("var_sigma must be positive")
 
         self.update_every = int(update_every)
         self.ema_alpha = float(ema_alpha)
         self.max_online_frames = int(max_online_frames)
         self.min_online_frames = int(min_online_frames)
         self.min_terminal_episodes = int(min_terminal_episodes)
+        self.var_sigma = float(var_sigma)
+        self.min_var_similarity = float(min_var_similarity)
 
         self.obs_dim_ = int(base_demand.obs_dim_)
         self.controllable_ = np.asarray(base_demand.controllable_, dtype=float).copy()
-        self.env_center_ = np.asarray(base_demand.env_center_, dtype=float).copy()
-        self.env_halfwidth_ = np.asarray(base_demand.env_halfwidth_, dtype=float).copy()
-        self.demand_weights_ = np.asarray(base_demand.demand_weights_, dtype=float).copy()
+        self._base_center = np.asarray(base_demand.env_center_, dtype=float).copy()
+        self._base_halfwidth = np.asarray(base_demand.env_halfwidth_, dtype=float).copy()
+        self._base_weights = np.asarray(base_demand.demand_weights_, dtype=float).copy()
+        self.env_center_ = self._base_center.copy()
+        self.env_halfwidth_ = self._base_halfwidth.copy()
+        self.demand_weights_ = self._base_weights.copy()
         self._inv_scaled_w = self.demand_weights_ / self.env_halfwidth_
         self.envelope_low_q = float(base_demand.envelope_low_q)
         self.envelope_high_q = float(base_demand.envelope_high_q)
         self.survival_top_q = float(base_demand.survival_top_q)
         self.imminent_steps = float(base_demand.imminent_steps)
 
-        self._online_chunks: List[Tuple[np.ndarray, np.ndarray, np.ndarray, bool]] = []
+        self._online_chunks: List[
+            Tuple[np.ndarray, np.ndarray, np.ndarray, bool, Optional[np.ndarray]]
+        ] = []
         self._online_frames: int = 0
         self.episodes_seen: int = 0
         self.updates: int = 0
+        self.active_var_signature: Optional[np.ndarray] = None
+        self.world_switches: int = 0
 
     def distance_batch(self, states: np.ndarray) -> np.ndarray:
         """Weighted normalized L1 distance to the latest online safe-envelope center."""
@@ -273,8 +286,18 @@ class OnlineFeatureDemandUpdater:
         view = arr[:, :self.obs_dim_]
         return np.abs(view - self.env_center_[None, :]) @ self._inv_scaled_w
 
-    def record_episode_rows(self, ep_rows: Sequence[Mapping]) -> bool:
-        """Ingest one realized episode and EMA-update the safe envelope on cadence."""
+    def record_episode_rows(
+        self,
+        ep_rows: Sequence[Mapping],
+        var_signature: Optional[np.ndarray] = None,
+    ) -> bool:
+        """Ingest one realized episode and EMA-update the safe envelope on cadence.
+
+        When ``var_signature`` is provided, scopes updates strictly to episodes
+        whose inferred world-variable signature matches within
+        ``min_var_similarity``; on a world shift, resets to the shared class
+        prior and immediately recalls any matching prior episodes for that world.
+        """
         if not ep_rows:
             return False
         arr = np.asarray(
@@ -287,27 +310,62 @@ class OnlineFeatureDemandUpdater:
         # being labeled as imminent failures.
         rem = np.arange(n, 0, -1, dtype=float) + (0.0 if is_term else float(n))
         dead = (rem <= self.imminent_steps) if is_term else np.zeros(n, dtype=bool)
+        sig_copy = (
+            None if var_signature is None
+            else np.asarray(var_signature, dtype=float).reshape(-1).copy()
+        )
 
-        self._online_chunks.append((arr, rem, dead, is_term))
+        self._online_chunks.append((arr, rem, dead, is_term, sig_copy))
         self._online_frames += n
         while self._online_frames > self.max_online_frames and len(self._online_chunks) > 1:
             dropped = self._online_chunks.pop(0)
             self._online_frames -= len(dropped[0])
         self.episodes_seen += 1
 
-        if (
-            self.episodes_seen % self.update_every != 0
-            or self._online_frames < self.min_online_frames
-        ):
+        shifted = False
+        if sig_copy is not None:
+            if self.active_var_signature is not None:
+                from node_variables import variable_similarity
+                shifted = (
+                    variable_similarity(
+                        sig_copy, self.active_var_signature, sigma=self.var_sigma,
+                    )
+                    < self.min_var_similarity
+                )
+            self.active_var_signature = sig_copy
+
+        if shifted:
+            # Reset to shared class-node prior before recalling matching world episodes.
+            self.env_center_ = self._base_center.copy()
+            self.env_halfwidth_ = self._base_halfwidth.copy()
+            self.demand_weights_ = self._base_weights.copy()
+            self._inv_scaled_w = self.demand_weights_ / self.env_halfwidth_
+            self.world_switches += 1
+
+        if not shifted and (self.episodes_seen % self.update_every != 0):
+            return False
+
+        if sig_copy is None:
+            matching = self._online_chunks
+        else:
+            from node_variables import variable_similarity
+            matching = [
+                chunk for chunk in self._online_chunks
+                if variable_similarity(sig_copy, chunk[4], sigma=self.var_sigma)
+                >= self.min_var_similarity
+            ]
+
+        match_frames = sum(len(chunk[0]) for chunk in matching)
+        if match_frames < self.min_online_frames:
             return False
         if self.min_terminal_episodes > 0:
-            n_term_in_window = sum(1 for chunk in self._online_chunks if chunk[3])
+            n_term_in_window = sum(1 for chunk in matching if chunk[3])
             if n_term_in_window < self.min_terminal_episodes:
                 return False
 
-        s_all = np.vstack([chunk[0] for chunk in self._online_chunks])
-        rem_all = np.concatenate([chunk[1] for chunk in self._online_chunks])
-        dead_mask = np.concatenate([chunk[2] for chunk in self._online_chunks])
+        s_all = np.vstack([chunk[0] for chunk in matching])
+        rem_all = np.concatenate([chunk[1] for chunk in matching])
+        dead_mask = np.concatenate([chunk[2] for chunk in matching])
 
         y_val = np.log1p(rem_all)
         q_cut = float(np.quantile(y_val, self.survival_top_q))
@@ -367,6 +425,7 @@ class OnlineFeatureDemandUpdater:
             episodes_seen=int(self.episodes_seen),
             online_frames=int(self._online_frames),
             updates=int(self.updates),
+            world_switches=int(self.world_switches),
             env_center=tuple(round(float(c), 4) for c in self.env_center_),
             demand_weights=tuple(round(float(w), 4) for w in self.demand_weights_),
         )

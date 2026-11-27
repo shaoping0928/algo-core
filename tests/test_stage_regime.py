@@ -999,6 +999,42 @@ class TestAdaptiveSearchControllerAndPlanner(unittest.TestCase):
         # Center must have moved substantially from biased +0.5 toward true safe corridor -0.5
         self.assertLess(float(upd.env_center_[0]), float(base_dem.env_center_[0]) - 0.3)
 
+        # Optional min_terminal_episodes guard suppresses updates until enough terminal episodes exist
+        upd_guarded = OnlineFeatureDemandUpdater(
+            base_dem, update_every=2, ema_alpha=0.30, min_online_frames=50,
+            min_terminal_episodes=5,
+        )
+        for ep in range(4):
+            ep_rows = [
+                dict(
+                    episode=200 + ep,
+                    obs=np.asarray([-0.5, 0.0, float(t)]),
+                    next_obs=np.asarray([-0.5, 0.0, float(t + 1)]),
+                    done=(t == 29),
+                )
+                for t in range(30)
+            ]
+            upd_guarded.record_episode_rows(ep_rows)
+        self.assertEqual(upd_guarded.updates, 0)
+
+        # Optional var_signature scoping resets on world shift without cross-world mixing
+        upd_scoped = OnlineFeatureDemandUpdater(
+            base_dem, update_every=1, ema_alpha=0.50, min_online_frames=40,
+        )
+        sig_a = np.asarray([0.0, 0.0], dtype=float)
+        sig_b = np.asarray([5.0, 0.0], dtype=float)
+        rows_a = [
+            dict(obs=np.asarray([-0.6, 0.0, float(t)]), done=(t == 49))
+            for t in range(50)
+        ]
+        rows_b = [
+            dict(obs=np.asarray([0.9, 0.0, float(t)]), done=(t == 49))
+            for t in range(50)
+        ]
+        upd_scoped.record_episode_rows(rows_a, var_signature=sig_a)
+        upd_scoped.record_episode_rows(rows_b, var_signature=sig_b)
+        self.assertEqual(upd_scoped.world_switches, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4090,6 +4090,7 @@ def run_seed(task):
                     ema_alpha=chain_demand_ema,
                     max_online_frames=chain_demand_online_frames,
                     min_online_frames=chain_demand_min_frames,
+                    var_sigma=world_var_sigma,
                 )
                 heuristic_demand_cb = online_feature_demand.distance_batch
             else:
