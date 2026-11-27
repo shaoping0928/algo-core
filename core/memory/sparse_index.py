@@ -47,7 +47,8 @@ class SparseFeatureActionIndex:
         self.quantize_step = float(quantize_step)
         self.include_nonzero_ids = bool(include_nonzero_ids)
         self.prior_weight = float(prior_weight)
-        self._postings: Dict[Tuple[int, int], Dict[int, List[float]]] = defaultdict(dict)
+        self._postings: Dict[Tuple[int, ...], Dict[int, List[float]]] = defaultdict(dict)
+        self._key_totals: Dict[Tuple[int, ...], float] = defaultdict(float)
         self._global_counts: Counter = Counter()
         self._global_scores: Dict[int, float] = defaultdict(float)
         self.total_updates = 0
@@ -79,6 +80,7 @@ class SparseFeatureActionIndex:
             else:
                 bucket[0] += 1.0
                 bucket[1] += score
+            self._key_totals[fk] += 1.0
         self._global_counts[act] += 1
         self._global_scores[act] += score
         self.total_updates += 1
@@ -144,17 +146,24 @@ class SparseFeatureActionIndex:
         )
         scores: Dict[int, float] = defaultdict(float)
         counts: Dict[int, float] = defaultdict(float)
+        discount = 0.5
         for fk in feats:
             post = self._postings.get(fk)
             if not post:
                 continue
-            if sparse_keys is not None and len(fk) >= 2 and fk[0] >= 10:
+            key_tot = self._key_totals.get(fk, 0.0)
+            if sparse_keys is not None and len(fk) >= 2 and fk[0] >= 10 and key_tot > 0.0:
                 spec = 10.0 ** float(len(fk) - 2)
+                inv_tot = 1.0 / key_tot
+                for act, (cnt, s_sum) in post.items():
+                    ad_prob = max(cnt - discount, 0.0) * inv_tot
+                    if ad_prob > 0.0:
+                        counts[act] += 1.0
+                        scores[act] += (ad_prob * (s_sum / max(cnt, 1.0))) * spec
             else:
-                spec = 1.0
-            for act, (cnt, s_sum) in post.items():
-                counts[act] += cnt * spec
-                scores[act] += s_sum * spec
+                for act, (cnt, s_sum) in post.items():
+                    counts[act] += cnt
+                    scores[act] += s_sum
 
         if scores:
             ranked = sorted(
