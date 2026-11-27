@@ -39,6 +39,59 @@ from temp_context import TemporaryContextMemory
 from virtual_node_dag import BidirectionalVirtualNodeDAG
 
 
+class LearnedClassContextGate:
+    """Task-agnostic per-class context gate learned strictly from prediction feedback.
+
+    Starts completely uniform (0.5 for every class, zero distinction between
+    singletons, function words, or content classes).  For each observed step,
+    compares whether short-term context injection helped or hurt the predicted
+    class and updates that class's gate weight online.
+    """
+
+    def __init__(self, n_classes: int, lr: float = 0.25, init_logit: float = 0.0):
+        self.n_classes = max(int(n_classes), 1)
+        self.lr = float(lr)
+        self.logits = np.full(self.n_classes, float(init_logit), dtype=float)
+        self.counts = np.zeros(self.n_classes, dtype=int)
+
+    def class_gate(self, cid: int) -> float:
+        i = int(cid)
+        if i < 0 or i >= self.n_classes:
+            return 0.5
+        z = float(np.clip(self.logits[i], -6.0, 6.0))
+        return 1.0 / (1.0 + float(np.exp(-z)))
+
+    def gate_for_distribution(
+        self, cids: Sequence[int], cprobs: np.ndarray,
+    ) -> float:
+        p_tot = float(np.sum(cprobs))
+        if p_tot <= 1e-12:
+            return 0.5
+        acc = 0.0
+        for cid, cp in zip(cids, cprobs):
+            acc += (float(cp) / p_tot) * self.class_gate(int(cid))
+        return float(np.clip(acc, 0.0, 1.0))
+
+    def update(self, cid: int, advantage: float) -> None:
+        """Update gate logit for ``cid`` from counterfactual advantage ``rew_with - rew_without``."""
+        i = int(cid)
+        if i < 0 or i >= self.n_classes:
+            return
+        self.counts[i] += 1
+        step = self.lr / (1.0 + 0.02 * float(self.counts[i]))
+        self.logits[i] = float(np.clip(self.logits[i] + step * float(advantage), -6.0, 6.0))
+
+    def snapshot(self) -> dict:
+        gates = 1.0 / (1.0 + np.exp(-np.clip(self.logits, -6.0, 6.0)))
+        seen = self.counts > 0
+        return dict(
+            seen_classes=int(np.sum(seen)),
+            mean_gate=round(float(gates[seen].mean()), 3) if np.any(seen) else 0.5,
+            min_gate=round(float(gates[seen].min()), 3) if np.any(seen) else 0.5,
+            max_gate=round(float(gates[seen].max()), 3) if np.any(seen) else 0.5,
+        )
+
+
 class ContextDrivenDecisionController:
     """Steers next-symbol decisions using live short-term context over long-term reserves."""
 
@@ -58,6 +111,7 @@ class ContextDrivenDecisionController:
         bridge_weight: float = 0.14,
         top_active_targets: int = 16,
         content_class_gate: bool = True,
+        learned_class_gate: Optional[LearnedClassContextGate] = None,
         lookahead_depth: int = 1,
         lookahead_beam: int = 4,
     ):
@@ -74,6 +128,14 @@ class ContextDrivenDecisionController:
         self.bridge_weight = float(bridge_weight)
         self.top_active_targets = max(int(top_active_targets), 4)
         self.content_class_gate = bool(content_class_gate)
+        self.learned_class_gate = (
+            learned_class_gate
+            if learned_class_gate is not None
+            else (
+                LearnedClassContextGate(class_policy.n_classes)
+                if self.content_class_gate else None
+            )
+        )
         self.lookahead_depth = max(int(lookahead_depth), 1)
         self.lookahead_beam = max(int(lookahead_beam), 2)
 
@@ -175,22 +237,11 @@ class ContextDrivenDecisionController:
         active_strengths, tree_stats = self._collect_active_node_strengths(slow_state)
         injected = 0
         bridged = 0
-        # Content-class gate: activate PMI content injection only when ClassPolicy
-        # predicts a content class rather than a confident singleton glue token.
+        # Self-learned per-class context gate (zero hand-coded singleton/grammar rules)
         content_gate = 1.0
-        if self.content_class_gate and self.class_policy.n_singletons > 0:
+        if self.learned_class_gate is not None:
             cids, cprobs = self.class_policy.predict_next_classes(ctx_tokens, top_c=8)
-            p_tot = float(cprobs.sum())
-            if p_tot > 1e-12:
-                top1_is_singleton = int(cids[0]) <= self.class_policy.n_singletons
-                top1_share = float(cprobs[0]) / p_tot
-                p_content = float(
-                    sum(float(cp) for cid, cp in zip(cids, cprobs) if cid > self.class_policy.n_singletons)
-                ) / p_tot
-                if top1_is_singleton and top1_share >= 0.30:
-                    content_gate = 0.0
-                else:
-                    content_gate = float(np.clip(p_content, 0.0, 1.0))
+            content_gate = self.learned_class_gate.gate_for_distribution(cids, cprobs)
         if prev1 > 0 and active_strengths:
             top_active = sorted(active_strengths.items(), key=lambda kv: kv[1], reverse=True)[
                 : self.top_active_targets
@@ -312,3 +363,51 @@ class ContextDrivenDecisionController:
         out_p /= max(float(out_p.sum()), 1e-12)
         info["lookahead_depth"] = float(d)
         return [a for _, a in top], out_p, info
+
+    def learn_gate_step(
+        self,
+        ctx_tokens: Sequence[int],
+        slow_state: Optional[np.ndarray],
+        actual_target: int,
+        *,
+        k: int = 8,
+    ) -> float:
+        """Online self-supervised update of ``learned_class_gate`` from real feedback.
+
+        Compares counterfactual prediction quality with injection OFF vs ON
+        and updates the predicted class's gate logit strictly from advantage.
+        """
+        if self.learned_class_gate is None or int(actual_target) <= 0:
+            return 0.0
+        tgt = int(actual_target)
+        cids, _ = self.class_policy.predict_next_classes(ctx_tokens, top_c=1)
+        pred_cid = int(cids[0]) if cids else 0
+
+        # Counterfactual OFF vs ON
+        orig_inj, orig_br, orig_gate = (
+            self.active_inject_weight,
+            self.bridge_weight,
+            self.learned_class_gate,
+        )
+        try:
+            self.learned_class_gate = None
+            self.active_inject_weight = 0.0
+            self.bridge_weight = 0.0
+            cand_off, _, _ = self.decide_distribution(ctx_tokens, slow_state, k=k)
+
+            self.active_inject_weight = max(orig_inj, 0.25)
+            self.bridge_weight = max(orig_br, 0.15)
+            cand_on, _, _ = self.decide_distribution(ctx_tokens, slow_state, k=k)
+        finally:
+            self.active_inject_weight = orig_inj
+            self.bridge_weight = orig_br
+            self.learned_class_gate = orig_gate
+
+        def _score(cand_list: Sequence[int]) -> float:
+            h1 = 1.0 if (cand_list and cand_list[0] == tgt) else 0.0
+            h8 = 1.0 if (tgt in cand_list) else 0.0
+            return 0.6 * h1 + 0.4 * h8
+
+        adv = _score(cand_on) - _score(cand_off)
+        self.learned_class_gate.update(pred_cid, adv)
+        return float(adv)

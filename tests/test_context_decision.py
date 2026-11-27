@@ -63,6 +63,18 @@ class ContextDrivenDecisionTests(unittest.TestCase):
         self.assertAlmostEqual(float(probs.sum()), 1.0, places=5)
         self.assertGreater(info["tree_visited"], 0.0)
 
+    def test_learned_class_context_gate_updates_without_hardcoded_rules(self):
+        from context_decision import LearnedClassContextGate
+
+        gate = LearnedClassContextGate(n_classes=10, lr=0.8)
+        self.assertAlmostEqual(gate.class_gate(2), 0.5)
+        self.assertAlmostEqual(gate.class_gate(7), 0.5)
+        for _ in range(15):
+            gate.update(2, -1.0)
+            gate.update(7, +1.0)
+        self.assertLess(gate.class_gate(2), 0.2)
+        self.assertGreater(gate.class_gate(7), 0.8)
+
 
 if __name__ == "__main__":
     unittest.main()
