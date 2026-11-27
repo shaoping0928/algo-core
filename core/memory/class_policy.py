@@ -30,7 +30,8 @@ class ClassLevelSequencePolicy:
         self,
         vocab_size: int,
         *,
-        n_classes: int = 96,
+        n_classes: int = 128,
+        n_singletons: int = 64,
         feature_dim: int = 32,
         window: int = 4,
         class_ctx_len: int = 4,
@@ -39,7 +40,9 @@ class ClassLevelSequencePolicy:
         seed: int = 0,
     ):
         self.vocab_size = max(int(vocab_size), 2)
-        self.n_classes = max(int(n_classes), 4)
+        self.n_singletons = max(0, min(int(n_singletons), self.vocab_size - 2))
+        self.n_content_classes = max(int(n_classes), 4)
+        self.n_classes = 1 + self.n_singletons + self.n_content_classes
         self.class_ctx_len = max(int(class_ctx_len), 1)
         self.local_ctx_len = max(int(local_ctx_len), 1)
         self.ema_alpha = float(ema_alpha)
@@ -70,27 +73,41 @@ class ClassLevelSequencePolicy:
         emb = self.feature_map.embeddings_
         counts = np.bincount(arr, minlength=self.vocab_size).astype(float)
 
-        # 2. Discover n_classes symbol classes from embeddings (class 0 reserved for <UNK>)
+        # 2. Data-driven split: top-frequency skeleton symbols become singleton
+        #    classes so they do not form a giant black-hole cluster; remaining
+        #    content symbols cluster into semantic classes via embeddings.
         valid_syms = np.flatnonzero((np.arange(self.vocab_size) > 0) & (counts > 0))
-        k_cls = min(self.n_classes - 1, max(len(valid_syms), 1))
-        centers = _fit_deterministic_centroids(emb[valid_syms].astype(float), k_cls, max_iter=35)
-        self.class_centers_ = centers.astype(np.float32)
-
-        # Assign every valid symbol to its nearest class center
-        c_norm = np.einsum("ij,ij->i", centers, centers)[None, :]
-        e_valid = emb[valid_syms].astype(float)
-        e_norm = np.einsum("ij,ij->i", e_valid, e_valid)[:, None]
-        d2 = e_valid @ (-2.0 * centers.T) + e_norm + c_norm
-        assigned = np.argmin(d2, axis=1) + 1  # 1..k_cls
+        freq_order = valid_syms[np.argsort(-counts[valid_syms])]
+        n_sing = min(self.n_singletons, max(len(freq_order) - 2, 0))
+        singleton_syms = freq_order[:n_sing]
+        content_syms = freq_order[n_sing:]
 
         sym_to_cls = np.zeros(self.vocab_size, dtype=np.int32)
-        sym_to_cls[valid_syms] = assigned.astype(np.int32)
+        for idx_s, sym in enumerate(singleton_syms):
+            sym_to_cls[int(sym)] = idx_s + 1  # 1..n_sing
+
+        k_cls = min(self.n_content_classes, max(len(content_syms), 1))
+        if len(content_syms) > 0:
+            centers = _fit_deterministic_centroids(
+                emb[content_syms].astype(float), k_cls, max_iter=35,
+            )
+            self.class_centers_ = centers.astype(np.float32)
+            c_norm = np.einsum("ij,ij->i", centers, centers)[None, :]
+            e_cont = emb[content_syms].astype(float)
+            e_norm = np.einsum("ij,ij->i", e_cont, e_cont)[:, None]
+            d2 = e_cont @ (-2.0 * centers.T) + e_norm + c_norm
+            assigned = np.argmin(d2, axis=1) + 1 + n_sing
+            sym_to_cls[content_syms] = assigned.astype(np.int32)
+        else:
+            self.class_centers_ = np.zeros((0, emb.shape[1]), dtype=np.float32)
+
         self.sym_to_class_ = sym_to_cls
 
-        # Store per-class member list and smoothed intra-class emission distribution P(s | C)
+        # Store per-class member list and smoothed intra-class emission P(s | C)
         self.class_members_ = {}
         self.class_emit_probs_ = {}
-        for cid in range(1, k_cls + 1):
+        max_cid = int(sym_to_cls.max())
+        for cid in range(1, max_cid + 1):
             members = np.flatnonzero(sym_to_cls == cid)
             if len(members) == 0:
                 continue
