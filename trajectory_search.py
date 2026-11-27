@@ -10,7 +10,15 @@ Task-specific state encodings, learned models, goals, and constraints are suppli
 """
 from dataclasses import dataclass
 from itertools import product
-from typing import Callable, Iterable, Iterator, Optional, Sequence, Tuple, Union
+from typing import (
+    Callable,
+    Iterable,
+    Iterator,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 
@@ -43,6 +51,9 @@ class SearchResult:
     # but not an exact death.  It can be penalised without vetoing.
     first_near: int = -1
     near_count: int = 0
+    # Cumulative search-order credit is diagnostic only; it is not part of
+    # the objective score used to select the final retained plan.
+    rank_priority: float = 0.0
 
 
 def _sequence_batches(
@@ -86,6 +97,65 @@ def _lexicographic_order(scores, indices):
     subset = scores[indices]
     keys = tuple(subset[:, column] for column in reversed(range(subset.shape[1])))
     return np.lexsort(keys)
+
+
+def _rank_outputs(value, count):
+    """Parse scalar priorities and optional per-candidate proposal groups."""
+    if isinstance(value, tuple) and len(value) == 2:
+        priorities, groups = value
+    else:
+        priorities, groups = value, None
+    priorities = np.asarray(priorities, dtype=float)
+    if priorities.ndim == 2 and priorities.shape[1] == 1:
+        priorities = priorities[:, 0]
+    if priorities.shape != (count,):
+        raise ValueError("rank_step must return one scalar per candidate")
+    if not np.isfinite(priorities).all():
+        raise ValueError("rank_step priorities must be finite")
+    if groups is not None:
+        groups = tuple(groups)
+        if len(groups) != count:
+            raise ValueError("rank groups must match the candidate count")
+        for group in groups:
+            if group is not None:
+                try:
+                    hash(group)
+                except TypeError as error:
+                    raise ValueError(
+                        "rank groups must be hashable"
+                    ) from error
+    return priorities, groups
+
+
+def _reserve_rank_groups(ordered, groups, quota, width):
+    """Keep the top candidates per supported proposal group, then fill."""
+    ordered = [int(index) for index in ordered]
+    quota = int(quota)
+    width = int(width)
+    if quota <= 0 or groups is None:
+        return np.asarray(ordered[:width], dtype=int)
+    kept = []
+    counts = {}
+    selected = set()
+    for index in ordered:
+        group = groups[index]
+        if group is None:
+            continue
+        group_count = counts.get(group, 0)
+        if group_count >= quota:
+            continue
+        kept.append(index)
+        selected.add(index)
+        counts[group] = group_count + 1
+        if len(kept) >= width:
+            return np.asarray(kept, dtype=int)
+    for index in ordered:
+        if index in selected:
+            continue
+        kept.append(index)
+        if len(kept) >= width:
+            break
+    return np.asarray(kept, dtype=int)
 
 
 def _combine_modes(combine, columns):
@@ -528,6 +598,7 @@ def beam_search(
     ]] = None,
     rank_mode: str = "order",
     rank_margin: float = 0.0,
+    rank_group_quota: int = 0,
     frontier_callback: Optional[Callable[[dict], None]] = None,
 ) -> SearchResult:
     """Beam-limited version of exhaustive_search for long horizons.
@@ -559,11 +630,14 @@ def beam_search(
         raise ValueError("rank_mode must be order or tie")
     if float(rank_margin) < 0.0:
         raise ValueError("rank_margin must be non-negative")
+    if int(rank_group_quota) < 0:
+        raise ValueError("rank_group_quota must be non-negative")
 
     states = state0.reshape(1, -1)
     sequences = np.zeros((1, horizon), dtype=float)
     scores = None
     priorities = None
+    rank_groups = None
     feasible = np.ones(1, dtype=bool)
     first_states = None
     candidate_count = 0
@@ -620,18 +694,12 @@ def beam_search(
             order = _lexicographic_order(candidate_scores, selectable)
             keep = selectable[order[:beam_width]]
             next_priorities = None
+            next_rank_groups = None
         else:
-            increments_priority = np.asarray(
-                rank_step(next_states, next_sequences, step), dtype=float,
+            increments_priority, next_rank_groups = _rank_outputs(
+                rank_step(next_states, next_sequences, step),
+                count * width,
             )
-            if increments_priority.ndim == 2 and increments_priority.shape[1] == 1:
-                increments_priority = increments_priority[:, 0]
-            if increments_priority.shape != (count * width,):
-                raise ValueError(
-                    "rank_step must return one scalar per candidate"
-                )
-            if not np.isfinite(increments_priority).all():
-                raise ValueError("rank_step priorities must be finite")
             next_priorities = increments_priority.copy()
             if priorities is not None:
                 next_priorities += np.repeat(priorities, width)
@@ -649,30 +717,45 @@ def beam_search(
                 far = [
                     index for index in selectable if index not in near_set
                 ]
-                ordered = sorted(
+                near_order = sorted(
                     near,
                     key=lambda index: (
                         -float(next_priorities[index]),
                         tuple(float(value) for value in candidate_scores[index]),
                         int(index),
                     ),
-                ) + sorted(
+                )
+                far_order = sorted(
                     far,
                     key=lambda index: (
                         tuple(float(value) for value in candidate_scores[index]),
                         int(index),
                     ),
                 )
-                keep = np.asarray(ordered[:beam_width], dtype=int)
+                keep_near = _reserve_rank_groups(
+                    near_order, next_rank_groups,
+                    rank_group_quota, beam_width,
+                ).tolist()
+                near_selected = set(keep_near)
+                keep = np.asarray(
+                    keep_near + [
+                        index for index in far_order
+                        if index not in near_selected
+                    ][:max(beam_width - len(keep_near), 0)],
+                    dtype=int,
+                )
             else:
-                keep = np.asarray(sorted(
+                ordered = sorted(
                     selectable.tolist(),
                     key=lambda index: (
                         -float(next_priorities[index]),
                         tuple(float(value) for value in candidate_scores[index]),
                         int(index),
                     ),
-                )[:beam_width], dtype=int)
+                )
+                keep = _reserve_rank_groups(
+                    ordered, next_rank_groups, rank_group_quota, beam_width,
+                )
         if frontier_callback is not None:
             retained = np.zeros(count * width, dtype=bool)
             retained[keep] = True
@@ -685,6 +768,7 @@ def beam_search(
                     None if next_priorities is None
                     else next_priorities.copy()
                 ),
+                rank_groups=next_rank_groups,
                 feasible=candidate_feasible.copy(),
                 selectable=np.isin(
                     np.arange(count * width), selectable
@@ -699,6 +783,10 @@ def beam_search(
         first_states = candidate_first_states[keep]
         priorities = (
             None if next_priorities is None else next_priorities[keep]
+        )
+        rank_groups = (
+            None if next_rank_groups is None
+            else tuple(next_rank_groups[int(index)] for index in keep)
         )
         candidate_count += count * width
 
@@ -726,4 +814,279 @@ def beam_search(
         candidate_count=candidate_count,
         first_state=first_states[index].copy(),
         final_state=states[index].copy(),
+        rank_priority=(
+            float(priorities[index]) if priorities is not None else 0.0
+        ),
+    )
+
+
+def chunked_beam_search(
+    initial_state: np.ndarray,
+    action_space: Iterable,
+    horizon: int,
+    transition_batch: Callable[[np.ndarray, np.ndarray, int], np.ndarray],
+    evaluate_step: Callable[
+        [np.ndarray, np.ndarray, int], Tuple[np.ndarray, np.ndarray]
+    ],
+    evaluate_terminal: Optional[Callable[
+        [np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]
+    ]] = None,
+    beam_width: int = 256,
+    chunk_size: int = 3,
+    score_combine: Union[str, Sequence[str]] = "sum",
+    rank_step: Optional[Callable[
+        [np.ndarray, np.ndarray, int], np.ndarray
+    ]] = None,
+    rank_mode: str = "order",
+    rank_margin: float = 0.0,
+    rank_group_quota: int = 0,
+    frontier_callback: Optional[Callable[[dict], None]] = None,
+) -> SearchResult:
+    """Search in short rollout chunks, pruning only at chunk boundaries.
+
+    Every beam candidate carries its full state, action prefix and cumulative
+    objective through successive chunks. A chunk of three binary actions
+    screens at most eight continuations per parent before pruning. The demand
+    ``rank_step`` remains a separate priority: it can change which paths
+    survive a checkpoint, but never changes feasibility or final scores.
+    """
+    state0 = np.asarray(initial_state, dtype=float)
+    if state0.ndim == 0:
+        state0 = state0.reshape(1)
+    actions = tuple(action_space)
+    if not actions:
+        raise ValueError("action_space must not be empty")
+    if int(horizon) < 1:
+        raise ValueError("horizon must be a positive integer")
+    if int(beam_width) < 1:
+        raise ValueError("beam_width must be a positive integer")
+    if int(chunk_size) < 1:
+        raise ValueError("chunk_size must be a positive integer")
+    if rank_mode not in ("order", "tie"):
+        raise ValueError("rank_mode must be order or tie")
+    if float(rank_margin) < 0.0:
+        raise ValueError("rank_margin must be non-negative")
+    if int(rank_group_quota) < 0:
+        raise ValueError("rank_group_quota must be non-negative")
+
+    horizon = int(horizon)
+    chunk_size = int(chunk_size)
+    width = len(actions)
+    states = state0.reshape(1, -1)
+    sequences = np.zeros((1, horizon), dtype=float)
+    scores = None
+    modes = None
+    priorities = None
+    rank_groups = None
+    feasible = np.ones(1, dtype=bool)
+    first_states = None
+    candidate_count = 0
+    feasible_checks = 0
+
+    for chunk_index, chunk_start in enumerate(range(0, horizon, chunk_size)):
+        chunk_end = min(chunk_start + chunk_size, horizon)
+        chunk_first_candidate_count = 0
+        for step in range(chunk_start, chunk_end):
+            count = len(states)
+            next_states = np.repeat(states, width, axis=0)
+            next_sequences = np.repeat(sequences, width, axis=0)
+            next_sequences[:, step] = np.tile(
+                np.asarray(actions, dtype=float), count
+            )
+            next_states = np.asarray(
+                transition_batch(next_states, next_sequences, step),
+                dtype=float,
+            )
+            if next_states.shape != (count * width,) + state0.shape:
+                raise ValueError(
+                    "transition_batch must preserve the batched state shape; "
+                    "got %r" % (next_states.shape,)
+                )
+            increments, step_feasible = evaluate_step(
+                next_states, next_sequences, step
+            )
+            increments = _score_matrix(
+                increments, count * width, "evaluate_step"
+            )
+            step_feasible = np.asarray(
+                step_feasible, dtype=bool
+            ).reshape(-1)
+            if step_feasible.shape != (count * width,):
+                raise ValueError(
+                    "evaluate_step must return one feasibility flag per "
+                    "candidate"
+                )
+
+            candidate_first_states = (
+                next_states.copy() if first_states is None
+                else np.repeat(first_states, width, axis=0)
+            )
+            if scores is None:
+                modes = _combine_modes(score_combine, increments.shape[1])
+                candidate_scores = increments.copy()
+            else:
+                candidate_scores = _combine_scores(
+                    np.repeat(scores, width, axis=0), increments, modes
+                )
+            candidate_feasible = np.repeat(feasible, width) & step_feasible
+            feasible_checks += int(candidate_feasible.sum())
+            finite = np.isfinite(candidate_scores).all(axis=1)
+            selectable = np.flatnonzero(finite & candidate_feasible)
+            if not len(selectable):
+                selectable = np.flatnonzero(finite)
+            if not len(selectable):
+                raise ValueError(
+                    "evaluators returned no finite score for any candidate"
+                )
+
+            if rank_step is None:
+                next_priorities = None
+                next_rank_groups = None
+            else:
+                increments_priority, next_rank_groups = _rank_outputs(
+                    rank_step(next_states, next_sequences, step),
+                    count * width,
+                )
+                next_priorities = increments_priority.copy()
+                if priorities is not None:
+                    next_priorities += np.repeat(priorities, width)
+
+            chunk_first_candidate_count += count * width
+            candidate_count += count * width
+            states = next_states
+            sequences = next_sequences
+            scores = candidate_scores
+            feasible = candidate_feasible
+            first_states = candidate_first_states
+            priorities = next_priorities
+
+        finite = np.isfinite(scores).all(axis=1)
+        selectable = np.flatnonzero(finite & feasible)
+        if not len(selectable):
+            selectable = np.flatnonzero(finite)
+        if not len(selectable):
+            raise ValueError(
+                "evaluators returned no finite score for any candidate"
+            )
+
+        if priorities is None:
+            order = _lexicographic_order(scores, selectable)
+            keep = selectable[order[:int(beam_width)]]
+        elif rank_mode == "tie":
+            primary = np.asarray(scores[:, 0], dtype=float)
+            best = float(primary[selectable].min())
+            near = [
+                index for index in selectable
+                if float(primary[index]) <= best + float(rank_margin)
+            ]
+            near_set = set(near)
+            far = [index for index in selectable if index not in near_set]
+            near_order = sorted(
+                near,
+                key=lambda index: (
+                    -float(priorities[index]),
+                    tuple(float(value) for value in scores[index]),
+                    int(index),
+                ),
+            )
+            far_order = sorted(
+                far,
+                key=lambda index: (
+                    tuple(float(value) for value in scores[index]),
+                    int(index),
+                ),
+            )
+            keep_near = _reserve_rank_groups(
+                near_order, next_rank_groups, rank_group_quota,
+                int(beam_width),
+            ).tolist()
+            near_selected = set(keep_near)
+            keep = np.asarray(
+                keep_near + [
+                    index for index in far_order
+                    if index not in near_selected
+                ][:max(int(beam_width) - len(keep_near), 0)],
+                dtype=int,
+            )
+        else:
+            ordered = sorted(
+                selectable.tolist(),
+                key=lambda index: (
+                    -float(priorities[index]),
+                    tuple(float(value) for value in scores[index]),
+                    int(index),
+                ),
+            )
+            keep = _reserve_rank_groups(
+                ordered, next_rank_groups, rank_group_quota,
+                int(beam_width),
+            )
+
+        if frontier_callback is not None:
+            retained = np.zeros(len(states), dtype=bool)
+            retained[keep] = True
+            frontier_callback(dict(
+                step=int(chunk_end - 1),
+                chunk_index=int(chunk_index),
+                chunk_start=int(chunk_start),
+                chunk_end=int(chunk_end),
+                chunk_size=int(chunk_end - chunk_start),
+                chunk_candidate_count=int(chunk_first_candidate_count),
+                states=states.copy(),
+                sequences=sequences.copy(),
+                scores=scores.copy(),
+                priorities=(
+                    None if priorities is None else priorities.copy()
+                ),
+                rank_groups=next_rank_groups,
+                feasible=feasible.copy(),
+                selectable=np.isin(np.arange(len(states)), selectable),
+                retained=retained,
+                retained_indices=keep.copy(),
+            ))
+
+        states = states[keep]
+        sequences = sequences[keep]
+        scores = scores[keep]
+        feasible = feasible[keep]
+        first_states = first_states[keep]
+        priorities = None if priorities is None else priorities[keep]
+        rank_groups = (
+            None if next_rank_groups is None
+            else tuple(next_rank_groups[int(index)] for index in keep)
+        )
+
+    if evaluate_terminal is not None:
+        increments, terminal_feasible = evaluate_terminal(states, sequences)
+        increments = _score_matrix(
+            increments, len(states), "evaluate_terminal"
+        )
+        terminal_feasible = np.asarray(
+            terminal_feasible, dtype=bool
+        ).reshape(-1)
+        scores = _combine_scores(scores, increments, modes)
+        feasible = feasible & terminal_feasible
+
+    finite = np.isfinite(scores).all(axis=1)
+    if not finite.any():
+        raise ValueError(
+            "evaluators returned no finite score for any candidate"
+        )
+    feasible_indices = np.flatnonzero(feasible & finite)
+    selectable = feasible_indices if len(feasible_indices) else np.flatnonzero(finite)
+    order = _lexicographic_order(scores, selectable)
+    index = int(selectable[order[0]])
+    score = tuple(float(value) for value in scores[index])
+    score = score[0] if len(score) == 1 else score
+    return SearchResult(
+        actions=sequences[index].copy(),
+        score=score,
+        feasible=bool(len(feasible_indices)),
+        feasible_count=feasible_checks,
+        candidate_count=candidate_count,
+        first_state=first_states[index].copy(),
+        final_state=states[index].copy(),
+        rank_priority=(
+            float(priorities[index]) if priorities is not None else 0.0
+        ),
     )

@@ -6,6 +6,7 @@ from trajectory_search import (
     SearchResult,
     beam_search,
     best_candidate_index,
+    chunked_beam_search,
     exhaustive_search,
     merge_candidate_batches,
     override_first_action,
@@ -147,6 +148,162 @@ class TrajectorySearchTests(unittest.TestCase):
         self.assertEqual(int(result.actions.sum()), 2)
         self.assertEqual(result.final_state[0], 2.0)
         self.assertGreater(result.candidate_count, 0)
+
+    def test_chunk_size_one_matches_frame_beam_search(self):
+        def evaluate_step(states, sequences, step):
+            score = np.abs(states[:, 0] - 2.0)
+            return score, np.ones(len(sequences), dtype=bool)
+
+        def evaluate_terminal(states, _sequences):
+            score = np.abs(states[:, 0] - 3.0)
+            return score, np.ones(len(states), dtype=bool)
+
+        kwargs = dict(
+            initial_state=np.asarray([0.0]),
+            action_space=(0, 1),
+            horizon=5,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            evaluate_terminal=evaluate_terminal,
+            beam_width=3,
+        )
+        frame = beam_search(**kwargs)
+        chunked = chunked_beam_search(**kwargs, chunk_size=1)
+        np.testing.assert_array_equal(chunked.actions, frame.actions)
+        np.testing.assert_array_equal(chunked.final_state, frame.final_state)
+        self.assertEqual(chunked.score, frame.score)
+        self.assertEqual(chunked.candidate_count, frame.candidate_count)
+        self.assertEqual(chunked.feasible_count, frame.feasible_count)
+
+    def test_chunked_beam_expands_three_frames_then_prunes(self):
+        def evaluate_step(states, _sequences, _step):
+            return np.zeros(len(states)), np.ones(len(states), dtype=bool)
+
+        trace = []
+        result = chunked_beam_search(
+            initial_state=np.asarray([0.0]),
+            action_space=(0, 1),
+            horizon=6,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            beam_width=2,
+            chunk_size=3,
+            frontier_callback=trace.append,
+        )
+
+        self.assertEqual(len(trace), 2)
+        self.assertEqual(
+            [
+                (row["chunk_start"], row["chunk_end"], row["step"])
+                for row in trace
+            ],
+            [(0, 3, 2), (3, 6, 5)],
+        )
+        self.assertEqual(
+            [row["chunk_candidate_count"] for row in trace], [14, 28],
+        )
+        self.assertEqual(result.candidate_count, 42)
+        self.assertTrue(all(
+            int(row["retained"].sum()) == 2 for row in trace
+        ))
+
+    def test_chunked_rank_credit_stays_separate_from_objective_score(self):
+        def evaluate_step(states, _sequences, _step):
+            return np.zeros(len(states)), np.ones(len(states), dtype=bool)
+
+        def evaluate_terminal(states, _sequences):
+            return np.abs(states[:, 0] - 1.0), np.ones(
+                len(states), dtype=bool
+            )
+
+        result = chunked_beam_search(
+            initial_state=np.asarray([0.0]),
+            action_space=(0, 1),
+            horizon=2,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            evaluate_terminal=evaluate_terminal,
+            beam_width=2,
+            chunk_size=2,
+            rank_step=lambda states, _sequences, _step: states[:, 0],
+        )
+
+        self.assertEqual(result.score, 0.0)
+        self.assertEqual(result.rank_priority, 2.0)
+        np.testing.assert_array_equal(result.actions, [1.0, 0.0])
+
+    def test_chunked_group_quota_preserves_proposals_without_changing_objective(self):
+        def evaluate_step(states, _sequences, _step):
+            return states[:, 0].copy(), np.ones(
+                len(states), dtype=bool,
+            )
+
+        def rank_step(_states, sequences, _step):
+            groups = tuple(
+                "left" if float(actions[0]) == 0.0 else "right"
+                for actions in sequences
+            )
+            priorities = np.asarray([
+                10.0 if group == "left" else 0.0
+                for group in groups
+            ])
+            return priorities, groups
+
+        trace = []
+        result = chunked_beam_search(
+            initial_state=np.asarray([0.0]),
+            action_space=(0, 1),
+            horizon=2,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            beam_width=2,
+            chunk_size=2,
+            rank_step=rank_step,
+            rank_group_quota=1,
+            frontier_callback=trace.append,
+        )
+
+        final_frontier = trace[-1]
+        retained_groups = {
+            final_frontier["rank_groups"][index]
+            for index in np.flatnonzero(final_frontier["retained"])
+        }
+        self.assertEqual(retained_groups, {"left", "right"})
+        self.assertEqual(result.score, 0.0)
+        np.testing.assert_array_equal(result.actions, [0.0, 0.0])
+        self.assertEqual(result.candidate_count, 6)
+
+    def test_tie_mode_group_quota_does_not_displace_clear_objective_winner(self):
+        def evaluate_step(states, _sequences, _step):
+            return states[:, 0].copy(), np.ones(
+                len(states), dtype=bool,
+            )
+
+        def rank_step(states, _sequences, _step):
+            groups = tuple(
+                "lower-objective" if state[0] == 0.0 else "higher-objective"
+                for state in states
+            )
+            priorities = np.where(states[:, 0] == 0.0, 0.0, 100.0)
+            return priorities, groups
+
+        result = chunked_beam_search(
+            initial_state=np.asarray([0.0]),
+            action_space=(0, 1),
+            horizon=1,
+            transition_batch=self.add_action,
+            evaluate_step=evaluate_step,
+            beam_width=1,
+            chunk_size=1,
+            rank_step=rank_step,
+            rank_mode="tie",
+            rank_margin=0.0,
+            rank_group_quota=1,
+        )
+
+        self.assertEqual(result.score, 0.0)
+        self.assertEqual(result.final_state[0], 0.0)
+        np.testing.assert_array_equal(result.actions, [0.0])
 
     def test_frontier_callback_is_observational_only(self):
         def evaluate_step(states, _actions, _step):

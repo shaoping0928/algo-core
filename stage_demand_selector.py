@@ -251,6 +251,21 @@ class StageDemandSelector:
             report["reason"] = "no_supported_nonterminal_sibling"
             return None, report
         best = candidates[0]
+        support_confidence = (
+            best["episode_support"]
+            / float(best["episode_support"] + self.min_outcome_episodes)
+        )
+        if len(candidates) > 1:
+            margin = max(
+                best["value"] - candidates[1]["value"], 0.0,
+            )
+            separation = margin / max(self.readout.target_std, 1e-9)
+            value_confidence = 1.0 - float(np.exp(-separation))
+        else:
+            value_confidence = 0.5
+        demand_strength = float(np.clip(
+            support_confidence * value_confidence, 0.0, 1.0,
+        ))
         # Build from the exact row that was scored.  Re-matching by target
         # could pick another outcome row with the same destination but a
         # different probability when the memory reports duplicates.
@@ -262,6 +277,8 @@ class StageDemandSelector:
             transition_probability=best["probability"],
             transition_support=int(prediction.get("support", 0)),
             transition_resolution=prediction.get("resolution"),
+            transition_episode_support=best["episode_support"],
+            demand_strength=demand_strength,
         )
         report.update(
             status="supported",
@@ -276,6 +293,9 @@ class StageDemandSelector:
             ),
             provenance="world_feedback_outcome_readout",
             affects_value=False,
+            demand_strength=demand_strength,
+            support_confidence=float(support_confidence),
+            value_confidence=float(value_confidence),
         )
         return demand, report
 

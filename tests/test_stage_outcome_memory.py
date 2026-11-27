@@ -59,6 +59,48 @@ class SignalSegmentationTests(unittest.TestCase):
         self.assertEqual(detector.thresholds, fitted_thresholds)
         self.assertEqual(signals[1], ())
 
+    def test_detector_ignores_float32_ulp_noise_on_constant_drift_channel(self):
+        # Simulate float32 constant drift (-0.01/frame) with one genuine jump (+0.80).
+        xs = np.empty(120, dtype=np.float32)
+        value = np.float32(0.8)
+        for i in range(120):
+            xs[i] = value
+            if i == 78:
+                value = np.float32(value + np.float32(0.80))
+            else:
+                value = np.float32(value - np.float32(0.01))
+        obs = xs.astype(np.float64)[:, None]
+        detector = GenericKeySignalDetector(quantile=0.98).fit([
+            dict(observations=obs, feedback=np.zeros((119, 1))),
+        ])
+        signals = detector.transform_episode(obs, feedback=np.zeros((119, 1)))
+        fired_steps = [
+            step for step, row in enumerate(signals)
+            if any(sig.channel == ("observation_change", 0) for sig in row)
+        ]
+        self.assertEqual(fired_steps, [79])
+
+    def test_detector_ignores_monotonic_constant_counter_channel(self):
+        counter = np.arange(50, dtype=float)[:, None]
+        detector = GenericKeySignalDetector(quantile=0.98).fit([
+            dict(observations=counter, feedback=np.zeros((49, 1))),
+        ])
+        self.assertNotIn(("observation_change", 0), detector.thresholds)
+        signals = detector.transform_episode(
+            counter, feedback=np.zeros((49, 1)),
+        )
+        self.assertTrue(all(row == () for row in signals))
+
+    def test_detector_suppresses_routine_action_echo_plateau(self):
+        # 80% of steps drift by -0.016, 20% jump by +0.184 (+float32 jitter).
+        rng = np.random.RandomState(0)
+        deltas = np.where(rng.rand(200) < 0.20, 0.184, -0.016).astype(np.float32)
+        obs = np.concatenate([[0.0], np.cumsum(deltas)]).astype(np.float64)[:, None]
+        detector = GenericKeySignalDetector(quantile=0.98).fit([
+            dict(observations=obs, feedback=np.zeros((200, 1))),
+        ])
+        self.assertNotIn(("observation_change", 0), detector.thresholds)
+
     def test_sustained_key_signal_creates_one_boundary_on_rising_edge(self):
         observations = np.arange(6, dtype=float)[:, None]
         actions = [0, 0, 1, 1, 0]

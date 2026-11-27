@@ -75,25 +75,51 @@ def _row_features(agent, obs, pending, source: str = "branch"):
     ``prototype`` returns the runtime's own nearest node for the encoded
     state, which is available for any candidate state and therefore gives the
     demand association a dense feature source without task geometry.
+    ``hybrid`` keeps both views under separate namespaces.
     """
-    if source == "prototype":
+    if source not in ("branch", "prototype", "hybrid"):
+        raise ValueError("feature source must be branch/prototype/hybrid")
+    features = []
+    if source in ("prototype", "hybrid"):
         nearest = getattr(agent, "_nearest", None)
-        if nearest is None:
-            return ()
-        scales = np.asarray(agent.scales, dtype=float)
-        state = np.concatenate([
-            np.asarray(obs, dtype=float).reshape(-1),
-            np.asarray(pending, dtype=float).reshape(-1),
-        ])
-        if state.size != scales.size:
-            return ()
-        node, distance = nearest(state / scales)
-        if node is None or not np.isfinite(distance):
-            return ()
-        return (("prototype", str(node)),)
-    branch = getattr(agent, "_branch_active_features", None)
-    features = branch(obs) if branch is not None else ()
-    return tuple(dict.fromkeys(_native(feature) for feature in features))
+        if nearest is not None:
+            scales = np.asarray(agent.scales, dtype=float)
+            state = np.concatenate([
+                np.asarray(obs, dtype=float).reshape(-1),
+                np.asarray(pending, dtype=float).reshape(-1),
+            ])
+            if state.size == scales.size:
+                node, distance = nearest(state / scales)
+                if node is not None and np.isfinite(distance):
+                    features.append(("prototype", str(node)))
+    if source in ("branch", "hybrid"):
+        branch = getattr(agent, "_branch_active_features", None)
+        active = branch(obs) if branch is not None else ()
+        if source == "branch":
+            features.extend(_native(feature) for feature in active)
+        else:
+            features.extend(
+                ("branch", _native(feature)) for feature in active
+            )
+    if source == "hybrid":
+        all_features = list(getattr(agent, "_feature_all", ()))
+        value_roots = set(getattr(agent, "value_feature_ids", ()))
+        mask_reader = getattr(agent, "_feature_mask_table", None)
+        scales = np.asarray(getattr(agent, "scales", ()), dtype=float)
+        observation = np.asarray(obs, dtype=float).reshape(-1)
+        if (mask_reader is not None and scales.size >= observation.size
+                and value_roots):
+            masks = mask_reader(
+                (observation / scales[:observation.size]).reshape(1, -1)
+            )
+            for feature_id in value_roots:
+                if feature_id not in all_features:
+                    continue
+                mask = masks[all_features.index(feature_id)]
+                if mask is not None and bool(
+                        np.asarray(mask, dtype=bool).reshape(-1)[0]):
+                    features.append(("value", str(feature_id)))
+    return tuple(dict.fromkeys(features))
 
 
 def _episode_frames(rows: Sequence[Mapping], agent, lag: int,
@@ -109,8 +135,8 @@ def _episode_frames(rows: Sequence[Mapping], agent, lag: int,
     when only stage alignment is needed; the feature masks are expensive and
     are not required by the resolver.
     """
-    if feature_source not in ("branch", "prototype"):
-        raise ValueError("feature_source must be branch or prototype")
+    if feature_source not in ("branch", "prototype", "hybrid"):
+        raise ValueError("feature_source must be branch/prototype/hybrid")
     grouped = OrderedDict()
     contiguous = {}
     previous = None

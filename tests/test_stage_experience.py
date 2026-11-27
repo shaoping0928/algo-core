@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from stage_experience import StageExperienceBatch
+from stage_experience import StageExperienceBatch, _row_features
 from stage_outcome_memory import StageOutcomeMemory
 
 
@@ -122,6 +122,40 @@ class StageExperienceTests(unittest.TestCase):
         transformed = batch.transform(heldout, self.agent)
         self.assertEqual(transformed.feature_source, "prototype")
         self.assertAlmostEqual(transformed.census["feature_coverage"], 1.0)
+
+    def test_hybrid_source_keeps_branch_and_prototype_tokens_separate(self):
+        batch = StageExperienceBatch.fit(
+            training_rows(), self.agent, lag=2, quantile=0.6,
+            feature_source="hybrid",
+        )
+        self.assertEqual(batch.feature_source, "hybrid")
+        observed = {
+            feature
+            for episode in batch.episodes
+            for stage in episode
+            for snapshot in stage.feature_snapshots
+            for feature in snapshot
+        }
+        self.assertIn(("branch", "f_low"), observed)
+        self.assertIn(("branch", "f_high"), observed)
+        self.assertIn(("prototype", "p_low"), observed)
+        self.assertIn(("prototype", "p_high"), observed)
+        self.assertEqual(batch.census["feature_ids"], 4)
+
+    def test_hybrid_source_exposes_value_only_roots_to_demand_learning(self):
+        agent = FakeAgent(lag=2)
+        agent.value_feature_ids = ["value_alignment"]
+        agent._feature_all = ["value_alignment"]
+        agent._feature_mask_table = lambda observations: [
+            np.abs(np.asarray(observations, dtype=float)[:, 0]) < 1.0
+        ]
+
+        features = _row_features(
+            agent, np.asarray([0.0, 0.0]), np.zeros(2), "hybrid",
+        )
+        self.assertIn(("value", "value_alignment"), features)
+        self.assertIn(("branch", "f_low"), features)
+        self.assertIn(("prototype", "p_low"), features)
 
     def test_stage_boundaries_come_from_generic_change_channels(self):
         first, second = self.batch.episodes

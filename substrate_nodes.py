@@ -78,6 +78,7 @@ from substrate_generic import (
 from trajectory_search import (
     SearchResult,
     beam_search,
+    chunked_beam_search,
     exhaustive_search,
     merge_candidate_batches,
     override_first_action,
@@ -185,7 +186,9 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         death_rule_envelope: bool = False,
         readout_propagation_gain: float = 0.0,
         readout_propagation_steps: int = 1,
-        readout_propagation_edges: str = "transition"):
+        readout_propagation_edges: str = "transition",
+        online_feature_learning: bool = False,
+        online_feature_options=None):
     """Fit the world model and the node runtime on a transition stream."""
     obs_dim = len(transitions[0]["obs"])
     action_dim = lag + 1
@@ -250,6 +253,8 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         readout_propagation_gain=readout_propagation_gain,
         readout_propagation_steps=readout_propagation_steps,
         readout_propagation_edges=readout_propagation_edges,
+        online_feature_learning=online_feature_learning,
+        online_feature_options=online_feature_options,
     )
     episodes = {}
     for row in transitions:
@@ -323,7 +328,9 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
                 # their single-pass statistics.
                 agent.replay_features(episode)
             else:
-                agent.learn_episode(episode)
+                agent.learn_episode(
+                    episode, learn_online=(epoch == 0),
+                )
         if induce_features and epoch == 0:
             primary = pain_short if long_window is not None else pain
             agent.induce_rules(
@@ -845,6 +852,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         option_tolerance=0.05,
         option_min_support=1,
         option_min_episodes=1,
+        online_feature_learning=False,
+        online_feature_options=None,
         env_factory=None):
     """Collect transitions and train the node runtime on them.
 
@@ -881,9 +890,10 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         raise ValueError("lag must be non-negative")
     if not 0.5 < float(stage_memory_quantile) < 1.0:
         raise ValueError("stage_memory_quantile must be between 0.5 and 1")
-    if str(stage_memory_feature_source) not in ("branch", "prototype"):
+    if str(stage_memory_feature_source) not in (
+            "branch", "prototype", "hybrid"):
         raise ValueError(
-            "stage_memory_feature_source must be branch or prototype"
+            "stage_memory_feature_source must be branch/prototype/hybrid"
         )
     if int(stage_demand_min_support) < 1:
         raise ValueError("stage_demand_min_support must be positive")
@@ -978,6 +988,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
             branch_transitions=branch_transitions,
             action_edge_weight=action_edge_weight,
             action_edge_trust_samples=action_edge_trust_samples,
+            online_feature_learning=online_feature_learning,
+            online_feature_options=online_feature_options,
         )
         propensities = []
         # Re-collect the whole stream with the guide instead of splicing
@@ -1071,6 +1083,8 @@ def fit(seed, steps=5000, coverage=0.1, max_nodes=5000,
         readout_propagation_gain=readout_propagation_gain,
         readout_propagation_steps=readout_propagation_steps,
         readout_propagation_edges=readout_propagation_edges,
+        online_feature_learning=online_feature_learning,
+        online_feature_options=online_feature_options,
     )
     world, agent = _train(transitions, **train_kwargs)
     dagger_log = []
@@ -2217,6 +2231,71 @@ def make_node_prototype_rank_step(agent, demand, heuristic,
     )
 
 
+def make_node_hybrid_rank_step(agent, demand, heuristic,
+                               pending_prefix, lag, stats=None):
+    """Combine learned feature roots and prototypes for demand ranking.
+
+    Training and candidate-time tokens are namespaced identically. The
+    high-level demand changes only beam priority; it does not alter feature
+    readouts, feasibility, or the final objective score.
+    """
+    from stage_demand_heuristic import make_demand_rank_step
+
+    obs_dim = int(agent.obs_dim)
+    lag = int(lag)
+    scales = np.asarray(agent.scales, dtype=float)
+    prefix = np.asarray(pending_prefix, dtype=float).reshape(-1)
+    branch = getattr(agent, "_branch_active_features", None)
+
+    def extract_features(states, sequences, step):
+        states = np.asarray(states, dtype=float)
+        history = history_features(
+            sequences, step + 1, prefix, action_dim=lag + 1,
+        )
+        pending = history[:, :lag][:, ::-1] if lag else np.zeros(
+            (len(states), 0)
+        )
+        observations = states[:, :obs_dim]
+        encoded = np.concatenate([observations, pending], axis=1)
+        if encoded.shape[1] != scales.size:
+            raise ValueError(
+                "candidate state dimension does not match the agent scales"
+            )
+        encoded /= scales
+        value_roots = set(getattr(agent, "value_feature_ids", ()))
+        all_features = list(getattr(agent, "_feature_all", ()))
+        value_masks = (
+            agent._feature_mask_table(observations / scales[:obs_dim])
+            if value_roots else ()
+        )
+
+        feature_sets = []
+        for index, (observation, state) in enumerate(zip(observations, encoded)):
+            features = []
+            if branch is not None:
+                features.extend(
+                    ("branch", feature)
+                    for feature in branch(observation)
+                )
+            node, distance = agent._nearest(state)
+            if node is not None and np.isfinite(distance):
+                features.append(("prototype", str(node)))
+            for feature_id in value_roots:
+                if feature_id not in all_features:
+                    continue
+                mask = value_masks[all_features.index(feature_id)]
+                if mask is not None and bool(
+                        np.asarray(mask, dtype=bool).reshape(-1)[index]):
+                    features.append(("value", str(feature_id)))
+            feature_sets.append(tuple(features))
+        return feature_sets
+
+    return make_demand_rank_step(
+        heuristic, demand, feature_extractor=extract_features,
+        stats=stats,
+    )
+
+
 def make_node_root_rank_step(agent, demand, heuristic,
                              pending_prefix, lag, stats=None):
     """Rank candidate states by their resolved stage root.
@@ -2253,6 +2332,9 @@ def make_node_root_rank_step(agent, demand, heuristic,
                 "candidate state dimension does not match the agent scales"
             )
         raw_observations = np.asarray(states, dtype=float)[:, :obs_dim]
+        target_stages = tuple(getattr(
+            demand, "target_stages", (demand.target_stage,),
+        ))
         features = []
         for observation, queue in zip(raw_observations, pending):
             resolved = resolver.resolve(agent, observation, queue)
@@ -2272,7 +2354,7 @@ def make_node_root_rank_step(agent, demand, heuristic,
                 stats["feature_present"] = (
                     int(stats.get("feature_present", 0)) + 1
                 )
-                if (node_token,) == demand.target_stage:
+                if (node_token,) in target_stages:
                     stats["target_present"] = (
                         int(stats.get("target_present", 0)) + 1
                     )
@@ -2344,7 +2426,8 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                   demand_heuristic=None, rank_stats=None,
                   rank_mode="order", rank_margin=0.0,
                   stage_value=None, stage_value_weight=0.0,
-                  frontier_callback=None):
+                  frontier_callback=None, search_chunk_size=0,
+                  rank_group_quota=1):
     initial = np.asarray(env.obs(), dtype=float)
     agent_obs_dim = int(agent.obs_dim)
     if (stage_demand is None) != (demand_heuristic is None):
@@ -2364,6 +2447,13 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             )
         elif getattr(
                 agent, "stage_demand_feature_source", "branch",
+        ) == "hybrid":
+            rank_step = make_node_hybrid_rank_step(
+                agent, stage_demand, demand_heuristic, prefix, lag,
+                stats=rank_stats,
+            )
+        elif getattr(
+                agent, "stage_demand_feature_source", "branch",
         ) == "prototype":
             rank_step = make_node_prototype_rank_step(
                 agent, stage_demand, demand_heuristic, prefix, lag,
@@ -2376,6 +2466,14 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             )
     if rank_step is not None and int(beam_width) <= 0:
         raise ValueError("rank_step requires beam search with positive beam_width")
+    if int(search_chunk_size) < 0:
+        raise ValueError("search_chunk_size must be non-negative")
+    if int(rank_group_quota) < 0:
+        raise ValueError("rank_group_quota must be non-negative")
+    if int(search_chunk_size) > 0 and int(beam_width) <= 0:
+        raise ValueError(
+            "search_chunk_size requires beam search with positive beam_width"
+        )
 
     def agent_view(batch):
         """The agent's raw observation; a world may carry extra state dims."""
@@ -2456,7 +2554,31 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             _curiosity_potential(agent.evidence_batch(encoded_start))[0]
         )
 
+    action_space = tuple(getattr(agent, "action_space", (0, 1)))
+    n_actions = len(action_space)
+    full_exhaustive_count = (
+        (n_actions ** int(horizon))
+        if int(beam_width) == 0 and n_actions > 0 else 0
+    )
+
+    def _prefix_stride(count, step):
+        if (
+            full_exhaustive_count > 0
+            and count == full_exhaustive_count
+            and step + 1 < horizon
+        ):
+            return n_actions ** (horizon - 1 - step)
+        return 1
+
     def predict_batch(states, sequences, step):
+        stride = _prefix_stride(len(states), step)
+        if stride > 1:
+            history = history_features(
+                sequences[::stride], step + 1, pending_prefix,
+                action_dim=action_dim,
+            )
+            predicted = world.predict(states[::stride], history)
+            return np.repeat(predicted, stride, axis=0)
         history = history_features(
             sequences, step + 1, pending_prefix, action_dim=action_dim
         )
@@ -2555,13 +2677,40 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             # from the plan rather than the pending prefix, so a plain
             # stride can step over the first point the plan can actually
             # influence.
-            previous = previous_states_for(states, step)
+            previous = (
+                previous_states_for(states, step)
+                if q_table is not None else None
+            )
             if step % step_stride != 0 and not (
                 stride_includes_lag and step == lag
             ):
                 return (
                     np.zeros((len(states), 6)),
                     np.isfinite(states).all(axis=1),
+                )
+            stride = _prefix_stride(len(states), step)
+            if stride > 1 and q_table is None:
+                sub_states = states[::stride]
+                history = history_features(
+                    sequences[::stride], step + 1, pending_prefix,
+                    action_dim=action_dim,
+                )
+                pending = history[:, :agent.lag][:, ::-1]
+                encoded = (
+                    np.concatenate([agent_view(sub_states), pending], axis=1)
+                    / agent.scales
+                )
+                risk = agent.pain_signal_batch(encoded) * risk_weight * (
+                    risk_decay ** step
+                ) * error_factor(step)
+                zeros = np.zeros(len(sub_states))
+                cols = np.column_stack([
+                    risk, zeros, risk, zeros, zeros, zeros,
+                ])
+                finite = np.isfinite(encoded).all(axis=1)
+                return (
+                    np.repeat(cols, stride, axis=0),
+                    np.repeat(finite, stride, axis=0),
                 )
             history = history_features(
                 sequences, step + 1, pending_prefix, action_dim=action_dim
@@ -2571,18 +2720,18 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 np.concatenate([agent_view(states), pending], axis=1)
                 / agent.scales
             )
-            previous_history = history_features(
-                sequences, step, pending_prefix, action_dim=action_dim
-            )
-            previous_pending = previous_history[:, :agent.lag][:, ::-1]
-            previous_encoded = np.concatenate(
-                [agent_view(previous), previous_pending], axis=1
-            ) / agent.scales
             risk = agent.pain_signal_batch(encoded) * risk_weight * (
                 risk_decay ** step
             ) * error_factor(step)
             q_cost = np.zeros(len(states))
             if q_table is not None:
+                previous_history = history_features(
+                    sequences, step, pending_prefix, action_dim=action_dim
+                )
+                previous_pending = previous_history[:, :agent.lag][:, ::-1]
+                previous_encoded = np.concatenate(
+                    [agent_view(previous), previous_pending], axis=1
+                ) / agent.scales
                 q_pain, q_count = agent.action_edge_transition_q_batch(
                     previous_encoded, encoded, q_table
                 )
@@ -2612,19 +2761,36 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
                 np.concatenate([agent_view(states), pending], axis=1)
                 / agent.scales
             )
-            pain, dopamine = agent.valence_state_batch(encoded)
+            if isinstance(agent, NodeRuntime) and len(encoded) > 0:
+                soft_weights = agent._soft_weights_batch(encoded)
+                pain, dopamine = agent.valence_state_batch(
+                    encoded, soft_weights=soft_weights
+                )
+            else:
+                soft_weights = None
+                pain, dopamine = agent.valence_state_batch(encoded)
             mask_table = agent._feature_mask_table(
                 encoded[:, :agent.obs_dim]
             )
             if getattr(agent, "predicate_readouts", False):
                 # D3: the terminal hazard comes from the predicates only;
                 # the prototype valence no longer bounds it.
-                signal = agent.pain_signal_batch(encoded, mask_table)
+                if soft_weights is not None:
+                    signal = agent.pain_signal_batch(
+                        encoded, mask_table, soft_weights=soft_weights
+                    )
+                else:
+                    signal = agent.pain_signal_batch(encoded, mask_table)
                 risk = signal * risk_weight * (risk_decay ** horizon) * (
                     error_factor(horizon - 1)
                 )
             else:
-                signal = agent.pain_signal_batch(encoded, mask_table)
+                if soft_weights is not None:
+                    signal = agent.pain_signal_batch(
+                        encoded, mask_table, soft_weights=soft_weights
+                    )
+                else:
+                    signal = agent.pain_signal_batch(encoded, mask_table)
                 risk = terminal_hazard(
                     pain,
                     signal,
@@ -2860,7 +3026,11 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             )
             frontier_callback(payload)
 
-        result = beam_search(
+        search_function = (
+            beam_search if int(search_chunk_size) == 0
+            else chunked_beam_search
+        )
+        search_options = dict(
             initial_state=initial,
             action_space=tuple(getattr(agent, "action_space", (0, 1))),
             horizon=horizon,
@@ -2872,10 +3042,17 @@ def policy_result(env, world, agent, prefix, horizon, lag=LAG,
             rank_step=rank_step,
             rank_mode=rank_mode,
             rank_margin=rank_margin,
+            rank_group_quota=(
+                int(rank_group_quota)
+                if int(search_chunk_size) > 0 else 0
+            ),
             frontier_callback=(
                 trace_frontier if frontier_callback is not None else None
             ),
         )
+        if int(search_chunk_size) > 0:
+            search_options["chunk_size"] = int(search_chunk_size)
+        result = search_function(**search_options)
         return result
     result = exhaustive_search(
         initial_state=initial,
@@ -3025,6 +3202,184 @@ def stage_result(env, world, agent, prefix, blocks=4, block_frames=4, lag=LAG,
     )
 
 
+def chained_shallow_result(
+    env, world, agent, prefix, chunk_size=2, n_hops=3, beam_width=2,
+    lag=LAG, step_stride=2, risk_weight=1.0,
+    stage_value=None, stage_value_weight=0.0,
+    heuristic_demand=None, heuristic_demand_weight=0.0,
+    diverse_first_action=True,
+) -> SearchResult:
+    """Chained 2-3 frame active-pruning shallow search.
+
+    Chains ``n_hops`` short searches of ``chunk_size`` frames, pruning to the
+    top ``beam_width`` frontier states at each intermediate hop boundary.
+    ``heuristic_demand`` (when provided) is used strictly for intermediate
+    pruning/ranking and NEVER alters the final objective score used to choose
+    among the surviving terminal candidates.
+    """
+    if int(chunk_size) < 1:
+        raise ValueError("chunk_size must be positive")
+    if int(n_hops) < 1:
+        raise ValueError("n_hops must be positive")
+    if int(beam_width) < 1:
+        raise ValueError("beam_width must be positive")
+    initial = np.asarray(env.obs(), dtype=float)
+    pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
+    action_space = tuple(getattr(agent, "action_space", (0, 1)))
+    n_act = len(action_space)
+    action_arr = np.asarray(action_space, dtype=float)
+    action_dim = int(lag) + 1
+    step_stride = max(int(step_stride), 1)
+    risk_weight = float(risk_weight)
+    obs_dim = int(agent.obs_dim)
+    scales = agent.scales
+    chunk_size = int(chunk_size)
+    n_hops = int(n_hops)
+    beam_width = int(beam_width)
+    horizon = chunk_size * n_hops
+    is_rt = isinstance(agent, NodeRuntime)
+    sv_weight = float(stage_value_weight)
+    hd_weight = float(heuristic_demand_weight)
+
+    states = initial.reshape(1, -1)
+    sequences = np.zeros((1, horizon), dtype=float)
+    cum_risk = np.zeros(1, dtype=float)
+    first_states = None
+    candidate_count = 0
+
+    for hop in range(n_hops):
+        start_step = hop * chunk_size
+        end_step = start_step + chunk_size
+        for step in range(start_step, end_step):
+            count = len(states)
+            next_states = np.repeat(states, n_act, axis=0)
+            next_seqs = np.repeat(sequences, n_act, axis=0)
+            next_seqs[:, step] = np.tile(action_arr, count)
+            history = history_features(
+                next_seqs, step + 1, pending_prefix, action_dim=action_dim,
+            )
+            next_states = np.asarray(
+                world.predict(next_states, history), dtype=float
+            )
+            if first_states is None:
+                first_states = next_states.copy()
+            else:
+                first_states = np.repeat(first_states, n_act, axis=0)
+            candidate_count += len(next_states)
+            next_risk = np.repeat(cum_risk, n_act)
+            if step % step_stride == 0 and step < horizon - 1:
+                pending = history[:, :agent.lag][:, ::-1]
+                encoded = np.concatenate(
+                    [next_states[:, :obs_dim], pending], axis=1
+                ) / scales
+                next_risk = next_risk + np.asarray(
+                    agent.pain_signal_batch(encoded), dtype=float
+                ) * risk_weight
+            states = next_states
+            sequences = next_seqs
+            cum_risk = next_risk
+
+        if hop < n_hops - 1:
+            # Intermediate active pruning: heuristic ranker only (separate from
+            # the true terminal objective).
+            h_score = cum_risk.copy()
+            if stage_value is not None and sv_weight > 0.0:
+                pen = np.asarray(
+                    stage_value(states, sequences), dtype=float
+                ).reshape(-1)
+                h_score = h_score + sv_weight * pen
+            if heuristic_demand is not None and hd_weight > 0.0:
+                h_score = h_score + hd_weight * np.asarray(
+                    heuristic_demand(states), dtype=float
+                ).reshape(-1)
+            finite = np.isfinite(h_score) & np.isfinite(states).all(axis=1)
+            if finite.any():
+                h_score = np.where(finite, h_score, np.inf)
+            else:
+                h_score = np.zeros(len(states), dtype=float)
+            k_keep = min(beam_width, len(states))
+            if diverse_first_action and hop == 0 and k_keep >= n_act:
+                chosen = []
+                used = set()
+                per_a = max(1, k_keep // n_act)
+                for a_val in action_space:
+                    idxs = np.flatnonzero(sequences[:, 0] == float(a_val))
+                    if len(idxs):
+                        for ii in idxs[np.argsort(h_score[idxs])[:per_a]]:
+                            chosen.append(int(ii))
+                            used.add(int(ii))
+                for ii in np.argsort(h_score):
+                    if len(chosen) >= k_keep:
+                        break
+                    if int(ii) not in used:
+                        chosen.append(int(ii))
+                        used.add(int(ii))
+                keep = np.asarray(chosen[:k_keep], dtype=int)
+            else:
+                keep = np.argsort(h_score)[:k_keep]
+            states = states[keep]
+            sequences = sequences[keep]
+            cum_risk = cum_risk[keep]
+            first_states = first_states[keep]
+
+    # Final terminal evaluation using strictly the true calibrated objective.
+    history = history_features(
+        sequences, horizon, pending_prefix, action_dim=action_dim,
+    )
+    pending = history[:, :agent.lag][:, ::-1]
+    encoded = np.concatenate([states[:, :obs_dim], pending], axis=1) / scales
+    if is_rt and len(encoded) > 0:
+        sw = agent._soft_weights_batch(encoded)
+        pain, dopamine = agent.valence_state_batch(encoded, soft_weights=sw)
+        mask_table = agent._feature_mask_table(encoded[:, :obs_dim])
+        signal = agent.pain_signal_batch(encoded, mask_table, soft_weights=sw)
+    else:
+        pain, dopamine = agent.valence_state_batch(encoded)
+        mask_table = agent._feature_mask_table(encoded[:, :obs_dim])
+        signal = agent.pain_signal_batch(encoded, mask_table)
+    term_risk = terminal_hazard(pain, signal, risk_weight)
+    risk = cum_risk + term_risk
+    if getattr(agent, "value_readout", "cells") == "association":
+        value, support = association_value_batch(agent, encoded)
+    else:
+        value, support = agent.feature_value_batch(
+            encoded, mask_table, return_support=True
+        )
+    trust = support / (support + getattr(agent, "value_trust_samples", 150.0))
+    value_term = -agent.feature_value_weight * trust * value
+    cost = risk + value_term
+    if stage_value is not None and sv_weight > 0.0:
+        penalties = np.asarray(
+            stage_value(states, sequences), dtype=float
+        ).reshape(-1)
+        if penalties.shape != (len(states),) or not np.isfinite(penalties).all():
+            raise ValueError("stage_value must return finite penalties")
+        cost = cost + sv_weight * penalties
+    finite = np.isfinite(cost) & np.isfinite(encoded).all(axis=1)
+    if not finite.any():
+        raise ValueError("chained shallow search found no finite candidate")
+    ranking_cost = np.where(finite, cost, np.inf)
+    order = np.lexsort((-dopamine, ranking_cost))
+    best = int(order[0])
+    score = (
+        float(cost[best]),
+        float(-dopamine[best]),
+        float(risk[best]),
+        float(value_term[best]),
+        0.0,
+        0.0,
+    )
+    return SearchResult(
+        actions=np.asarray(sequences[best], dtype=float).copy(),
+        score=score,
+        feasible=True,
+        feasible_count=int(finite.sum()),
+        candidate_count=int(candidate_count),
+        first_state=np.asarray(first_states[best], dtype=float).copy(),
+        final_state=np.asarray(states[best], dtype=float).copy(),
+    )
+
+
 def policy_action(env, world, agent, prefix, horizon, lag=LAG,
                   step_stride=2, stride_includes_lag=False):
     return int(policy_result(
@@ -3111,7 +3466,10 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                     demand_heuristic=None, rank_stats=None,
                     rank_mode="order", rank_margin=0.0,
                     stage_value=None, stage_value_weight=0.0,
-                    frontier_callback=None):
+                    frontier_callback=None, search_chunk_size=0,
+                    rank_group_quota=1,
+                    chain_chunk_size=2, chain_hops=3, chain_beam_width=2,
+                    heuristic_demand=None, heuristic_demand_weight=0.0):
     """Dispatch one decision to the searched or the cell-Q-only policy.
 
     With `ledger_out` (a list) and the search decision, the winning
@@ -3162,6 +3520,8 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
             stage_value=stage_value,
             stage_value_weight=stage_value_weight,
             frontier_callback=frontier_callback,
+            search_chunk_size=search_chunk_size,
+            rank_group_quota=rank_group_quota,
         )
         if ledger_out is not None:
             score = result.score
@@ -3177,10 +3537,34 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                 final=np.asarray(result.final_state, dtype=float),
                 actions=np.asarray(result.actions, dtype=float),
                 cost=float(np.asarray(result.score).reshape(-1)[0]),
+                objective_score=np.asarray(
+                    result.score, dtype=float
+                ).reshape(-1).tolist(),
+                rank_credit=float(
+                    getattr(result, "rank_priority", 0.0)
+                ),
                 candidate_count=int(
                     getattr(result, "candidate_count", 0)
                 ),
             ))
+        return int(result.actions[0])
+    if decision == "chained":
+        result = chained_shallow_result(
+            env, world, agent, prefix,
+            chunk_size=chain_chunk_size,
+            n_hops=chain_hops,
+            beam_width=chain_beam_width,
+            lag=lag,
+            step_stride=step_stride,
+            risk_weight=risk_weight,
+            stage_value=stage_value,
+            stage_value_weight=stage_value_weight,
+            heuristic_demand=heuristic_demand,
+            heuristic_demand_weight=heuristic_demand_weight,
+        )
+        if ledger_out is not None:
+            score = result.score
+            ledger_out.append((float(score[2]), float(score[3])))
         return int(result.actions[0])
     if decision == "stage":
         result = stage_result(
@@ -3303,7 +3687,11 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
              stage_demand_provider=None, rank_stats=None,
              rank_mode="order", rank_margin=0.0,
              stage_value=None, stage_value_weight=0.0,
-             frontier_callback=None):
+             frontier_callback=None, search_chunk_size=0,
+             rank_group_quota=1,
+             chain_chunk_size=2, chain_hops=3, chain_beam_width=2,
+             heuristic_demand=None, heuristic_demand_weight=0.0,
+             adapt_world=False):
     """Run one deterministic evaluation episode.
 
     ``env_seed`` selects the world instance; when omitted the historical
@@ -3366,6 +3754,11 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
                 threshold, frame, scale=getattr(agent, "milestone_scale", None)
             )
     visited = [] if tracker is not None else None
+    observe_online_features = (
+        getattr(agent, "observe_online_transition", None)
+        if getattr(agent, "online_feature_learner", None) is not None
+        else None
+    )
     while not env.dead and env.t < cap:
         obs = np.asarray(env.obs(), dtype=float)
         agent_obs = obs[:int(agent.obs_dim)]
@@ -3434,6 +3827,13 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             stage_value=stage_value,
             stage_value_weight=stage_value_weight,
             frontier_callback=frontier_callback,
+            search_chunk_size=search_chunk_size,
+            rank_group_quota=rank_group_quota,
+            chain_chunk_size=chain_chunk_size,
+            chain_hops=chain_hops,
+            chain_beam_width=chain_beam_width,
+            heuristic_demand=heuristic_demand,
+            heuristic_demand_weight=heuristic_demand_weight,
         )
         if candidate_out is not None:
             candidate_out.append(collected)
@@ -3452,11 +3852,15 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             stage_demand_provider, "observe_transition", None
         )
         next_obs = None
-        if prediction_hook or record or observe_provider is not None:
+        if (prediction_hook or record or observe_provider is not None
+                or observe_online_features is not None or adapt_world):
             next_obs = np.asarray(env.obs(), dtype=float)
+        if adapt_world and hasattr(world, "observe"):
+            world.observe(obs, history, next_obs)
         if prediction_hook:
             agent.observe_prediction(next_obs[:int(agent.obs_dim)])
-        if record or observe_provider is not None:
+        if (record or observe_provider is not None
+                or observe_online_features is not None):
             feedback = env.feedback()
             transition_record = dict(
                 obs=obs,
@@ -3481,7 +3885,18 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
                 transitions.append(transition_record)
             if observe_provider is not None:
                 observe_provider(dict(transition_record))
+            if observe_online_features is not None:
+                online_transition = dict(transition_record)
+                online_transition["episode"] = (
+                    int(seed if env_seed is None else env_seed),
+                    int(episode),
+                )
+                observe_online_features(online_transition)
         recent = [float(action)] + recent[:-1]
+    if observe_online_features is not None:
+        agent.online_feature_learner.end_episode(
+            terminal=bool(env.dead),
+        )
     if metrics_out is not None:
         # Task-level progress the world reports but the learner never sees:
         # how many progress milestones the episode reached.  Frames count
@@ -3616,6 +4031,34 @@ def run_seed(task):
     stage_memory_feature_source = str(
         task.get("stage_memory_feature_source", "branch")
     )
+    online_feature_learning = bool(
+        task.get("online_feature_learning", False)
+    )
+    regime_value_weight = float(task.get("regime_value_weight", 0.0))
+    regime_n_regimes = int(task.get("regime_n_regimes", 16))
+    regime_min_dwell = int(task.get("regime_min_dwell", 6))
+    regime_partition = str(task.get("regime_partition", "survival_tree"))
+    regime_k_stages = int(task.get("regime_k_stages", 8))
+    regime_mode = str(task.get("regime_mode", "lcb"))
+    regime_lcb_z = float(task.get("regime_lcb_z", 1.0))
+    regime_value_key = str(task.get("regime_value_key", "cum_survival"))
+    regime_soft_top_k = int(task.get("regime_soft_top_k", 4))
+    regime_kernel_tau = float(task.get("regime_kernel_tau", 0.7))
+    regime_min_coverage = float(task.get("regime_min_coverage", 0.80))
+    regime_ood_policy = str(task.get("regime_ood_policy", "neutral_mean"))
+    regime_online_every = int(task.get("regime_online_every", 0))
+    regime_online_frames = int(task.get("regime_online_frames", 12000))
+    regime_failure_weight = float(task.get("regime_failure_weight", 0.0))
+    regime_failure_sigma = float(task.get("regime_failure_sigma", 0.25))
+    regime_failure_prior = float(task.get("regime_failure_prior", 4.0))
+    world_variables = bool(task.get("world_variables", False))
+    world_var_reset_episode = bool(task.get("world_var_reset_episode", False))
+    world_var_sigma = float(task.get("world_var_sigma", 0.75))
+    chain_chunk_size = int(task.get("chain_chunk_size", 2))
+    chain_hops = int(task.get("chain_hops", 3))
+    chain_beam_width = int(task.get("chain_beam_width", 2))
+    chain_demand_weight = float(task.get("chain_demand_weight", 0.10))
+    online_feature_options = task.get("online_feature_options")
 
     world, agent = fit(
         seed, steps=steps, coverage=coverage,
@@ -3690,8 +4133,115 @@ def run_seed(task):
         stage_memory=stage_memory,
         stage_memory_quantile=stage_memory_quantile,
         stage_memory_feature_source=stage_memory_feature_source,
+        online_feature_learning=online_feature_learning,
+        online_feature_options=online_feature_options,
     )
     explicit_eval = bool(eval_seeds)
+    eval_world = world
+    world_var_node = None
+    if world_variables:
+        from node_variables import DynamicsClassNode
+        training_rows_for_vars = getattr(agent, "milestone_training_rows", ())
+        if training_rows_for_vars:
+            world_var_node = DynamicsClassNode(world, training_rows_for_vars)
+            eval_world = world_var_node
+    regime_evaluator = None
+    regime_online_updater = None
+    regime_stage_value = None
+    regime_stats = None
+    feature_demand = None
+    heuristic_demand_cb = None
+    online_episode_id = 0
+    if regime_value_weight > 0.0:
+        from stage_regime import (
+            CalibratedRegimeTransitionModel,
+            ControllableFeatureDemand,
+            OnlineRegimeContinuationUpdater,
+            RegimeContinuationEvaluator,
+            StageRegimeSummarizer,
+            TrunkPointFailureMemory,
+        )
+        training_rows = getattr(agent, "milestone_training_rows", ())
+        summarizer = StageRegimeSummarizer(
+            n_regimes=regime_n_regimes,
+            min_dwell=regime_min_dwell,
+            partition=regime_partition,
+        ).fit_rows(training_rows, lag=lag)
+        regime_episodes = summarizer.transform_rows(training_rows, lag=lag)
+        regime_model = CalibratedRegimeTransitionModel(
+            max_depth=2, min_episodes=2,
+        ).fit(regime_episodes, use_action=True)
+        regime_values = regime_model.continuation_values(
+            len(summarizer.centers_),
+            horizon_stages=regime_k_stages,
+            mode=regime_mode,
+            min_action_episodes=4,
+            lcb_z=regime_lcb_z,
+        )
+        regime_evaluator = RegimeContinuationEvaluator(
+            summarizer,
+            regime_values,
+            min_regime_episodes=2,
+            min_decision_coverage=regime_min_coverage,
+            ood_policy=regime_ood_policy,
+            value_key=regime_value_key,
+            soft_top_k=regime_soft_top_k,
+            kernel_tau=regime_kernel_tau,
+        )
+        regime_stats = {}
+        if regime_online_every > 0:
+            failure_mem = None
+            if regime_failure_weight > 0.0:
+                failure_mem = TrunkPointFailureMemory(
+                    summarizer,
+                    sigma_mult=regime_failure_sigma,
+                    prior=regime_failure_prior,
+                    var_sigma=world_var_sigma,
+                )
+                failure_mem.ingest_rows(training_rows, include_failures=False)
+            regime_online_updater = OnlineRegimeContinuationUpdater(
+                summarizer,
+                regime_episodes,
+                horizon_stages=regime_k_stages,
+                mode=regime_mode,
+                min_action_episodes=4,
+                lcb_z=regime_lcb_z,
+                max_depth=2,
+                min_episodes=2,
+                min_regime_episodes=2,
+                min_decision_coverage=regime_min_coverage,
+                ood_policy=regime_ood_policy,
+                value_key=regime_value_key,
+                soft_top_k=regime_soft_top_k,
+                kernel_tau=regime_kernel_tau,
+                update_every=regime_online_every,
+                max_online_frames=regime_online_frames,
+                initial_evaluator=regime_evaluator,
+                failure_memory=failure_mem,
+                failure_memory_weight=regime_failure_weight,
+                var_sigma=world_var_sigma,
+            )
+            regime_stage_value = regime_online_updater.as_stage_value_callback(
+                stats=regime_stats,
+                var_signature_getter=(
+                    world_var_node.world_signature
+                    if world_var_node is not None else None
+                ),
+            )
+            online_episode_id = (
+                max((int(r.get("episode", 0)) for r in training_rows), default=0)
+                + 1000
+            )
+        else:
+            regime_stage_value = regime_evaluator.as_stage_value_callback(
+                stats=regime_stats,
+            )
+        if decision == "chained" and chain_demand_weight > 0.0:
+            feature_demand = ControllableFeatureDemand().fit_rows(
+                world, agent, training_rows, lag=lag,
+            )
+            heuristic_demand_cb = feature_demand.distance_batch
+
     if not explicit_eval:
         eval_seeds = [seed]
     rows = []
@@ -3711,11 +4261,16 @@ def run_seed(task):
                 else:
                     env_seed = int(eval_seed) * 10000 + episode
                 metrics = {}
-                frames, actions, _ = evaluate(
-                    seed, world, agent, cap=cap, horizon=horizon, lag=lag,
+                if world_var_node is not None and world_var_reset_episode:
+                    world_var_node.reset_variables()
+                record_online = regime_online_updater is not None
+                frames, actions, ep_rows = evaluate(
+                    seed, eval_world, agent, cap=cap, horizon=horizon, lag=lag,
                     step_stride=step_stride,
                     stride_includes_lag=stride_includes_lag,
                     env_seed=env_seed,
+                    record=record_online,
+                    episode=online_episode_id if record_online else 0,
                     decision=decision,
                     risk_weight=risk_weight,
                     risk_decay=risk_decay,
@@ -3726,7 +4281,29 @@ def run_seed(task):
                     spacing=eval_spacing if eval_spacing > 0.0 else None,
                     milestone_weight=milestone_weight,
                     milestone_mode=milestone_mode,
+                    stage_value=regime_stage_value,
+                    stage_value_weight=regime_value_weight,
+                    chain_chunk_size=chain_chunk_size,
+                    chain_hops=chain_hops,
+                    chain_beam_width=chain_beam_width,
+                    heuristic_demand=heuristic_demand_cb,
+                    heuristic_demand_weight=(
+                        chain_demand_weight
+                        if heuristic_demand_cb is not None else 0.0
+                    ),
+                    adapt_world=(world_var_node is not None),
                 )
+                if record_online:
+                    online_episode_id += 1
+                    regime_online_updater.record_episode_rows(
+                        ep_rows,
+                        lag=lag,
+                        var_signature=(
+                            world_var_node.world_signature()
+                            if world_var_node is not None else None
+                        ),
+                    )
+                    regime_evaluator = regime_online_updater.evaluator
                 rows.append(dict(
                     train_seed=seed,
                     eval_seed=int(eval_seed),
@@ -3752,6 +4329,11 @@ def run_seed(task):
             agent.stage_experience.snapshot()
             if getattr(agent, "stage_experience", None) is not None else None
         ),
+        online_features=(
+            agent.online_feature_learner.snapshot()
+            if getattr(agent, "online_feature_learner", None) is not None
+            else None
+        ),
         stage_resolver=(
             agent.stage_resolver.snapshot()
             if getattr(agent, "stage_resolver", None) is not None else None
@@ -3769,6 +4351,22 @@ def run_seed(task):
         stage_tree=(
             agent.stage_tree.snapshot()
             if getattr(agent, "stage_tree", None) is not None else None
+        ),
+        regime_continuation=(
+            dict(
+                weight=regime_value_weight,
+                evaluator=regime_evaluator.snapshot(),
+                stats=regime_stats,
+                online=(
+                    regime_online_updater.snapshot()
+                    if regime_online_updater is not None else None
+                ),
+            )
+            if regime_evaluator is not None else None
+        ),
+        world_variables=(
+            world_var_node.snapshot()
+            if world_var_node is not None else None
         ),
         stage_tree_heuristic=(
             agent.stage_tree_heuristic.snapshot()
@@ -3857,12 +4455,22 @@ def main():
     parser.add_argument("--stride-includes-lag", action="store_true",
                         help="also query step == lag, the first predicted "
                              "state the plan action can affect")
-    parser.add_argument("--decision", choices=("search", "cellq", "stage"),
+    parser.add_argument("--decision", choices=("search", "cellq", "stage", "chained"),
                         default="search",
                         help="search = full MPC planning; cellq = read the "
                              "learned (feature, action) cells directly; "
                              "stage = score block-wise constant action "
-                             "schedules over blocks * block-frames frames")
+                             "schedules; chained = chain short 2-3 frame "
+                             "active-pruning searches")
+    parser.add_argument("--chain-chunk-size", type=int, default=2,
+                        help="frames per hop in --decision chained")
+    parser.add_argument("--chain-hops", type=int, default=3,
+                        help="number of chained shallow hops in --decision chained")
+    parser.add_argument("--chain-beam-width", type=int, default=2,
+                        help="frontier states retained per hop in --decision chained")
+    parser.add_argument("--chain-demand-weight", type=float, default=0.10,
+                        help="weight on learned controllable feature demand "
+                             "(heuristic pruning ONLY, separate from final objective)")
     parser.add_argument("--stage-blocks", type=int, default=4,
                         help="number of action blocks a stage-level "
                              "(--decision stage) schedule holds")
@@ -4126,14 +4734,87 @@ def main():
     parser.add_argument("--stage-memory", action="store_true",
                         help="build the self-supervised stage experience from "
                              "the realized stream (read-only; planner unwired)")
+    parser.add_argument("--online-feature-learning", action="store_true",
+                        help="update the default-off online feature candidate "
+                             "bank from each real transition; it does not "
+                             "change planner decisions")
     parser.add_argument("--stage-memory-quantile", type=float, default=0.98,
                         help="upper-tail quantile for the generic key-signal "
                              "detector's channels")
     parser.add_argument("--stage-feature-source",
-                        choices=("branch", "prototype"), default="branch",
+                        choices=("branch", "prototype", "hybrid"),
+                        default="branch",
                         help="read-only feature source for stage demand "
-                             "samples: induced feature roots (sparse) or the "
-                             "runtime's nearest prototype (dense)")
+                             "samples: induced roots, nearest prototype, or "
+                             "both namespaced together")
+    parser.add_argument("--regime-value-weight", type=float, default=0.0,
+                        help="opt-in weight on calibrated stage-regime "
+                             "continuation risk at search endpoints (0 = off)")
+    parser.add_argument("--regime-n-regimes", type=int, default=16,
+                        help="number of self-supervised state regimes when "
+                             "--regime-value-weight > 0")
+    parser.add_argument("--regime-partition",
+                        choices=("survival_tree", "kmeans"),
+                        default="survival_tree",
+                        help="state regime partitioning method when "
+                             "--regime-value-weight > 0")
+    parser.add_argument("--regime-k-stages", type=int, default=8,
+                        help="continuation stage horizon when "
+                             "--regime-value-weight > 0")
+    parser.add_argument("--regime-mode",
+                        choices=("lcb", "pooled", "optimal"),
+                        default="lcb",
+                        help="continuation Bellman mode when "
+                             "--regime-value-weight > 0")
+    parser.add_argument("--regime-lcb-z", type=float, default=1.0,
+                        help="LCB confidence penalty z when "
+                             "--regime-mode lcb")
+    parser.add_argument("--regime-value-key",
+                        choices=("cum_survival", "survival"),
+                        default="cum_survival",
+                        help="continuation value statistic when "
+                             "--regime-value-weight > 0")
+    parser.add_argument("--regime-soft-top-k", type=int, default=4,
+                        help="number of nearest supported regimes for "
+                             "kernel interpolation (1 = hard lookup)")
+    parser.add_argument("--regime-kernel-tau", type=float, default=0.7,
+                        help="bandwidth multiplier on training inter-regime "
+                             "scale for soft kernel interpolation")
+    parser.add_argument("--regime-min-coverage", type=float, default=0.80,
+                        help="minimum fraction of supported candidate "
+                             "endpoints required to apply regime continuation")
+    parser.add_argument("--regime-ood-policy",
+                        choices=("baseline", "neutral_mean", "conservative"),
+                        default="neutral_mean",
+                        help="OOD fallback policy for active regime decisions")
+    parser.add_argument("--regime-online-every", type=int, default=0,
+                        help="fixed-partition online regime transition/LCB "
+                             "refit cadence in evaluation episodes (0 = off, "
+                             "frozen evaluation; requires --regime-value-weight > 0)")
+    parser.add_argument("--regime-online-frames", type=int, default=12000,
+                        help="sliding tail frame budget kept for online "
+                             "regime transition updates alongside bootstrap "
+                             "rows (0 = unbounded)")
+    parser.add_argument("--regime-failure-weight", type=float, default=0.0,
+                        help="opt-in weight on trunk-indexed pure-online "
+                             "point-event failure memory (0 = off; requires "
+                             "--regime-value-weight > 0 and --regime-online-every > 0)")
+    parser.add_argument("--regime-failure-sigma", type=float, default=0.25,
+                        help="local Gaussian bandwidth multiplier for online "
+                             "point-event failure memory")
+    parser.add_argument("--regime-failure-prior", type=float, default=4.0,
+                        help="evidence strength prior for online point-event "
+                             "failure memory")
+    parser.add_argument("--world-variables", action="store_true",
+                        help="opt-in task-agnostic DynamicsClassNode latent "
+                             "world-variable extraction and variable-scoped "
+                             "class-node memory instantiation (default off)")
+    parser.add_argument("--world-var-reset-episode", action="store_true",
+                        help="reset fast world-variable slots at the start of "
+                             "each evaluation episode (requires --world-variables)")
+    parser.add_argument("--world-var-sigma", type=float, default=0.75,
+                        help="similarity bandwidth in normalized variable space "
+                             "for variable-scoped class-node instantiation")
     parser.add_argument("--benchmark", action="store_true",
                         help="standard ruler: 1500 offline frames replayed "
                              "once, then one 5000-frame free-control round "
@@ -4198,6 +4879,32 @@ def main():
         raise ValueError("--epochs must be positive")
     if not 0.5 < args.stage_memory_quantile < 1.0:
         raise ValueError("--stage-memory-quantile must be in (0.5, 1)")
+    if args.regime_value_weight < 0.0:
+        raise ValueError("--regime-value-weight must be non-negative")
+    if args.regime_n_regimes < 1:
+        raise ValueError("--regime-n-regimes must be positive")
+    if args.regime_k_stages < 1:
+        raise ValueError("--regime-k-stages must be positive")
+    if args.regime_lcb_z < 0.0:
+        raise ValueError("--regime-lcb-z must be non-negative")
+    if args.regime_soft_top_k < 1:
+        raise ValueError("--regime-soft-top-k must be positive")
+    if args.regime_kernel_tau <= 0.0:
+        raise ValueError("--regime-kernel-tau must be positive")
+    if not 0.0 <= args.regime_min_coverage <= 1.0:
+        raise ValueError("--regime-min-coverage must be in [0, 1]")
+    if args.regime_online_every < 0:
+        raise ValueError("--regime-online-every must be non-negative")
+    if args.regime_online_frames < 0:
+        raise ValueError("--regime-online-frames must be non-negative")
+    if args.regime_failure_weight < 0.0:
+        raise ValueError("--regime-failure-weight must be non-negative")
+    if args.regime_failure_sigma <= 0.0:
+        raise ValueError("--regime-failure-sigma must be positive")
+    if args.regime_failure_prior < 0.0:
+        raise ValueError("--regime-failure-prior must be non-negative")
+    if args.world_var_sigma <= 0.0:
+        raise ValueError("--world-var-sigma must be positive")
     if args.lag < 0:
         raise ValueError("--lag must be non-negative")
     if args.pain_horizon < 0:
@@ -4374,6 +5081,30 @@ def main():
             stage_memory=args.stage_memory,
             stage_memory_quantile=args.stage_memory_quantile,
             stage_memory_feature_source=args.stage_feature_source,
+            online_feature_learning=args.online_feature_learning,
+            regime_value_weight=args.regime_value_weight,
+            regime_n_regimes=args.regime_n_regimes,
+            regime_partition=args.regime_partition,
+            regime_k_stages=args.regime_k_stages,
+            regime_mode=args.regime_mode,
+            regime_lcb_z=args.regime_lcb_z,
+            regime_value_key=args.regime_value_key,
+            regime_soft_top_k=args.regime_soft_top_k,
+            regime_kernel_tau=args.regime_kernel_tau,
+            regime_min_coverage=args.regime_min_coverage,
+            regime_ood_policy=args.regime_ood_policy,
+            regime_online_every=args.regime_online_every,
+            regime_online_frames=args.regime_online_frames,
+            regime_failure_weight=args.regime_failure_weight,
+            regime_failure_sigma=args.regime_failure_sigma,
+            regime_failure_prior=args.regime_failure_prior,
+            world_variables=args.world_variables,
+            world_var_reset_episode=args.world_var_reset_episode,
+            world_var_sigma=args.world_var_sigma,
+            chain_chunk_size=args.chain_chunk_size,
+            chain_hops=args.chain_hops,
+            chain_beam_width=args.chain_beam_width,
+            chain_demand_weight=args.chain_demand_weight,
         )
         for seed in seeds
     ]
@@ -4573,6 +5304,56 @@ def main():
                     tree_heuristic["context_outcomes"],
                 )
             )
+    if args.regime_value_weight > 0.0 and args.regime_online_every > 0:
+        rc = rows[0].get("regime_continuation") or {}
+        online = rc.get("online")
+        stats = rc.get("stats") or {}
+        if online:
+            decisions = int(stats.get("decisions", 0))
+            active_rate = (
+                float(stats.get("active", 0)) / decisions
+                if decisions else 0.0
+            )
+            fm = online.get("failure_memory")
+            fm_note = (
+                ", fail_mem=%d deaths (%d/%d leaves)"
+                % (
+                    fm["total_failures"],
+                    fm["active_failure_leaves"],
+                    fm["active_failure_leaves"] + fm["compressed_leaves"],
+                )
+                if fm else ""
+            )
+            print(
+                "regime online (seed %d): %d updates over %d eval episodes "
+                "(every %d ep, buffered %d ep / %d frames, active %.3f%s)"
+                % (
+                    rows[0]["seed"],
+                    online["updates"],
+                    online["episodes_seen"],
+                    online["update_every"],
+                    online["online_episodes_buffered"],
+                    online["online_frames_buffered"],
+                    active_rate,
+                    fm_note,
+                )
+            )
+    if args.world_variables:
+        wv = rows[0].get("world_variables")
+        if wv:
+            print(
+                "world variables (seed %d): active_channels=%s, updates=%d, "
+                "skipped_jumps=%d, changes=%d, cred=%.3f, sig_norm=%.3f"
+                % (
+                    rows[0]["seed"],
+                    wv["active_channels"],
+                    wv["updates"],
+                    wv["skipped_jumps"],
+                    wv["changes"],
+                    wv["credibility"],
+                    wv["signature_norm"],
+                )
+            )
     if overall["clusters"] < 5:
         print("warning: fewer than 5 trained models; the interval is "
               "descriptive, not a significance test")
@@ -4628,6 +5409,15 @@ def main():
                 stage_memory=args.stage_memory,
                 stage_memory_quantile=args.stage_memory_quantile,
                 stage_feature_source=args.stage_feature_source,
+                regime_value_weight=args.regime_value_weight,
+                regime_online_every=args.regime_online_every,
+                regime_online_frames=args.regime_online_frames,
+                regime_failure_weight=args.regime_failure_weight,
+                regime_failure_sigma=args.regime_failure_sigma,
+                regime_failure_prior=args.regime_failure_prior,
+                world_variables=args.world_variables,
+                world_var_reset_episode=args.world_var_reset_episode,
+                world_var_sigma=args.world_var_sigma,
             ),
             rows=eval_rows,
             milestones=[

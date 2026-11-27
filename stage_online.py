@@ -23,8 +23,12 @@ from typing import Optional
 
 import numpy as np
 
-from stage_demand_heuristic import StageDemand
+from stage_demand_heuristic import (
+    StageDemand,
+    StageDemandAlternatives,
+)
 from stage_outcome_memory import segment_episode
+from stage_strategy_credit import StageStrategyCredit
 
 
 class OnlineStageTracker:
@@ -111,7 +115,8 @@ class OnlineStageDemandProvider:
     def __init__(self, agent, feature_source: Optional[str] = None,
                  rank_feature_source: Optional[str] = None,
                  min_target_probability: float = 0.0,
-                 min_prediction_support: int = 0):
+                 min_prediction_support: int = 0,
+                 max_strategy_proposals: int = 3):
         experience = getattr(agent, "stage_experience", None)
         if experience is None:
             raise ValueError("agent has no fitted stage experience")
@@ -119,6 +124,8 @@ class OnlineStageDemandProvider:
             raise ValueError("min_target_probability must be in [0, 1]")
         if int(min_prediction_support) < 0:
             raise ValueError("min_prediction_support must be non-negative")
+        if int(max_strategy_proposals) < 1:
+            raise ValueError("max_strategy_proposals must be positive")
         self.tracker = OnlineStageTracker(experience.detector, agent.lag)
         self.memory = getattr(agent, "stage_outcome_memory", None)
         self.selector = getattr(agent, "stage_demand_selector", None)
@@ -128,6 +135,7 @@ class OnlineStageDemandProvider:
         )
         self.min_target_probability = float(min_target_probability)
         self.min_prediction_support = int(min_prediction_support)
+        self.max_strategy_proposals = int(max_strategy_proposals)
         if self.rank_feature_source == "root":
             self.heuristic = getattr(agent, "stage_root_heuristic", None)
         else:
@@ -143,13 +151,111 @@ class OnlineStageDemandProvider:
             )
         self.counts = Counter()
         self.last = None
+        self.last_validation = None
+        self.strategy_credit = getattr(
+            agent, "stage_strategy_credit", None,
+        )
+        if self.strategy_credit is None:
+            self.strategy_credit = StageStrategyCredit()
+            agent.stage_strategy_credit = self.strategy_credit
+        self._intent_stage_depth = None
+        self._intent_request = None
 
-    def reset_episode(self, *_args, **_kwargs):
-        self.tracker.reset()
+    def reset_episode(self, *args, **kwargs):
+        if self._intent_request is not None:
+            self.counts["intent_censored_episode_reset"] += 1
+        episode_id = kwargs.get("seed", kwargs.get("episode"))
+        if episode_id is None:
+            episode_id = args[1] if len(args) > 1 else (
+                args[0] if args else None
+            )
+        self.tracker.reset(episode=episode_id)
+        self._release_intent()
         return self
 
     def observe_transition(self, transition):
-        self.tracker.observe_transition(transition)
+        accepted = self.tracker.observe_transition(transition)
+        if (accepted and self._intent_request is not None
+                and bool(transition.get(
+                    "done", transition.get("terminal", False)
+                ))):
+            self._record_intent_result(
+                actual_stage_key=None,
+                episode=self.tracker.episode,
+                terminal=True,
+            )
+            self._release_intent("terminal")
+
+    def _record_intent_result(self, actual_stage_key, episode,
+                              terminal=False):
+        if self.last is None:
+            return None
+        target = tuple(self.last.get("target", ()))
+        proposals = tuple(self.last.get("proposals", (target,)))
+        actual_chain = (
+            () if actual_stage_key is None
+            else self.tree.chain(actual_stage_key)
+        )
+        if terminal:
+            similarity = 0.0
+            reason = "terminal_before_target"
+        elif not actual_chain:
+            self.counts["intent_validation_unknown"] += 1
+            return None
+        else:
+            actual_nodes = {str(node) for node in actual_chain}
+            matched = [
+                proposal for proposal in proposals
+                if any(
+                    isinstance(token, (tuple, list))
+                    and len(token) == 2
+                    and token[0] == "tree"
+                    and str(token[1]) in actual_nodes
+                    for token in proposal
+                )
+            ]
+            for proposal in matched:
+                self.strategy_credit.record(
+                    self.last.get("history", ()),
+                    proposal,
+                    episode,
+                    1.0,
+                )
+            similarity = float(target in matched)
+            reason = "target_stage_match" if similarity else (
+                "different_realized_stage"
+            )
+        if terminal or similarity == 0.0:
+            recorded = self.strategy_credit.record(
+                self.last.get("history", ()),
+                target,
+                episode,
+                similarity,
+            )
+        else:
+            recorded = True
+        if not recorded:
+            self.counts["intent_duplicate_episode_outcome"] += 1
+        self.last_validation = dict(
+            target=target,
+            proposals=proposals,
+            matched_proposals=(
+                tuple(matched) if not terminal and actual_chain else ()
+            ),
+            actual_stage=actual_stage_key,
+            episode=episode,
+            similarity=similarity,
+            reason=reason,
+            recorded=bool(recorded),
+        )
+        self.counts["intent_validation_%s" % reason] += 1
+        return self.last_validation
+
+    def _release_intent(self, reason=None):
+        if self._intent_request is not None and reason is not None:
+            self.counts["intent_released_%s" % reason] += 1
+        self._intent_stage_depth = None
+        self._intent_request = None
 
     @staticmethod
     def _collapse_key(tree, key):
@@ -163,7 +269,20 @@ class OnlineStageDemandProvider:
         context = self.tracker.context()
         if context is None:
             self.counts["no_context"] += 1
+            self._release_intent("unknown_context")
             return None
+        stage_depth = len(context["stages"])
+        if self._intent_request is not None:
+            if stage_depth == self._intent_stage_depth:
+                self.counts["intent_reused"] += 1
+                self.counts["supported"] += 1
+                return self._intent_request
+            actual_stage = context["stages"][-1]
+            self._record_intent_result(
+                actual_stage_key=getattr(actual_stage, "key", None),
+                episode=self.tracker.episode,
+            )
+            self._release_intent("stage_boundary")
         prediction = self.memory.predict_pooled(context["history"])
         if prediction.get("status") != "supported":
             self.counts["no_prediction"] += 1
@@ -200,23 +319,157 @@ class OnlineStageDemandProvider:
             self._collapse_key(self.tree, key)
             for key in context["history"]
         )
-        node_demand = StageDemand(
-            target_stage=(root_token,),
-            stage_history=collapsed_history,
-            action_trace=None,
-            association_action_trace=association_trace,
-            transition_probability=demand.transition_probability,
-            transition_support=demand.transition_support,
-            transition_resolution=demand.transition_resolution,
+        primary_validation = self.strategy_credit.estimate(
+            collapsed_history, (root_token,),
+        )
+        value_confidence = float(report.get("value_confidence", 0.0) or 0.0)
+        prior_similarity = primary_validation["mean_similarity"]
+        if primary_validation["status"] != "supported":
+            proposal_trigger = "primary_unvalidated"
+        elif prior_similarity is not None and prior_similarity < 0.5:
+            proposal_trigger = "primary_mismatch"
+        else:
+            combined_confidence = min(
+                float(np.clip(value_confidence, 0.0, 1.0)),
+                float(primary_validation[
+                    "probability_better_than_chance"
+                ]),
+            )
+            proposal_limit = max(
+                1,
+                min(
+                    self.max_strategy_proposals,
+                    int(np.ceil(
+                        self.max_strategy_proposals
+                        * (1.0 - combined_confidence)
+                    )),
+                ),
+            )
+            proposal_trigger = (
+                "primary_stable" if proposal_limit == 1
+                else "uncertainty_budget"
+            )
+        if proposal_trigger in ("primary_unvalidated", "primary_mismatch"):
+            proposal_limit = self.max_strategy_proposals
+        self.counts["proposal_limit_%d" % proposal_limit] += 1
+        if proposal_limit == 1:
+            self.counts["proposal_slate_collapsed"] += 1
+        else:
+            self.counts[
+                "proposal_slate_expanded_%s" % proposal_trigger
+            ] += 1
+        proposal_demands = []
+        proposal_roots = set()
+
+        def add_proposal(target_key, probability, support,
+                         episode_support, resolution, strength):
+            chain = self.tree.chain(target_key)
+            if not chain:
+                return
+            target_root = ("tree", str(chain[-1]))
+            if target_root in proposal_roots:
+                return
+            proposal_roots.add(target_root)
+            validation = self.strategy_credit.estimate(
+                collapsed_history, (target_root,),
+            )
+            if validation["status"] == "supported":
+                self.counts["strategy_credit_supported"] += 1
+            if validation["priority_multiplier"] != 1.0:
+                self.counts["strategy_credit_adjusted"] += 1
+            adjusted_strength = float(np.clip(
+                strength * validation["priority_multiplier"], 0.0, 1.0,
+            ))
+            proposal_demands.append(StageDemand(
+                target_stage=(target_root,),
+                stage_history=collapsed_history,
+                action_trace=None,
+                association_action_trace=association_trace,
+                transition_probability=probability,
+                transition_support=support,
+                transition_resolution=resolution,
+                transition_episode_support=episode_support,
+                demand_strength=adjusted_strength,
+            ))
+
+        add_proposal(
+            exact_target,
+            demand.transition_probability,
+            demand.transition_support,
+            demand.transition_episode_support,
+            demand.transition_resolution,
+            demand.demand_strength,
+        )
+        report_candidates = tuple(report.get("candidates", ()))
+        if len(proposal_demands) < proposal_limit:
+            target_std = max(
+                float(getattr(
+                    getattr(self.selector, "readout", None),
+                    "target_std", 1.0,
+                )),
+                1e-9,
+            )
+            minimum_episodes = int(getattr(
+                self.selector, "min_outcome_episodes", 2,
+            ))
+            best_value = max(
+                (float(row.get("value", 0.0))
+                 for row in report_candidates),
+                default=0.0,
+            )
+            for row in report_candidates:
+                if len(proposal_demands) >= proposal_limit:
+                    break
+                target_key = tuple(row.get("destination") or ())
+                if not target_key or target_key == exact_target:
+                    continue
+                episode_support = int(row.get("episode_support", 0))
+                support_confidence = episode_support / float(
+                    episode_support + minimum_episodes
+                )
+                value_similarity = float(np.exp(
+                    min(float(row.get("value", best_value)) - best_value, 0.0)
+                    / target_std
+                ))
+                add_proposal(
+                    target_key,
+                    row.get("probability"),
+                    int(row.get("support", 0)),
+                    episode_support,
+                    prediction.get("resolution"),
+                    support_confidence * value_similarity,
+                )
+        if not proposal_demands:
+            self.counts["no_tree_target"] += 1
+            return None
+        self.counts["strategy_proposals"] += len(proposal_demands)
+        self.counts["strategy_slate_decisions"] += int(
+            len(proposal_demands) > 1
+        )
+        rank_demand = (
+            proposal_demands[0] if len(proposal_demands) == 1
+            else StageDemandAlternatives(tuple(proposal_demands))
         )
         self.counts["supported"] += 1
+        self.counts["intent_started"] += 1
+        self._intent_stage_depth = stage_depth
+        self._intent_request = (rank_demand, self.heuristic)
         self.last = dict(
-            target=(root_token,),
+            target=proposal_demands[0].target_stage,
+            proposals=tuple(
+                proposal.target_stage for proposal in proposal_demands
+            ),
             history=collapsed_history,
             prefix=association_trace,
             prediction_support=int(prediction.get("support", 0)),
+            demand_strength=proposal_demands[0].demand_strength,
+            stage_depth=int(stage_depth),
+            strategy_validation=primary_validation,
+            value_confidence=value_confidence,
+            proposal_trigger=proposal_trigger,
+            proposal_limit=int(proposal_limit),
         )
-        return node_demand, self.heuristic
+        return self._intent_request
 
     def snapshot(self):
         return dict(
@@ -226,6 +479,15 @@ class OnlineStageDemandProvider:
             },
             feature_source=self.feature_source,
             rank_feature_source=self.rank_feature_source,
+            active_intent=(
+                None if self._intent_request is None else dict(self.last)
+            ),
+            last_validation=(
+                None if self.last_validation is None
+                else dict(self.last_validation)
+            ),
+            strategy_credit=self.strategy_credit.snapshot(),
+            max_strategy_proposals=self.max_strategy_proposals,
             min_target_probability=self.min_target_probability,
             min_prediction_support=self.min_prediction_support,
         )

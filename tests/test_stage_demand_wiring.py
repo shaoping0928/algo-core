@@ -10,6 +10,7 @@ from substrate_nodes import (
     decision_action,
     evaluate,
     make_node_demand_rank_step,
+    make_node_hybrid_rank_step,
     make_node_prototype_rank_step,
     make_node_root_rank_step,
     policy_result,
@@ -134,6 +135,54 @@ class StageDemandWiringTests(unittest.TestCase):
         sequences = np.zeros((3, 2))
         priorities = rank_step(states, sequences, step=0)
         np.testing.assert_array_equal(priorities, [0.0, 1.5, 0.0])
+
+    def test_hybrid_ranker_combines_namespaced_branch_and_prototype_features(self):
+        class HybridRuntime:
+            obs_dim = 1
+            lag = 1
+            scales = np.ones(2)
+            value_feature_ids = ["value_alignment"]
+            _feature_all = ["value_alignment"]
+
+            @staticmethod
+            def _branch_active_features(observation):
+                return ("f_high",) if float(observation[0]) >= 0.5 else ()
+
+            @staticmethod
+            def _feature_mask_table(observations):
+                values = np.asarray(observations, dtype=float)
+                return [values[:, 0] >= 0.5]
+
+            @staticmethod
+            def _nearest(state):
+                return (
+                    "p_high" if float(state[0]) >= 0.5 else "p_low",
+                    0.0,
+                )
+
+        class HybridHeuristic:
+            @staticmethod
+            def score(features, _demand):
+                if (("branch", "f_high") in features
+                        and ("prototype", "p_high") in features
+                        and ("value", "value_alignment") in features):
+                    return dict(status="supported", priority=2.0)
+                return dict(status="unknown", priority=None)
+
+        demand = StageDemand(
+            target_stage=(("tree", "0"),),
+            stage_history=((("tree", "0"),),),
+        )
+        rank_step = make_node_hybrid_rank_step(
+            HybridRuntime(), demand, HybridHeuristic(),
+            pending_prefix=[0.0], lag=1,
+        )
+        priorities = rank_step(
+            np.asarray([[0.0], [1.0]]),
+            np.zeros((2, 2)),
+            step=0,
+        )
+        np.testing.assert_array_equal(priorities, [0.0, 2.0])
 
     def test_root_resolver_features_feed_the_rank_channel(self):
         class RootResolver:
@@ -281,6 +330,31 @@ class StageDemandWiringTests(unittest.TestCase):
             )
         self.assertEqual(captured["rank_mode"], "tie")
         self.assertEqual(captured["rank_margin"], 0.05)
+        self.assertEqual(captured["rank_group_quota"], 0)
+
+    def test_policy_result_selects_chunked_search_only_when_requested(self):
+        class Env:
+            @staticmethod
+            def obs():
+                return np.asarray([0.0])
+
+        captured = {}
+
+        def fake_chunked_search(**kwargs):
+            captured.update(kwargs)
+            return object()
+
+        with patch(
+            "substrate_nodes.chunked_beam_search",
+            side_effect=fake_chunked_search,
+        ):
+            policy_result(
+                Env(), None, FakeRuntime(), prefix=[0.0],
+                horizon=6, lag=1, beam_width=2,
+                search_chunk_size=3,
+            )
+        self.assertEqual(captured["chunk_size"], 3)
+        self.assertEqual(captured["rank_group_quota"], 1)
 
     def test_policy_result_requires_beam_for_demand_ranking(self):
         class Env:

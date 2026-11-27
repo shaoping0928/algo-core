@@ -6,7 +6,9 @@ import numpy as np
 from stage_demand_heuristic import (
     DemandAssociationSample,
     StageDemand,
+    StageDemandAlternatives,
     StageDemandHeuristic,
+    make_demand_rank_step,
 )
 from stage_outcome_memory import (
     KeySignal,
@@ -66,6 +68,66 @@ class StageDemandHeuristicTests(unittest.TestCase):
         self.assertFalse(toward["action_conditioned"])
         self.assertEqual(toward["provenance"], "observed_cooccurrence")
 
+    def test_demand_strength_scales_only_the_search_priority(self):
+        strong = self.memory.score(("toward-target",), self.demand)
+        weaker_demand = StageDemand(
+            target_stage=self.demand.target_stage,
+            stage_history=self.demand.stage_history,
+            action_trace=self.demand.action_trace,
+            transition_probability=self.demand.transition_probability,
+            transition_support=self.demand.transition_support,
+            demand_strength=0.25,
+        )
+        weaker = self.memory.score(("toward-target",), weaker_demand)
+        self.assertAlmostEqual(
+            weaker["priority"], 0.25 * strong["priority"],
+        )
+        self.assertFalse(weaker["affects_value"])
+        self.assertEqual(weaker["demand_strength"], 0.25)
+
+    def test_alternatives_share_one_search_priority_from_best_supported_target(self):
+        other = StageDemand(
+            target_stage=("other",),
+            stage_history=(("source",),),
+            action_trace=self.option,
+        )
+        alternatives = StageDemandAlternatives((self.demand, other))
+        toward = self.memory.score(("toward-target",), self.demand)
+        combined = self.memory.score(("toward-target",), alternatives)
+
+        self.assertEqual(combined["status"], "supported")
+        self.assertEqual(combined["proposal_count"], 2)
+        self.assertEqual(
+            combined["proposal_target"], self.demand.target_stage,
+        )
+        self.assertAlmostEqual(combined["priority"], toward["priority"])
+        self.assertFalse(combined["affects_value"])
+
+    def test_rank_adapter_returns_the_supported_proposal_group(self):
+        other = StageDemand(
+            target_stage=("other",),
+            stage_history=(("source",),),
+            action_trace=self.option,
+        )
+        alternatives = StageDemandAlternatives((self.demand, other))
+        stats = {}
+        rank_step = make_demand_rank_step(
+            self.memory,
+            alternatives,
+            feature_extractor=lambda states, _sequences, _step: [
+                ("toward-target",) for _ in states
+            ],
+            stats=stats,
+        )
+
+        priorities, groups = rank_step(
+            np.zeros((1, 1)), np.zeros((1, 1)), 0,
+        )
+
+        self.assertGreater(priorities[0], 0.0)
+        self.assertEqual(groups, (self.demand.target_stage,))
+        self.assertEqual(stats["proposal_scores"], 2)
+
     def test_target_demand_can_be_created_from_a_sibling_prediction(self):
         demand = StageDemand.from_transition_prediction(
             prediction=dict(
@@ -76,6 +138,7 @@ class StageDemandHeuristicTests(unittest.TestCase):
                     dict(
                         destination=("target",), terminal=False,
                         censored=False, probability=0.75,
+                        episode_support=4,
                     ),
                 ),
             ),
@@ -85,6 +148,8 @@ class StageDemandHeuristicTests(unittest.TestCase):
         )
         self.assertEqual(demand.target_stage, ("target",))
         self.assertEqual(demand.transition_probability, 0.75)
+        self.assertEqual(demand.transition_episode_support, 4)
+        self.assertGreater(demand.demand_strength, 0.0)
         with self.assertRaises(ValueError):
             StageDemand.from_transition_prediction(
                 prediction=dict(status="unknown", outcomes=()),

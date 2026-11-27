@@ -47,6 +47,7 @@ from node_graph import (
     TRANSITION_EDGE,
     NodeGraph,
 )
+from online_feature_learner import OnlineFeatureLearner
 
 
 def future_pain_labels(rows, window: int) -> List[float]:
@@ -319,6 +320,8 @@ class NodeRuntime:
         readout_propagation_gain: float = 0.0,
         readout_propagation_steps: int = 1,
         readout_propagation_edges: str = "transition",
+        online_feature_learning: bool = False,
+        online_feature_options: Optional[dict] = None,
     ):
         if int(obs_dim) < 1:
             raise ValueError("obs_dim must be positive")
@@ -747,6 +750,27 @@ class NodeRuntime:
         self._node_pain_mean = {}
         self._node_pain_m2 = {}
         self._memory_counter = 0
+        self.online_feature_learner = None
+        if online_feature_learning:
+            self.enable_online_feature_learning(
+                **({} if online_feature_options is None
+                   else dict(online_feature_options))
+            )
+
+    def enable_online_feature_learning(self, **options):
+        """Enable default-off streaming feature discovery on real feedback."""
+        self.online_feature_learner = OnlineFeatureLearner(
+            obs_dim=self.obs_dim, lag=self.lag, scales=self.scales,
+            **options
+        )
+        return self.online_feature_learner
+
+    def observe_online_transition(self, transition):
+        """Feed one real transition to the optional online feature learner."""
+        learner = self.online_feature_learner
+        if learner is None:
+            return None
+        return learner.observe_transition(transition)
 
     # ---- encoding ----------------------------------------------------------
     def _zero_pending(self):
@@ -1467,7 +1491,8 @@ class NodeRuntime:
 
     def _hazard_channels(self, states: np.ndarray,
                          mask_table: Optional[List] = None,
-                         include: Optional[Iterable[str]] = None
+                         include: Optional[Iterable[str]] = None,
+                         soft_weights=None
                          ) -> Dict[str, np.ndarray]:
         """The individual hazard readouts the signal composes.
 
@@ -1489,7 +1514,10 @@ class NodeRuntime:
         if not self.predicate_readouts and (
             want is None or "prototype" in want
         ):
-            indices, weights, nearest_min = self._soft_weights_batch(states)
+            if soft_weights is None:
+                indices, weights, nearest_min = self._soft_weights_batch(states)
+            else:
+                indices, weights, nearest_min = soft_weights
             prototype = np.zeros(len(states), dtype=float)
             if indices is not None:
                 if self.readout_propagation_gain > 0.0:
@@ -1547,7 +1575,8 @@ class NodeRuntime:
         return channels
 
     def pain_signal_batch(self, states: np.ndarray,
-                          mask_table: Optional[List] = None) -> np.ndarray:
+                          mask_table: Optional[List] = None,
+                          soft_weights=None) -> np.ndarray:
         states = np.asarray(states, dtype=float)
         if len(states) == 0:
             return np.zeros(0)
@@ -1560,11 +1589,22 @@ class NodeRuntime:
                 name for name, weight in composition.items()
                 if float(weight) > 0.0
             ]
-            channels = self._hazard_channels(
-                states, mask_table, include=needed
-            )
+            if soft_weights is None:
+                channels = self._hazard_channels(
+                    states, mask_table, include=needed
+                )
+            else:
+                channels = self._hazard_channels(
+                    states, mask_table, include=needed,
+                    soft_weights=soft_weights,
+                )
         else:
-            channels = self._hazard_channels(states, mask_table)
+            if soft_weights is None:
+                channels = self._hazard_channels(states, mask_table)
+            else:
+                channels = self._hazard_channels(
+                    states, mask_table, soft_weights=soft_weights
+                )
         if composition:
             # P2 stacked composition: the non-negative least-squares
             # weights were fitted to the precursor labels, so the read is
@@ -2024,6 +2064,31 @@ class NodeRuntime:
                 self.reset()
             return
 
+        if self.online_feature_learner is not None:
+            source = np.asarray(self.last_state, dtype=float).reshape(-1)
+            source_observation = (
+                source[:self.obs_dim] * self.scales[:self.obs_dim]
+            )
+            pending = (
+                source[self.obs_dim:] * self.scales[self.obs_dim:]
+            )
+            issued = (
+                int(self.last_action)
+                if self.last_action is not None else int(action)
+            )
+            history = np.concatenate([
+                np.asarray([float(issued)]),
+                np.asarray(pending, dtype=float)[::-1],
+            ])
+            self.observe_online_transition(dict(
+                obs=source_observation,
+                pending=pending,
+                history=history,
+                next_obs=np.asarray(observation, dtype=float),
+                signals=valence.copy(),
+                done=bool(done),
+            ))
+
         next_state = self.encode(observation)
         next_node = self._assign(next_state, create=True, count=True)
         current_active = (
@@ -2074,6 +2139,8 @@ class NodeRuntime:
 
     def reset(self) -> None:
         """Reset episode-local state; node values and edges are retained."""
+        if self.online_feature_learner is not None:
+            self.online_feature_learner.end_episode(terminal=False)
         self._invalidate_readout_cache()
         self.pending = self._zero_pending()
         self.last_node = None
@@ -2100,6 +2167,21 @@ class NodeRuntime:
         if valence.shape != (2,) or not np.isfinite(valence).all():
             raise ValueError("valence must contain finite dopamine and pain")
         state = self.encode(observation)
+        if self.online_feature_learner is not None:
+            pending = np.asarray(
+                list(self.pending), dtype=float,
+            ).reshape(-1)
+            history = np.concatenate([
+                np.asarray([float(action)]), pending[::-1],
+            ])
+            self.observe_online_transition(dict(
+                obs=np.asarray(observation, dtype=float),
+                pending=pending,
+                history=history,
+                next_obs=np.asarray(next_observation, dtype=float),
+                signals=valence.copy(),
+                done=bool(done),
+            ))
         current = self._assign(state, create=True, count=True)
         self._component_step(current)
         current_active = self._active_feature_ids(state)
@@ -2145,17 +2227,22 @@ class NodeRuntime:
         if done:
             self.reset()
 
-    def learn_episode(self, rows) -> None:
+    def learn_episode(self, rows, learn_online=True) -> None:
         """Monte-Carlo node/edge values for one real episode.
 
         `rows` are transition dicts with ``obs``, ``next_obs``, ``history``,
         ``signals`` and ``done`` (an episode boundary, not a risk label).
         Values are accumulated backward from the world's pain signal.
+        `learn_online=False` lets batch replay train the runtime without
+        counting the same real episode again in online feature statistics.
         """
         rows = list(rows)
         if not rows:
             return
         self.reset()
+        if self.online_feature_learner is not None and learn_online:
+            for row in rows:
+                self.observe_online_transition(row)
         # Every node's activation over this episode is computed once: the
         # per-row sweeps used to re-evaluate all masks for both the current
         # and the next state of every row.
@@ -2829,6 +2916,52 @@ class NodeRuntime:
             hits=float(hits), count=float(count),
         )
 
+    def _compiled_feature_plan(self):
+        """Compile materialized feature rules into vectorized primitive arrays."""
+        cached = self._cached_readout("feature_plan")
+        if cached is not None:
+            return cached
+        from node_features import Composite, Primitive
+
+        prim_index = {}
+        dims = []
+        is_abs = []
+        is_lt = []
+        thresholds = []
+
+        def compile_obj(obj):
+            if isinstance(obj, Primitive):
+                key = (obj.dim, obj.magnitude, obj.op, obj.threshold)
+                idx = prim_index.get(key)
+                if idx is None:
+                    idx = len(dims)
+                    prim_index[key] = idx
+                    dims.append(int(obj.dim))
+                    is_abs.append(bool(obj.magnitude))
+                    is_lt.append(obj.op == "<")
+                    thresholds.append(float(obj.threshold))
+                return ("prim", idx)
+            if isinstance(obj, Composite):
+                if obj.op not in ("and", "or"):
+                    return ("fallback", obj)
+                return (obj.op, tuple(compile_obj(c) for c in obj.children))
+            return ("fallback", obj)
+
+        entries = [
+            None if node_id not in self._feature_objects
+            else compile_obj(self._feature_objects[node_id])
+            for node_id in self._feature_all
+        ]
+        result = (
+            np.asarray(dims, dtype=np.intp),
+            np.asarray(is_abs, dtype=bool),
+            np.asarray(is_lt, dtype=bool),
+            np.asarray(thresholds, dtype=float),
+            tuple(entries),
+        )
+        self._store_readout_cache("feature_plan", result)
+        return result
+
     def _feature_mask_table(self, obs: np.ndarray) -> List:
         """Every node's activation over a batch of raw observations.
 
@@ -2840,10 +2973,43 @@ class NodeRuntime:
         obs = np.asarray(obs, dtype=float)
         if self.pairwise_features:
             obs = expand_observation(obs)
+        dims, is_abs, is_lt, thresholds, entries = self._compiled_feature_plan()
+        n = len(obs)
+        if dims.size:
+            vals = obs[:, dims]
+            if is_abs.any():
+                vals = np.where(is_abs[None, :], np.abs(vals), vals)
+            pmasks = np.where(
+                is_lt[None, :],
+                vals < thresholds[None, :],
+                vals > thresholds[None, :],
+            )
+        else:
+            pmasks = None
+
+        def eval_entry(entry):
+            kind, payload = entry
+            if kind == "prim":
+                return pmasks[:, payload]
+            if kind == "and":
+                if not payload:
+                    return np.zeros(n, dtype=bool)
+                out = eval_entry(payload[0])
+                for child in payload[1:]:
+                    out = out & eval_entry(child)
+                return out
+            if kind == "or":
+                if not payload:
+                    return np.zeros(n, dtype=bool)
+                out = eval_entry(payload[0])
+                for child in payload[1:]:
+                    out = out | eval_entry(child)
+                return out
+            return payload.mask(obs)
+
         return [
-            None if node_id not in self._feature_objects
-            else self._feature_objects[node_id].mask(obs)
-            for node_id in self._feature_all
+            None if entry is None else eval_entry(entry)
+            for entry in entries
         ]
 
     def _active_feature_roots(self, state) -> List[str]:
@@ -3829,6 +3995,7 @@ class NodeRuntime:
             len(self._prototype_ids),
             len(self.graph.nodes),
             len(self.graph.edges),
+            len(self._feature_objects),
         )
 
     def _store_readout_cache(self, key, value) -> None:
@@ -4228,74 +4395,90 @@ class NodeRuntime:
             )
         return out[:, 0] if flat else out
 
+    def _prototype_geometry(self):
+        """Cached prototype squared norms and -2 * prototypes.T for fast BLAS."""
+        cached = self._cached_readout("proto_geom")
+        if cached is not None:
+            return cached
+        prototypes = self._prototype_matrix
+        proto_norm = np.einsum("ij,ij->i", prototypes, prototypes)[None, :]
+        proto_t_neg2 = np.ascontiguousarray(-2.0 * prototypes.T)
+        geom = (proto_norm, proto_t_neg2)
+        self._store_readout_cache("proto_geom", geom)
+        return geom
+
     def _soft_weights_batch(self, states: np.ndarray):
         states = np.asarray(states, dtype=float)
         if states.ndim != 2 or states.shape[1] != len(self.scales):
             raise ValueError("states must be a matrix with the runtime width")
         if not self._prototype_ids:
             return None, None, None
-        # Squared distances via matrix multiplication; this bounds memory to
-        # (states x prototypes) instead of materialising states x prototypes x dim.
-        prototypes = self._prototype_matrix
+        # Squared distances via cached -2*P^T matmul and in-place norm adds.
+        proto_norm, proto_t_neg2 = self._prototype_geometry()
         state_norm = np.einsum("ij,ij->i", states, states)[:, None]
-        proto_norm = np.einsum("ij,ij->i", prototypes, prototypes)[None, :]
-        distances = (
-            state_norm + proto_norm - 2.0 * (states @ prototypes.T)
-        )
+        distances = states @ proto_t_neg2
+        distances += state_norm
+        distances += proto_norm
         np.maximum(distances, 0.0, out=distances)
         count = min(self.soft_neighbors, distances.shape[1])
         indices = np.argpartition(distances, count - 1, axis=1)[:, :count]
         nearest = np.take_along_axis(distances, indices, axis=1)
         nearest_min = nearest.min(axis=1)
-        weights = np.exp(
-            -0.5 * nearest / (self.soft_sigma * self.soft_sigma)
-        )
+        inv_2sigma2 = -0.5 / (self.soft_sigma * self.soft_sigma)
+        weights = np.exp(inv_2sigma2 * nearest)
         total = weights.sum(axis=1, keepdims=True)
-        weights = weights / np.where(total > 0.0, total, 1.0)
+        weights /= np.where(total > 0.0, total, 1.0)
         return indices, weights, nearest_min
+
+    def _prototype_memory_attribute_vectors(self, attribute: str):
+        """Cached per-prototype weighted memory sums and masses for ``attribute``."""
+        cache_key = ("memory_attr", attribute)
+        cached = self._cached_readout(cache_key)
+        if cached is not None:
+            return cached
+        n_proto = len(self._prototype_ids)
+        attr_sum = np.zeros(n_proto, dtype=float)
+        mass_sum = np.zeros(n_proto, dtype=float)
+        for p_idx, node_id in enumerate(self._prototype_ids):
+            memories = self.memories_for([node_id])
+            for memory_id, strength in memories.items():
+                memory = self.graph.nodes.get(memory_id)
+                if memory is None or memory.kind != MEMORY:
+                    continue
+                s = float(strength)
+                if s <= 0.0:
+                    continue
+                attr_sum[p_idx] += s * getattr(memory, attribute)
+                mass_sum[p_idx] += s
+        pair = (attr_sum, mass_sum)
+        self._store_readout_cache(cache_key, pair)
+        return pair
 
     def _memory_values_batch(self, indices, weights, attribute: str,
                              cache: Optional[Dict[str, Dict[str, float]]] = None):
-        count = len(indices)
-        sums = np.zeros(count, dtype=float)
-        mass = np.zeros(count, dtype=float)
-        cache = {} if cache is None else cache
-        for row in range(count):
-            for column, index in enumerate(indices[row]):
-                node_id = self._prototype_ids[int(index)]
-                memories = cache.get(node_id)
-                if memories is None:
-                    memories = self.memories_for([node_id])
-                    cache[node_id] = memories
-                for memory_id, strength in memories.items():
-                    memory = self.graph.nodes.get(memory_id)
-                    if memory is None or memory.kind != MEMORY:
-                        continue
-                    weight = float(weights[row, column]) * float(strength)
-                    if weight <= 0.0:
-                        continue
-                    sums[row] += weight * getattr(memory, attribute)
-                    mass[row] += weight
+        if len(indices) == 0:
+            return np.zeros(0, dtype=float), np.zeros(0, dtype=float)
+        attr_sum, mass_sum = self._prototype_memory_attribute_vectors(attribute)
+        sums = (weights * attr_sum[indices]).sum(axis=1)
+        mass = (weights * mass_sum[indices]).sum(axis=1)
         return sums, mass
 
-    def valence_state_batch(self, states: np.ndarray):
+    def valence_state_batch(self, states: np.ndarray, soft_weights=None):
         """Soft-neighbour pain/dopamine values for encoded states."""
         states = np.asarray(states, dtype=float)
         if len(states) == 0:
             return np.zeros(0), np.zeros(0)
-        indices, weights, nearest_min = self._soft_weights_batch(states)
+        if soft_weights is None:
+            indices, weights, nearest_min = self._soft_weights_batch(states)
+        else:
+            indices, weights, nearest_min = soft_weights
         if indices is None:
             length = len(np.asarray(states))
             return np.zeros(length), np.zeros(length)
+        pain_column, dopamine_column, _hazard, _assoc = (
+            self._prototype_columns()
+        )
         if self.readout_propagation_gain > 0.0:
-            # Relax the geometric seed over learned edges first, so the node
-            # values are averaged over the topological neighbourhood.  The
-            # per-prototype columns come from the cache, so the scan is paid
-            # once per readout phase rather than once per query, and the two
-            # valence channels share one relaxation.
-            pain_column, dopamine_column, _hazard, _assoc = (
-                self._prototype_columns()
-            )
             channels = self._propagated_readout(
                 indices, weights,
                 np.stack([pain_column, dopamine_column], axis=1),
@@ -4303,18 +4486,8 @@ class NodeRuntime:
             pain = channels[:, 0]
             dopamine = channels[:, 1]
         else:
-            nodes = [
-                self.graph.nodes[self._prototype_ids[int(index)]]
-                for index in indices.ravel()
-            ]
-            pain_values = np.asarray([
-                node.value + node.immediate_pain for node in nodes
-            ]).reshape(indices.shape)
-            dopamine_values = np.asarray([
-                node.dopamine + node.immediate_dopamine for node in nodes
-            ]).reshape(indices.shape)
-            pain = (weights * pain_values).sum(axis=1)
-            dopamine = (weights * dopamine_values).sum(axis=1)
+            pain = (weights * pain_column[indices]).sum(axis=1)
+            dopamine = (weights * dopamine_column[indices]).sum(axis=1)
         # Both valence channels read the same memory neighbourhoods; one
         # retrieval pass per prototype serves both instead of rescanning
         # the membership/association graph for each attribute.

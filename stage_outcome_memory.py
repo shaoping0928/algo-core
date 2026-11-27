@@ -120,17 +120,31 @@ class KeySignal:
 class GenericKeySignalDetector:
     """Fold-fitted detector for generic transition and feedback changes.
 
-    The detector learns one upper-tail threshold per opaque input channel.
-    It can consume observation changes, feedback changes, and optional model
-    prediction errors. Thresholds are fit only on the episodes passed to
-    :meth:`fit`; applying them to held-out episodes does not update the fit.
+    The detector learns a per-channel baseline step (median delta for
+    directional channels, zero for unsigned prediction errors), a scale-aware
+    numerical noise floor, and an upper-tail deviation threshold. Subtracting
+    the channel baseline and ignoring sub-noise-floor jitter prevents constant
+    drift or counter dimensions from firing on floating-point rounding noise,
+    while preserving genuine rare jumps and continuous upper-tail excursions.
+    Thresholds are fit only on the episodes passed to :meth:`fit`; applying
+    them to held-out episodes does not update the fit.
     """
 
-    def __init__(self, quantile: float = 0.98):
+    def __init__(self, quantile: float = 0.98, min_deviation: float = 1e-5,
+                 noise_scale: float = 1e-5, plateau_multiplier: float = 2.5):
         self.quantile = float(quantile)
         if not 0.5 < self.quantile < 1.0:
             raise ValueError("quantile must be between 0.5 and 1")
+        self.min_deviation = float(min_deviation)
+        self.noise_scale = float(noise_scale)
+        self.plateau_multiplier = float(plateau_multiplier)
+        if self.min_deviation < 0.0 or self.noise_scale < 0.0:
+            raise ValueError("noise tolerances must be non-negative")
+        if self.plateau_multiplier < 1.0:
+            raise ValueError("plateau_multiplier must be >= 1.0")
         self.thresholds = {}
+        self.baselines = {}
+        self.noise_floors = {}
         self.fitted = False
 
     @staticmethod
@@ -143,8 +157,9 @@ class GenericKeySignalDetector:
         return result
 
     def fit(self, episodes: Sequence[Mapping]):
-        """Fit channel thresholds from training episodes only."""
-        magnitudes = defaultdict(list)
+        """Fit channel baselines and thresholds from training episodes only."""
+        raw_values = defaultdict(list)
+        directional_flags = {}
         dimensions = {}
         presence = {}
         for episode in episodes:
@@ -155,8 +170,9 @@ class GenericKeySignalDetector:
             self._check_dimension(
                 dimensions, "observation_change", state_delta.shape[1],
             )
-            self._append_magnitudes(
-                magnitudes, "observation_change", state_delta,
+            self._append_raw(
+                raw_values, directional_flags,
+                "observation_change", state_delta, directional=True,
             )
 
             feedback = episode.get("feedback")
@@ -171,9 +187,10 @@ class GenericKeySignalDetector:
                     dimensions, "feedback_change", feedback.shape[1],
                 )
                 if len(feedback) > 1:
-                    self._append_magnitudes(
-                        magnitudes, "feedback_change",
-                        np.diff(feedback, axis=0),
+                    self._append_raw(
+                        raw_values, directional_flags,
+                        "feedback_change", np.diff(feedback, axis=0),
+                        directional=True,
                     )
 
             errors = episode.get("prediction_error")
@@ -187,28 +204,72 @@ class GenericKeySignalDetector:
                 self._check_dimension(
                     dimensions, "prediction_error", errors.shape[1],
                 )
-                self._append_magnitudes(
-                    magnitudes, "prediction_error", errors,
+                self._append_raw(
+                    raw_values, directional_flags,
+                    "prediction_error", errors, directional=False,
                 )
 
         if "observation_change" not in dimensions:
             raise ValueError("at least one training episode is required")
-        self.thresholds = {
-            channel: float(np.quantile(values, self.quantile))
-            for channel, values in magnitudes.items()
-            if values and float(np.max(values)) > 0.0
-        }
+
+        self.thresholds = {}
+        self.baselines = {}
+        self.noise_floors = {}
+        tail_rate = 1.0 - self.quantile
+        max_plateau_rate = min(0.5, self.plateau_multiplier * tail_rate)
+        for channel, values in raw_values.items():
+            if not values:
+                continue
+            arr = np.asarray(values, dtype=float)
+            directional = directional_flags[channel]
+            scale = max(float(np.max(np.abs(arr))), 1.0)
+            noise_floor = max(self.min_deviation, self.noise_scale * scale)
+            if directional:
+                # Only treat a non-zero step as a steady drift baseline when
+                # at least half of transitions sit within the noise floor of it.
+                median_step = float(np.median(arr))
+                zero_share = float(np.mean(np.abs(arr) <= noise_floor))
+                median_share = float(
+                    np.mean(np.abs(arr - median_step) <= noise_floor)
+                )
+                if zero_share >= 0.5:
+                    baseline = 0.0
+                elif median_share >= 0.5:
+                    baseline = median_step
+                else:
+                    baseline = 0.0
+            else:
+                baseline = 0.0
+            self.baselines[channel] = baseline
+            self.noise_floors[channel] = noise_floor
+
+            deviations = np.abs(arr - baseline) if directional else np.abs(arr)
+            clean = np.where(deviations > noise_floor, deviations, 0.0)
+            supranoise = clean[clean > noise_floor]
+            if not len(supranoise):
+                continue
+
+            q_supra = float(np.quantile(supranoise, self.quantile))
+            # Guard against routine discrete plateaus whose frequency far
+            # exceeds the requested upper-tail rate (e.g. frequent constant-size
+            # action echoes), while preserving sparse/moderate events.
+            plateau_rate = float(np.mean(clean >= q_supra - noise_floor))
+            if (len(arr) >= 20
+                    and plateau_rate > max_plateau_rate
+                    and float(np.max(supranoise)) <= q_supra + noise_floor):
+                continue
+            self.thresholds[channel] = float(q_supra)
+
         self.dimensions = dimensions
         self.fitted = True
         return self
 
     @staticmethod
-    def _append_magnitudes(target, kind, values):
+    def _append_raw(target, flags, kind, values, directional):
         for dimension in range(values.shape[1]):
-            column = np.abs(values[:, dimension])
-            target[(kind, int(dimension))].extend(
-                float(value) for value in column if value > 0.0
-            )
+            channel = (kind, int(dimension))
+            flags[channel] = bool(directional)
+            target[channel].extend(float(v) for v in values[:, dimension])
 
     @staticmethod
     def _check_dimension(dimensions, kind, size):
@@ -283,12 +344,18 @@ class GenericKeySignalDetector:
             threshold = self.thresholds.get(channel, 0.0)
             if threshold <= 0.0:
                 continue
+            baseline = self.baselines.get(channel, 0.0) if directional else 0.0
+            noise_floor = self.noise_floors.get(channel, 0.0)
             for index, value in enumerate(values[:, dimension]):
-                magnitude = abs(float(value))
-                if magnitude < threshold:
+                deviation = (
+                    float(value) - baseline if directional else float(value)
+                )
+                magnitude = abs(deviation)
+                if (magnitude <= noise_floor
+                        or magnitude + 0.5 * noise_floor < threshold):
                     continue
                 polarity = (
-                    (1 if value > 0.0 else -1)
+                    (1 if deviation > 0.0 else -1)
                     if directional else 0
                 )
                 step = index + int(step_offset)

@@ -122,6 +122,14 @@ class StageDemandSelectorTests(unittest.TestCase):
         self.assertEqual(demand.action_trace, OPTION)
         self.assertGreater(report["value"], report["runner_up_value"])
         self.assertGreater(report["margin"], 0.0)
+        self.assertGreater(demand.demand_strength, 0.0)
+        self.assertEqual(
+            demand.transition_episode_support,
+            report["candidates"][0]["episode_support"],
+        )
+        self.assertEqual(
+            report["demand_strength"], demand.demand_strength,
+        )
         self.assertFalse(report["affects_value"])
         self.assertEqual(
             report["provenance"], "world_feedback_outcome_readout"

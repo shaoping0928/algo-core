@@ -63,6 +63,8 @@ class StageDemand:
     ``action_trace`` identifies the high-level transition option. The feature
     heuristic may use a separately trained action-conditioned association
     trace; when absent it deliberately uses its pooled observational readout.
+    ``demand_strength`` scales only the temporary search priority, never the
+    feature's learned value or the planner's final objective.
     """
 
     target_stage: StageKey
@@ -72,6 +74,8 @@ class StageDemand:
     transition_probability: Optional[float] = None
     transition_support: int = 0
     transition_resolution: Optional[int] = None
+    transition_episode_support: int = 0
+    demand_strength: float = 1.0
 
     def __post_init__(self):
         target = tuple(_native(token) for token in self.target_stage)
@@ -105,6 +109,13 @@ class StageDemand:
                 raise ValueError("transition_probability must be in [0, 1]")
         if int(self.transition_support) < 0:
             raise ValueError("transition_support must be non-negative")
+        if int(self.transition_episode_support) < 0:
+            raise ValueError(
+                "transition_episode_support must be non-negative"
+            )
+        strength = float(self.demand_strength)
+        if not np.isfinite(strength) or not 0.0 <= strength <= 1.0:
+            raise ValueError("demand_strength must be in [0, 1]")
         object.__setattr__(self, "target_stage", target)
         object.__setattr__(self, "stage_history", history)
         object.__setattr__(self, "action_trace", trace)
@@ -115,6 +126,11 @@ class StageDemand:
         object.__setattr__(
             self, "transition_support", int(self.transition_support)
         )
+        object.__setattr__(
+            self, "transition_episode_support",
+            int(self.transition_episode_support),
+        )
+        object.__setattr__(self, "demand_strength", strength)
 
     @classmethod
     def from_transition_prediction(cls, prediction, target_stage,
@@ -134,15 +150,52 @@ class StageDemand:
         ]
         if not matching:
             raise ValueError("target is not a supported sibling outcome")
+        outcome = matching[0]
+        episode_support = int(outcome.get("episode_support", 0))
+        strength = episode_support / float(episode_support + 2)
         return cls(
             target_stage=target,
             stage_history=tuple(stage_history),
             action_trace=action_trace,
             association_action_trace=association_action_trace,
-            transition_probability=float(matching[0]["probability"]),
+            transition_probability=float(outcome["probability"]),
             transition_support=int(prediction["support"]),
             transition_resolution=prediction.get("resolution"),
+            transition_episode_support=episode_support,
+            demand_strength=strength,
         )
+
+
+@dataclass(frozen=True)
+class StageDemandAlternatives:
+    """A bounded slate of learned successor strategies for one shared search."""
+
+    demands: Tuple[StageDemand, ...]
+
+    def __post_init__(self):
+        demands = tuple(self.demands)
+        if not demands or any(
+                not isinstance(demand, StageDemand) for demand in demands):
+            raise ValueError(
+                "demands must contain at least one StageDemand"
+            )
+        object.__setattr__(self, "demands", demands)
+
+    @property
+    def target_stage(self):
+        return self.demands[0].target_stage
+
+    @property
+    def target_stages(self):
+        return tuple(demand.target_stage for demand in self.demands)
+
+    @property
+    def stage_history(self):
+        return self.demands[0].stage_history
+
+    @property
+    def association_action_trace(self):
+        return self.demands[0].association_action_trace
 
 
 @dataclass(frozen=True)
@@ -431,6 +484,27 @@ class StageDemandHeuristic:
     def score(self, active_features, demand: StageDemand):
         """Return a separate heuristic priority; higher means more relevant."""
         features = _features_with_activation(active_features)
+        if isinstance(demand, StageDemandAlternatives):
+            results = [
+                (proposal, self.score(features, proposal))
+                for proposal in demand.demands
+            ]
+            supported = [
+                (proposal, result) for proposal, result in results
+                if result["status"] == "supported"
+            ]
+            if not supported:
+                return self._unknown()
+            best_proposal, best = max(
+                supported,
+                key=lambda item: float(item[1]["priority"]),
+            )
+            return dict(
+                best,
+                proposal_count=len(demand.demands),
+                proposal_target=best_proposal.target_stage,
+                provenance="bounded_realized_strategy_slate",
+            )
         trace = demand.association_action_trace
         traces = _option_backoff(trace)
         fallback = None
@@ -513,7 +587,8 @@ class StageDemandHeuristic:
                 return dict(
                     status="supported",
                     priority=float(
-                        weighted_priority / activation_total
+                        demand.demand_strength
+                        * weighted_priority / activation_total
                     ),
                     context=context,
                     context_depth=int(len(context)),
@@ -524,6 +599,7 @@ class StageDemandHeuristic:
                     target_base_rate=float(base_rate),
                     action_conditioned=trace is not None,
                     evidence=tuple(evidence),
+                    demand_strength=float(demand.demand_strength),
                     provenance="observed_cooccurrence",
                     affects_value=False,
                 )
@@ -582,6 +658,7 @@ def make_demand_rank_step(heuristic: StageDemandHeuristic,
                 "feature_extractor must return one feature set per state"
             )
         priorities = []
+        groups = []
         for features in feature_sets:
             result = heuristic.score(features, demand)
             supported = result["status"] == "supported"
@@ -590,6 +667,11 @@ def make_demand_rank_step(heuristic: StageDemandHeuristic,
             )
             if stats is not None:
                 stats["candidates"] = int(stats.get("candidates", 0)) + 1
+                if isinstance(demand, StageDemandAlternatives):
+                    stats["proposal_scores"] = (
+                        int(stats.get("proposal_scores", 0))
+                        + len(demand.demands)
+                    )
                 if supported:
                     stats["supported"] = (
                         int(stats.get("supported", 0)) + 1
@@ -598,11 +680,22 @@ def make_demand_rank_step(heuristic: StageDemandHeuristic,
                         stats["nonzero"] = (
                             int(stats.get("nonzero", 0)) + 1
                         )
+                    proposal_target = result.get("proposal_target")
+                    if proposal_target is not None:
+                        key = "proposal_wins:%r" % (proposal_target,)
+                        stats[key] = int(stats.get(key, 0)) + 1
                 else:
                     stats["unknown"] = (
                         int(stats.get("unknown", 0)) + 1
                     )
             priorities.append(priority)
-        return np.asarray(priorities, dtype=float)
+            groups.append(
+                result.get("proposal_target")
+                if supported and priority > 0.0 else None
+            )
+        priority_array = np.asarray(priorities, dtype=float)
+        if isinstance(demand, StageDemandAlternatives):
+            return priority_array, tuple(groups)
+        return priority_array
 
     return rank_step
