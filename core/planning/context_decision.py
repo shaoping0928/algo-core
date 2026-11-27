@@ -57,6 +57,9 @@ class ContextDrivenDecisionController:
         active_inject_weight: float = 0.22,
         bridge_weight: float = 0.14,
         top_active_targets: int = 16,
+        content_class_gate: bool = True,
+        lookahead_depth: int = 1,
+        lookahead_beam: int = 4,
     ):
         self.class_policy = class_policy
         self.virtual_dag = virtual_dag
@@ -70,6 +73,9 @@ class ContextDrivenDecisionController:
         self.active_inject_weight = float(active_inject_weight)
         self.bridge_weight = float(bridge_weight)
         self.top_active_targets = max(int(top_active_targets), 4)
+        self.content_class_gate = bool(content_class_gate)
+        self.lookahead_depth = max(int(lookahead_depth), 1)
+        self.lookahead_beam = max(int(lookahead_beam), 2)
 
     def _local_pair_prob_and_lift(self, prev1: int, target: int) -> Tuple[float, float]:
         post = self.class_policy.local_index._postings.get((-1, int(prev1)))
@@ -169,12 +175,22 @@ class ContextDrivenDecisionController:
         active_strengths, tree_stats = self._collect_active_node_strengths(slow_state)
         injected = 0
         bridged = 0
+        # Content-class gate: scale content injection by P(next class is content, not singleton glue)
+        content_gate = 1.0
+        if self.content_class_gate and self.class_policy.n_singletons > 0:
+            cids, cprobs = self.class_policy.predict_next_classes(ctx_tokens, top_c=8)
+            p_tot = float(cprobs.sum())
+            if p_tot > 1e-12:
+                p_content = float(
+                    sum(float(cp) for cid, cp in zip(cids, cprobs) if cid > self.class_policy.n_singletons)
+                ) / p_tot
+                content_gate = float(np.clip(p_content, 0.05, 1.0))
         if prev1 > 0 and active_strengths:
             top_active = sorted(active_strengths.items(), key=lambda kv: kv[1], reverse=True)[
                 : self.top_active_targets
             ]
-            w_inj = self.active_inject_weight * ent_gate
-            w_br = self.bridge_weight * ent_gate
+            w_inj = self.active_inject_weight * ent_gate * content_gate
+            w_br = self.bridge_weight * ent_gate * content_gate
             for goal_sym, strength in top_active:
                 if goal_sym == prev1:
                     continue
@@ -207,8 +223,86 @@ class ContextDrivenDecisionController:
             out_p /= out_sum
         info = dict(
             entropy_gate=ent_gate,
+            content_gate=content_gate,
             active_injected=float(injected),
             active_bridged=float(bridged),
             tree_visited=float(tree_stats["nodes_visited"]),
+            lookahead_depth=float(self.lookahead_depth),
         )
         return acts, out_p, info
+
+    def decide_with_lookahead(
+        self,
+        ctx_tokens: Sequence[int],
+        slow_state: Optional[np.ndarray] = None,
+        *,
+        k: int = 8,
+        depth: Optional[int] = None,
+        beam_width: Optional[int] = None,
+    ) -> Tuple[List[int], np.ndarray, Dict[str, float]]:
+        """Multi-step lookahead beam decision over ``decide_distribution``.
+
+        When ``depth <= 1``, delegates directly to 1-step ``decide_distribution``.
+        When ``depth >= 2``, rolls forward the top ``beam_width`` candidate
+        paths for ``depth`` steps and ranks each first action by the best
+        cumulative path log-likelihood + active-field continuity.
+        """
+        d = self.lookahead_depth if depth is None else max(int(depth), 1)
+        bw = self.lookahead_beam if beam_width is None else max(int(beam_width), 2)
+        acts1, probs1, info = self.decide_distribution(ctx_tokens, slow_state, k=max(int(k), bw))
+        if d <= 1 or len(acts1) <= 1:
+            return acts1[:k], probs1[:k] / max(float(probs1[:k].sum()), 1e-12), info
+
+        base_ctx = [int(x) for x in ctx_tokens[-6:]]
+        eff_field = self.temp_memory.effective_field(root_blend=0.45)
+        f_max = max(float(eff_field.max()), 1e-8)
+
+        # Beam entries: (cum_score, first_action, rolled_ctx, rolled_slow)
+        beam = []
+        for a, p in zip(acts1[:bw], probs1[:bw]):
+            h_next = (
+                self.class_policy.update_slow_state(slow_state, a)
+                if slow_state is not None else None
+            )
+            f_bonus = 0.15 * float(eff_field[a]) / f_max if a > 0 else 0.0
+            beam.append((float(np.log(max(float(p), 1e-9))) + f_bonus, int(a), base_ctx + [int(a)], h_next))
+
+        for _step in range(1, d):
+            next_beam = []
+            for sc, first_a, r_ctx, r_h in beam:
+                a_sub, p_sub, _ = self.decide_distribution(r_ctx, r_h, k=bw)
+                for a2, p2 in zip(a_sub[:bw], p_sub[:bw]):
+                    h2 = (
+                        self.class_policy.update_slow_state(r_h, a2)
+                        if r_h is not None else None
+                    )
+                    f_bonus = 0.15 * float(eff_field[a2]) / f_max if a2 > 0 else 0.0
+                    next_beam.append((
+                        sc + 0.75 * float(np.log(max(float(p2), 1e-9))) + f_bonus,
+                        first_a,
+                        r_ctx + [int(a2)],
+                        h2,
+                    ))
+            next_beam.sort(key=lambda item: item[0], reverse=True)
+            beam = next_beam[: max(bw * 2, 6)]
+
+        # Aggregate best lookahead path score per first action
+        best_by_first: Dict[int, float] = {}
+        for sc, first_a, _rc, _rh in beam:
+            if first_a not in best_by_first or sc > best_by_first[first_a]:
+                best_by_first[first_a] = sc
+
+        # Blend lookahead scores with 1-step tail candidates
+        scored_first = []
+        min_la = min(best_by_first.values()) if best_by_first else -10.0
+        for a, p in zip(acts1, probs1):
+            la_s = best_by_first.get(int(a), min_la - 1.0 + float(np.log(max(float(p), 1e-9))))
+            scored_first.append((la_s, int(a)))
+        scored_first.sort(key=lambda item: item[0], reverse=True)
+        top = scored_first[: max(int(k), 1)]
+        logits = np.asarray([s for s, _ in top], dtype=float)
+        logits -= float(logits.max())
+        out_p = np.exp(logits)
+        out_p /= max(float(out_p.sum()), 1e-12)
+        info["lookahead_depth"] = float(d)
+        return [a for _, a in top], out_p, info
