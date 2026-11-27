@@ -77,6 +77,7 @@ class TrunkPointFailureMemory:
     def _route_trunk_batch(
         self, obs_view: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Standardize states and assign each to its nearest frozen trunk leaf + OOD check."""
         z = self.summarizer._standardize(obs_view)
         z_norm = np.einsum("ij,ij->i", z, z)[:, None]
         d2 = z @ self._center_t_neg2
@@ -145,6 +146,8 @@ class TrunkPointFailureMemory:
                     self.total_failures += 1
                     added_failures += 1
 
+            # Exclude the final 2 pre-terminal frames from the safe reservoir so
+            # imminent impact approaches never dilute point-event failure density.
             safe_end = max(0, length - 2) if terminal else length
             for idx in range(0, safe_end, self.safe_stride):
                 if not in_rad[idx]:

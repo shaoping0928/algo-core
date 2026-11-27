@@ -85,7 +85,14 @@ class AdaptiveSearchController:
         self.episodes_seen: int = 0
 
     def begin_episode(self, stage_gate=None) -> bool:
-        """Decide causally whether the upcoming episode uses adaptive deepening."""
+        """Decide causally whether the upcoming episode uses adaptive deepening.
+
+        Adaptive deepening is unlocked only when BOTH outer causal gates pass:
+          1. ``stage_gate`` confirms the online stage evaluator has predictive
+             signal (Wilson-LCB >= ``meta_lcb`` after ``stage_warmup`` episodes).
+          2. ``mode_audit_gate`` confirms adaptive episodes are not collapsing
+             relative to the running conservative baseline median.
+        """
         if self.meta_lcb <= 0.0:
             stage_ok = True
         else:
@@ -109,7 +116,12 @@ class AdaptiveSearchController:
     def record_episode(
         self, frames: int, used_adaptive: Optional[bool] = None,
     ) -> None:
-        """Record realized episode survival for the causal mode self-audit."""
+        """Record realized episode survival for the causal mode self-audit.
+
+        Conservative episodes populate the baseline survival reference; adaptive
+        episodes are judged against ``audit_ratio * median(base_lengths)`` so
+        regressing regimes trigger automatic fallback without future leakage.
+        """
         ep_len = float(max(int(frames), 0))
         was_adaptive = self.active if used_adaptive is None else bool(used_adaptive)
         self.episodes_seen += 1
@@ -120,7 +132,12 @@ class AdaptiveSearchController:
             self.mode_audit_gate.observe(ep_len >= self.audit_ratio * base_med)
 
     def observe_tier0_confidence(self, conf: float) -> Tuple[float, float]:
-        """Record Tier-0 plan confidence and return ``(tau_0, decay)``."""
+        """Record Tier-0 plan confidence and return ``(tau_0, decay)``.
+
+        When ``conf_quantile > 0``, waits for at least 32 Tier-0 samples before
+        switching from ``conf_threshold`` to the rolling quantile estimate so
+        cold-start variance does not destabilize early thresholds.
+        """
         c = float(conf)
         if math.isfinite(c):
             self._conf_history.append(c)

@@ -278,6 +278,9 @@ class OnlineFeatureDemandUpdater:
         )[:, :self.obs_dim_]
         n = len(arr)
         is_term = bool(ep_rows[-1].get("done", False))
+        # Non-terminal (capped) episodes are verified survivors: offset remaining
+        # horizon by +n so their states rank in the top quartile without ever
+        # being labeled as imminent failures.
         rem = np.arange(n, 0, -1, dtype=float) + (0.0 if is_term else float(n))
         dead = (rem <= self.imminent_steps) if is_term else np.zeros(n, dtype=bool)
 
@@ -308,6 +311,8 @@ class OnlineFeatureDemandUpdater:
         new_center = 0.5 * (q_lo + q_hi)
         new_hw = np.maximum(0.5 * (q_hi - q_lo), 1e-4)
 
+        # Re-estimate alignment & failure contrast while keeping the structural
+        # controllability mask fixed from the initial world-model probe.
         dead_states = s_all[dead_mask]
         d = self.obs_dim_
         align_gain = np.zeros(d, dtype=float)

@@ -241,6 +241,13 @@ def _select_adaptive_beam(
     states, seqs, first_states, cum_risk, path_sp, path_dem,
     score, beam_width, action_space, keep_diverse,
 ):
+    """Prune frontier states to ``beam_width``, optionally preserving first-action diversity.
+
+    When ``keep_diverse`` is True (used at hop boundaries up to and past ``lag``),
+    allocates an equal quota per distinct root action before filling remaining
+    slots globally.  This prevents premature single-action beam collapse before
+    the root action has physically taken effect in the dynamics.
+    """
     finite = np.isfinite(score) & np.isfinite(states).all(axis=1)
     safe = (
         np.where(finite, score, np.inf)
@@ -257,6 +264,7 @@ def _select_adaptive_beam(
                 for ii in idxs[np.argsort(safe[idxs])[:per_a]]:
                     chosen.append(int(ii))
                     used.add(int(ii))
+        # Fill any leftover beam budget with the globally best remaining trajectories.
         for ii in np.argsort(safe):
             if len(chosen) >= k:
                 break
@@ -282,6 +290,12 @@ def _expand_clean_chunk(
     start_step, chunk_size, pending_prefix, world, agent,
     lag=LAG, step_stride=2, risk_weight=0.0,
 ):
+    """Roll the current beam forward by ``chunk_size`` steps without recomputing earlier hops.
+
+    Adaptive tiers pass ``risk_weight=0.0`` once the online evaluator is verified
+    reliable, avoiding distortion from frozen offline pain readouts during deeper
+    multi-step lookahead.
+    """
     action_space = tuple(getattr(agent, "action_space", (0, 1)))
     n_act = len(action_space)
     action_arr = np.asarray(action_space, dtype=float)
@@ -290,13 +304,14 @@ def _expand_clean_chunk(
     scales = agent.scales
     end_step = int(start_step) + int(chunk_size)
     if seqs.shape[1] < end_step:
+        # Grow action buffer on demand when incrementally extending past base_hops.
         pad = np.zeros((len(seqs), end_step - seqs.shape[1]), dtype=float)
         seqs = np.concatenate([seqs, pad], axis=1)
     added = 0
     for step in range(int(start_step), end_step):
         count = len(states)
         next_states = np.repeat(states, n_act, axis=0)
-        next_seqs = np.repeat(seqs, n_act, axis=0)
+        next_seqs = np.repeat(sequences := seqs, n_act, axis=0)
         next_seqs[:, step] = np.tile(action_arr, count)
         hist = history_features(
             next_seqs, step + 1, pending_prefix, action_dim=action_dim,
@@ -327,6 +342,12 @@ def _score_clean_frontier(
     stage_value, stage_value_weight, heuristic_demand, heuristic_demand_weight,
     lag=LAG,
 ):
+    """Score frontier consistently across all controllable hops (``horizon > lag``).
+
+    Pre-lag states are identical across root actions and are excluded from the
+    path-mean accumulator so early uncontrollable steps cannot dilute downstream
+    controllable differences.
+    """
     if stage_value is not None and stage_value_weight > 0.0:
         sp = stage_value_weight * np.asarray(
             stage_value(states, seqs), dtype=float
@@ -367,6 +388,7 @@ def _run_clean_chain_tier(
     diverse_hop1, stage_value, stage_value_weight,
     heuristic_demand, heuristic_demand_weight, lag=LAG, step_stride=2,
 ):
+    """Evaluate one segmented search tier and compute its monotonic bottleneck confidence."""
     action_space = tuple(getattr(agent, "action_space", (0, 1)))
     states = initial.reshape(1, -1)
     seqs = np.zeros((1, int(chunk_size) * int(n_hops)), dtype=float)
@@ -408,6 +430,8 @@ def _run_clean_chain_tier(
         raise ValueError("adaptive chained search found no finite candidate")
     best = int(np.argmin(cost))
     r_best = max(0.0, float(cum_risk[best]))
+    # Bottleneck (max) post-lag penalty ensures confidence is monotonically
+    # non-increasing with depth, preventing cross-horizon optimism illusion.
     worst_sp = (
         float(np.max(np.clip(path_sp[best], 0.0, 1.0)))
         if (path_sp is not None and path_sp.shape[1] > 0) else 0.0
@@ -425,6 +449,7 @@ def _extend_clean_frontier_one_chunk(
     stage_value, stage_value_weight, heuristic_demand, heuristic_demand_weight,
     lag=LAG, step_stride=2,
 ):
+    """Incrementally extend an existing frontier by one chunk (zero recompute of earlier hops)."""
     states, seqs, first_states, cum_risk, path_sp, path_dem, cost, cur_h = frontier
     action_space = tuple(getattr(agent, "action_space", (0, 1)))
     (

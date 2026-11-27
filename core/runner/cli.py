@@ -19,6 +19,7 @@ from latent_world import SEEDS
 
 
 def main():
+    """Parse CLI flags, validate options, run parallel seed evaluation, and print reports."""
     from substrate_nodes import DEFAULT_JOBS, FREE_THREADED, LAG, run_seed
 
     parser = argparse.ArgumentParser()
