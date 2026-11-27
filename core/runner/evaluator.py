@@ -327,6 +327,27 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
     return env.t, actions, transitions
 
 
+def _resolve_env_factory(env_name: str, lag: int, cap: int):
+    """Resolve a CLI ``--env`` name into an ``env_factory`` (or ``None`` for Flappy)."""
+    name = str(env_name or "flappy").strip()
+    low = name.lower()
+    if low == "flappy":
+        return None
+    if low == "cartpole":
+        from cartpole_env import make_cartpole_factory
+        return make_cartpole_factory(lag=lag, cap=cap)
+    if low == "mountaincar":
+        from mountaincar_env import make_mountaincar_factory
+        return make_mountaincar_factory(lag=lag, cap=cap)
+    if low.startswith("gym:"):
+        gym_id = name.split(":", 1)[1].strip()
+        if not gym_id:
+            raise ValueError("gym:<env_id> requires a non-empty environment id")
+        from gym_adapter import make_gym_factory
+        return make_gym_factory(gym_id, lag=lag, cap=cap)
+    raise ValueError(f"unsupported --env {env_name!r}; expected 'flappy', 'cartpole', or 'gym:<env_id>'")
+
+
 def run_seed(task):
     """Train one model and score it on the requested evaluation worlds.
 
@@ -337,6 +358,7 @@ def run_seed(task):
     evaluation seed and every requested episode of that seed.
     """
     seed = int(task["seed"])
+    env_name = str(task.get("env", "flappy"))
     steps = int(task.get("steps", 5000))
     coverage = float(task.get("coverage", 0.1))
     cap = int(task.get("cap", 6000))
@@ -345,6 +367,7 @@ def run_seed(task):
     horizon = int(task.get("horizon", 10))
     epochs = int(task.get("epochs", 5))
     lag = int(task.get("lag", LAG))
+    env_factory = _resolve_env_factory(env_name, lag=lag, cap=cap)
     component_kinds = tuple(task.get("component_kinds", ()))
     component_min_count = int(task.get("component_min_count", 8))
     max_components = int(task.get("max_components", 128))
@@ -568,6 +591,7 @@ def run_seed(task):
         stage_memory_feature_source=stage_memory_feature_source,
         online_feature_learning=online_feature_learning,
         online_feature_options=online_feature_options,
+        env_factory=env_factory,
     )
     explicit_eval = bool(eval_seeds)
     eval_world = world
@@ -780,6 +804,7 @@ def run_seed(task):
                     adaptive_controller=adaptive_controller,
                     chain_max_hops=chain_max_hops,
                     chain_wide_beam_width=chain_wide_beam_width,
+                    env_factory=env_factory,
                 )
                 if adaptive_controller is not None:
                     adaptive_controller.record_episode(int(frames))

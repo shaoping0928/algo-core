@@ -136,35 +136,47 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
             seed * 10000 + episode, spacing=spacing, gravity=gravity,
             flap=flap, speed=speed,
         )
+        env_actions = tuple(getattr(env, "action_space", (0, 1)))
+        n_actions = len(env_actions)
         lp.hist = [0.0] * 8
         while not env.dead and done < steps:
-            gains = np.abs(lp.h)
-            total = float(gains.sum())
-            confidence = float(gains.max() / total) if total > 1e-9 else 0.0
-            if total > 1e-9 and (lp.t >= 20 or confidence >= 0.25):
-                gain = float(lp.h[int(np.argmax(gains))])
-                center = float(np.clip(-lp.b / gain, 0.0, 1.0))
-            else:
-                center = 0.1
-            explore = 0.03 + 0.10 * (1.0 - confidence)
             obs = np.asarray(env.obs(), dtype=float)
-            # Draw order matters: the uniform offset is consumed after the
-            # uniform-variate rand, matching the original sampler's stream.
-            draw = rng.rand()
-            offset = rng.uniform(-explore, explore)
-            behavior_p = float(np.clip(center + offset, 0.0, 1.0))
-            action = int(draw < behavior_p)
-            propensity = behavior_p
+            if n_actions == 2:
+                gains = np.abs(lp.h)
+                total = float(gains.sum())
+                confidence = float(gains.max() / total) if total > 1e-9 else 0.0
+                if total > 1e-9 and (lp.t >= 20 or confidence >= 0.25):
+                    gain = float(lp.h[int(np.argmax(gains))])
+                    center = float(np.clip(-lp.b / gain, 0.0, 1.0))
+                else:
+                    center = 0.1
+                explore = 0.03 + 0.10 * (1.0 - confidence)
+                # Draw order matters: the uniform offset is consumed after the
+                # uniform-variate rand, matching the original sampler's stream.
+                draw = rng.rand()
+                offset = rng.uniform(-explore, explore)
+                behavior_p = float(np.clip(center + offset, 0.0, 1.0))
+                action = int(draw < behavior_p)
+                propensity = behavior_p
+            else:
+                action = int(env_actions[int(rng.randint(n_actions))])
+                propensity = 1.0 / float(n_actions)
             overridden = False
             if coverage > 0.0 and rng.rand() < coverage:
                 # Generic action-coverage exploration: choose the less-used action
                 # in the current observation bucket. This uses no task geometry.
                 key = tuple(np.round(obs, 1))
-                counts = action_counts.setdefault(key, [0, 0])
-                action = int(counts[1] < counts[0] or (
-                    counts[1] == counts[0] and rng.rand() < 0.5
-                ))
-                propensity = 0.5
+                counts = action_counts.setdefault(key, [0] * n_actions)
+                if n_actions == 2:
+                    action = int(counts[1] < counts[0] or (
+                        counts[1] == counts[0] and rng.rand() < 0.5
+                    ))
+                    propensity = 0.5
+                else:
+                    min_c = min(counts)
+                    least = [i for i, c in enumerate(counts) if c == min_c]
+                    action = int(env_actions[least[int(rng.randint(len(least)))]])
+                    propensity = 1.0 / float(len(least))
                 overridden = True
             if guide is not None and spent < int(budget):
                 tested = guide(obs)
@@ -176,7 +188,7 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
             if propensities is not None:
                 propensities.append(propensity)
             key = tuple(np.round(obs, 1))
-            action_counts.setdefault(key, [0, 0])[action] += 1
+            action_counts.setdefault(key, [0] * n_actions)[action] += 1
             vy0 = getattr(env, "vy", float(obs[1]) if len(obs) > 1 else 0.0)
             history = np.asarray([action] + lp.hist[:int(lag)], dtype=float)
             env.step(action)
@@ -199,7 +211,7 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
                 # Nothing here consumes an rng draw, so the pinned behavior
                 # stream is untouched.
                 propensity=(
-                    float(propensity) if overridden
+                    float(propensity) if (overridden or n_actions != 2)
                     else (behavior_p if action == 1 else 1.0 - behavior_p)
                 ),
             ))
@@ -212,7 +224,8 @@ def fit(transitions, seed):
     if not transitions:
         raise ValueError("need at least one transition to fit")
     obs_dim = len(transitions[0]["obs"])
-    world = LinearObservationModel(obs_dim, ACTION_DIM).fit(
+    action_dim = len(transitions[0]["history"])
+    world = LinearObservationModel(obs_dim, action_dim).fit(
         [row["obs"] for row in transitions],
         [row["history"] for row in transitions],
         [row["next_obs"] for row in transitions],
@@ -233,9 +246,9 @@ def fit(transitions, seed):
     value_replay = ReturnReplay(capacity=len(transitions) + 1, seed=seed)
     risk_replay = TransitionReplay.for_stream(len(transitions), seed=seed)
     value_head = WorldFeedbackValueHead(
-        feature_dim=obs_dim + ACTION_DIM, discount=0.99, seed=seed
+        feature_dim=obs_dim + action_dim, discount=0.99, seed=seed
     )
-    risk_head = TerminalRiskHead(feature_dim=obs_dim + ACTION_DIM)
+    risk_head = TerminalRiskHead(feature_dim=obs_dim + action_dim)
     by_episode = {}
     for index, row in enumerate(transitions):
         by_episode.setdefault(row["episode"], []).append((index, row))

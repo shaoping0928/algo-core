@@ -188,7 +188,8 @@ def _transition_table(transitions, agent, min_support: int = 2):
     raw = {}
     pain = {}
     visits = {}
-    action_totals = np.zeros(2)
+    n_actions = max(2, len(getattr(agent, "action_space", (0, 1))))
+    action_totals = np.zeros(n_actions)
     for rows in episodes.values():
         observations = np.asarray([row["obs"] for row in rows], dtype=float)
         encoded = np.concatenate(

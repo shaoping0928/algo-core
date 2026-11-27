@@ -181,8 +181,10 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
             np.asarray(rule_coverage_x, dtype=float)
             / scales[:obs_dim]
         )
+    observed_actions = sorted({int(row["history"][0]) for row in transitions})
+    action_space = tuple(observed_actions) if len(observed_actions) >= 2 else (0, 1)
     agent = NodeRuntime(
-        obs_dim=obs_dim, action_space=(0, 1), lag=lag,
+        obs_dim=obs_dim, action_space=action_space, lag=lag,
         birth_threshold=birth_threshold, max_nodes=max_nodes,
         exploration=0.0, seed=seed, scales=scales,
         component_kinds=component_kinds,

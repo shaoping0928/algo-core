@@ -516,6 +516,9 @@ def main():
     parser.add_argument("--fast", action="store_true",
                         help="small development preset: 1500 steps, 3 epochs, "
                              "1000 nodes, 400-frame evaluation")
+    parser.add_argument("--env", default="flappy",
+                        help="environment to run: 'flappy', 'cartpole', "
+                             "'mountaincar', or 'gym:<env_id>' (default: flappy)")
     args = parser.parse_args()
     if args.fast:
         args.steps = 1500
@@ -717,6 +720,7 @@ def main():
         )
     tasks = [
         dict(
+            env=args.env,
             seed=seed,
             steps=args.steps,
             coverage=args.coverage,
