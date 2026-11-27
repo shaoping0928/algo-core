@@ -177,7 +177,7 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
                 propensities.append(propensity)
             key = tuple(np.round(obs, 1))
             action_counts.setdefault(key, [0, 0])[action] += 1
-            vy0 = env.vy
+            vy0 = getattr(env, "vy", float(obs[1]) if len(obs) > 1 else 0.0)
             history = np.asarray([action] + lp.hist[:int(lag)], dtype=float)
             env.step(action)
             next_obs = np.asarray(env.obs(), dtype=float)
@@ -185,7 +185,8 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
             signals = np.asarray(
                 [feedback["dopamine"], feedback["pain"]], dtype=float
             )
-            lp.observe(env.vy - vy0, float(action))
+            vy1 = getattr(env, "vy", float(next_obs[1]) if len(next_obs) > 1 else 0.0)
+            lp.observe(vy1 - vy0, float(action))
             transitions.append(dict(
                 obs=obs, next_obs=next_obs, history=history,
                 signals=signals, terminal=bool(env.dead),

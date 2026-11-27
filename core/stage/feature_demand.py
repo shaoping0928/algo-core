@@ -226,6 +226,7 @@ class OnlineFeatureDemandUpdater:
         ema_alpha: float = 0.30,
         max_online_frames: int = 12000,
         min_online_frames: int = 600,
+        min_terminal_episodes: int = 0,
     ):
         if not base_demand.fitted:
             raise ValueError("base_demand must be fitted")
@@ -237,11 +238,14 @@ class OnlineFeatureDemandUpdater:
             raise ValueError("max_online_frames must be positive")
         if int(min_online_frames) < 1:
             raise ValueError("min_online_frames must be positive")
+        if int(min_terminal_episodes) < 0:
+            raise ValueError("min_terminal_episodes must be non-negative")
 
         self.update_every = int(update_every)
         self.ema_alpha = float(ema_alpha)
         self.max_online_frames = int(max_online_frames)
         self.min_online_frames = int(min_online_frames)
+        self.min_terminal_episodes = int(min_terminal_episodes)
 
         self.obs_dim_ = int(base_demand.obs_dim_)
         self.controllable_ = np.asarray(base_demand.controllable_, dtype=float).copy()
@@ -254,7 +258,7 @@ class OnlineFeatureDemandUpdater:
         self.survival_top_q = float(base_demand.survival_top_q)
         self.imminent_steps = float(base_demand.imminent_steps)
 
-        self._online_chunks: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        self._online_chunks: List[Tuple[np.ndarray, np.ndarray, np.ndarray, bool]] = []
         self._online_frames: int = 0
         self.episodes_seen: int = 0
         self.updates: int = 0
@@ -284,7 +288,7 @@ class OnlineFeatureDemandUpdater:
         rem = np.arange(n, 0, -1, dtype=float) + (0.0 if is_term else float(n))
         dead = (rem <= self.imminent_steps) if is_term else np.zeros(n, dtype=bool)
 
-        self._online_chunks.append((arr, rem, dead))
+        self._online_chunks.append((arr, rem, dead, is_term))
         self._online_frames += n
         while self._online_frames > self.max_online_frames and len(self._online_chunks) > 1:
             dropped = self._online_chunks.pop(0)
@@ -296,6 +300,10 @@ class OnlineFeatureDemandUpdater:
             or self._online_frames < self.min_online_frames
         ):
             return False
+        if self.min_terminal_episodes > 0:
+            n_term_in_window = sum(1 for chunk in self._online_chunks if chunk[3])
+            if n_term_in_window < self.min_terminal_episodes:
+                return False
 
         s_all = np.vstack([chunk[0] for chunk in self._online_chunks])
         rem_all = np.concatenate([chunk[1] for chunk in self._online_chunks])

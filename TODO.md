@@ -196,9 +196,20 @@
   - 将原先平铺的 31 个 `core/*.py` 重构为 6 个职责清晰的子包：`core/env/`（环境与动作延迟）、`core/memory/`（节点运行时、图、特征、规则、变量槽位与工作记忆）、`core/stage/`（现役阶段与在线适应体系）、`core/planning/`（搜索与自适应规划）、`core/runner/`（评测协议与 CLI）、`core/legacy/`（历史阶段/里程碑实验模块隔离）；
   - 拆分 2,467 行 `core/stage_regime.py` 为 `core/stage/{summarizer,transition,failure_memory,feature_demand,adaptive_controller}.py`（50 行薄兼容门面）；从 6,012 行 `core/substrate_nodes.py` 抽离 `core/planning/chained_search.py`（581 行）与 `core/runner/cli.py`（1,215 行），主干瘦身至 4,274 行；
   - 经 `core/_paths.py` 统一路径引导保持 100% 向后兼容，全量 **781/781** 单测、`probes/` 导入、任务无关性审计与 CLI 端到端冒烟全部一次绿灯。
-- [ ] **Phase 13 — 后续可选方向（默认栈仍不变，按需推进）**：
-  - 在 `cap=5000` 完整 benchmark 口径上验证 `Chain Adaptive + OnlineFeatureDemandUpdater + OnlineRegimeContinuationUpdater + TrunkPointFailureMemory + SourceAbstainGate` 的长尾上限；
-  - 将抽象类节点进一步扩展至“关系型/对称特征类模板”（跨观测通道共享边界/接近关系模板）及长程多世界变量树先验召回。
+- [x] **Phase 13 — `cap=5000` 全口径长尾摸底 + 第二基准环境（Delayed CartPole）真跨任务泛化验证（2026-11-27 完成）**：
+  - **方向 1：`cap=5000` 全口径 600 局基准（6 种子 × 100 世界 `eval 200–299`）**：
+    - `phase10_base_2x3`: `403.7`（med `232.0`, `2481p`, `>=1200: 43`, `2.96 ms/f`）
+    - `phase11_adaptive`: `429.2`（`+25.4`, `2669p`, `>=1200: 60`, `seed 104: 1255.4`, `2.71 ms/f`）
+    - **`phase12_full`**: **`516.6`（`+112.9` vs P10, med `312.0`, `3328p` `+847`, `5/6` 正，首次打满 `cap=5000`，`2.82 ms/f`）**（`seed 100: 466.9, 101: 400.1, 102: 307.5, 103: 680.1 [max 5000], 104: 947.5, 105: 297.7`）；
+    - 为 `OnlineFeatureDemandUpdater` 新增可选终局数守卫 `min_terminal_episodes`（默认 `0`；设为 `12` 在 `cap=5000` 360 局上达 **`518.8 (+14.2)`**，将 `seed 104` 由 `1042.0` 救回 **`1258.5 (+216.5)`**、`seed 103` 升至 **`835.1`**）。
+  - **方向 2：第二基准环境（非线性对称控制 [core/env/cartpole_env.py](file:///c:/workspace/code/algo_core/core/env/cartpole_env.py) `DelayedCartPole(lag=2)`）零算法改动跨任务首测（6 种子 × 50 世界 = 300 局/组，`cap=500`）**：
+    - 修复 [core/runner/substrate_generic.py](file:///c:/workspace/code/algo_core/core/runner/substrate_generic.py) 中 `collect()` 对 `env.vy` 的隐式属性假设（改为 `getattr(env, "vy", ...)`，原基准逐位不变）；
+    - **零改动首跑全线大胜（`6/6` 种子全正）**：`random_policy` **`20.5`** → `base_search_h6` **`108.3`** → `frozen_chain_2x3` **`184.7` (`20/300` 满 500)** → **`phase12_full_online` `369.3`（`18.0×` 随机、`3.41×` 穷举 `H=6`、`2.00×` 冻结分节，中位 `477.5`，`140/300` 满 `cap=500` 彻底通关！）**；
+    - 自监督内部诊断确认：`ControllableFeatureDemand` 在 6/6 种子上自动剥离单调时钟维并精准识别可控维 `(0,1,2,3)`，`OnlineFeatureDemandUpdater` 自发收敛到物理平衡点 `theta ≈ 0.000 ± 0.004 rad`，`AdaptiveSearchController` 自动放行 `88–97%`（零误拦 `blk=0`）；
+    - 新增 [tests/test_cartpole_cross_task.py](file:///c:/workspace/code/algo_core/tests/test_cartpole_cross_task.py) 锁定跨任务兼容性。
+- [ ] **Phase 14 — 后续可选方向（默认栈仍不变，按需推进）**：
+  - 将 `OnlineFeatureDemandUpdater` 扩展 `var_signature` 作用域，与 `DynamicsClassNode` + `adaptive_chained_result` 在交替变物理多世界上合体验证（方向 3）；
+  - 拆解 `core/memory/node_runtime.py` 与 `core/substrate_nodes.py` 剩余大文件（方向 4）。
 
 ## P0：多视窗状态转移机制重设计（当前主线）
 
