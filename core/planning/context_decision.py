@@ -114,6 +114,9 @@ class ContextDrivenDecisionController:
         learned_class_gate: Optional[LearnedClassContextGate] = None,
         lookahead_depth: int = 1,
         lookahead_beam: int = 4,
+        lookahead_pmi_alpha: float = 0.35,
+        lookahead_anchor_weight: float = 0.25,
+        lookahead_stagnation_weight: float = 0.65,
     ):
         self.class_policy = class_policy
         self.virtual_dag = virtual_dag
@@ -138,6 +141,54 @@ class ContextDrivenDecisionController:
         )
         self.lookahead_depth = max(int(lookahead_depth), 1)
         self.lookahead_beam = max(int(lookahead_beam), 2)
+        self.lookahead_pmi_alpha = float(lookahead_pmi_alpha)
+        self.lookahead_anchor_weight = float(lookahead_anchor_weight)
+        self.lookahead_stagnation_weight = float(lookahead_stagnation_weight)
+
+        self._anchor_state: Optional[np.ndarray] = None
+        self._tree_root_slots: Dict[int, float] = {}
+        if self.stage_tree is not None:
+            self.attach_stage_tree(self.stage_tree, drill_policy=self.drill_policy)
+
+    def attach_stage_tree(
+        self,
+        stage_tree: Optional[HierarchicalStageTree],
+        *,
+        drill_policy: Optional[LearnedDrillDownPolicy] = None,
+    ) -> None:
+        """Bind a ``HierarchicalStageTree`` and pin its persistent root summary & role slots."""
+        self.stage_tree = stage_tree
+        if drill_policy is not None:
+            self.drill_policy = drill_policy
+        self._anchor_state = None
+        self._tree_root_slots = {}
+        if stage_tree is None or not stage_tree.roots:
+            return
+        durs = np.asarray([max(int(n.duration), 1) for n in stage_tree.roots], dtype=float)
+        w = durs / max(float(durs.sum()), 1.0)
+        self._anchor_state = np.sum(
+            np.vstack([np.asarray(n.mean_state, dtype=float) for n in stage_tree.roots]) * w[:, None],
+            axis=0,
+        )
+        slots_acc: Dict[int, float] = {}
+        for n in stage_tree.roots:
+            for sl in n.slots:
+                s_id = int(sl.symbol)
+                if s_id > 0:
+                    val = float(sl.salience) * float(sl.confidence)
+                    if val > slots_acc.get(s_id, 0.0):
+                        slots_acc[s_id] = val
+        self._tree_root_slots = slots_acc
+        if slots_acc:
+            self.temp_memory.pin_stage_anchors(slots_acc)
+
+    def pin_anchor_state(self, state: Optional[np.ndarray]) -> None:
+        """Pin an episode-level latent anchor state (e.g., end of external prompt)."""
+        if state is None:
+            return
+        arr = np.asarray(state, dtype=float).reshape(-1)
+        if np.linalg.norm(arr) > 1e-8:
+            self._anchor_state = arr.copy()
 
     def _local_pair_prob_and_lift(self, prev1: int, target: int) -> Tuple[float, float]:
         post = self.class_policy.local_index._postings.get((-1, int(prev1)))
@@ -175,9 +226,19 @@ class ContextDrivenDecisionController:
                 if i > 0 and val > 0.15:
                     strengths[i] = val
 
+        if self._tree_root_slots:
+            max_rs = max(self._tree_root_slots.values(), default=0.0)
+            if max_rs > 1e-8:
+                for s_id, raw_v in self._tree_root_slots.items():
+                    boost = 0.45 * (float(raw_v) / max_rs)
+                    strengths[s_id] = min(strengths.get(s_id, 0.0) + boost, 1.5)
+
         if self.stage_tree is not None and slow_state is not None:
+            q_state = np.asarray(slow_state, dtype=float)
+            if self._anchor_state is not None and len(self._anchor_state) == len(q_state):
+                q_state = 0.55 * q_state + 0.45 * self._anchor_state
             hits, tree_stats = self.stage_tree.attend(
-                slow_state, policy=self.drill_policy, top_k=2,
+                q_state, policy=self.drill_policy, top_k=2,
             )
             for node, sim in hits:
                 if sim <= 0.0:
@@ -313,29 +374,69 @@ class ContextDrivenDecisionController:
         base_ctx = [int(x) for x in ctx_tokens[-6:]]
         eff_field = self.temp_memory.effective_field(root_blend=0.45)
         f_max = max(float(eff_field.max()), 1e-8)
+        gl_probs = self.class_policy.feature_map.global_probs_
+        anchor = self._anchor_state
+        anchor_norm = float(np.linalg.norm(anchor)) if anchor is not None else 0.0
+
+        def _step_utility(
+            prev_sym: int,
+            sym: int,
+            prob: float,
+            prev_h: Optional[np.ndarray],
+            next_h: Optional[np.ndarray],
+        ) -> float:
+            # 1. Conditional PMI information progress: log P(a|ctx) - alpha * log P_global(a)
+            ll = float(np.log(max(float(prob), 1e-9)))
+            g_p = (
+                float(gl_probs[sym])
+                if gl_probs is not None and 0 <= sym < len(gl_probs)
+                else 1e-3
+            )
+            pmi_term = ll - self.lookahead_pmi_alpha * float(np.log(max(g_p, 1e-6)))
+            # 2. Active working-memory + stage-tree field alignment
+            f_bonus = 0.18 * float(eff_field[sym]) / f_max if sym > 0 else 0.0
+            # 3. Persistent macro-topic anchor alignment
+            a_bonus = 0.0
+            if anchor is not None and anchor_norm > 1e-8 and next_h is not None and len(next_h) == len(anchor):
+                hn = float(np.linalg.norm(next_h))
+                if hn > 1e-8:
+                    a_bonus = self.lookahead_anchor_weight * float(np.dot(next_h, anchor) / (hn * anchor_norm))
+            # 4. Absorbing zero-progress state discount (purely information/state-space based):
+            #    penalizes stalling in a self-transition (sym == prev_sym) when latent state barely moves.
+            stag_pen = 0.0
+            if prev_sym > 0 and sym == prev_sym and self.lookahead_stagnation_weight > 0.0:
+                if prev_h is not None and next_h is not None:
+                    p_norm = max(float(np.linalg.norm(prev_h)), 1e-6)
+                    disp = float(np.linalg.norm(next_h - prev_h)) / p_norm
+                else:
+                    disp = 0.0
+                stag_pen = self.lookahead_stagnation_weight * max(1.0 - min(disp, 1.0), 0.0)
+            return pmi_term + f_bonus + a_bonus - stag_pen
 
         # Beam entries: (cum_score, first_action, rolled_ctx, rolled_slow)
         beam = []
+        prev0 = base_ctx[-1] if base_ctx else 0
         for a, p in zip(acts1[:bw], probs1[:bw]):
             h_next = (
                 self.class_policy.update_slow_state(slow_state, a)
                 if slow_state is not None else None
             )
-            f_bonus = 0.15 * float(eff_field[a]) / f_max if a > 0 else 0.0
-            beam.append((float(np.log(max(float(p), 1e-9))) + f_bonus, int(a), base_ctx + [int(a)], h_next))
+            sc0 = _step_utility(prev0, int(a), float(p), slow_state, h_next)
+            beam.append((sc0, int(a), base_ctx + [int(a)], h_next))
 
         for _step in range(1, d):
             next_beam = []
             for sc, first_a, r_ctx, r_h in beam:
                 a_sub, p_sub, _ = self.decide_distribution(r_ctx, r_h, k=bw)
+                prev_r = r_ctx[-1] if r_ctx else 0
                 for a2, p2 in zip(a_sub[:bw], p_sub[:bw]):
                     h2 = (
                         self.class_policy.update_slow_state(r_h, a2)
                         if r_h is not None else None
                     )
-                    f_bonus = 0.15 * float(eff_field[a2]) / f_max if a2 > 0 else 0.0
+                    u2 = _step_utility(prev_r, int(a2), float(p2), r_h, h2)
                     next_beam.append((
-                        sc + 0.75 * float(np.log(max(float(p2), 1e-9))) + f_bonus,
+                        sc + 0.75 * u2,
                         first_a,
                         r_ctx + [int(a2)],
                         h2,

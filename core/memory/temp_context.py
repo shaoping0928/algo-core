@@ -57,6 +57,7 @@ class TemporaryContextMemory:
         self._root_field: np.ndarray = np.zeros(self.vocab_size, dtype=float)
         self._recent: List[int] = []
         self._steps: int = 0
+        self._last_source: str = "external"
 
     def fit_associations(
         self,
@@ -141,10 +142,29 @@ class TemporaryContextMemory:
         self._root_field.fill(0.0)
         self._recent.clear()
         self._steps = 0
+        self._last_source = "external"
 
     def pin_root_context(self) -> None:
         """Snapshot the current active field as persistent episode root summary."""
         np.copyto(self._root_field, self._field)
+
+    def pin_stage_anchors(self, anchor_weights: Dict[int, float], *, spread_scale: float = 0.5) -> None:
+        """Merge persistent hierarchical stage-tree anchor slots into ``_root_field``."""
+        if not anchor_weights:
+            return
+        max_w = max((float(v) for v in anchor_weights.values() if float(v) > 0.0), default=0.0)
+        if max_w <= 1e-8:
+            return
+        base_scale = max(float(self._root_field.max()), float(self._field.max()), 1.0)
+        for sym, w in anchor_weights.items():
+            s = int(sym)
+            if s <= 0 or s >= self.vocab_size or float(w) <= 0.0:
+                continue
+            wn = (float(w) / max_w) * base_scale
+            self._root_field[s] += 0.6 * wn
+            if spread_scale > 0.0:
+                for nb, edge_w in self.assoc_graph_.get(s, ()):
+                    self._root_field[nb] += float(spread_scale) * float(edge_w) * wn
 
     def effective_field(self, root_blend: float = 0.45) -> np.ndarray:
         """Return live decaying working-memory field blended with pinned root summary."""
@@ -157,8 +177,31 @@ class TemporaryContextMemory:
         root_norm = self._root_field / r_max
         return (1.0 - rb) * live_norm + rb * root_norm
 
-    def observe(self, symbol: int) -> None:
-        """Ingest one observed symbol into temporary working memory."""
+    def observe(
+        self,
+        symbol: int,
+        *,
+        source: str = "external",
+        self_spread_weight: float = 0.25,
+    ) -> None:
+        """Ingest one observed symbol into temporary working memory.
+
+        Args:
+            symbol: Observed discrete symbol ID.
+            source: ``"external"`` for real input/ground-truth observations
+                (updates episodic cache + full spreading activation), or
+                ``"self"`` for self-generated rollouts/continuations (auto-pins
+                the external root summary on transition, skips episodic-cache
+                self-echo reinforcement, and spreads damped activation).
+            self_spread_weight: Damping multiplier for spreading activation
+                when ``source == "self"``.
+        """
+        is_self = (source == "self")
+        if is_self and self._last_source != "self" and float(self._root_field.max()) <= 1e-6:
+            # Automatically preserve the external prompt's working-memory summary
+            self.pin_root_context()
+        self._last_source = "self" if is_self else "external"
+
         sym = int(symbol)
         if sym <= 0 or sym >= self.vocab_size:
             self._recent.append(0)
@@ -175,29 +218,32 @@ class TemporaryContextMemory:
                 if self._anchors[k] < 1e-3:
                     del self._anchors[k]
 
-        # 2. Update episodic local cache (within-context unigram, bigram, trigram)
-        if len(self._recent) >= 1 and self._recent[-1] > 0:
-            p1 = self._recent[-1]
-            bmap = self._ep_bigram[p1]
-            for k in list(bmap.keys()):
-                bmap[k] *= cd
-            bmap[sym] = bmap.get(sym, 0.0) + 1.0
-        if len(self._recent) >= 2 and self._recent[-1] > 0 and self._recent[-2] > 0:
-            key2 = (self._recent[-2], self._recent[-1])
-            tmap = self._ep_trigram[key2]
-            for k in list(tmap.keys()):
-                tmap[k] *= cd
-            tmap[sym] = tmap.get(sym, 0.0) + 1.0
-        self._ep_unigram[sym] = self._ep_unigram.get(sym, 0.0) * cd + 1.0
+        # 2. Update episodic local cache ONLY from verified external observations
+        #    (prevents self-generated tokens from creating episodic echo loops)
+        if not is_self:
+            if len(self._recent) >= 1 and self._recent[-1] > 0:
+                p1 = self._recent[-1]
+                bmap = self._ep_bigram[p1]
+                for k in list(bmap.keys()):
+                    bmap[k] *= cd
+                bmap[sym] = bmap.get(sym, 0.0) + 1.0
+            if len(self._recent) >= 2 and self._recent[-1] > 0 and self._recent[-2] > 0:
+                key2 = (self._recent[-2], self._recent[-1])
+                tmap = self._ep_trigram[key2]
+                for k in list(tmap.keys()):
+                    tmap[k] *= cd
+                tmap[sym] = tmap.get(sym, 0.0) + 1.0
+            self._ep_unigram[sym] = self._ep_unigram.get(sym, 0.0) * cd + 1.0
 
         # 3. Spread activation if sym is a salient content anchor
         is_c = getattr(self, "_is_content", None)
         sal = float(self.salience_[sym]) if self.salience_ is not None else 1.0
-        if is_c is None or bool(is_c[sym]):
-            self._anchors[sym] = min(self._anchors.get(sym, 0.0) + sal, 5.0)
-            self._field[sym] += 0.5 * sal
+        spread_mul = float(np.clip(self_spread_weight, 0.0, 1.0)) if is_self else 1.0
+        if (is_c is None or bool(is_c[sym])) and spread_mul > 0.0:
+            self._anchors[sym] = min(self._anchors.get(sym, 0.0) + spread_mul * sal, 5.0)
+            self._field[sym] += 0.5 * spread_mul * sal
             for nb, w in self.assoc_graph_.get(sym, ()):
-                self._field[nb] += w * sal
+                self._field[nb] += spread_mul * w * sal
             # Prune anchors to bounded capacity
             if len(self._anchors) > self.max_anchors:
                 keep = sorted(self._anchors.items(), key=lambda kv: kv[1], reverse=True)[: self.max_anchors]
