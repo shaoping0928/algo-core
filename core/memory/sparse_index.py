@@ -91,24 +91,109 @@ class SparseFeatureActionIndex:
         *,
         ctx_len: int = 4,
     ) -> "SparseFeatureActionIndex":
-        """Directly index n-gram context keys -> next token from a token stream."""
+        """Directly index nested suffix n-gram keys -> next token from a token stream."""
         arr = np.asarray(tokens, dtype=np.int32).reshape(-1)
         c = max(int(ctx_len), 1)
         for pos in range(c, len(arr)):
             t_m1 = int(arr[pos - 1])
-            keys = [(-1, t_m1)]
-            if c >= 2:
-                t_m2 = int(arr[pos - 2])
-                keys.append((-2, t_m2))
-                keys.append((12, t_m2, t_m1))
-            if c >= 3:
-                t_m3 = int(arr[pos - 3])
-                keys.append((13, t_m3, t_m2, t_m1))
-            if c >= 4:
-                t_m4 = int(arr[pos - 4])
-                keys.append((14, t_m4, t_m3, t_m2, t_m1))
+            keys: List[Tuple[int, ...]] = [(-1, t_m1)]
+            for order in range(2, c + 1):
+                suffix = tuple(int(x) for x in arr[pos - order : pos])
+                keys.append((10 + order,) + suffix)
             self.update(None, int(arr[pos]), dopamine=1.0, pain=0.0, sparse_keys=keys)
         return self
+
+    def _propose_interpolated_ad(
+        self,
+        sparse_keys: Sequence[Tuple[int, ...]],
+        k_req: int,
+        discount: float = 0.5,
+    ) -> Tuple[List[int], np.ndarray]:
+        """Exact top-down Interpolated Absolute Discounting over nested suffix keys."""
+        # Extract nested suffix keys ordered from highest order down to order 1.
+        ordered_keys: List[Tuple[int, Tuple[int, ...]]] = []
+        for fk in sparse_keys:
+            if len(fk) >= 2 and fk[0] == -1:
+                ordered_keys.append((1, fk))
+            elif len(fk) >= 3 and fk[0] >= 12:
+                ordered_keys.append((len(fk) - 1, fk))
+        ordered_keys.sort(key=lambda item: item[0], reverse=True)
+
+        probs: Dict[int, float] = defaultdict(float)
+        weight = 1.0
+        d = float(discount)
+        for _order, fk in ordered_keys:
+            post = self._postings.get(fk)
+            tot = self._key_totals.get(fk, 0.0)
+            if not post or tot <= 0.0:
+                continue
+            inv_tot = 1.0 / tot
+            for act, (cnt, s_sum) in post.items():
+                eff = max(cnt - d, 0.0)
+                if eff > 0.0:
+                    pos_rate = max(s_sum / cnt, 0.0)
+                    if pos_rate > 0.0:
+                        probs[act] += weight * (eff * inv_tot) * pos_rate
+            # Exact backoff mass passed down to shorter suffix contexts.
+            n_types = float(len(post))
+            weight *= min((d * n_types) * inv_tot, 1.0)
+            if weight <= 1e-12:
+                break
+
+        # Fold remaining backoff mass into global unigram distribution.
+        if weight > 1e-12 and self._global_counts:
+            g_tot = float(sum(self._global_counts.values()))
+            if g_tot > 0.0:
+                inv_g = 1.0 / g_tot
+                for act in list(probs.keys()):
+                    gc = self._global_counts.get(act, 0)
+                    if gc > 0:
+                        pos_rate = max(self._global_scores[act] / float(gc), 0.0)
+                        probs[act] += weight * (float(gc) * inv_g) * pos_rate
+                if len(probs) < k_req:
+                    for act, gc in self._global_counts.most_common(k_req * 2):
+                        if act not in probs and gc > 0:
+                            pos_rate = max(self._global_scores[act] / float(gc), 0.0)
+                            probs[act] = weight * (float(gc) * inv_g) * pos_rate
+
+        if probs:
+            ranked = sorted(
+                probs.keys(),
+                key=lambda a: (probs[a], -a),
+                reverse=True,
+            )[:k_req]
+            p_vals = np.asarray([probs[a] for a in ranked], dtype=float)
+        else:
+            ranked = []
+            p_vals = np.zeros(0, dtype=float)
+
+        if len(ranked) < k_req:
+            seen = set(ranked)
+            extra: List[int] = []
+            for a in self.action_space:
+                if a not in seen:
+                    extra.append(a)
+                    seen.add(a)
+                    if len(ranked) + len(extra) == k_req:
+                        break
+            ranked.extend(extra)
+            p_vals = np.concatenate([p_vals, np.zeros(len(extra), dtype=float)])
+
+        return ranked, p_vals
+
+    def propose_with_probs(
+        self,
+        state: Optional[np.ndarray],
+        k: int,
+        sparse_keys: Optional[Sequence[Tuple[int, ...]]] = None,
+        discount: float = 0.5,
+    ) -> Tuple[List[int], np.ndarray]:
+        """Return ``(top_k_actions, scores_or_probs)`` for a single query."""
+        k_req = min(max(int(k), 1), len(self.action_space))
+        if sparse_keys is not None:
+            return self._propose_interpolated_ad(sparse_keys, k_req, discount=discount)
+        ranked = self.propose_one(state, k_req, sparse_keys=None)
+        return ranked, np.full(len(ranked), 1.0 / max(len(ranked), 1), dtype=float)
 
     def fit_transitions(self, transitions: Sequence[dict], lag: int = 0) -> "SparseFeatureActionIndex":
         """Bulk-index a list of transition dicts from ``collect``."""
@@ -127,43 +212,34 @@ class SparseFeatureActionIndex:
 
     def propose_one(
         self,
-        state: np.ndarray,
+        state: Optional[np.ndarray],
         k: int,
         sparse_keys: Optional[Sequence[Tuple[int, ...]]] = None,
+        discount: float = 0.5,
     ) -> List[int]:
         """Return Top-K candidate actions for a single state via sparse postings."""
         k_req = min(max(int(k), 1), len(self.action_space))
+        if sparse_keys is not None:
+            ranked, _ = self._propose_interpolated_ad(
+                sparse_keys, k_req, discount=discount,
+            )
+            return ranked
         if k_req >= len(self.action_space):
             return list(self.action_space)
-        feats = (
-            tuple(sparse_keys)
-            if sparse_keys is not None
-            else extract_sparse_features(
-                state,
-                quantize_step=self.quantize_step,
-                include_nonzero_ids=self.include_nonzero_ids,
-            )
+        feats = extract_sparse_features(
+            state,
+            quantize_step=self.quantize_step,
+            include_nonzero_ids=self.include_nonzero_ids,
         )
         scores: Dict[int, float] = defaultdict(float)
         counts: Dict[int, float] = defaultdict(float)
-        discount = 0.5
         for fk in feats:
             post = self._postings.get(fk)
             if not post:
                 continue
-            key_tot = self._key_totals.get(fk, 0.0)
-            if sparse_keys is not None and len(fk) >= 2 and fk[0] >= 10 and key_tot > 0.0:
-                spec = 10.0 ** float(len(fk) - 2)
-                inv_tot = 1.0 / key_tot
-                for act, (cnt, s_sum) in post.items():
-                    ad_prob = max(cnt - discount, 0.0) * inv_tot
-                    if ad_prob > 0.0:
-                        counts[act] += 1.0
-                        scores[act] += (ad_prob * (s_sum / max(cnt, 1.0))) * spec
-            else:
-                for act, (cnt, s_sum) in post.items():
-                    counts[act] += cnt
-                    scores[act] += s_sum
+            for act, (cnt, s_sum) in post.items():
+                counts[act] += cnt
+                scores[act] += s_sum
 
         if scores:
             ranked = sorted(

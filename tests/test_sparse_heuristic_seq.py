@@ -76,7 +76,8 @@ class SparseHeuristicSeqTests(unittest.TestCase):
         env = TextCorpusSeqEnv(tokens[160:], vocab_size=32, ctx_len=4, lag=0, cap=24, start_pos=4)
         hits = 0
         for _ in range(24):
-            cand = idx.propose_one(env.obs(), k=4, sparse_keys=env.sparse_keys())
+            cand, probs = idx.propose_with_probs(env.obs(), k=4, sparse_keys=env.sparse_keys())
+            self.assertGreater(float(probs[0]), 0.5)
             if cand[0] == int(env.tokens[env.pos]):
                 hits += 1
             env.step(cand[0])
