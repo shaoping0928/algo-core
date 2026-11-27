@@ -175,16 +175,22 @@ class ContextDrivenDecisionController:
         active_strengths, tree_stats = self._collect_active_node_strengths(slow_state)
         injected = 0
         bridged = 0
-        # Content-class gate: scale content injection by P(next class is content, not singleton glue)
+        # Content-class gate: activate PMI content injection only when ClassPolicy
+        # predicts a content class rather than a confident singleton glue token.
         content_gate = 1.0
         if self.content_class_gate and self.class_policy.n_singletons > 0:
             cids, cprobs = self.class_policy.predict_next_classes(ctx_tokens, top_c=8)
             p_tot = float(cprobs.sum())
             if p_tot > 1e-12:
+                top1_is_singleton = int(cids[0]) <= self.class_policy.n_singletons
+                top1_share = float(cprobs[0]) / p_tot
                 p_content = float(
                     sum(float(cp) for cid, cp in zip(cids, cprobs) if cid > self.class_policy.n_singletons)
                 ) / p_tot
-                content_gate = float(np.clip(p_content, 0.05, 1.0))
+                if top1_is_singleton and top1_share >= 0.30:
+                    content_gate = 0.0
+                else:
+                    content_gate = float(np.clip(p_content, 0.0, 1.0))
         if prev1 > 0 and active_strengths:
             top_active = sorted(active_strengths.items(), key=lambda kv: kv[1], reverse=True)[
                 : self.top_active_targets
