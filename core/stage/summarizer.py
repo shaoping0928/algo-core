@@ -86,8 +86,12 @@ def _fit_deterministic_centroids(
         d2 = np.sum((matrix - centers[-1]) ** 2, axis=1)
         min_d2 = np.minimum(min_d2, d2)
     centers = np.asarray(centers, dtype=float)
+    m_norm = np.einsum("ij,ij->i", matrix, matrix)[:, None]
     for _ in range(int(max_iter)):
-        d2 = np.sum((matrix[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+        c_norm = np.einsum("ij,ij->i", centers, centers)[None, :]
+        d2 = matrix @ (-2.0 * centers.T)
+        d2 += m_norm
+        d2 += c_norm
         labels = np.argmin(d2, axis=1)
         updated = centers.copy()
         for idx in range(k):
