@@ -1541,25 +1541,25 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertLess(scores[0]["cost"], scores[1]["cost"])
 
     def test_core_does_not_embed_task_geometry(self):
-        root = Path(__file__).resolve().parents[1] / "core"
+        from _paths import find_core_file
         forbidden = (
             "BIRD_X", "GAP", "pipes", "target_gap", "near_pipe",
             "crossing", "TerminalRiskHead", "latent_world", "flappy",
         )
         for name in ("node_runtime.py", "node_graph.py"):
-            text = (root / name).read_text(encoding="utf-8")
+            text = find_core_file(name).read_text(encoding="utf-8")
             for token in forbidden:
                 self.assertNotIn(token, text, "%s in %s" % (token, name))
         # The feature grammar must stay task-neutral too: its comments may
         # not lean on the benchmark world's shapes.
-        feature_text = (root / "node_features.py").read_text(
+        feature_text = find_core_file("node_features.py").read_text(
             encoding="utf-8"
         )
         for token in ("pipe", "flap", "gap", "boundary"):
             self.assertNotIn(
                 token, feature_text, "%s in node_features.py" % token
             )
-        adapter = (root / "substrate_nodes.py").read_text(encoding="utf-8")
+        adapter = find_core_file("substrate_nodes.py").read_text(encoding="utf-8")
         for token in (
             "BIRD_X", "GAP", "pipes", "target_gap", "near_pipe",
             "crossing", "TerminalRiskHead",
@@ -1575,7 +1575,10 @@ class NodeRuntimeTests(unittest.TestCase):
             "rule_expressions.py", "contextual_rules.py",
             "milestone_graph.py",
         ):
-            src = (repo / "core" / name) if (repo / "core" / name).exists() else (repo / "modules" / name)
+            try:
+                src = find_core_file(name)
+            except FileNotFoundError:
+                src = repo / "modules" / name
             text = src.read_text(encoding="utf-8")
             for token in (
                 "gravity", "flap", "BIRD_X", "pipes",

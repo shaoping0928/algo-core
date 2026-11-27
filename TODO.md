@@ -192,6 +192,10 @@
     - [core/stage_regime.py](file:///c:/workspace/code/algo_core/core/stage_regime.py) 新增 `OnlineFeatureDemandUpdater`；
     - [core/substrate_nodes.py](file:///c:/workspace/code/algo_core/core/substrate_nodes.py) 新增 `--chain-demand-online-every`（默认 `0`，推荐 `4`）、`--chain-demand-ema`（默认 `0.30`）、`--chain-demand-online-frames`（默认 `12000`）、`--chain-demand-min-frames`（默认 `600`）；
     - [tests/test_stage_regime.py](file:///c:/workspace/code/algo_core/tests/test_stage_regime.py) 新增在线需求偏置自愈、截断长局安全纳入与滑窗上限单测。
+- [x] **工程架构整理 — `core/` 六层子包化与两大巨石文件拆解（2026-11-27 完成）**：
+  - 将原先平铺的 31 个 `core/*.py` 重构为 6 个职责清晰的子包：`core/env/`（环境与动作延迟）、`core/memory/`（节点运行时、图、特征、规则、变量槽位与工作记忆）、`core/stage/`（现役阶段与在线适应体系）、`core/planning/`（搜索与自适应规划）、`core/runner/`（评测协议与 CLI）、`core/legacy/`（历史阶段/里程碑实验模块隔离）；
+  - 拆分 2,467 行 `core/stage_regime.py` 为 `core/stage/{summarizer,transition,failure_memory,feature_demand,adaptive_controller}.py`（50 行薄兼容门面）；从 6,012 行 `core/substrate_nodes.py` 抽离 `core/planning/chained_search.py`（581 行）与 `core/runner/cli.py`（1,215 行），主干瘦身至 4,274 行；
+  - 经 `core/_paths.py` 统一路径引导保持 100% 向后兼容，全量 **781/781** 单测、`probes/` 导入、任务无关性审计与 CLI 端到端冒烟全部一次绿灯。
 - [ ] **Phase 13 — 后续可选方向（默认栈仍不变，按需推进）**：
   - 在 `cap=5000` 完整 benchmark 口径上验证 `Chain Adaptive + OnlineFeatureDemandUpdater + OnlineRegimeContinuationUpdater + TrunkPointFailureMemory + SourceAbstainGate` 的长尾上限；
   - 将抽象类节点进一步扩展至“关系型/对称特征类模板”（跨观测通道共享边界/接近关系模板）及长程多世界变量树先验召回。

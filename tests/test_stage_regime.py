@@ -228,11 +228,12 @@ class StageRegimeTests(unittest.TestCase):
 
     def test_module_is_task_agnostic(self):
         from pathlib import Path
-        path = Path(__file__).resolve().parents[1] / "core" / "stage_regime.py"
-        with open(path, "r", encoding="utf-8") as handle:
-            source = handle.read().lower()
-        for forbidden in ("flappy", "bird_x", "pipe", "gap", "flap", "gravity"):
-            self.assertNotIn(forbidden, source)
+        core_dir = Path(__file__).resolve().parents[1] / "core"
+        targets = [core_dir / "stage_regime.py", *sorted((core_dir / "stage").glob("*.py"))]
+        for path in targets:
+            source = path.read_text(encoding="utf-8").lower()
+            for forbidden in ("flappy", "bird_x", "pipe", "gap", "flap", "gravity"):
+                self.assertNotIn(forbidden, source, f"{forbidden} found in {path.name}")
 
     def test_run_seed_opt_in_regime_wiring_is_invariant_at_zero(self):
         from substrate_nodes import run_seed
