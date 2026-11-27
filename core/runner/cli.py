@@ -122,6 +122,13 @@ def main():
                         help="sliding frame window for online demand updates")
     parser.add_argument("--chain-demand-min-frames", type=int, default=600,
                         help="minimum online frames before first demand update")
+    parser.add_argument("--chain-demand-rel-pairs", type=int, default=0,
+                        help="max self-supervised relational difference pairs "
+                             "(x_i - x_j) added to ControllableFeatureDemand "
+                             "(0 = raw dims only, recommended 2)")
+    parser.add_argument("--chain-demand-min-terminal", type=int, default=0,
+                        help="minimum terminal episodes in sliding window before "
+                             "online demand EMA updates (0 = no gate, recommended 12)")
     parser.add_argument("--chain-adaptive", action="store_true",
                         help="enable dual-confidence decaying-threshold adaptive "
                              "segmented deepening under --decision chained "
@@ -608,6 +615,10 @@ def main():
         raise ValueError("--chain-demand-online-frames must be positive")
     if args.chain_demand_min_frames < 1:
         raise ValueError("--chain-demand-min-frames must be positive")
+    if args.chain_demand_rel_pairs < 0:
+        raise ValueError("--chain-demand-rel-pairs must be non-negative")
+    if args.chain_demand_min_terminal < 0:
+        raise ValueError("--chain-demand-min-terminal must be non-negative")
     if args.lag < 0:
         raise ValueError("--lag must be non-negative")
     if args.pain_horizon < 0:
@@ -814,6 +825,8 @@ def main():
             chain_demand_ema=args.chain_demand_ema,
             chain_demand_online_frames=args.chain_demand_online_frames,
             chain_demand_min_frames=args.chain_demand_min_frames,
+            chain_demand_rel_pairs=args.chain_demand_rel_pairs,
+            chain_demand_min_terminal=args.chain_demand_min_terminal,
             chain_adaptive=args.chain_adaptive,
             chain_max_hops=args.chain_max_hops,
             chain_wide_beam_width=args.chain_wide_beam_width,
@@ -1147,6 +1160,8 @@ def main():
                 chain_demand_ema=args.chain_demand_ema,
                 chain_demand_online_frames=args.chain_demand_online_frames,
                 chain_demand_min_frames=args.chain_demand_min_frames,
+                chain_demand_rel_pairs=args.chain_demand_rel_pairs,
+                chain_demand_min_terminal=args.chain_demand_min_terminal,
             ),
             rows=eval_rows,
             milestones=[

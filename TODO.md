@@ -215,6 +215,15 @@
   - `core/substrate_nodes.py`（原 6,012L → 4,275L → **1,821L**）：抽离 [core/runner/trainer.py](file:///c:/workspace/code/algo_core/core/runner/trainer.py)（1,747L，训练/校准/里程碑归纳）与 [core/runner/evaluator.py](file:///c:/workspace/code/algo_core/core/runner/evaluator.py)（860L，评测主循环与 `run_seed` 调度），主干保留 MPC 规划与完整兼容门面；
   - `core/memory/node_runtime.py`（原 4,674L → **878L**）：按 Mixin 架构拆出 [core/memory/node_learning.py](file:///c:/workspace/code/algo_core/core/memory/node_learning.py)（2,150L，原型增删/记忆追踪/动作边/规则归纳）与 [core/memory/node_readout.py](file:///c:/workspace/code/algo_core/core/memory/node_readout.py)（1,725L，特征单元/保序校准/图传播/批量读出），并将 [tests/test_node_runtime.py](file:///c:/workspace/code/algo_core/tests/test_node_runtime.py) 的任务无关性静态扫描扩展至全部 3 个运行时文件；
   - **全量 `783/783` 单元测试通过（`58.67s`）**，对外 API 与默认栈逐位不变。
+- [x] **Phase 16 — 方向 A：自监督关系差特征发现与全口径千帧突破（2026-11-27 完成）**：
+  - **机制（严格任务无关，默认关闭、默认栈逐位不变）**：
+    - [core/stage/feature_demand.py](file:///c:/workspace/code/algo_core/core/stage/feature_demand.py) 新增 `discover_relational_pairs()` 与 `augment_obs_with_pairs()`：从非漂移、同量纲观测通道对中自监督筛选在存活相关性与临终对比度上严格超越原始单通道的成对关系差 `(x_i - x_j)`（如平移不变的相对对准关系），并在 `ControllableFeatureDemand(max_rel_pairs=0)` 与 `OnlineFeatureDemandUpdater` 中对调用方完全透明地生效；
+    - [core/runner/evaluator.py](file:///c:/workspace/code/algo_core/core/runner/evaluator.py) 与 [core/runner/cli.py](file:///c:/workspace/code/algo_core/core/runner/cli.py) 新增 opt-in CLI 参数 `--chain-demand-rel-pairs`（默认 `0`，推荐 `2`）与 `--chain-demand-min-terminal`（默认 `0`，推荐 `12`）。
+  - **600 局 `cap=5000` 全口径最终确认（6 种子 × 100 世界 `eval 200–299`，另切出从未碰过的 240 局 `eval 260–299`）**：
+    - **全量 600 局（`eval 200–299`）**：`base_p12_mt12` **`564.9`（med `312.0`, `3690p`, `2.99 ms/f`）** → **`a1_rel_demand` `1178.6`（`+613.7` / `+108.6%` 翻倍突破！med `718.5`, p90 `2632.4`, `8299p` `+124.9%`, `2.48 ms/f` 提速 17%, `333W/163T/104L`, `4/6` 正）**（`seed 100: 460.3→1656.0, 101: 305.1→1525.3, 103: 923.9→2154.4, 104: 1182.2→1259.2`）；
+    - **全程未碰 240 局（`eval 260–299`）**：`base_p12_mt12` **`634.1`（`1683p`）** → **`a1_rel_demand` `1399.2`（`+765.1` / `+120.7%`!, med `989.0`, p90 `2800.8`, `3982p` `+136.6%`, `150W/53T/37L`）**（`seed 100: 1695.2, 101: 2064.9, 103: 2726.1, 104: 1277.6`）；
+    - 负对照归档：按叶局部中心混合 `a2_regime_demand`（`518.0 vs 518.8`, `-0.8`）与额外修改划分树 `a3_rel_tree_and_dem`（`765.5` 弱于 `1031.5`）均已否决，仅保留纯关系差需求增强；
+  - **回归测试**：[tests/test_stage_regime.py](file:///c:/workspace/code/algo_core/tests/test_stage_regime.py) 新增平移不变关系对发现与透明需求增强单测，全量单元测试通过。
 
 ## P0：多视窗状态转移机制重设计（当前主线）
 

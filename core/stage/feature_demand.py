@@ -9,6 +9,119 @@ import numpy as np
 from summarizer import detect_pure_drift_dims
 
 
+def discover_relational_pairs(
+    rows: Sequence[Mapping],
+    max_pairs: int = 2,
+    min_gain: float = 0.05,
+    min_score: float = 0.15,
+    max_scale_ratio: float = 4.0,
+) -> Tuple[Tuple[int, int], ...]:
+    """Strictly task-agnostic discovery of high-survival relational difference pairs ``(i, j)``.
+
+    Inspects comparable-scale, non-drift observation channel pairs on terminal
+    training episodes and keeps up to ``max_pairs`` difference features
+    ``x_i - x_j`` whose survival alignment/contrast strictly exceeds both raw
+    constituent channels ``i`` and ``j`` by at least ``min_gain``.
+    """
+    if int(max_pairs) <= 0 or not rows:
+        return ()
+    by_ep: Dict[Hashable, List[Mapping]] = {}
+    for row in rows:
+        by_ep.setdefault(row.get("episode", 0), []).append(row)
+    ep_seqs = [
+        np.asarray([item["obs"] for item in seq], dtype=float)
+        for seq in by_ep.values()
+        if len(seq) >= 3
+    ]
+    drift = set(detect_pure_drift_dims(ep_seqs)) if ep_seqs else set()
+
+    s_list, rem_list = [], []
+    for seq in by_ep.values():
+        if not seq or not bool(seq[-1].get("done", False)):
+            continue
+        arr = np.asarray([item["obs"] for item in seq], dtype=float)
+        s_list.append(arr)
+        rem_list.append(np.arange(len(arr), 0, -1, dtype=float))
+    if not s_list:
+        return ()
+
+    obs_term = np.vstack(s_list)
+    rem = np.concatenate(rem_list)
+    y_val = np.log1p(rem)
+    safe_mask = y_val >= float(np.quantile(y_val, 0.75))
+    dead_mask = rem <= 5.0
+    d = obs_term.shape[1]
+    stds = np.std(obs_term, axis=0)
+
+    def _channel_score(col: np.ndarray) -> float:
+        if float(np.std(col)) <= 1e-8:
+            return 0.0
+        safe_c = col[safe_mask]
+        if len(safe_c) < 2:
+            return 0.0
+        q_lo = float(np.quantile(safe_c, 0.05))
+        q_hi = float(np.quantile(safe_c, 0.95))
+        ctr = 0.5 * (q_lo + q_hi)
+        hw = max(0.5 * (q_hi - q_lo), 1e-4)
+        closeness = -np.abs(col - ctr)
+        r = 0.0
+        if np.std(closeness) > 1e-9 and np.std(y_val) > 1e-9:
+            rv = float(np.corrcoef(closeness, y_val)[0, 1])
+            if math.isfinite(rv):
+                r = max(0.0, rv)
+        fc = 0.0
+        if dead_mask.any():
+            d_dead = float(np.mean(np.abs(col[dead_mask] - ctr)))
+            d_safe = float(np.mean(np.abs(safe_c - ctr)))
+            fc = max(0.0, (d_dead - d_safe) / hw)
+        return r * (r + fc)
+
+    raw_scores = [
+        _channel_score(obs_term[:, j]) if j not in drift else 0.0
+        for j in range(d)
+    ]
+
+    cands = []
+    for i in range(d):
+        if i in drift or stds[i] <= 1e-8:
+            continue
+        for j in range(i + 1, d):
+            if j in drift or stds[j] <= 1e-8:
+                continue
+            ratio = max(stds[i], stds[j]) / min(stds[i], stds[j])
+            if ratio > float(max_scale_ratio):
+                continue
+            corr_ij = abs(float(np.corrcoef(obs_term[:, i], obs_term[:, j])[0, 1]))
+            if not math.isfinite(corr_ij) or corr_ij > 0.995:
+                continue
+            diff = obs_term[:, i] - obs_term[:, j]
+            if float(np.std(diff)) <= 1e-8:
+                continue
+            sc = _channel_score(diff)
+            best_raw = max(raw_scores[i], raw_scores[j])
+            if sc >= float(min_score) and sc >= best_raw + float(min_gain):
+                cands.append((sc - best_raw, sc, (i, j)))
+
+    cands.sort(reverse=True)
+    return tuple(pair for _, _, pair in cands[:int(max_pairs)])
+
+
+def augment_obs_with_pairs(
+    arr: np.ndarray,
+    pairs: Sequence[Tuple[int, int]],
+) -> np.ndarray:
+    """Append relational difference columns ``x_i - x_j`` to ``arr``."""
+    a = np.asarray(arr, dtype=float)
+    if not pairs:
+        return a
+    is_1d = a.ndim == 1
+    if is_1d:
+        a = a.reshape(1, -1)
+    cols = [a] + [(a[:, i] - a[:, j]).reshape(-1, 1) for i, j in pairs]
+    out = np.concatenate(cols, axis=1)
+    return out[0] if is_1d else out
+
+
 class ControllableFeatureDemand:
     """Strictly task-agnostic discovery of controllable, value-aligned feature demands.
 
@@ -37,6 +150,7 @@ class ControllableFeatureDemand:
         imminent_steps: float = 5.0,
         sample_size: int = 128,
         seed: int = 0,
+        max_rel_pairs: int = 0,
     ):
         self.min_rel_effect = float(min_rel_effect)
         self.min_snr = float(min_snr)
@@ -46,6 +160,9 @@ class ControllableFeatureDemand:
         self.imminent_steps = float(imminent_steps)
         self.sample_size = int(sample_size)
         self.seed = int(seed)
+        self.max_rel_pairs = int(max_rel_pairs)
+        self.rel_pairs_: Tuple[Tuple[int, int], ...] = ()
+        self.raw_obs_dim_: int = 0
         self.fitted = False
 
     def fit_rows(
@@ -60,8 +177,15 @@ class ControllableFeatureDemand:
             raise ValueError("rows must not be empty")
         from substrate_generic import history_features
 
-        obs_all = np.asarray([row["obs"] for row in rows], dtype=float)
-        nxt_all = np.asarray([row["next_obs"] for row in rows], dtype=float)
+        obs_raw = np.asarray([row["obs"] for row in rows], dtype=float)
+        nxt_raw = np.asarray([row["next_obs"] for row in rows], dtype=float)
+        raw_d = obs_raw.shape[1]
+        rel_pairs = (
+            discover_relational_pairs(rows, max_pairs=self.max_rel_pairs)
+            if self.max_rel_pairs > 0 else ()
+        )
+        obs_all = augment_obs_with_pairs(obs_raw, rel_pairs)
+        nxt_all = augment_obs_with_pairs(nxt_raw, rel_pairs)
         n, d = obs_all.shape
         obs_std = np.std(obs_all, axis=0)
         obs_std = np.where(obs_std > 1e-8, obs_std, 1.0)
@@ -82,7 +206,7 @@ class ControllableFeatureDemand:
         rng = np.random.RandomState(self.seed)
         sample_n = min(self.sample_size, n)
         sample_idx = rng.choice(n, size=sample_n, replace=False)
-        s0 = obs_all[sample_idx]
+        s0 = obs_raw[sample_idx]
         action_space = tuple(getattr(agent, "action_space", (0, 1)))
         roll_h = max(1, int(lag) + 2)
         action_dim = int(lag) + 1
@@ -97,7 +221,7 @@ class ControllableFeatureDemand:
                     seq, step + 1, prefix, action_dim=action_dim,
                 )
                 st = np.asarray(world.predict(st, hist), dtype=float)
-            endpoints.append(st[:, :d])
+            endpoints.append(augment_obs_with_pairs(st[:, :raw_d], rel_pairs))
         ep_stack = np.stack(endpoints, axis=0)
         act_std = np.mean(np.std(ep_stack, axis=0), axis=0)
         rel_effect = act_std / obs_std
@@ -117,7 +241,10 @@ class ControllableFeatureDemand:
         for seq in by_ep.values():
             if not seq or not bool(seq[-1].get("done", False)):
                 continue
-            arr = np.asarray([item["obs"] for item in seq], dtype=float)
+            arr = augment_obs_with_pairs(
+                np.asarray([item["obs"] for item in seq], dtype=float),
+                rel_pairs,
+            )
             rem = np.arange(len(arr), 0, -1, dtype=float)
             s_term_list.append(arr)
             rem_list.append(rem)
@@ -170,6 +297,8 @@ class ControllableFeatureDemand:
         )
 
         self.obs_dim_ = int(d)
+        self.raw_obs_dim_ = int(raw_d)
+        self.rel_pairs_ = rel_pairs
         self.drift_dims_ = tuple(sorted(int(x) for x in drift_dims))
         self.controllable_ = controllable
         self.env_center_ = np.asarray(env_center, dtype=float)
@@ -190,7 +319,10 @@ class ControllableFeatureDemand:
             arr = arr.reshape(1, -1)
         if len(arr) == 0:
             return np.zeros(0, dtype=float)
-        view = arr[:, :self.obs_dim_]
+        if self.rel_pairs_:
+            view = augment_obs_with_pairs(arr[:, :self.raw_obs_dim_], self.rel_pairs_)
+        else:
+            view = arr[:, :self.obs_dim_]
         return np.abs(view - self.env_center_[None, :]) @ self._inv_scaled_w
 
     def snapshot(self) -> dict:
@@ -199,6 +331,8 @@ class ControllableFeatureDemand:
         return dict(
             fitted=True,
             obs_dim=self.obs_dim_,
+            raw_obs_dim=self.raw_obs_dim_,
+            rel_pairs=self.rel_pairs_,
             drift_dims=self.drift_dims_,
             controllable_dims=tuple(
                 int(j) for j in range(self.obs_dim_) if self.controllable_[j] > 0.0
@@ -254,6 +388,8 @@ class OnlineFeatureDemandUpdater:
         self.min_var_similarity = float(min_var_similarity)
 
         self.obs_dim_ = int(base_demand.obs_dim_)
+        self.raw_obs_dim_ = int(getattr(base_demand, "raw_obs_dim_", self.obs_dim_))
+        self.rel_pairs_ = tuple(getattr(base_demand, "rel_pairs_", ()))
         self.controllable_ = np.asarray(base_demand.controllable_, dtype=float).copy()
         self._base_center = np.asarray(base_demand.env_center_, dtype=float).copy()
         self._base_halfwidth = np.asarray(base_demand.env_halfwidth_, dtype=float).copy()
@@ -283,7 +419,10 @@ class OnlineFeatureDemandUpdater:
             arr = arr.reshape(1, -1)
         if len(arr) == 0:
             return np.zeros(0, dtype=float)
-        view = arr[:, :self.obs_dim_]
+        if self.rel_pairs_:
+            view = augment_obs_with_pairs(arr[:, :self.raw_obs_dim_], self.rel_pairs_)
+        else:
+            view = arr[:, :self.obs_dim_]
         return np.abs(view - self.env_center_[None, :]) @ self._inv_scaled_w
 
     def record_episode_rows(
@@ -300,9 +439,13 @@ class OnlineFeatureDemandUpdater:
         """
         if not ep_rows:
             return False
-        arr = np.asarray(
+        arr_raw = np.asarray(
             [row["obs"] for row in ep_rows], dtype=float
-        )[:, :self.obs_dim_]
+        )[:, :self.raw_obs_dim_]
+        arr = (
+            augment_obs_with_pairs(arr_raw, self.rel_pairs_)
+            if self.rel_pairs_ else arr_raw
+        )
         n = len(arr)
         is_term = bool(ep_rows[-1].get("done", False))
         # Non-terminal (capped) episodes are verified survivors: offset remaining

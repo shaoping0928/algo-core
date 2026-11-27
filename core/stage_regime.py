@@ -16,7 +16,12 @@ ensure_core_paths()
 
 from adaptive_controller import AdaptiveSearchController
 from failure_memory import TrunkPointFailureMemory
-from feature_demand import ControllableFeatureDemand, OnlineFeatureDemandUpdater
+from feature_demand import (
+    ControllableFeatureDemand,
+    OnlineFeatureDemandUpdater,
+    augment_obs_with_pairs,
+    discover_relational_pairs,
+)
 from summarizer import (
     UNKNOWN,
     RegimeStage,
@@ -47,4 +52,6 @@ __all__ = [
     "OnlineFeatureDemandUpdater",
     "AdaptiveSearchController",
     "detect_pure_drift_dims",
+    "discover_relational_pairs",
+    "augment_obs_with_pairs",
 ]

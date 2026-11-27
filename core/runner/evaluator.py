@@ -479,6 +479,8 @@ def run_seed(task):
     chain_demand_ema = float(task.get("chain_demand_ema", 0.30))
     chain_demand_online_frames = int(task.get("chain_demand_online_frames", 12000))
     chain_demand_min_frames = int(task.get("chain_demand_min_frames", 600))
+    chain_demand_rel_pairs = int(task.get("chain_demand_rel_pairs", 0))
+    chain_demand_min_terminal = int(task.get("chain_demand_min_terminal", 0))
     chain_adaptive = bool(task.get("chain_adaptive", False))
     chain_max_hops = int(task.get("chain_max_hops", 5))
     chain_wide_beam_width = int(task.get("chain_wide_beam_width", 6))
@@ -673,7 +675,9 @@ def run_seed(task):
                 stats=regime_stats,
             )
         if decision == "chained" and chain_demand_weight > 0.0:
-            feature_demand = ControllableFeatureDemand().fit_rows(
+            feature_demand = ControllableFeatureDemand(
+                max_rel_pairs=chain_demand_rel_pairs,
+            ).fit_rows(
                 world, agent, training_rows, lag=lag,
             )
             if chain_demand_online_every > 0:
@@ -683,6 +687,7 @@ def run_seed(task):
                     ema_alpha=chain_demand_ema,
                     max_online_frames=chain_demand_online_frames,
                     min_online_frames=chain_demand_min_frames,
+                    min_terminal_episodes=chain_demand_min_terminal,
                     var_sigma=world_var_sigma,
                 )
                 heuristic_demand_cb = online_feature_demand.distance_batch

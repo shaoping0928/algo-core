@@ -1035,6 +1035,78 @@ class TestAdaptiveSearchControllerAndPlanner(unittest.TestCase):
         upd_scoped.record_episode_rows(rows_b, var_signature=sig_b)
         self.assertEqual(upd_scoped.world_switches, 1)
 
+    def test_relational_pair_discovery_and_transparent_demand_augmentation(self):
+        from stage_regime import (
+            ControllableFeatureDemand,
+            OnlineFeatureDemandUpdater,
+            discover_relational_pairs,
+        )
+
+        # Synthetic translation-invariant system:
+        #   dim 0 = agent position (drifts across episodes [-2, +2])
+        #   dim 1 = target position (drifts across episodes [-2, +2])
+        #   dim 2 = monotonic clock
+        # Neither dim 0 nor dim 1 alone predicts survival, ONLY (x_0 - x_1)!
+        rng = np.random.default_rng(19)
+        rows = []
+        for ep in range(20):
+            target = float(rng.uniform(-2.0, 2.0))
+            pos = target + float(rng.uniform(-0.3, 0.3))
+            is_long = ep % 2 == 0
+            length = 50 if is_long else 12
+            for t in range(length):
+                drift = float(rng.normal(0.0, 0.05)) if is_long else 0.12
+                nxt_pos = pos + drift
+                rows.append(dict(
+                    episode=ep,
+                    obs=np.asarray([pos, target, float(t)]),
+                    next_obs=np.asarray([nxt_pos, target, float(t + 1)]),
+                    history=np.asarray([float(t % 2)]),
+                    done=(t == length - 1),
+                ))
+                pos = nxt_pos
+
+        pairs = discover_relational_pairs(rows, max_pairs=2)
+        self.assertIn((0, 1), pairs)
+
+        class _MockWorld:
+            def predict(self, st, hist):
+                nxt = st.copy()
+                nxt[:, 0] += np.where(hist[:, -1] > 0.5, 0.25, -0.25)
+                nxt[:, 2] += 1.0
+                return nxt
+
+        class _MockAgent:
+            action_space = (0, 1)
+
+        dem = ControllableFeatureDemand(max_rel_pairs=2).fit_rows(
+            _MockWorld(), _MockAgent(), rows, lag=0,
+        )
+        snap = dem.snapshot()
+        self.assertIn((0, 1), snap["rel_pairs"])
+        self.assertEqual(snap["raw_obs_dim"], 3)
+        self.assertEqual(snap["obs_dim"], 3 + len(snap["rel_pairs"]))
+
+        # Aligned vs misaligned states at arbitrary translated offsets [-1.5, +1.5]
+        probe = np.asarray([
+            [1.5, 1.5, 10.0],    # aligned: x0 - x1 = 0
+            [-1.5, -1.5, 10.0],  # aligned: x0 - x1 = 0
+            [1.5, 0.5, 10.0],    # misaligned: x0 - x1 = 1.0
+        ], dtype=float)
+        d = dem.distance_batch(probe)
+        self.assertLess(float(d[0]), float(d[2]))
+        self.assertLess(float(d[1]), float(d[2]))
+
+        # OnlineFeatureDemandUpdater transparently accepts raw 3D rows & queries
+        upd = OnlineFeatureDemandUpdater(
+            dem, update_every=2, ema_alpha=0.30, min_online_frames=40,
+        )
+        upd.record_episode_rows(rows[:50])
+        upd.record_episode_rows(rows[50:100])
+        d_online = upd.distance_batch(probe)
+        self.assertEqual(d_online.shape, (3,))
+        self.assertLess(float(d_online[0]), float(d_online[2]))
+
 
 if __name__ == "__main__":
     unittest.main()
