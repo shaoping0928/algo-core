@@ -21,12 +21,251 @@ floor, channel predictability) are derived strictly from training transitions.
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+import math
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from variable_registry import VariableRegistry
+
+
+def wilson_lcb(wins: float, total: float, z: float = 1.0) -> float:
+    """Conservative Wilson lower confidence bound in ``[0, 1]``."""
+    if total <= 0.0:
+        return 0.0
+    p = max(0.0, min(1.0, float(wins) / float(total)))
+    n = float(total)
+    z2 = float(z) ** 2
+    denom = 1.0 + z2 / n
+    center = p + z2 / (2.0 * n)
+    rad = float(z) * math.sqrt((p * (1.0 - p) + z2 / (4.0 * n)) / n)
+    return max(0.0, (center - rad) / denom)
+
+
+class SourceAbstainGate:
+    """Closed-form online source-level Wilson-LCB self-monitor.
+
+    Tracks exponentially-weighted causal wins/trials of an auxiliary source
+    (e.g., adapted dynamics or stage continuation risk) against its fallback.
+    During the warmup grace period or whenever the Wilson lower confidence
+    bound clears ``target_lcb``, returns ``1.0`` (full trust); otherwise
+    smoothly backs off toward ``floor_weight``.
+    """
+
+    def __init__(
+        self,
+        warmup: int = 5,
+        decay: float = 0.90,
+        target_lcb: float = 0.45,
+        floor_weight: float = 0.35,
+        z: float = 1.0,
+    ):
+        if int(warmup) < 1:
+            raise ValueError("warmup must be positive")
+        if not 0.0 < float(decay) <= 1.0:
+            raise ValueError("decay must be in (0, 1]")
+        if not 0.0 <= float(target_lcb) <= 1.0:
+            raise ValueError("target_lcb must be in [0, 1]")
+        if not 0.0 <= float(floor_weight) <= 1.0:
+            raise ValueError("floor_weight must be in [0, 1]")
+        self.warmup = int(warmup)
+        self.decay = float(decay)
+        self.target_lcb = float(target_lcb)
+        self.floor_weight = float(floor_weight)
+        self.z = float(z)
+        self.wins = 0.0
+        self.trials = 0.0
+        self.raw_trials = 0
+
+    def reset(self) -> None:
+        self.wins = 0.0
+        self.trials = 0.0
+        self.raw_trials = 0
+
+    def observe(self, improved: bool) -> float:
+        self.wins = self.decay * self.wins + (1.0 if improved else 0.0)
+        self.trials = self.decay * self.trials + 1.0
+        self.raw_trials += 1
+        return self.weight()
+
+    def lcb(self) -> float:
+        return wilson_lcb(self.wins, self.trials, z=self.z)
+
+    def weight(self) -> float:
+        if self.raw_trials < self.warmup:
+            return 1.0
+        if self.target_lcb <= 0.0:
+            return 1.0
+        cur = self.lcb()
+        if cur >= self.target_lcb:
+            return 1.0
+        ratio = max(0.0, cur / self.target_lcb)
+        return self.floor_weight + (1.0 - self.floor_weight) * ratio
+
+    def snapshot(self) -> dict:
+        return dict(
+            raw_trials=int(self.raw_trials),
+            eff_trials=round(float(self.trials), 2),
+            lcb=round(self.lcb(), 4),
+            weight=round(self.weight(), 4),
+            target_lcb=self.target_lcb,
+            floor_weight=self.floor_weight,
+        )
+
+
+class _UnboundSentinel:
+    """Explicit sentinel distinguishing an unbound slot from a bound zero/None."""
+
+    def __repr__(self) -> str:
+        return "UNBOUND"
+
+
+UNBOUND = _UnboundSentinel()
+
+
+@dataclass
+class SlotBinding:
+    """One candidate binding inside a working-memory slot."""
+
+    filler: Any
+    strength: float
+    born: int
+    last_seen: int
+    hits: int = 1
+    suppress: float = 0.0
+    provenance: str = ""
+
+
+class WorkingMemorySlots:
+    """Task-agnostic working memory with slot competition and lateral inhibition.
+
+    Stores temporary current-context bindings under ``(scope, entity, role)``
+    keys.  Writing a new value into an occupied slot laterally inhibits rival
+    fillers in that slot; reading competes by:
+
+        ``score = strength * (decay ** age) - suppress``
+
+    and returns :data:`UNBOUND` whenever no binding clears ``min_score``,
+    keeping unknown slots strictly distinct from bound zero values.
+    """
+
+    def __init__(
+        self,
+        decay: float = 0.98,
+        inhibit_gain: float = 0.5,
+        min_score: float = 0.05,
+        max_fillers_per_slot: int = 4,
+    ):
+        if not 0.0 < float(decay) <= 1.0:
+            raise ValueError("decay must be in (0, 1]")
+        if float(inhibit_gain) < 0.0:
+            raise ValueError("inhibit_gain must be non-negative")
+        self.decay = float(decay)
+        self.inhibit_gain = float(inhibit_gain)
+        self.min_score = float(min_score)
+        self.max_fillers_per_slot = max(int(max_fillers_per_slot), 1)
+        self._slots: Dict[Tuple[str, str, str], List[SlotBinding]] = {}
+        self.clock = 0
+
+    def step_clock(self, ticks: int = 1) -> int:
+        self.clock += max(int(ticks), 0)
+        return self.clock
+
+    @staticmethod
+    def _same_filler(a: Any, b: Any, tol: float = 1e-6) -> bool:
+        if isinstance(a, np.ndarray) and isinstance(b, np.ndarray):
+            return a.shape == b.shape and bool(np.allclose(a, b, atol=tol))
+        return a == b
+
+    def score(self, binding: SlotBinding) -> float:
+        age = max(0, self.clock - binding.last_seen)
+        return float(binding.strength * (self.decay ** age) - binding.suppress)
+
+    def bind(
+        self,
+        scope: str,
+        entity: str,
+        role: str,
+        filler: Any,
+        strength: float = 1.0,
+        provenance: str = "",
+        inhibit_rivals: bool = True,
+    ) -> SlotBinding:
+        key = (str(scope), str(entity), str(role))
+        entries = self._slots.setdefault(key, [])
+        value = filler.copy() if isinstance(filler, np.ndarray) else filler
+        matched = None
+        for entry in entries:
+            if self._same_filler(entry.filler, value):
+                matched = entry
+                entry.strength = float(strength)
+                entry.last_seen = self.clock
+                entry.hits += 1
+                entry.suppress = max(0.0, entry.suppress * 0.5)
+                if provenance:
+                    entry.provenance = str(provenance)
+            elif inhibit_rivals:
+                entry.suppress += self.inhibit_gain
+        if matched is None:
+            matched = SlotBinding(
+                filler=value,
+                strength=float(strength),
+                born=self.clock,
+                last_seen=self.clock,
+                hits=1,
+                suppress=0.0,
+                provenance=str(provenance),
+            )
+            entries.append(matched)
+        if len(entries) > self.max_fillers_per_slot:
+            entries.sort(key=self.score, reverse=True)
+            del entries[self.max_fillers_per_slot:]
+        return matched
+
+    def clear_slot(self, scope: str, entity: str, role: str) -> None:
+        self._slots.pop((str(scope), str(entity), str(role)), None)
+
+    def clear_scope(self, scope: str) -> None:
+        target = str(scope)
+        for key in [k for k in self._slots if k[0] == target]:
+            del self._slots[key]
+
+    def read(self, scope: str, entity: str, role: str) -> Any:
+        """Return the winning filler or :data:`UNBOUND` if no active binding."""
+        entries = self._slots.get((str(scope), str(entity), str(role)))
+        if not entries:
+            return UNBOUND
+        best = max(entries, key=self.score)
+        if self.score(best) < self.min_score:
+            return UNBOUND
+        return best.filler
+
+    def is_bound(self, scope: str, entity: str, role: str) -> bool:
+        return self.read(scope, entity, role) is not UNBOUND
+
+    def prune(self) -> int:
+        removed = 0
+        for key in list(self._slots.keys()):
+            kept = [e for e in self._slots[key] if self.score(e) >= self.min_score]
+            removed += len(self._slots[key]) - len(kept)
+            if kept:
+                self._slots[key] = kept
+            else:
+                del self._slots[key]
+        return removed
+
+    def snapshot(self) -> dict:
+        bound_slots = [
+            key for key in self._slots
+            if self.read(*key) is not UNBOUND
+        ]
+        return dict(
+            clock=int(self.clock),
+            total_slots=len(self._slots),
+            bound_slots=len(bound_slots),
+            bound_keys=sorted(bound_slots),
+        )
 
 
 @dataclass(frozen=True)
@@ -71,6 +310,7 @@ class DynamicsClassNode:
         min_clean_samples: int = 4,
         change_patience: int = 3,
         change_factor: float = 4.0,
+        abstain_lcb: float = 0.0,
         registry: Optional[VariableRegistry] = None,
     ):
         if not train_rows:
@@ -94,6 +334,16 @@ class DynamicsClassNode:
         self.min_clean_samples = int(min_clean_samples)
         self.change_patience = max(int(change_patience), 1)
         self.change_factor = float(change_factor)
+        if not 0.0 <= float(abstain_lcb) <= 1.0:
+            raise ValueError("abstain_lcb must be in [0, 1]")
+        self.abstain_lcb = float(abstain_lcb)
+        self.abstain_gate: Optional[SourceAbstainGate] = (
+            SourceAbstainGate(
+                warmup=4, decay=0.90, target_lcb=self.abstain_lcb,
+                floor_weight=0.0, z=1.0,
+            )
+            if self.abstain_lcb > 0.0 else None
+        )
 
         prior = np.empty(self.feat_dim, dtype=float)
         prior[:self.obs_dim] = float(state_ridge)
@@ -142,6 +392,9 @@ class DynamicsClassNode:
         self.registry = (
             registry if registry is not None else VariableRegistry(base_prior=4.0)
         )
+        self.working_memory = WorkingMemorySlots(
+            decay=0.995, inhibit_gain=0.75, min_score=0.05,
+        )
         self._register_class_and_slots()
         self.reset_variables()
 
@@ -187,6 +440,14 @@ class DynamicsClassNode:
         self.changes = 0
         self.updates = 0
         self.skipped_jumps = 0
+        self._abstain_ewma_base: Optional[float] = None
+        self._abstain_ewma_adapt: Optional[float] = None
+        self._abstain_allow = self.abstain_gate is None
+        self.allow_steps = 0
+        self.abstain_steps = 0
+        if self.abstain_gate is not None:
+            self.abstain_gate.reset()
+        self.working_memory.clear_scope("world")
         for j in range(self.obs_dim):
             var = self.registry.variables[f"var:dyn:ch{j}"]
             var.estimate = np.zeros(self.feat_dim, dtype=float)
@@ -206,7 +467,7 @@ class DynamicsClassNode:
         """Predict next observations using slow class template + active variables."""
         obs = np.asarray(observations, dtype=float)
         hist = np.asarray(histories, dtype=float)
-        if not np.any(self.active_mask):
+        if not np.any(self.active_mask) or not self._abstain_allow:
             return np.asarray(self.base_world.predict(obs, hist), dtype=float)
         x = self._features(obs, hist)
         return x @ (self.base_world.weights + self.delta_w)
@@ -235,6 +496,33 @@ class DynamicsClassNode:
         x = self._features(obs_v.reshape(1, -1), hist_v.reshape(1, -1))[0]
         r_base = nxt_v - x @ self.base_world.weights
         r_cur = nxt_v - x @ (self.base_world.weights + self.delta_w)
+
+        # Strictly causal out-of-sample AbstainGate check BEFORE updating delta_w
+        if self.abstain_gate is not None:
+            if np.any(self._smooth_dims) and np.any(self.active_mask):
+                sm = self._smooth_dims
+                e_base = float(np.mean(np.abs(r_base[sm]) / self._res_scale[sm]))
+                e_adapt = float(np.mean(np.abs(r_cur[sm]) / self._res_scale[sm]))
+                self._abstain_ewma_base = (
+                    e_base if self._abstain_ewma_base is None
+                    else 0.85 * self._abstain_ewma_base + 0.15 * e_base
+                )
+                self._abstain_ewma_adapt = (
+                    e_adapt if self._abstain_ewma_adapt is None
+                    else 0.85 * self._abstain_ewma_adapt + 0.15 * e_adapt
+                )
+                self.abstain_gate.observe(e_adapt < 0.95 * e_base)
+                self._abstain_allow = (
+                    self.abstain_gate.raw_trials >= self.abstain_gate.warmup
+                    and self.abstain_gate.lcb() >= self.abstain_gate.target_lcb
+                    and self._abstain_ewma_adapt < 0.90 * self._abstain_ewma_base
+                )
+            else:
+                self._abstain_allow = False
+            if self._abstain_allow:
+                self.allow_steps += 1
+            else:
+                self.abstain_steps += 1
 
         changed = False
         if np.any(self._smooth_dims):
@@ -296,17 +584,32 @@ class DynamicsClassNode:
         self.active_mask = new_active
         self.updates += 1
 
-        # Sync fast variable slots in VariableRegistry
+        # Sync fast variable slots in VariableRegistry & WorkingMemorySlots
+        self.working_memory.step_clock(1)
+        if changed:
+            self.working_memory.clear_scope("world")
+            if self.abstain_gate is not None:
+                self.abstain_gate.reset()
+                self._abstain_ewma_base = None
+                self._abstain_ewma_adapt = None
+                self._abstain_allow = False
         for j in range(self.obs_dim):
             var = self.registry.variables[f"var:dyn:ch{j}"]
             if new_active[j]:
                 var.estimate = new_dw[:, j].copy()
                 var.support = float(n_buf)
                 var.metadata["active"] = True
+                cred_j = self.registry.credibility(f"var:dyn:ch{j}")
+                self.working_memory.bind(
+                    "world", f"ch{j}", "dynamics_delta",
+                    new_dw[:, j], strength=cred_j,
+                    provenance=f"obs@{self.updates}",
+                )
             else:
                 var.estimate = np.zeros(self.feat_dim, dtype=float)
                 var.support = 0.0
                 var.metadata["active"] = False
+                self.working_memory.clear_slot("world", f"ch{j}", "dynamics_delta")
 
         return dict(
             skipped_jump=False,
@@ -335,6 +638,8 @@ class DynamicsClassNode:
         """
         # 2 summary scalars per obs_dim: normalized bias shift & mean action-gain shift
         sig = np.zeros(2 * self.obs_dim, dtype=float)
+        if not self._abstain_allow:
+            return sig
         for j in range(self.obs_dim):
             if not self.active_mask[j]:
                 continue
@@ -370,6 +675,11 @@ class DynamicsClassNode:
             changes=int(self.changes),
             credibility=round(self.mean_credibility(), 4),
             signature_norm=round(float(np.linalg.norm(sig)), 4),
+            abstain_gate=(
+                self.abstain_gate.snapshot()
+                if self.abstain_gate is not None else None
+            ),
+            working_memory=self.working_memory.snapshot(),
         )
 
 

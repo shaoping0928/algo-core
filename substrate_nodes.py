@@ -4051,9 +4051,11 @@ def run_seed(task):
     regime_failure_weight = float(task.get("regime_failure_weight", 0.0))
     regime_failure_sigma = float(task.get("regime_failure_sigma", 0.25))
     regime_failure_prior = float(task.get("regime_failure_prior", 4.0))
+    regime_abstain_lcb = float(task.get("regime_abstain_lcb", 0.0))
     world_variables = bool(task.get("world_variables", False))
     world_var_reset_episode = bool(task.get("world_var_reset_episode", False))
     world_var_sigma = float(task.get("world_var_sigma", 0.75))
+    world_var_abstain_lcb = float(task.get("world_var_abstain_lcb", 0.0))
     chain_chunk_size = int(task.get("chain_chunk_size", 2))
     chain_hops = int(task.get("chain_hops", 3))
     chain_beam_width = int(task.get("chain_beam_width", 2))
@@ -4143,7 +4145,10 @@ def run_seed(task):
         from node_variables import DynamicsClassNode
         training_rows_for_vars = getattr(agent, "milestone_training_rows", ())
         if training_rows_for_vars:
-            world_var_node = DynamicsClassNode(world, training_rows_for_vars)
+            world_var_node = DynamicsClassNode(
+                world, training_rows_for_vars,
+                abstain_lcb=world_var_abstain_lcb,
+            )
             eval_world = world_var_node
     regime_evaluator = None
     regime_online_updater = None
@@ -4220,6 +4225,7 @@ def run_seed(task):
                 failure_memory=failure_mem,
                 failure_memory_weight=regime_failure_weight,
                 var_sigma=world_var_sigma,
+                stage_abstain_lcb=regime_abstain_lcb,
             )
             regime_stage_value = regime_online_updater.as_stage_value_callback(
                 stats=regime_stats,
@@ -4805,6 +4811,10 @@ def main():
     parser.add_argument("--regime-failure-prior", type=float, default=4.0,
                         help="evidence strength prior for online point-event "
                              "failure memory")
+    parser.add_argument("--regime-abstain-lcb", type=float, default=0.0,
+                        help="opt-in Wilson-LCB threshold for causal post-episode "
+                             "self-monitoring of stage continuation calibration "
+                             "(0 = off; e.g. 0.45 dampens inverted stage models)")
     parser.add_argument("--world-variables", action="store_true",
                         help="opt-in task-agnostic DynamicsClassNode latent "
                              "world-variable extraction and variable-scoped "
@@ -4815,6 +4825,10 @@ def main():
     parser.add_argument("--world-var-sigma", type=float, default=0.75,
                         help="similarity bandwidth in normalized variable space "
                              "for variable-scoped class-node instantiation")
+    parser.add_argument("--world-var-abstain-lcb", type=float, default=0.0,
+                        help="opt-in Wilson-LCB threshold for causal 1-step "
+                             "out-of-sample self-monitoring of world-variable "
+                             "predictions (0 = off; e.g. 0.55)")
     parser.add_argument("--benchmark", action="store_true",
                         help="standard ruler: 1500 offline frames replayed "
                              "once, then one 5000-frame free-control round "
@@ -4905,6 +4919,10 @@ def main():
         raise ValueError("--regime-failure-prior must be non-negative")
     if args.world_var_sigma <= 0.0:
         raise ValueError("--world-var-sigma must be positive")
+    if not 0.0 <= args.regime_abstain_lcb <= 1.0:
+        raise ValueError("--regime-abstain-lcb must be in [0, 1]")
+    if not 0.0 <= args.world_var_abstain_lcb <= 1.0:
+        raise ValueError("--world-var-abstain-lcb must be in [0, 1]")
     if args.lag < 0:
         raise ValueError("--lag must be non-negative")
     if args.pain_horizon < 0:
@@ -5098,9 +5116,11 @@ def main():
             regime_failure_weight=args.regime_failure_weight,
             regime_failure_sigma=args.regime_failure_sigma,
             regime_failure_prior=args.regime_failure_prior,
+            regime_abstain_lcb=args.regime_abstain_lcb,
             world_variables=args.world_variables,
             world_var_reset_episode=args.world_var_reset_episode,
             world_var_sigma=args.world_var_sigma,
+            world_var_abstain_lcb=args.world_var_abstain_lcb,
             chain_chunk_size=args.chain_chunk_size,
             chain_hops=args.chain_hops,
             chain_beam_width=args.chain_beam_width,
@@ -5415,9 +5435,11 @@ def main():
                 regime_failure_weight=args.regime_failure_weight,
                 regime_failure_sigma=args.regime_failure_sigma,
                 regime_failure_prior=args.regime_failure_prior,
+                regime_abstain_lcb=args.regime_abstain_lcb,
                 world_variables=args.world_variables,
                 world_var_reset_episode=args.world_var_reset_episode,
                 world_var_sigma=args.world_var_sigma,
+                world_var_abstain_lcb=args.world_var_abstain_lcb,
             ),
             rows=eval_rows,
             milestones=[

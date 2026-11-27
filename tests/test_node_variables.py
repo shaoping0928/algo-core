@@ -5,9 +5,13 @@ import unittest
 import numpy as np
 
 from node_variables import (
+    UNBOUND,
     DynamicsClassNode,
     ParameterizedState,
+    SourceAbstainGate,
+    WorkingMemorySlots,
     variable_similarity,
+    wilson_lcb,
 )
 from stage_regime import (
     OnlineRegimeContinuationUpdater,
@@ -228,6 +232,82 @@ class NodeVariablesTests(unittest.TestCase):
         self.assertIsNotNone(on["world_variables"])
         self.assertGreater(on["world_variables"]["updates"], 0)
         self.assertEqual(len(on["evals"]), 2)
+
+        # Opt-in AbstainGate flags stay bit-for-bit invariant at 0.0 and work when enabled
+        on_zero_abs = run_seed(dict(
+            common, world_variables=True,
+            regime_abstain_lcb=0.0, world_var_abstain_lcb=0.0,
+        ))
+        self.assertEqual(
+            [r["frames"] for r in on["evals"]],
+            [r["frames"] for r in on_zero_abs["evals"]],
+        )
+        on_abs = run_seed(dict(
+            common, world_variables=True,
+            regime_abstain_lcb=0.45, world_var_abstain_lcb=0.55,
+        ))
+        self.assertIsNotNone(on_abs["world_variables"]["abstain_gate"])
+        self.assertIsNotNone(
+            on_abs["regime_continuation"]["online"]["stage_abstain_gate"]
+        )
+
+    def test_working_memory_slots_distinguishes_unbound_and_inhibits_rivals(self):
+        wm = WorkingMemorySlots(decay=0.90, inhibit_gain=0.6, min_score=0.05)
+        self.assertIs(wm.read("world", "ch1", "drift"), UNBOUND)
+        self.assertFalse(wm.is_bound("world", "ch1", "drift"))
+
+        # Bound 0.0 is strictly distinct from UNBOUND
+        wm.bind("world", "ch1", "drift", 0.0, strength=1.0, provenance="init")
+        self.assertTrue(wm.is_bound("world", "ch1", "drift"))
+        self.assertEqual(wm.read("world", "ch1", "drift"), 0.0)
+
+        # Writing a rival value laterally suppresses the previous filler
+        wm.step_clock(1)
+        wm.bind("world", "ch1", "drift", 0.5, strength=0.9, provenance="switch")
+        self.assertEqual(wm.read("world", "ch1", "drift"), 0.5)
+
+        # Decay ages out stale bindings back to UNBOUND
+        wm.step_clock(50)
+        self.assertIs(wm.read("world", "ch1", "drift"), UNBOUND)
+        self.assertGreaterEqual(wm.prune(), 1)
+
+    def test_source_abstain_gate_and_causal_dynamics_abstention(self):
+        self.assertEqual(wilson_lcb(0, 0), 0.0)
+        self.assertGreater(wilson_lcb(20, 20, z=1.0), 0.85)
+
+        gate = SourceAbstainGate(
+            warmup=4, decay=0.95, target_lcb=0.50, floor_weight=0.30, z=1.0,
+        )
+        # During warmup grace period weight stays 1.0 even on misses
+        for _ in range(3):
+            self.assertEqual(gate.observe(False), 1.0)
+        # After warmup, persistent misses back off cleanly toward floor
+        for _ in range(8):
+            w = gate.observe(False)
+        self.assertLess(w, 0.45)
+        # Sustained recovery restores full weight 1.0
+        for _ in range(20):
+            w = gate.observe(True)
+        self.assertEqual(w, 1.0)
+
+        # Causal DynamicsClassNode abstention stays off on default world, activates on shift
+        train_rows = _synthetic_linear_world_rows(n_episodes=10, drift=-0.02, gain=0.10, seed=3)
+        obs = np.asarray([r["obs"] for r in train_rows], dtype=float)
+        hist = np.asarray([r["history"] for r in train_rows], dtype=float)
+        nxt = np.asarray([r["next_obs"] for r in train_rows], dtype=float)
+        base = LinearObservationModel(3, 1).fit(obs, hist, nxt)
+
+        node = DynamicsClassNode(base, train_rows, abstain_lcb=0.55)
+        same_rows = _synthetic_linear_world_rows(n_episodes=1, drift=-0.02, gain=0.10, seed=8)
+        for r in same_rows:
+            node.observe(r["obs"], r["history"], r["next_obs"])
+        self.assertEqual(node.allow_steps, 0)
+
+        shifted_rows = _synthetic_linear_world_rows(n_episodes=2, drift=+0.015, gain=0.10, seed=9)
+        for r in shifted_rows:
+            node.observe(r["obs"], r["history"], r["next_obs"])
+        self.assertGreater(node.allow_steps, 10)
+        self.assertGreater(float(np.linalg.norm(node.world_signature())), 0.0)
 
 
 if __name__ == "__main__":

@@ -1721,6 +1721,8 @@ class OnlineRegimeContinuationUpdater:
         failure_memory_weight: float = 0.0,
         var_sigma: float = 0.75,
         min_var_similarity: float = 0.35,
+        stage_abstain_lcb: float = 0.0,
+        stage_abstain_floor: float = 0.35,
     ):
         if not summarizer.fitted:
             raise ValueError("summarizer must be fitted")
@@ -1732,6 +1734,8 @@ class OnlineRegimeContinuationUpdater:
             raise ValueError("failure_memory_weight must be non-negative")
         if float(var_sigma) <= 0.0:
             raise ValueError("var_sigma must be positive")
+        if not 0.0 <= float(stage_abstain_lcb) <= 1.0:
+            raise ValueError("stage_abstain_lcb must be in [0, 1]")
         self.summarizer = summarizer
         self._base_episodes = tuple(
             tuple(ep) for ep in base_episodes if ep
@@ -1754,6 +1758,14 @@ class OnlineRegimeContinuationUpdater:
         self.failure_memory_weight = float(failure_memory_weight)
         self.var_sigma = float(var_sigma)
         self.min_var_similarity = float(min_var_similarity)
+        self.stage_abstain_lcb = float(stage_abstain_lcb)
+        self.stage_abstain_gate = None
+        if self.stage_abstain_lcb > 0.0:
+            from node_variables import SourceAbstainGate
+            self.stage_abstain_gate = SourceAbstainGate(
+                warmup=5, decay=0.90, target_lcb=self.stage_abstain_lcb,
+                floor_weight=float(stage_abstain_floor), z=1.0,
+            )
 
         self._online_buffer: List[
             Tuple[Tuple[Tuple[RegimeStage, ...], ...], int, Optional[np.ndarray]]
@@ -1835,6 +1847,18 @@ class OnlineRegimeContinuationUpdater:
         """
         if not rows:
             return False
+        if (
+            self.stage_abstain_gate is not None
+            and bool(rows[-1].get("done", False))
+            and len(rows) >= 25
+        ):
+            obs_arr = np.asarray(
+                [r["obs"] for r in rows], dtype=float,
+            )
+            sr, _sup = self.evaluator.continuation_risk_batch(obs_arr)
+            pre_mean = float(np.mean(sr[-15:]))
+            safe_mean = float(np.mean(sr[:-25]))
+            self.stage_abstain_gate.observe(pre_mean > safe_mean)
         new_eps = self.summarizer.transform_rows(rows, lag=int(lag))
         if not new_eps:
             return False
@@ -1902,6 +1926,8 @@ class OnlineRegimeContinuationUpdater:
                         states, var_signature=cur_sig,
                     )
                 )
+            if self.stage_abstain_gate is not None:
+                penalties = self.stage_abstain_gate.weight() * penalties
             return penalties
         return callback
 
@@ -1919,6 +1945,10 @@ class OnlineRegimeContinuationUpdater:
             failure_memory=(
                 self.failure_memory.snapshot()
                 if self.failure_memory is not None else None
+            ),
+            stage_abstain_gate=(
+                self.stage_abstain_gate.snapshot()
+                if self.stage_abstain_gate is not None else None
             ),
             evaluator=self.evaluator.snapshot(),
         )

@@ -148,8 +148,23 @@
       - `dyn_unscoped`（不区分变量的在线记忆）：`255.1`（`547p`，重返 `B3+B4 = 216.5`，因跨世界混入体验导致轻/重回归段掉分）；
       - **`dyn_var_scoped`（按变量签名的类节点实例化）**：**`284.1`（`633p`，相对静态 `+126.8`，相对不区分变量 `+28.9` / `+86p`）**，重返旧世界段 `B3+B4` 达 **`268.5`（比不区分变量高 `+52.0` 帧：`B3 Light 259.9 vs 195.3`, `B4 Heavy 277.1 vs 237.6`）**。
   - **回归测试**：新增 [tests/test_node_variables.py](file:///c:/workspace/code/algo_core/tests/test_node_variables.py)（含任务无关性锁、死区零扰动锁、`|r|>0.999` 隐变量提取与局中切换恢复、跨世界记忆隔离与 `run_seed` 接线测试）。
-- [ ] **Phase 10 — 后续可选方向（默认栈仍不变，按需推进）**：
-  - 在 `cap=5000` 完整 benchmark 口径上验证 `Chain 2×3 + OnlineRegimeContinuationUpdater + TrunkPointFailureMemory + DynamicsClassNode` 的长尾上限；
+- [x] **Phase 10 — OMNI 机制交叉吸收验证：工作记忆槽位 + 来源级因果 `AbstainGate`（2026-11-27 完成）**：
+  - **第一项（2400 局 = 6 种子 × 4 组 × 100 未见世界 `eval 200–299`）**：
+    - **保留原语**：在 [node_variables.py](file:///c:/workspace/code/algo_core/node_variables.py) 合入 `WorkingMemorySlots`（`UNBOUND` 哨兵、`(scope, entity, role)` 槽位竞争、侧抑制与老化）并接入 `DynamicsClassNode`；
+    - **负对照否决**：在 `TrunkPointFailureMemory` 上叠硬 `LEARN/QUARANTINE` 门控（`328.4 vs 338.0, -9.5`）与 `node_rel_age` 衰减（`316.7 vs 338.0, -21.3, 0/6` 正）均为负——因平滑贝叶斯先验 `prior=4.0` 已柔性保护高安全区，硬隔离会饿死弱种子，而相对时钟衰减会让系统在成功避障后遗忘真实物理死墙；不合入。
+  - **第二项（4320 局并行验证）**：
+    - **负对照否决**：静态 `branch_entropy` 降权（360 局：`324.2 vs 330.4, -6.2`）误伤已校准种子；不合入。
+    - **过门晋升① — 阶段续策局后因果 Wilson-LCB `SourceAbstainGate`（360 局，`eval 200–259`）**：
+      - `base_cal_w25` `330.4 (1157p)` → **`stage_abstain` `340.7 (+10.3, 1203p +46)`**；5/6 已校准种子精确零触碰（`0.0` 变化），**外科手术式自动识别并拉升唯一倒挂种子 `seed 103`：`291.0 → 353.0（+62.0 帧）`**！
+    - **过门晋升② — 动力学类节点因果 1 步预测 Wilson-LCB `SourceAbstainGate`（2880 局，8 变物理场景）**：
+      - 默认世界自动弃权 `94.8%`（`279.9 vs 280.9` 零退化），变化世界自动激活 `94%–96%`；**`full_var_abstain` 达成 `8/8` 全部物理场景全正**（把唯一负场景 `multi_light` 翻正至 `326.2 vs 323.1`，`mid_switch_g` 升至 **`307.9 (+128.9)`**，`1.75×` 超重 **`282.9 (+141.8)`**，`1.00×` 默认 **`331.0 (+50.1)`**）。
+  - **主程序 opt-in 接线（默认关闭，默认栈逐位不变）**：
+    - [node_variables.py](file:///c:/workspace/code/algo_core/node_variables.py) 新增 `wilson_lcb()`、`SourceAbstainGate` 及 `DynamicsClassNode(abstain_lcb=0.0)`；
+    - [stage_regime.py](file:///c:/workspace/code/algo_core/stage_regime.py) 为 `OnlineRegimeContinuationUpdater` 增加 `stage_abstain_lcb=0.0`；
+    - [substrate_nodes.py](file:///c:/workspace/code/algo_core/substrate_nodes.py) 新增 `--regime-abstain-lcb`（默认 `0.0`，推荐 `0.45`）与 `--world-var-abstain-lcb`（默认 `0.0`，推荐 `0.55`）；
+    - [tests/test_node_variables.py](file:///c:/workspace/code/algo_core/tests/test_node_variables.py) 补齐 `WorkingMemorySlots`、`SourceAbstainGate` 与因果自监视单测。
+- [ ] **Phase 11 — 后续可选方向（默认栈仍不变，按需推进）**：
+  - 在 `cap=5000` 完整 benchmark 口径上验证 `Chain 2×3 + OnlineRegimeContinuationUpdater + TrunkPointFailureMemory + DynamicsClassNode + SourceAbstainGate` 的长尾上限；
   - 将抽象类节点进一步扩展至“关系型/对称特征类模板”（跨观测通道共享边界/接近关系模板）及长程多世界变量树先验召回。
 
 ## P0：多视窗状态转移机制重设计（当前主线）
