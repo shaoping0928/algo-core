@@ -211,8 +211,10 @@
   - 为 `OnlineFeatureDemandUpdater` 增加可选 `var_signature` 作用域绑定（默认 `None` 保持几何包络跨物理共享），并在 2,400 局变物理双门基准上验证统一全栈（`DynamicsClassNode(abstain_lcb=0.55)` + 变量作用域阶段/失败记忆 + `stage_abstain_lcb=0.45` + `adaptive_chained_result` + `OnlineFeatureDemandUpdater`）：
     - **Gate A（轻 `0.55×g` / 重 `1.65×g` 交替 4 块防遗忘，240 局/组）**：`static_p10` **`214.6` (`427p`, Return `204.2`)** → `p10_var_scoped` **`268.8` (`588p`, Return `225.5`)** → `full_var_scoped_dem` **`298.7` (`675p`, Return `302.9`)** → **`full_unscoped_dem` `324.1`（`+55.3` vs P10 / `+109.5` vs static，`752p`，Return `B3+B4 = 347.1` `+121.6` vs P10，`B4 Heavy` 达 `487.8`！）**——证实安全几何走廊包络跨重力不变，池化更新优于频繁重置；
     - **Gate B（6 变物理 + 局中 `t=60` 切重力，120 局/场景）**：**5/6 场景大幅胜过 Phase 10 冠军**（6 场景总均分 **`290.6 → 337.2, +46.6`**）：`default_1.00x +69.4 (339.3→408.8)`、`heavy_1.38x +56.2 (303.6→359.8)`、`ultra_1.75x +90.6 (284.8→375.4)`、`multi_light +13.5 (263.7→277.2)`、`mid_switch_g +84.5 (285.1→369.6)`，仅 `light_0.50x -34.4`。
-- [ ] **Phase 15 — 后续可选方向（默认栈仍不变，按需推进）**：
-  - 拆解 `core/memory/node_runtime.py` 与 `core/substrate_nodes.py` 剩余大文件（方向 4）。
+- [x] **Phase 15 — 方向 4：拆解剩余两大巨石文件 `substrate_nodes.py` 与 `node_runtime.py`（2026-11-27 完成）**：
+  - `core/substrate_nodes.py`（原 6,012L → 4,275L → **1,821L**）：抽离 [core/runner/trainer.py](file:///c:/workspace/code/algo_core/core/runner/trainer.py)（1,747L，训练/校准/里程碑归纳）与 [core/runner/evaluator.py](file:///c:/workspace/code/algo_core/core/runner/evaluator.py)（860L，评测主循环与 `run_seed` 调度），主干保留 MPC 规划与完整兼容门面；
+  - `core/memory/node_runtime.py`（原 4,674L → **878L**）：按 Mixin 架构拆出 [core/memory/node_learning.py](file:///c:/workspace/code/algo_core/core/memory/node_learning.py)（2,150L，原型增删/记忆追踪/动作边/规则归纳）与 [core/memory/node_readout.py](file:///c:/workspace/code/algo_core/core/memory/node_readout.py)（1,725L，特征单元/保序校准/图传播/批量读出），并将 [tests/test_node_runtime.py](file:///c:/workspace/code/algo_core/tests/test_node_runtime.py) 的任务无关性静态扫描扩展至全部 3 个运行时文件；
+  - **全量 `783/783` 单元测试通过（`58.67s`）**，对外 API 与默认栈逐位不变。
 
 ## P0：多视窗状态转移机制重设计（当前主线）
 

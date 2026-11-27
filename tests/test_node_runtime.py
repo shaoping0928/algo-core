@@ -1546,7 +1546,7 @@ class NodeRuntimeTests(unittest.TestCase):
             "BIRD_X", "GAP", "pipes", "target_gap", "near_pipe",
             "crossing", "TerminalRiskHead", "latent_world", "flappy",
         )
-        for name in ("node_runtime.py", "node_graph.py"):
+        for name in ("node_runtime.py", "node_learning.py", "node_readout.py", "node_graph.py"):
             text = find_core_file(name).read_text(encoding="utf-8")
             for token in forbidden:
                 self.assertNotIn(token, text, "%s in %s" % (token, name))
