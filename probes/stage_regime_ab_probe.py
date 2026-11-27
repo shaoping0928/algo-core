@@ -13,10 +13,17 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 import json
 import os
+from pathlib import Path
 import pickle
 import sys
 import time
 import numpy as np
+
+_ROOT = Path(__file__).resolve().parents[1]
+for _sub in ("core", "modules", "probes"):
+    _p = str(_ROOT / _sub)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from stage_regime import (
     CalibratedRegimeTransitionModel,
@@ -57,11 +64,15 @@ def _eval_clone(agent):
 
 
 def _load_or_fit_model(seed: int, cache_prefix: str = "b0"):
-    path = f"{cache_prefix}-{seed}.pkl"
-    if os.path.exists(path):
-        with open(path, "rb") as handle:
-            bundle = pickle.load(handle)
-        return bundle["world"], bundle["agent"]
+    candidates = (
+        os.path.join(str(_ROOT), "results", "models", f"{cache_prefix}-{seed}.pkl"),
+        f"{cache_prefix}-{seed}.pkl",
+    )
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path, "rb") as handle:
+                bundle = pickle.load(handle)
+            return bundle["world"], bundle["agent"]
     return fit(
         seed, steps=1500, coverage=0.1, max_nodes=1000, epochs=1,
         dagger_rounds=1, dagger_frames=5000, dagger_cap=5000,

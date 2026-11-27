@@ -227,7 +227,9 @@ class StageRegimeTests(unittest.TestCase):
         )
 
     def test_module_is_task_agnostic(self):
-        with open("stage_regime.py", "r", encoding="utf-8") as handle:
+        from pathlib import Path
+        path = Path(__file__).resolve().parents[1] / "core" / "stage_regime.py"
+        with open(path, "r", encoding="utf-8") as handle:
             source = handle.read().lower()
         for forbidden in ("flappy", "bird_x", "pipe", "gap", "flap", "gravity"):
             self.assertNotIn(forbidden, source)

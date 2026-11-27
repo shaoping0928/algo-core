@@ -12,8 +12,11 @@ class RecallSplitTests(unittest.TestCase):
         env.pop("OMNI_ARMS", None)
         env.pop("OMNI_TYPES", None)
         env["OMNI_SEED"] = "21"
+        env["PYTHONPATH"] = os.pathsep.join(
+            str(root / sub) for sub in ("core", "modules", "probes")
+        )
         result = subprocess.run(
-            [sys.executable, "recall_world.py", "30", "64", "1"],
+            [sys.executable, str(root / "probes" / "recall_world.py"), "30", "64", "1"],
             cwd=root,
             env=env,
             capture_output=True,

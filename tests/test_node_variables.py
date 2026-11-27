@@ -64,7 +64,7 @@ def _synthetic_linear_world_rows(
 
 class NodeVariablesTests(unittest.TestCase):
     def test_module_is_task_agnostic(self):
-        source = (Path(__file__).resolve().parents[1] / "node_variables.py").read_text(
+        source = (Path(__file__).resolve().parents[1] / "core" / "node_variables.py").read_text(
             encoding="utf-8"
         ).lower()
         for forbidden in ("flappy", "bird", "pipe", "gap", "flap", "gravity"):

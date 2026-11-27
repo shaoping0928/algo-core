@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .pytest_cache/
 .venv-t/
+results/
 *.pkl
 consume-*.json
 span-decision-*.json

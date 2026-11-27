@@ -71,6 +71,8 @@ class FlappyTests(unittest.TestCase):
 
     def test_import_does_not_parse_cli_args_or_run_experiment(self):
         root = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(root / "core")
         result = subprocess.run(
             [
                 sys.executable,
@@ -78,7 +80,7 @@ class FlappyTests(unittest.TestCase):
                 "import sys; sys.argv = ['python', '--unrelated-flag']; import flappy",
             ],
             cwd=root,
-            env=os.environ.copy(),
+            env=env,
             capture_output=True,
             text=True,
             check=False,
@@ -88,6 +90,8 @@ class FlappyTests(unittest.TestCase):
 
     def test_latent_runner_respects_its_frame_cap(self):
         root = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(root / "core")
         result = subprocess.run(
             [
                 sys.executable,
@@ -100,7 +104,7 @@ class FlappyTests(unittest.TestCase):
                 ),
             ],
             cwd=root,
-            env=os.environ.copy(),
+            env=env,
             capture_output=True,
             text=True,
             check=False,

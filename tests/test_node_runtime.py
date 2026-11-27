@@ -1541,7 +1541,7 @@ class NodeRuntimeTests(unittest.TestCase):
         self.assertLess(scores[0]["cost"], scores[1]["cost"])
 
     def test_core_does_not_embed_task_geometry(self):
-        root = Path(__file__).resolve().parents[1]
+        root = Path(__file__).resolve().parents[1] / "core"
         forbidden = (
             "BIRD_X", "GAP", "pipes", "target_gap", "near_pipe",
             "crossing", "TerminalRiskHead", "latent_world", "flappy",
@@ -1567,6 +1567,7 @@ class NodeRuntimeTests(unittest.TestCase):
             self.assertNotIn(token, adapter, "%s in substrate_nodes.py" % token)
         # The generic context and memory modules must not privilege any
         # benchmark parameter either: they only see transitions.
+        repo = Path(__file__).resolve().parents[1]
         for name in (
             "context_model.py", "memory_tree.py",
             "variable_registry.py", "hierarchical_memory.py",
@@ -1574,7 +1575,8 @@ class NodeRuntimeTests(unittest.TestCase):
             "rule_expressions.py", "contextual_rules.py",
             "milestone_graph.py",
         ):
-            text = (root / name).read_text(encoding="utf-8")
+            src = (repo / "core" / name) if (repo / "core" / name).exists() else (repo / "modules" / name)
+            text = src.read_text(encoding="utf-8")
             for token in (
                 "gravity", "flap", "BIRD_X", "pipes",
                 "target_gap", "near_pipe", "collision",

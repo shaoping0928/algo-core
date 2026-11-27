@@ -18,10 +18,17 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import os
+from pathlib import Path
 import sys
 from collections import Counter, defaultdict
 
 import numpy as np
+
+_ROOT = Path(__file__).resolve().parents[1]
+for _sub in ("core", "modules", "probes"):
+    _p = str(_ROOT / _sub)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from stage_regime import (
     CalibratedRegimeTransitionModel,
