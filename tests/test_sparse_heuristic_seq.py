@@ -63,6 +63,25 @@ class SparseHeuristicSeqTests(unittest.TestCase):
         self.assertEqual(len(row["evals"]), 1)
         self.assertEqual(row["frames"], 30)
 
+    def test_text_corpus_seq_env_and_ngram_sparse_index(self):
+        from sparse_index import SparseFeatureActionIndex
+        from text_corpus_env import TextCorpusSeqEnv
+
+        # Repeating structured Chinese-like token pattern over V=32
+        pattern = np.array([3, 7, 11, 15, 19, 23, 27, 31], dtype=np.int32)
+        tokens = np.tile(pattern, 30)
+        idx = SparseFeatureActionIndex(tuple(range(32)), prior_weight=0.25)
+        idx.fit_token_stream(tokens[:160], ctx_len=4)
+
+        env = TextCorpusSeqEnv(tokens[160:], vocab_size=32, ctx_len=4, lag=0, cap=24, start_pos=4)
+        hits = 0
+        for _ in range(24):
+            cand = idx.propose_one(env.obs(), k=4, sparse_keys=env.sparse_keys())
+            if cand[0] == int(env.tokens[env.pos]):
+                hits += 1
+            env.step(cand[0])
+        self.assertGreaterEqual(hits, 20)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -58,14 +58,19 @@ class SparseFeatureActionIndex:
         action: int,
         dopamine: float = 0.0,
         pain: float = 0.0,
+        sparse_keys: Optional[Sequence[Tuple[int, ...]]] = None,
     ) -> None:
         """Record one observed ``(state, action, feedback)`` into inverted postings."""
         act = int(action)
         score = float(dopamine) - float(pain)
-        feats = extract_sparse_features(
-            state,
-            quantize_step=self.quantize_step,
-            include_nonzero_ids=self.include_nonzero_ids,
+        feats = (
+            tuple(sparse_keys)
+            if sparse_keys is not None
+            else extract_sparse_features(
+                state,
+                quantize_step=self.quantize_step,
+                include_nonzero_ids=self.include_nonzero_ids,
+            )
         )
         for fk in feats:
             bucket = self._postings[fk].get(act)
@@ -78,6 +83,31 @@ class SparseFeatureActionIndex:
         self._global_scores[act] += score
         self.total_updates += 1
 
+    def fit_token_stream(
+        self,
+        tokens: Sequence[int],
+        *,
+        ctx_len: int = 4,
+    ) -> "SparseFeatureActionIndex":
+        """Directly index n-gram context keys -> next token from a token stream."""
+        arr = np.asarray(tokens, dtype=np.int32).reshape(-1)
+        c = max(int(ctx_len), 1)
+        for pos in range(c, len(arr)):
+            t_m1 = int(arr[pos - 1])
+            keys = [(-1, t_m1)]
+            if c >= 2:
+                t_m2 = int(arr[pos - 2])
+                keys.append((-2, t_m2))
+                keys.append((12, t_m2, t_m1))
+            if c >= 3:
+                t_m3 = int(arr[pos - 3])
+                keys.append((13, t_m3, t_m2, t_m1))
+            if c >= 4:
+                t_m4 = int(arr[pos - 4])
+                keys.append((14, t_m4, t_m3, t_m2, t_m1))
+            self.update(None, int(arr[pos]), dopamine=1.0, pain=0.0, sparse_keys=keys)
+        return self
+
     def fit_transitions(self, transitions: Sequence[dict], lag: int = 0) -> "SparseFeatureActionIndex":
         """Bulk-index a list of transition dicts from ``collect``."""
         del lag
@@ -87,18 +117,30 @@ class SparseFeatureActionIndex:
                 continue
             act = int(round(float(hist[0])))
             sig = row.get("signals", (0.0, 0.0))
-            self.update(row["obs"], act, dopamine=float(sig[0]), pain=float(sig[1]))
+            self.update(
+                row["obs"], act, dopamine=float(sig[0]), pain=float(sig[1]),
+                sparse_keys=row.get("sparse_keys"),
+            )
         return self
 
-    def propose_one(self, state: np.ndarray, k: int) -> List[int]:
+    def propose_one(
+        self,
+        state: np.ndarray,
+        k: int,
+        sparse_keys: Optional[Sequence[Tuple[int, ...]]] = None,
+    ) -> List[int]:
         """Return Top-K candidate actions for a single state via sparse postings."""
         k_req = min(max(int(k), 1), len(self.action_space))
         if k_req >= len(self.action_space):
             return list(self.action_space)
-        feats = extract_sparse_features(
-            state,
-            quantize_step=self.quantize_step,
-            include_nonzero_ids=self.include_nonzero_ids,
+        feats = (
+            tuple(sparse_keys)
+            if sparse_keys is not None
+            else extract_sparse_features(
+                state,
+                quantize_step=self.quantize_step,
+                include_nonzero_ids=self.include_nonzero_ids,
+            )
         )
         scores: Dict[int, float] = defaultdict(float)
         counts: Dict[int, float] = defaultdict(float)
@@ -106,9 +148,13 @@ class SparseFeatureActionIndex:
             post = self._postings.get(fk)
             if not post:
                 continue
+            if sparse_keys is not None and len(fk) >= 2 and fk[0] >= 10:
+                spec = 10.0 ** float(len(fk) - 2)
+            else:
+                spec = 1.0
             for act, (cnt, s_sum) in post.items():
-                counts[act] += cnt
-                scores[act] += s_sum
+                counts[act] += cnt * spec
+                scores[act] += s_sum * spec
 
         if scores:
             ranked = sorted(
