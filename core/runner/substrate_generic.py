@@ -198,7 +198,8 @@ def collect(seed, steps=PRACTICE, coverage=0.0, lag=LAG, guide=None,
                 [feedback["dopamine"], feedback["pain"]], dtype=float
             )
             vy1 = getattr(env, "vy", float(next_obs[1]) if len(next_obs) > 1 else 0.0)
-            lp.observe(vy1 - vy0, float(action))
+            if n_actions == 2:
+                lp.observe(vy1 - vy0, float(action))
             transitions.append(dict(
                 obs=obs, next_obs=next_obs, history=history,
                 signals=signals, terminal=bool(env.dead),

@@ -339,6 +339,10 @@ def _resolve_env_factory(env_name: str, lag: int, cap: int):
     if low == "mountaincar":
         from mountaincar_env import make_mountaincar_factory
         return make_mountaincar_factory(lag=lag, cap=cap)
+    if low == "seq" or (low.startswith("seq") and low[3:].isdigit()):
+        from symbolic_seq_env import make_symbolic_seq_factory
+        vocab = int(low[3:]) if len(low) > 3 else 64
+        return make_symbolic_seq_factory(vocab_size=vocab, lag=lag, cap=cap)
     if low.startswith("gym:"):
         gym_id = name.split(":", 1)[1].strip()
         if not gym_id:

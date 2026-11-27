@@ -59,12 +59,21 @@ def association_value_batch(agent, encoded):
     return values, supports
 
 
+def _expand_step_actions(states, action_arr, n_act, action_top_k, action_proposer):
+    if int(action_top_k) > 0 and n_act > int(action_top_k) and action_proposer is not None:
+        cand = np.asarray(action_proposer(states, int(action_top_k)), dtype=float)
+        return int(cand.shape[1]), cand.reshape(-1)
+    return n_act, np.tile(action_arr, len(states))
+
+
 def chained_shallow_result(
     env, world, agent, prefix, chunk_size=2, n_hops=3, beam_width=2,
     lag=LAG, step_stride=2, risk_weight=1.0,
     stage_value=None, stage_value_weight=0.0,
     heuristic_demand=None, heuristic_demand_weight=0.0,
     diverse_first_action=True,
+    action_top_k: int = 0,
+    action_proposer=None,
 ) -> SearchResult:
     """Chained 2-3 frame active-pruning shallow search.
 
@@ -97,6 +106,11 @@ def chained_shallow_result(
     is_rt = isinstance(agent, NodeRuntime)
     sv_weight = float(stage_value_weight)
     hd_weight = float(heuristic_demand_weight)
+    proposer = (
+        action_proposer if action_proposer is not None
+        else getattr(agent, "propose_actions_batch", None)
+    )
+    top_k_act = int(action_top_k)
 
     states = initial.reshape(1, -1)
     sequences = np.zeros((1, horizon), dtype=float)
@@ -108,10 +122,12 @@ def chained_shallow_result(
         start_step = hop * chunk_size
         end_step = start_step + chunk_size
         for step in range(start_step, end_step):
-            count = len(states)
-            next_states = np.repeat(states, n_act, axis=0)
-            next_seqs = np.repeat(sequences, n_act, axis=0)
-            next_seqs[:, step] = np.tile(action_arr, count)
+            k_act, step_actions = _expand_step_actions(
+                states, action_arr, n_act, top_k_act, proposer,
+            )
+            next_states = np.repeat(states, k_act, axis=0)
+            next_seqs = np.repeat(sequences, k_act, axis=0)
+            next_seqs[:, step] = step_actions
             history = history_features(
                 next_seqs, step + 1, pending_prefix, action_dim=action_dim,
             )
@@ -121,9 +137,9 @@ def chained_shallow_result(
             if first_states is None:
                 first_states = next_states.copy()
             else:
-                first_states = np.repeat(first_states, n_act, axis=0)
+                first_states = np.repeat(first_states, k_act, axis=0)
             candidate_count += len(next_states)
-            next_risk = np.repeat(cum_risk, n_act)
+            next_risk = np.repeat(cum_risk, k_act)
             if step % step_stride == 0 and step < horizon - 1:
                 pending = history[:, :agent.lag][:, ::-1]
                 encoded = np.concatenate(
@@ -289,6 +305,7 @@ def _expand_clean_chunk(
     states, seqs, first_states, cum_risk, path_sp, path_dem,
     start_step, chunk_size, pending_prefix, world, agent,
     lag=LAG, step_stride=2, risk_weight=0.0,
+    action_top_k: int = 0, action_proposer=None,
 ):
     """Roll the current beam forward by ``chunk_size`` steps without recomputing earlier hops.
 
@@ -299,6 +316,11 @@ def _expand_clean_chunk(
     action_space = tuple(getattr(agent, "action_space", (0, 1)))
     n_act = len(action_space)
     action_arr = np.asarray(action_space, dtype=float)
+    proposer = (
+        action_proposer if action_proposer is not None
+        else getattr(agent, "propose_actions_batch", None)
+    )
+    top_k_act = int(action_top_k)
     action_dim = int(lag) + 1
     obs_dim = int(agent.obs_dim)
     scales = agent.scales
@@ -309,10 +331,12 @@ def _expand_clean_chunk(
         seqs = np.concatenate([seqs, pad], axis=1)
     added = 0
     for step in range(int(start_step), end_step):
-        count = len(states)
-        next_states = np.repeat(states, n_act, axis=0)
-        next_seqs = np.repeat(sequences := seqs, n_act, axis=0)
-        next_seqs[:, step] = np.tile(action_arr, count)
+        k_act, step_actions = _expand_step_actions(
+            states, action_arr, n_act, top_k_act, proposer,
+        )
+        next_states = np.repeat(states, k_act, axis=0)
+        next_seqs = np.repeat(seqs, k_act, axis=0)
+        next_seqs[:, step] = step_actions
         hist = history_features(
             next_seqs, step + 1, pending_prefix, action_dim=action_dim,
         )
@@ -320,13 +344,13 @@ def _expand_clean_chunk(
         if first_states is None:
             first_states = next_states.copy()
         else:
-            first_states = np.repeat(first_states, n_act, axis=0)
+            first_states = np.repeat(first_states, k_act, axis=0)
         added += len(next_states)
-        next_risk = np.repeat(cum_risk, n_act)
+        next_risk = np.repeat(cum_risk, k_act)
         if path_sp is not None:
-            path_sp = np.repeat(path_sp, n_act, axis=0)
+            path_sp = np.repeat(path_sp, k_act, axis=0)
         if path_dem is not None:
-            path_dem = np.repeat(path_dem, n_act, axis=0)
+            path_dem = np.repeat(path_dem, k_act, axis=0)
         if risk_weight > 0.0 and step % step_stride == 0 and step < end_step - 1:
             pend = hist[:, :agent.lag][:, ::-1]
             enc = np.concatenate([next_states[:, :obs_dim], pend], axis=1) / scales
@@ -387,6 +411,7 @@ def _run_clean_chain_tier(
     initial, world, agent, pending_prefix, chunk_size, n_hops, beam_width,
     diverse_hop1, stage_value, stage_value_weight,
     heuristic_demand, heuristic_demand_weight, lag=LAG, step_stride=2,
+    action_top_k: int = 0, action_proposer=None,
 ):
     """Evaluate one segmented search tier and compute its monotonic bottleneck confidence."""
     action_space = tuple(getattr(agent, "action_space", (0, 1)))
@@ -407,6 +432,7 @@ def _run_clean_chain_tier(
             start_step=start_step, chunk_size=chunk_size,
             pending_prefix=pending_prefix, world=world, agent=agent,
             lag=lag, step_stride=step_stride, risk_weight=0.0,
+            action_top_k=action_top_k, action_proposer=action_proposer,
         )
         total_cands += added
         cost, path_sp, path_dem, finite = _score_clean_frontier(
@@ -448,6 +474,7 @@ def _extend_clean_frontier_one_chunk(
     frontier, chunk_size, beam_width, world, agent, pending_prefix,
     stage_value, stage_value_weight, heuristic_demand, heuristic_demand_weight,
     lag=LAG, step_stride=2,
+    action_top_k: int = 0, action_proposer=None,
 ):
     """Incrementally extend an existing frontier by one chunk (zero recompute of earlier hops)."""
     states, seqs, first_states, cum_risk, path_sp, path_dem, cost, cur_h = frontier
@@ -466,6 +493,7 @@ def _extend_clean_frontier_one_chunk(
         start_step=cur_h, chunk_size=chunk_size,
         pending_prefix=pending_prefix, world=world, agent=agent,
         lag=lag, step_stride=step_stride, risk_weight=0.0,
+        action_top_k=action_top_k, action_proposer=action_proposer,
     )
     new_h = int(cur_h) + int(chunk_size)
     cost, path_sp, path_dem, finite = _score_clean_frontier(
@@ -496,6 +524,8 @@ def adaptive_chained_result(
     stage_value=None, stage_value_weight=0.0,
     heuristic_demand=None, heuristic_demand_weight=0.0,
     controller=None,
+    action_top_k: int = 0,
+    action_proposer=None,
 ) -> SearchResult:
     """Dual-confidence decaying-threshold adaptive segmented search.
 
@@ -527,6 +557,8 @@ def adaptive_chained_result(
             stage_value=stage_value, stage_value_weight=stage_value_weight,
             heuristic_demand=heuristic_demand,
             heuristic_demand_weight=heuristic_demand_weight,
+            action_top_k=action_top_k,
+            action_proposer=action_proposer,
         )
 
     initial = np.asarray(env.obs(), dtype=float)
@@ -542,6 +574,7 @@ def adaptive_chained_result(
         diverse_hop1=False, stage_value=stage_value, stage_value_weight=sv_w,
         heuristic_demand=heuristic_demand, heuristic_demand_weight=hd_w,
         lag=lag, step_stride=step_stride,
+        action_top_k=action_top_k, action_proposer=action_proposer,
     )
     total_candidates += cands
     if controller is not None:
@@ -566,6 +599,7 @@ def adaptive_chained_result(
             diverse_hop1=True, stage_value=stage_value, stage_value_weight=sv_w,
             heuristic_demand=heuristic_demand, heuristic_demand_weight=hd_w,
             lag=lag, step_stride=step_stride,
+            action_top_k=action_top_k, action_proposer=action_proposer,
         )
         total_candidates += cands
         cur_hops = next_hops
@@ -586,6 +620,7 @@ def adaptive_chained_result(
                 stage_value=stage_value, stage_value_weight=sv_w,
                 heuristic_demand=heuristic_demand, heuristic_demand_weight=hd_w,
                 lag=lag, step_stride=step_stride,
+                action_top_k=action_top_k, action_proposer=action_proposer,
             )
             total_candidates += cands
 

@@ -227,6 +227,13 @@ def _train(transitions, seed, epochs, lag, max_nodes, birth_threshold,
         online_feature_learning=online_feature_learning,
         online_feature_options=online_feature_options,
     )
+    if len(action_space) > 4:
+        from sparse_index import SparseFeatureActionIndex
+        sparse_idx = SparseFeatureActionIndex(action_space).fit_transitions(
+            transitions, lag=lag,
+        )
+        agent.sparse_action_index = sparse_idx
+        agent.propose_actions_batch = sparse_idx.propose_batch
     episodes = {}
     for row in transitions:
         episodes.setdefault(row["episode"], []).append(row)

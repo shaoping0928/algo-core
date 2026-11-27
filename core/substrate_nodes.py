@@ -1653,6 +1653,7 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
             ))
         return int(result.actions[0])
     if decision == "chained":
+        auto_top_k = 8 if len(getattr(agent, "action_space", (0, 1))) > 8 else 0
         if adaptive_controller is not None:
             result = adaptive_chained_result(
                 env, world, agent, prefix,
@@ -1669,6 +1670,7 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                 heuristic_demand=heuristic_demand,
                 heuristic_demand_weight=heuristic_demand_weight,
                 controller=adaptive_controller,
+                action_top_k=auto_top_k,
             )
         else:
             result = chained_shallow_result(
@@ -1683,6 +1685,7 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                 stage_value_weight=stage_value_weight,
                 heuristic_demand=heuristic_demand,
                 heuristic_demand_weight=heuristic_demand_weight,
+                action_top_k=auto_top_k,
             )
         if ledger_out is not None:
             score = result.score

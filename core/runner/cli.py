@@ -518,7 +518,8 @@ def main():
                              "1000 nodes, 400-frame evaluation")
     parser.add_argument("--env", default="flappy",
                         help="environment to run: 'flappy', 'cartpole', "
-                             "'mountaincar', or 'gym:<env_id>' (default: flappy)")
+                             "'mountaincar', 'seq[V]', or 'gym:<env_id>' "
+                             "(default: flappy)")
     args = parser.parse_args()
     if args.fast:
         args.steps = 1500
