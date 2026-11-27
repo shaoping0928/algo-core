@@ -768,5 +768,175 @@ class StageRegimeTests(unittest.TestCase):
         np.testing.assert_allclose(p_fm - p_plain, 0.25 * h, atol=1e-12)
 
 
+class TestAdaptiveSearchControllerAndPlanner(unittest.TestCase):
+    def test_controller_outer_lcb_and_causal_self_audit(self):
+        from node_variables import SourceAbstainGate
+        from stage_regime import AdaptiveSearchController
+
+        ctrl = AdaptiveSearchController(
+            conf_threshold=0.72, conf_decay=0.80, meta_lcb=0.65,
+            stage_warmup=5, audit_warmup=6, audit_target_lcb=0.25,
+            audit_ratio=0.55,
+        )
+        stage_gate = SourceAbstainGate(warmup=5, decay=0.90, target_lcb=0.45, z=1.0)
+
+        # Warmup: stays inactive while stage_gate has < 5 trials
+        for _ in range(4):
+            self.assertFalse(ctrl.begin_episode(stage_gate))
+            ctrl.record_episode(200)
+            stage_gate.observe(True)
+        # 5th observation clears warmup and LCB >= 0.65
+        stage_gate.observe(True)
+        self.assertGreaterEqual(stage_gate.lcb(), 0.65)
+        self.assertTrue(ctrl.begin_episode(stage_gate))
+
+        # Feed 6 collapsed adaptive episodes (< 0.55 * 200 = 110) -> audit must abstain!
+        for _ in range(6):
+            self.assertTrue(ctrl.begin_episode(stage_gate))
+            ctrl.record_episode(70)
+        self.assertFalse(ctrl.begin_episode(stage_gate))
+        self.assertEqual(ctrl.audit_blocked_episodes, 1)
+
+        # Healthy controller never gets blocked by self-audit
+        ctrl_ok = AdaptiveSearchController(
+            conf_threshold=0.72, conf_decay=0.80, meta_lcb=0.65,
+            stage_warmup=5, audit_warmup=6, audit_target_lcb=0.25,
+            audit_ratio=0.55,
+        )
+        for _ in range(5):
+            ctrl_ok.record_episode(200, used_adaptive=False)
+        for _ in range(10):
+            self.assertTrue(ctrl_ok.begin_episode(stage_gate))
+            ctrl_ok.record_episode(240, used_adaptive=True)
+        self.assertEqual(ctrl_ok.audit_blocked_episodes, 0)
+
+    def test_controller_decaying_threshold_and_self_calibrating_quantile(self):
+        from stage_regime import AdaptiveSearchController
+
+        ctrl = AdaptiveSearchController(
+            conf_threshold=0.72, conf_decay=0.80, conf_quantile=0.60,
+        )
+        # Before 32 samples, falls back to fixed conf_threshold
+        tau0, dec = ctrl.observe_tier0_confidence(0.50)
+        self.assertAlmostEqual(tau0, 0.72, places=6)
+        self.assertAlmostEqual(dec, 0.80, places=6)
+        # Decaying schedule strictly decreases and final tier always passes (-1.0)
+        t0 = ctrl.threshold_for_tier(0, tau0, dec, is_final=False)
+        t1 = ctrl.threshold_for_tier(1, tau0, dec, is_final=False)
+        t_final = ctrl.threshold_for_tier(2, tau0, dec, is_final=True)
+        self.assertGreater(t0, t1)
+        self.assertLess(t_final, 0.0)
+
+        # After 40 samples around [0.1..0.5], rolling 60th quantile self-calibrates
+        for v in np.linspace(0.10, 0.50, 40):
+            tau_q, _ = ctrl.observe_tier0_confidence(float(v))
+        self.assertLess(tau_q, 0.45)
+        self.assertGreater(tau_q, 0.25)
+
+    def test_adaptive_chained_result_fallback_and_tier_escalation(self):
+        from stage_regime import AdaptiveSearchController
+        from substrate_nodes import (
+            adaptive_chained_result,
+            chained_shallow_result,
+            decision_action,
+        )
+
+        class _DummyEnv:
+            def __init__(self, x):
+                self._x = np.asarray(x, dtype=float)
+                self.t = 0
+
+            def obs(self):
+                return self._x.copy()
+
+        class _DummyWorld:
+            def predict(self, states, history):
+                # Action at lag index shifts dim 0 by +0.2 (a=1) or -0.2 (a=0)
+                act = history[:, -1]
+                nxt = states.copy()
+                nxt[:, 0] = nxt[:, 0] + np.where(act > 0.5, 0.2, -0.2)
+                return nxt
+
+        class _DummyAgent:
+            action_space = (0, 1)
+            obs_dim = 2
+            lag = 2
+            scales = np.ones(4, dtype=float)
+            feature_value_weight = 0.0
+            value_readout = "cells"
+            value_trust_samples = 150.0
+
+            def pain_signal_batch(self, enc, mask_table=None, soft_weights=None):
+                return np.zeros(len(enc), dtype=float)
+
+            def valence_state_batch(self, enc, soft_weights=None):
+                z = np.zeros(len(enc), dtype=float)
+                return z, z
+
+            def _feature_mask_table(self, x):
+                return np.ones((len(x), 1), dtype=float)
+
+            def feature_value_batch(self, enc, mt, return_support=True):
+                z = np.zeros(len(enc), dtype=float)
+                return (z, z) if return_support else z
+
+        env = _DummyEnv([0.0, 0.0])
+        world = _DummyWorld()
+        agent = _DummyAgent()
+        prefix = np.zeros(2, dtype=float)
+
+        # 1. Inactive controller delegates bit-for-bit to chained_shallow_result
+        ctrl_off = AdaptiveSearchController(meta_lcb=0.65)
+        ctrl_off.active = False
+        safe_stage = lambda st, seq: np.clip(0.10 + 0.05 * np.abs(st[:, 0] - 0.4), 0.0, 1.0)
+        res_base = chained_shallow_result(
+            env, world, agent, prefix, chunk_size=2, n_hops=3, beam_width=4,
+            lag=2, stage_value=safe_stage, stage_value_weight=1.0,
+        )
+        res_off = adaptive_chained_result(
+            env, world, agent, prefix, chunk_size=2, base_hops=3, max_hops=5,
+            beam_width=4, wide_beam_width=6, lag=2,
+            stage_value=safe_stage, stage_value_weight=1.0, controller=ctrl_off,
+        )
+        np.testing.assert_array_equal(res_off.actions, res_base.actions)
+        self.assertEqual(res_off.score, res_base.score)
+        self.assertEqual(ctrl_off.base_steps, 1)
+        self.assertEqual(ctrl_off.adaptive_steps, 0)
+
+        # 2. Active controller on high-confidence safe state exits immediately at Tier 0
+        ctrl_fast = AdaptiveSearchController(conf_threshold=0.72, conf_decay=0.80, meta_lcb=0.0)
+        ctrl_fast.begin_episode(None)
+        res_t0 = adaptive_chained_result(
+            env, world, agent, prefix, chunk_size=2, base_hops=3, max_hops=5,
+            beam_width=4, wide_beam_width=6, lag=2,
+            stage_value=safe_stage, stage_value_weight=1.0, controller=ctrl_fast,
+        )
+        self.assertEqual(len(res_t0.actions), 6)
+        self.assertEqual(ctrl_fast.tier_counts, {0: 1})
+
+        # 3. Active controller on worst-case conf=0.0 state escalates to final Tier 2 (2x5) and terminates
+        ctrl_deep = AdaptiveSearchController(conf_threshold=0.72, conf_decay=0.80, meta_lcb=0.0)
+        ctrl_deep.begin_episode(None)
+        crisis_stage = lambda st, seq: np.ones(len(st), dtype=float)
+        res_t2 = adaptive_chained_result(
+            env, world, agent, prefix, chunk_size=2, base_hops=3, max_hops=5,
+            beam_width=4, wide_beam_width=6, lag=2,
+            stage_value=crisis_stage, stage_value_weight=1.0, controller=ctrl_deep,
+        )
+        self.assertEqual(len(res_t2.actions), 10)
+        self.assertEqual(ctrl_deep.tier_counts, {2: 1})
+        self.assertGreater(res_t2.candidate_count, res_t0.candidate_count)
+
+        # 4. decision_action dispatch works seamlessly with adaptive_controller
+        act = decision_action(
+            env, world, agent, prefix, horizon=6, lag=2, decision="chained",
+            stage_value=safe_stage, stage_value_weight=1.0,
+            chain_chunk_size=2, chain_hops=3, chain_beam_width=4,
+            adaptive_controller=ctrl_fast, chain_max_hops=5, chain_wide_beam_width=6,
+        )
+        self.assertIn(act, (0, 1))
+        self.assertEqual(ctrl_fast.tier_counts[0], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3380,6 +3380,349 @@ def chained_shallow_result(
     )
 
 
+def _select_adaptive_beam(
+    states, seqs, first_states, cum_risk, path_sp, path_dem,
+    score, beam_width, action_space, keep_diverse,
+):
+    finite = np.isfinite(score) & np.isfinite(states).all(axis=1)
+    safe = (
+        np.where(finite, score, np.inf)
+        if finite.any() else np.zeros(len(states), dtype=float)
+    )
+    k = min(int(beam_width), len(states))
+    n_act = len(action_space)
+    if keep_diverse and k >= n_act:
+        chosen, used = [], set()
+        per_a = max(1, k // n_act)
+        for a_val in action_space:
+            idxs = np.flatnonzero(seqs[:, 0] == float(a_val))
+            if len(idxs):
+                for ii in idxs[np.argsort(safe[idxs])[:per_a]]:
+                    chosen.append(int(ii))
+                    used.add(int(ii))
+        for ii in np.argsort(safe):
+            if len(chosen) >= k:
+                break
+            if int(ii) not in used:
+                chosen.append(int(ii))
+                used.add(int(ii))
+        keep = np.asarray(chosen[:k], dtype=int)
+    else:
+        keep = np.argsort(safe)[:k]
+    return (
+        states[keep],
+        seqs[keep],
+        first_states[keep] if first_states is not None else None,
+        cum_risk[keep],
+        path_sp[keep] if path_sp is not None else None,
+        path_dem[keep] if path_dem is not None else None,
+        safe[keep],
+    )
+
+
+def _expand_clean_chunk(
+    states, seqs, first_states, cum_risk, path_sp, path_dem,
+    start_step, chunk_size, pending_prefix, world, agent,
+    lag=LAG, step_stride=2, risk_weight=0.0,
+):
+    action_space = tuple(getattr(agent, "action_space", (0, 1)))
+    n_act = len(action_space)
+    action_arr = np.asarray(action_space, dtype=float)
+    action_dim = int(lag) + 1
+    obs_dim = int(agent.obs_dim)
+    scales = agent.scales
+    end_step = int(start_step) + int(chunk_size)
+    if seqs.shape[1] < end_step:
+        pad = np.zeros((len(seqs), end_step - seqs.shape[1]), dtype=float)
+        seqs = np.concatenate([seqs, pad], axis=1)
+    added = 0
+    for step in range(int(start_step), end_step):
+        count = len(states)
+        next_states = np.repeat(states, n_act, axis=0)
+        next_seqs = np.repeat(seqs, n_act, axis=0)
+        next_seqs[:, step] = np.tile(action_arr, count)
+        hist = history_features(
+            next_seqs, step + 1, pending_prefix, action_dim=action_dim,
+        )
+        next_states = np.asarray(world.predict(next_states, hist), dtype=float)
+        if first_states is None:
+            first_states = next_states.copy()
+        else:
+            first_states = np.repeat(first_states, n_act, axis=0)
+        added += len(next_states)
+        next_risk = np.repeat(cum_risk, n_act)
+        if path_sp is not None:
+            path_sp = np.repeat(path_sp, n_act, axis=0)
+        if path_dem is not None:
+            path_dem = np.repeat(path_dem, n_act, axis=0)
+        if risk_weight > 0.0 and step % step_stride == 0 and step < end_step - 1:
+            pend = hist[:, :agent.lag][:, ::-1]
+            enc = np.concatenate([next_states[:, :obs_dim], pend], axis=1) / scales
+            next_risk = next_risk + np.asarray(
+                agent.pain_signal_batch(enc), dtype=float
+            ) * risk_weight
+        states, seqs, cum_risk = next_states, next_seqs, next_risk
+    return states, seqs, first_states, cum_risk, path_sp, path_dem, added
+
+
+def _score_clean_frontier(
+    states, seqs, cum_risk, path_sp, path_dem, horizon,
+    stage_value, stage_value_weight, heuristic_demand, heuristic_demand_weight,
+    lag=LAG,
+):
+    if stage_value is not None and stage_value_weight > 0.0:
+        sp = stage_value_weight * np.asarray(
+            stage_value(states, seqs), dtype=float
+        ).reshape(-1)
+    else:
+        sp = np.zeros(len(states), dtype=float)
+    if heuristic_demand is not None and heuristic_demand_weight > 0.0:
+        dm = heuristic_demand_weight * np.asarray(
+            heuristic_demand(states), dtype=float
+        ).reshape(-1)
+    else:
+        dm = np.zeros(len(states), dtype=float)
+
+    if int(horizon) > int(lag):
+        col_sp = sp.reshape(-1, 1)
+        col_dm = dm.reshape(-1, 1)
+        full_sp = (
+            col_sp if path_sp is None else np.concatenate([path_sp, col_sp], axis=1)
+        )
+        full_dm = (
+            col_dm if path_dem is None else np.concatenate([path_dem, col_dm], axis=1)
+        )
+        sp_eff = np.mean(full_sp, axis=1)
+        dm_eff = np.mean(full_dm, axis=1)
+    else:
+        full_sp, full_dm = path_sp, path_dem
+        sp_eff, dm_eff = sp, dm
+
+    cost = cum_risk + sp_eff + dm_eff
+    finite = np.isfinite(cost) & np.isfinite(states).all(axis=1)
+    if finite.any():
+        cost = np.where(finite, cost, np.inf)
+    return cost, full_sp, full_dm, finite
+
+
+def _run_clean_chain_tier(
+    initial, world, agent, pending_prefix, chunk_size, n_hops, beam_width,
+    diverse_hop1, stage_value, stage_value_weight,
+    heuristic_demand, heuristic_demand_weight, lag=LAG, step_stride=2,
+):
+    action_space = tuple(getattr(agent, "action_space", (0, 1)))
+    states = initial.reshape(1, -1)
+    seqs = np.zeros((1, int(chunk_size) * int(n_hops)), dtype=float)
+    first_states = None
+    cum_risk = np.zeros(1, dtype=float)
+    path_sp, path_dem = None, None
+    total_cands = 0
+
+    for hop in range(int(n_hops)):
+        start_step = hop * int(chunk_size)
+        end_step = start_step + int(chunk_size)
+        (
+            states, seqs, first_states, cum_risk, path_sp, path_dem, added,
+        ) = _expand_clean_chunk(
+            states, seqs, first_states, cum_risk, path_sp, path_dem,
+            start_step=start_step, chunk_size=chunk_size,
+            pending_prefix=pending_prefix, world=world, agent=agent,
+            lag=lag, step_stride=step_stride, risk_weight=0.0,
+        )
+        total_cands += added
+        cost, path_sp, path_dem, finite = _score_clean_frontier(
+            states, seqs, cum_risk, path_sp, path_dem, horizon=end_step,
+            stage_value=stage_value, stage_value_weight=stage_value_weight,
+            heuristic_demand=heuristic_demand,
+            heuristic_demand_weight=heuristic_demand_weight,
+            lag=lag,
+        )
+        if hop < int(n_hops) - 1:
+            keep_div = (hop == 0) or (hop == 1 and diverse_hop1)
+            (
+                states, seqs, first_states, cum_risk, path_sp, path_dem, _,
+            ) = _select_adaptive_beam(
+                states, seqs, first_states, cum_risk, path_sp, path_dem,
+                cost, beam_width=beam_width, action_space=action_space,
+                keep_diverse=keep_div,
+            )
+
+    if not finite.any():
+        raise ValueError("adaptive chained search found no finite candidate")
+    best = int(np.argmin(cost))
+    r_best = max(0.0, float(cum_risk[best]))
+    worst_sp = (
+        float(np.max(np.clip(path_sp[best], 0.0, 1.0)))
+        if (path_sp is not None and path_sp.shape[1] > 0) else 0.0
+    )
+    conf = float(np.exp(-r_best) * (1.0 - worst_sp))
+    frontier = (
+        states, seqs, first_states, cum_risk, path_sp, path_dem,
+        cost, int(chunk_size) * int(n_hops),
+    )
+    return best, cost, finite, conf, total_cands, frontier
+
+
+def _extend_clean_frontier_one_chunk(
+    frontier, chunk_size, beam_width, world, agent, pending_prefix,
+    stage_value, stage_value_weight, heuristic_demand, heuristic_demand_weight,
+    lag=LAG, step_stride=2,
+):
+    states, seqs, first_states, cum_risk, path_sp, path_dem, cost, cur_h = frontier
+    action_space = tuple(getattr(agent, "action_space", (0, 1)))
+    (
+        states, seqs, first_states, cum_risk, path_sp, path_dem, _,
+    ) = _select_adaptive_beam(
+        states, seqs, first_states, cum_risk, path_sp, path_dem,
+        cost, beam_width=beam_width, action_space=action_space,
+        keep_diverse=True,
+    )
+    (
+        states, seqs, first_states, cum_risk, path_sp, path_dem, added,
+    ) = _expand_clean_chunk(
+        states, seqs, first_states, cum_risk, path_sp, path_dem,
+        start_step=cur_h, chunk_size=chunk_size,
+        pending_prefix=pending_prefix, world=world, agent=agent,
+        lag=lag, step_stride=step_stride, risk_weight=0.0,
+    )
+    new_h = int(cur_h) + int(chunk_size)
+    cost, path_sp, path_dem, finite = _score_clean_frontier(
+        states, seqs, cum_risk, path_sp, path_dem, horizon=new_h,
+        stage_value=stage_value, stage_value_weight=stage_value_weight,
+        heuristic_demand=heuristic_demand,
+        heuristic_demand_weight=heuristic_demand_weight,
+        lag=lag,
+    )
+    if not finite.any():
+        raise ValueError("adaptive chained deepening found no finite candidate")
+    best = int(np.argmin(cost))
+    r_best = max(0.0, float(cum_risk[best]))
+    worst_sp = (
+        float(np.max(np.clip(path_sp[best], 0.0, 1.0)))
+        if (path_sp is not None and path_sp.shape[1] > 0) else 0.0
+    )
+    conf = float(np.exp(-r_best) * (1.0 - worst_sp))
+    next_frontier = (
+        states, seqs, first_states, cum_risk, path_sp, path_dem, cost, new_h,
+    )
+    return best, cost, finite, conf, added, next_frontier
+
+
+def adaptive_chained_result(
+    env, world, agent, prefix, chunk_size=2, base_hops=3, max_hops=5,
+    beam_width=4, wide_beam_width=6, lag=LAG, step_stride=2, risk_weight=1.0,
+    stage_value=None, stage_value_weight=0.0,
+    heuristic_demand=None, heuristic_demand_weight=0.0,
+    controller=None,
+) -> SearchResult:
+    """Dual-confidence decaying-threshold adaptive segmented search.
+
+    When ``controller`` is provided and its outer causal gates are not active,
+    delegates to conservative :func:`chained_shallow_result`.  When active,
+    evaluates Tier 0 (``chunk_size x base_hops``, ``beam_width``) on the clean
+    path-consistent online objective and releases immediately if its monotonic
+    bottleneck confidence clears ``tau_0``; otherwise escalates to
+    ``base_hops + 1`` with ``wide_beam_width`` (preserving action diversity
+    past ``lag``) and incrementally extends the frontier one chunk at a time up
+    to ``max_hops`` under strictly decaying thresholds ``tau_k = tau_0 * decay**k``.
+    The final tier always releases, guaranteeing finite termination.
+    """
+    if int(chunk_size) < 1:
+        raise ValueError("chunk_size must be positive")
+    if int(base_hops) < 1:
+        raise ValueError("base_hops must be positive")
+    if int(max_hops) < int(base_hops):
+        raise ValueError("max_hops must be >= base_hops")
+    if int(beam_width) < 1 or int(wide_beam_width) < 1:
+        raise ValueError("beam widths must be positive")
+
+    if controller is not None and not controller.active:
+        controller.record_step(False)
+        return chained_shallow_result(
+            env, world, agent, prefix,
+            chunk_size=chunk_size, n_hops=base_hops, beam_width=beam_width,
+            lag=lag, step_stride=step_stride, risk_weight=risk_weight,
+            stage_value=stage_value, stage_value_weight=stage_value_weight,
+            heuristic_demand=heuristic_demand,
+            heuristic_demand_weight=heuristic_demand_weight,
+        )
+
+    initial = np.asarray(env.obs(), dtype=float)
+    pending_prefix = np.asarray(prefix, dtype=float).reshape(-1)
+    sv_w = float(stage_value_weight)
+    hd_w = float(heuristic_demand_weight)
+    total_candidates = 0
+
+    # Tier 0: fast narrow segmented search
+    best, cost, finite, conf, cands, frontier = _run_clean_chain_tier(
+        initial, world, agent, pending_prefix,
+        chunk_size=chunk_size, n_hops=base_hops, beam_width=beam_width,
+        diverse_hop1=False, stage_value=stage_value, stage_value_weight=sv_w,
+        heuristic_demand=heuristic_demand, heuristic_demand_weight=hd_w,
+        lag=lag, step_stride=step_stride,
+    )
+    total_candidates += cands
+    if controller is not None:
+        tau0, decay = controller.observe_tier0_confidence(conf)
+    else:
+        tau0, decay = 0.72, 0.80
+
+    exit_tier = 0
+    is_final_t0 = int(base_hops) >= int(max_hops)
+    thresh0 = (
+        controller.threshold_for_tier(0, tau0, decay, is_final_t0)
+        if controller is not None
+        else (-1.0 if is_final_t0 else tau0)
+    )
+    if conf < thresh0:
+        # Tier 1: deeper + wider with hop-1 action diversity
+        next_hops = int(base_hops) + 1
+        exit_tier = 1
+        best, cost, finite, conf, cands, frontier = _run_clean_chain_tier(
+            initial, world, agent, pending_prefix,
+            chunk_size=chunk_size, n_hops=next_hops, beam_width=wide_beam_width,
+            diverse_hop1=True, stage_value=stage_value, stage_value_weight=sv_w,
+            heuristic_demand=heuristic_demand, heuristic_demand_weight=hd_w,
+            lag=lag, step_stride=step_stride,
+        )
+        total_candidates += cands
+        cur_hops = next_hops
+        # Tier 2..K: zero-recompute incremental frontier deepening up to max_hops
+        while cur_hops < int(max_hops):
+            thresh_k = (
+                controller.threshold_for_tier(exit_tier, tau0, decay, False)
+                if controller is not None
+                else tau0 * (decay ** exit_tier)
+            )
+            if conf >= thresh_k:
+                break
+            exit_tier += 1
+            cur_hops += 1
+            best, cost, finite, conf, cands, frontier = _extend_clean_frontier_one_chunk(
+                frontier, chunk_size=chunk_size, beam_width=wide_beam_width,
+                world=world, agent=agent, pending_prefix=pending_prefix,
+                stage_value=stage_value, stage_value_weight=sv_w,
+                heuristic_demand=heuristic_demand, heuristic_demand_weight=hd_w,
+                lag=lag, step_stride=step_stride,
+            )
+            total_candidates += cands
+
+    if controller is not None:
+        controller.record_step(True, tier_index=exit_tier)
+
+    states, seqs, first_states = frontier[0], frontier[1], frontier[2]
+    score = (float(cost[best]), 0.0, 0.0, 0.0, 0.0, 0.0)
+    return SearchResult(
+        actions=np.asarray(seqs[best], dtype=float).copy(),
+        score=score,
+        feasible=True,
+        feasible_count=int(finite.sum()),
+        candidate_count=int(total_candidates),
+        first_state=np.asarray(first_states[best], dtype=float).copy(),
+        final_state=np.asarray(states[best], dtype=float).copy(),
+    )
+
+
 def policy_action(env, world, agent, prefix, horizon, lag=LAG,
                   step_stride=2, stride_includes_lag=False):
     return int(policy_result(
@@ -3469,7 +3812,9 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
                     frontier_callback=None, search_chunk_size=0,
                     rank_group_quota=1,
                     chain_chunk_size=2, chain_hops=3, chain_beam_width=2,
-                    heuristic_demand=None, heuristic_demand_weight=0.0):
+                    heuristic_demand=None, heuristic_demand_weight=0.0,
+                    adaptive_controller=None, chain_max_hops=5,
+                    chain_wide_beam_width=6):
     """Dispatch one decision to the searched or the cell-Q-only policy.
 
     With `ledger_out` (a list) and the search decision, the winning
@@ -3549,19 +3894,37 @@ def decision_action(env, world, agent, prefix, horizon, lag=LAG,
             ))
         return int(result.actions[0])
     if decision == "chained":
-        result = chained_shallow_result(
-            env, world, agent, prefix,
-            chunk_size=chain_chunk_size,
-            n_hops=chain_hops,
-            beam_width=chain_beam_width,
-            lag=lag,
-            step_stride=step_stride,
-            risk_weight=risk_weight,
-            stage_value=stage_value,
-            stage_value_weight=stage_value_weight,
-            heuristic_demand=heuristic_demand,
-            heuristic_demand_weight=heuristic_demand_weight,
-        )
+        if adaptive_controller is not None:
+            result = adaptive_chained_result(
+                env, world, agent, prefix,
+                chunk_size=chain_chunk_size,
+                base_hops=chain_hops,
+                max_hops=chain_max_hops,
+                beam_width=chain_beam_width,
+                wide_beam_width=chain_wide_beam_width,
+                lag=lag,
+                step_stride=step_stride,
+                risk_weight=risk_weight,
+                stage_value=stage_value,
+                stage_value_weight=stage_value_weight,
+                heuristic_demand=heuristic_demand,
+                heuristic_demand_weight=heuristic_demand_weight,
+                controller=adaptive_controller,
+            )
+        else:
+            result = chained_shallow_result(
+                env, world, agent, prefix,
+                chunk_size=chain_chunk_size,
+                n_hops=chain_hops,
+                beam_width=chain_beam_width,
+                lag=lag,
+                step_stride=step_stride,
+                risk_weight=risk_weight,
+                stage_value=stage_value,
+                stage_value_weight=stage_value_weight,
+                heuristic_demand=heuristic_demand,
+                heuristic_demand_weight=heuristic_demand_weight,
+            )
         if ledger_out is not None:
             score = result.score
             ledger_out.append((float(score[2]), float(score[3])))
@@ -3691,7 +4054,8 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
              rank_group_quota=1,
              chain_chunk_size=2, chain_hops=3, chain_beam_width=2,
              heuristic_demand=None, heuristic_demand_weight=0.0,
-             adapt_world=False):
+             adapt_world=False, adaptive_controller=None,
+             chain_max_hops=5, chain_wide_beam_width=6):
     """Run one deterministic evaluation episode.
 
     ``env_seed`` selects the world instance; when omitted the historical
@@ -3834,6 +4198,9 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
             chain_beam_width=chain_beam_width,
             heuristic_demand=heuristic_demand,
             heuristic_demand_weight=heuristic_demand_weight,
+            adaptive_controller=adaptive_controller,
+            chain_max_hops=chain_max_hops,
+            chain_wide_beam_width=chain_wide_beam_width,
         )
         if candidate_out is not None:
             candidate_out.append(collected)
@@ -4060,6 +4427,13 @@ def run_seed(task):
     chain_hops = int(task.get("chain_hops", 3))
     chain_beam_width = int(task.get("chain_beam_width", 2))
     chain_demand_weight = float(task.get("chain_demand_weight", 0.10))
+    chain_adaptive = bool(task.get("chain_adaptive", False))
+    chain_max_hops = int(task.get("chain_max_hops", 5))
+    chain_wide_beam_width = int(task.get("chain_wide_beam_width", 6))
+    chain_conf_threshold = float(task.get("chain_conf_threshold", 0.72))
+    chain_conf_decay = float(task.get("chain_conf_decay", 0.80))
+    chain_meta_lcb = float(task.get("chain_meta_lcb", 0.65))
+    chain_conf_quantile = float(task.get("chain_conf_quantile", 0.0))
     online_feature_options = task.get("online_feature_options")
 
     world, agent = fit(
@@ -4156,9 +4530,11 @@ def run_seed(task):
     regime_stats = None
     feature_demand = None
     heuristic_demand_cb = None
+    adaptive_controller = None
     online_episode_id = 0
     if regime_value_weight > 0.0:
         from stage_regime import (
+            AdaptiveSearchController,
             CalibratedRegimeTransitionModel,
             ControllableFeatureDemand,
             OnlineRegimeContinuationUpdater,
@@ -4247,6 +4623,13 @@ def run_seed(task):
                 world, agent, training_rows, lag=lag,
             )
             heuristic_demand_cb = feature_demand.distance_batch
+        if decision == "chained" and chain_adaptive:
+            adaptive_controller = AdaptiveSearchController(
+                conf_threshold=chain_conf_threshold,
+                conf_decay=chain_conf_decay,
+                conf_quantile=chain_conf_quantile,
+                meta_lcb=chain_meta_lcb,
+            )
 
     if not explicit_eval:
         eval_seeds = [seed]
@@ -4269,6 +4652,12 @@ def run_seed(task):
                 metrics = {}
                 if world_var_node is not None and world_var_reset_episode:
                     world_var_node.reset_variables()
+                if adaptive_controller is not None:
+                    stage_gate = (
+                        regime_online_updater.stage_abstain_gate
+                        if regime_online_updater is not None else None
+                    )
+                    adaptive_controller.begin_episode(stage_gate)
                 record_online = regime_online_updater is not None
                 frames, actions, ep_rows = evaluate(
                     seed, eval_world, agent, cap=cap, horizon=horizon, lag=lag,
@@ -4298,7 +4687,12 @@ def run_seed(task):
                         if heuristic_demand_cb is not None else 0.0
                     ),
                     adapt_world=(world_var_node is not None),
+                    adaptive_controller=adaptive_controller,
+                    chain_max_hops=chain_max_hops,
+                    chain_wide_beam_width=chain_wide_beam_width,
                 )
+                if adaptive_controller is not None:
+                    adaptive_controller.record_episode(int(frames))
                 if record_online:
                     online_episode_id += 1
                     regime_online_updater.record_episode_rows(
@@ -4366,6 +4760,10 @@ def run_seed(task):
                 online=(
                     regime_online_updater.snapshot()
                     if regime_online_updater is not None else None
+                ),
+                adaptive_search=(
+                    adaptive_controller.snapshot()
+                    if adaptive_controller is not None else None
                 ),
             )
             if regime_evaluator is not None else None
@@ -4477,6 +4875,26 @@ def main():
     parser.add_argument("--chain-demand-weight", type=float, default=0.10,
                         help="weight on learned controllable feature demand "
                              "(heuristic pruning ONLY, separate from final objective)")
+    parser.add_argument("--chain-adaptive", action="store_true",
+                        help="enable dual-confidence decaying-threshold adaptive "
+                             "segmented deepening under --decision chained "
+                             "(combine with --regime-online-every 2 "
+                             "--regime-abstain-lcb 0.45 for causal outer gating)")
+    parser.add_argument("--chain-max-hops", type=int, default=5,
+                        help="maximum segmented hops for --chain-adaptive deepening")
+    parser.add_argument("--chain-wide-beam-width", type=int, default=6,
+                        help="beam width on escalated tiers under --chain-adaptive")
+    parser.add_argument("--chain-conf-threshold", type=float, default=0.72,
+                        help="Tier-0 monotonic plan confidence release threshold "
+                             "under --chain-adaptive")
+    parser.add_argument("--chain-conf-decay", type=float, default=0.80,
+                        help="per-tier threshold decay factor under --chain-adaptive")
+    parser.add_argument("--chain-meta-lcb", type=float, default=0.65,
+                        help="minimum online stage Wilson-LCB before unlocking "
+                             "clean multi-step deepening (0 = unconditional)")
+    parser.add_argument("--chain-conf-quantile", type=float, default=0.0,
+                        help="optional rolling quantile (>0) to self-calibrate "
+                             "Tier-0 confidence threshold under --chain-adaptive")
     parser.add_argument("--stage-blocks", type=int, default=4,
                         help="number of action blocks a stage-level "
                              "(--decision stage) schedule holds")
@@ -4923,6 +5341,18 @@ def main():
         raise ValueError("--regime-abstain-lcb must be in [0, 1]")
     if not 0.0 <= args.world_var_abstain_lcb <= 1.0:
         raise ValueError("--world-var-abstain-lcb must be in [0, 1]")
+    if args.chain_max_hops < args.chain_hops:
+        raise ValueError("--chain-max-hops must be >= --chain-hops")
+    if args.chain_wide_beam_width < 1:
+        raise ValueError("--chain-wide-beam-width must be positive")
+    if not 0.0 <= args.chain_conf_threshold <= 1.0:
+        raise ValueError("--chain-conf-threshold must be in [0, 1]")
+    if not 0.0 < args.chain_conf_decay <= 1.0:
+        raise ValueError("--chain-conf-decay must be in (0, 1]")
+    if not 0.0 <= args.chain_meta_lcb <= 1.0:
+        raise ValueError("--chain-meta-lcb must be in [0, 1]")
+    if not 0.0 <= args.chain_conf_quantile <= 1.0:
+        raise ValueError("--chain-conf-quantile must be in [0, 1]")
     if args.lag < 0:
         raise ValueError("--lag must be non-negative")
     if args.pain_horizon < 0:
@@ -5125,6 +5555,13 @@ def main():
             chain_hops=args.chain_hops,
             chain_beam_width=args.chain_beam_width,
             chain_demand_weight=args.chain_demand_weight,
+            chain_adaptive=args.chain_adaptive,
+            chain_max_hops=args.chain_max_hops,
+            chain_wide_beam_width=args.chain_wide_beam_width,
+            chain_conf_threshold=args.chain_conf_threshold,
+            chain_conf_decay=args.chain_conf_decay,
+            chain_meta_lcb=args.chain_meta_lcb,
+            chain_conf_quantile=args.chain_conf_quantile,
         )
         for seed in seeds
     ]
@@ -5440,6 +5877,13 @@ def main():
                 world_var_reset_episode=args.world_var_reset_episode,
                 world_var_sigma=args.world_var_sigma,
                 world_var_abstain_lcb=args.world_var_abstain_lcb,
+                chain_adaptive=args.chain_adaptive,
+                chain_max_hops=args.chain_max_hops,
+                chain_wide_beam_width=args.chain_wide_beam_width,
+                chain_conf_threshold=args.chain_conf_threshold,
+                chain_conf_decay=args.chain_conf_decay,
+                chain_meta_lcb=args.chain_meta_lcb,
+                chain_conf_quantile=args.chain_conf_quantile,
             ),
             rows=eval_rows,
             milestones=[

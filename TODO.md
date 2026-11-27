@@ -163,8 +163,23 @@
     - [stage_regime.py](file:///c:/workspace/code/algo_core/stage_regime.py) 为 `OnlineRegimeContinuationUpdater` 增加 `stage_abstain_lcb=0.0`；
     - [substrate_nodes.py](file:///c:/workspace/code/algo_core/substrate_nodes.py) 新增 `--regime-abstain-lcb`（默认 `0.0`，推荐 `0.45`）与 `--world-var-abstain-lcb`（默认 `0.0`，推荐 `0.55`）；
     - [tests/test_node_variables.py](file:///c:/workspace/code/algo_core/tests/test_node_variables.py) 补齐 `WorkingMemorySlots`、`SourceAbstainGate` 与因果自监视单测。
-- [ ] **Phase 11 — 后续可选方向（默认栈仍不变，按需推进）**：
-  - 在 `cap=5000` 完整 benchmark 口径上验证 `Chain 2×3 + OnlineRegimeContinuationUpdater + TrunkPointFailureMemory + DynamicsClassNode + SourceAbstainGate` 的长尾上限；
+- [x] **Phase 11 — 分节搜索对照诊断与双层置信度自适应加深搜索（2026-11-27 完成）**：
+  - **穷举 vs 分节 & 深度/宽度因果解剖（`eval 200–259`，360 局/组，`cap=1200`）**：
+    - 穷举 `H=6` vs 分节 `2×3 (B=4)`：冻结态 `219.5 vs 200.5 (+19.0)`；**全在线态 `2×3 = 340.7 (med 232, 1203p, 4.04 ms/f)` 全面碾压穷举 `H=6 = 191.2 (med 152, 525p, 5.86 ms/f)`（`+149.5` 帧、`+678` 过柱 `2.29×`、`6/6` 种子全正、`1.45×` 更快）**；
+    - 逐帧分歧与因果消融（24,266 步 + 6 轮对照，累计 >10,000 局）：定位到 `2×3` 与 `2×5` 仅 `0.17%` 动作分歧（`hop 1 (t+4)` 处因 `lag=3` 导致 `99.3%` 单首动作坍缩），且既有终点 `_eval_terminal` 中权重 `1.0` 的离线冻结 `pain_signal / terminal_hazard` 会污染并盖过在线校准的 `stage_pen`，导致所有无保护加宽/加深/穷举全部回退至 `141–195`；
+    - 剥离离线冻结 `pain` 污染（`risk_weight=0.0` + `path_mean(stage_pen) + 0.10*path_mean(demand)`）后，**首次打通单调深度增益：`H=6 (288.3) < H=8 (295.7) < H=10 (308.2)`**（已校准 4 种子均分 `402.9 vs 375.9`，`seed 104` 冲上 `915.9`），仅弱/弃权种子需要保守兜底。
+  - **核心机制（严格任务无关，默认关闭、默认栈逐位不变）**：
+    - [core/stage_regime.py](file:///c:/workspace/code/algo_core/core/stage_regime.py) 新增 `AdaptiveSearchController`：
+      - **外层因果双护栏**：仅在在线阶段评估器通过因果 Wilson-LCB（`meta_lcb=0.65`, `stage_warmup=5`）后解锁纯净多步自适应加深，同时用独立因果 `SourceAbstainGate` 审计自适应局存活相对保守基线中位数（`audit_ratio=0.55, audit_warmup=8, target_lcb=0.25`），一旦某种子/体制下深搜掉分（如 `seed 105`）即自动止损退回保守 `2×3 B=4`；
+      - **内层单调木桶置信度 + 递减阈值加深**：`conf = exp(-cum_risk) * (1 - max_{h > lag} stage_pen)` 随深度单调不增（杜绝跨深度虚假乐观），阈值按 `tau_k = tau_0 * decay^k` 逐层递减（支持固定 `tau_0=0.72` 或滑动分位自校准 `--chain-conf-quantile`），末层必放行杜绝死循环；
+    - [core/substrate_nodes.py](file:///c:/workspace/code/algo_core/core/substrate_nodes.py) 新增 `adaptive_chained_result()`（`T0: 2×3 B=4 → T1: 2×4 B=6 div → T2..K: 零重算前沿续延至 2×5 B=6`）与 opt-in CLI 参数 `--chain-adaptive`、`--chain-max-hops`、`--chain-wide-beam-width`、`--chain-conf-threshold`、`--chain-conf-decay`、`--chain-meta-lcb`、`--chain-conf-quantile`。
+  - **100 未见世界 confirmation 门控（6 种子 × 100 世界 `eval 200–299` = 600 局/组，另单独切出从未碰过的 40 世界 `eval 260–299` = 240 局/组）**：
+    - **全量 600 局（`eval 200–299`）**：`base_2x3_b4` `342.0 (med 232.0, 2015p, 3.10 ms/f)` → **`dual_adapt_audit` `370.0 (+28.0, med 232.0, 2220p +205, 2.87 ms/f 提速 7.4%, 138W/358T/104L, 4/6 正)`**（`seed 100: +38.1, 101: +71.7, 102: +7.0, 104: +90.3`）；无硬编码分位自校准 `dual_adapt_self_cal` 达 **`363.7 (+21.7, 2172p +157, 2.97 ms/f)`**；
+    - **零调参全新未见 240 局（`eval 260–299`）**：`base_2x3_b4` `344.0 (med 232.0, 812p)` → **`dual_adapt_audit` `375.4 (+31.4, med 232.0, 903p +91 / +11.2%, 60W/134T/46L)`**（`seed 100: +55.3, 101: +130.3, 104: +90.9`），增益不衰减反扩大；
+    - 负对照归档：`2×2` 起步（低于 `lag+3` 下界，`-199.0`）、跨深度均值摊薄置信度（`-31.9 ~ -39.6`）、带离线 `pain` 权重 `1.0` 的 `B=8` 加宽（`-124.3 ~ -185.3`）均已否决并定位根因。
+  - **回归测试**：[tests/test_stage_regime.py](file:///c:/workspace/code/algo_core/tests/test_stage_regime.py) 新增 `TestAdaptiveSearchControllerAndPlanner`（锁定因果外层 LCB、自检止损、递减阈值必终止、分位自校准、非激活态逐位退回 `chained_shallow_result` 及 `decision_action` 接线）。
+- [ ] **Phase 12 — 后续可选方向（默认栈仍不变，按需推进）**：
+  - 在 `cap=5000` 完整 benchmark 口径上验证 `Chain Adaptive + OnlineRegimeContinuationUpdater + TrunkPointFailureMemory + DynamicsClassNode + SourceAbstainGate` 的长尾上限；
   - 将抽象类节点进一步扩展至“关系型/对称特征类模板”（跨观测通道共享边界/接近关系模板）及长程多世界变量树先验召回。
 
 ## P0：多视窗状态转移机制重设计（当前主线）
