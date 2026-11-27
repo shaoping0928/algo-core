@@ -292,11 +292,15 @@ class ContextDrivenDecisionController:
         ent_gate = float(np.clip(ent, 0.15, 1.0))
 
         # 2. Episodic cache + spreading-field modulation on existing pool
+        #    When recency_kernel is active, gate episodic cache by long-term novelty
+        #    to avoid double-counting known transitions that recency_kernel already models.
+        use_nov_cache = bool(self.recency_kernel is not None and self.recency_kernel._fitted)
         cand, probs = self.temp_memory.apply_to_candidates(
             ctx_tokens, cand, probs,
             field_beta=self.field_beta * ent_gate,
             cache_lambda=self.cache_lambda,
             extra_pool_k=max(int(k) * 2, 16),
+            novelty_gated_cache=use_nov_cache,
         )
         score_map: Dict[int, float] = {int(a): float(p) for a, p in zip(cand, probs) if int(a) > 0}
 

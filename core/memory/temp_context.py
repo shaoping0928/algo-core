@@ -414,11 +414,16 @@ class TemporaryContextMemory:
         field_beta: float = 0.6,
         cache_lambda: float = 0.25,
         extra_pool_k: int = 8,
+        novelty_gated_cache: bool = False,
     ) -> Tuple[List[int], np.ndarray]:
         """Re-rank & augment base candidates using active temporary working memory.
 
         1. Injects high-probability episodic cache matches (novel entities/terms
-           seen earlier in this exact passage) into the candidate pool.
+           seen earlier in this exact passage) into the candidate pool. When
+           ``novelty_gated_cache=True``, episodic cache mass is weighted by
+           long-term surprise ``(1 - min(4 * p_base, 1))`` so novel episode
+           bindings get full recall while already-known transitions are not
+           double-counted alongside a recency-lag kernel.
         2. Modulates candidate probabilities by the spreading-activation
            working-memory field ``self._field[sym]`` (keeping output grounded
            in the current context's active semantic field).
@@ -430,10 +435,27 @@ class TemporaryContextMemory:
         ep_probs = self.episodic_cache_probs(ctx_tokens)
         cl = float(cache_lambda) if ep_probs else 0.0
         if cl > 0.0:
-            for a in list(p_map.keys()):
-                p_map[a] *= (1.0 - cl)
-            for s, ep_p in ep_probs.items():
-                p_map[s] = p_map.get(s, 0.0) + cl * ep_p
+            if novelty_gated_cache:
+                added_mass = 0.0
+                gated_ep: Dict[int, float] = {}
+                for s, ep_p in ep_probs.items():
+                    base_p = p_map.get(s, 0.0)
+                    nov = max(1.0 - min(4.0 * base_p, 1.0), 0.0)
+                    w_add = cl * float(ep_p) * nov
+                    if w_add > 1e-8:
+                        gated_ep[s] = w_add
+                        added_mass += w_add
+                if added_mass > 0.0:
+                    scale_down = max(1.0 - min(added_mass, cl), 0.5)
+                    for a in list(p_map.keys()):
+                        p_map[a] *= scale_down
+                    for s, w_add in gated_ep.items():
+                        p_map[s] = p_map.get(s, 0.0) + w_add
+            else:
+                for a in list(p_map.keys()):
+                    p_map[a] *= (1.0 - cl)
+                for s, ep_p in ep_probs.items():
+                    p_map[s] = p_map.get(s, 0.0) + cl * ep_p
 
         # Modulate candidate probabilities using live + pinned root working-memory field
         eff_field = self.effective_field(root_blend=0.45)

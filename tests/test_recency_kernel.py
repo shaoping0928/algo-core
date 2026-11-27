@@ -104,6 +104,25 @@ class RecencyKernelAndDisambiguationTests(unittest.TestCase):
         field = tcm.effective_field(root_blend=0.0)
         self.assertGreater(float(field[25]), float(field[28]) * 2.0)
 
+    def test_novelty_gated_episodic_cache_boosts_novel_but_not_already_high_base(self):
+        from temp_context import TemporaryContextMemory
+
+        tcm = TemporaryContextMemory(vocab_size=30, assoc_window=5, min_cooc=2)
+        tcm.reset()
+        # Externally observe known transition (1 -> 2) and novel transition (1 -> 29)
+        for s in (1, 2, 1, 29):
+            tcm.observe(s, source="external")
+        # Base probs already know 2 (0.80) but do not know novel 29 (0.0)
+        cand, probs = tcm.apply_to_candidates(
+            [1], candidates=[2, 3], base_probs=np.array([0.80, 0.20]),
+            field_beta=0.0, cache_lambda=0.40, novelty_gated_cache=True,
+        )
+        p_map = dict(zip(cand, probs))
+        self.assertIn(29, p_map)
+        self.assertGreater(p_map[29], 0.05)
+        # Known symbol 2 should not have been inflated above its base share
+        self.assertLess(p_map[2], 0.80)
+
 
 if __name__ == "__main__":
     unittest.main()
