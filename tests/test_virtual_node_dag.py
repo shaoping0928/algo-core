@@ -61,6 +61,33 @@ class VirtualNodeDAGTests(unittest.TestCase):
         containers = dag.containing_virtual_nodes(10, direction="forward")
         self.assertIn(post1.node_id, [n.node_id for n in containers])
 
+    def test_automatic_bisimulation_refinement_splits_divergent_members(self):
+        from virtual_node_dag import BidirectionalVirtualNodeDAG
+
+        # Trigger 1 transitions to 4 members {10, 11, 20, 21}:
+        #   (1, 10) and (1, 11) continue to {30, 31}   (behavior group A)
+        #   (1, 20) and (1, 21) continue to {40, 41}   (behavior group B)
+        seq = []
+        for _ in range(20):
+            seq.extend([1, 10, 30, 50, 51, 52])
+            seq.extend([1, 11, 31, 53, 54, 55])
+            seq.extend([1, 20, 40, 56, 57, 58])
+            seq.extend([1, 21, 41, 59, 60, 61])
+        dag = BidirectionalVirtualNodeDAG(
+            vocab_size=70, min_trigger_count=5, min_pair_count=3, min_lift=1.2,
+        ).fit_sequence(seq)
+
+        post1 = dag.forward_node(1)
+        self.assertIsNotNone(post1)
+        children = dag.refine_virtual_node(
+            post1.node_id, max_splits=3, min_member_support=5, min_split_dissimilarity=0.5,
+        )
+        self.assertGreaterEqual(len(children), 2)
+        # Group A {10, 11} and Group B {20, 21} must be separated into distinct child virtual nodes
+        child_sets = [c.members for c in children]
+        self.assertTrue(any(10 in s and 20 not in s for s in child_sets))
+        self.assertTrue(any(20 in s and 10 not in s for s in child_sets))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -72,6 +72,8 @@ class BidirectionalVirtualNodeDAG:
         self._member_to_backward: Dict[int, Set[str]] = defaultdict(set)
         self._fwd_counts: Dict[int, Counter] = defaultdict(Counter)
         self._bwd_counts: Dict[int, Counter] = defaultdict(Counter)
+        self._pair_fwd_counts: Dict[Tuple[int, int], Counter] = defaultdict(Counter)
+        self._pair_bwd_counts: Dict[Tuple[int, int], Counter] = defaultdict(Counter)
         self._global_p: Optional[np.ndarray] = None
 
     def _register_node(self, node: VirtualNode) -> VirtualNode:
@@ -205,12 +207,137 @@ class BidirectionalVirtualNodeDAG:
         *,
         max_triggers_for_dag: int = 300,
     ) -> "BidirectionalVirtualNodeDAG":
-        """Build bidirectional virtual node DAG directly from a 1D discrete sequence."""
+        """Build bidirectional virtual node DAG + 2-step behavioral statistics from a sequence."""
         arr = np.asarray(tokens, dtype=np.int32).reshape(-1)
         if len(arr) < 2:
             return self
         pairs = list(zip(arr[:-1].tolist(), arr[1:].tolist()))
-        return self.fit_transitions(pairs, max_triggers_for_dag=max_triggers_for_dag)
+        self.fit_transitions(pairs, max_triggers_for_dag=max_triggers_for_dag)
+        # Collect 2-step behavioral continuations (t, m) -> z and (z -> t, m) for bisimulation splitting
+        self._pair_fwd_counts = defaultdict(Counter)
+        self._pair_bwd_counts = defaultdict(Counter)
+        v = self.vocab_size
+        n = len(arr)
+        for i in range(n - 2):
+            a, b, c = int(arr[i]), int(arr[i + 1]), int(arr[i + 2])
+            if 0 < a < v and 0 < b < v and 0 < c < v:
+                self._pair_fwd_counts[(a, b)][c] += 1
+                self._pair_bwd_counts[(b, c)][a] += 1
+        return self
+
+    def refine_virtual_node(
+        self,
+        node_id: str,
+        *,
+        max_splits: int = 4,
+        min_member_support: int = 4,
+        min_split_dissimilarity: float = 0.55,
+    ) -> List[VirtualNode]:
+        """Automatically split a coarse virtual node into finer child virtual nodes.
+
+        Uses task-agnostic 2-step behavioral signatures (bisimulation):
+          - For a forward node ``Post(T)``, each member ``m`` is characterized
+            by its downstream continuation distribution ``Post(T, m)`` together
+            with its cross-transition equivalence ``Pre(m)``.
+          - For a backward node ``Pre(T)``, each member ``m`` is characterized
+            by ``Pre(m, T)`` together with ``Post(m)``.
+        Members with divergent behavioral signatures are split into distinct
+        child virtual nodes under ``node_id`` in the DAG once sufficient data
+        has accumulated.
+        """
+        node = self.nodes.get(node_id)
+        if node is None or len(node.triggers) != 1 or node.size < 4:
+            return []
+        trig = int(node.triggers[0])
+        is_fwd = node.direction == "forward"
+
+        # Filter members with enough 2-step observations to justify splitting
+        eligible: List[int] = []
+        sigs: List[Dict[Tuple[int, int], float]] = []
+        for m in sorted(node.members):
+            pair_map = self._pair_fwd_counts[(trig, m)] if is_fwd else self._pair_bwd_counts[(m, trig)]
+            pair_tot = float(sum(pair_map.values()))
+            if pair_tot < float(min_member_support):
+                continue
+            cross_map = self._bwd_counts[m] if is_fwd else self._fwd_counts[m]
+            cross_tot = float(sum(cross_map.values()))
+            vec: Dict[Tuple[int, int], float] = {}
+            # 2-step conditional behavior (higher weight: distinguishes 吃+不 vs 吃+饭 vs 吃+亏)
+            for k_sym, cnt in pair_map.items():
+                if self._global_p is not None:
+                    lift = (float(cnt) / pair_tot) / max(float(self._global_p[k_sym]), 1e-12)
+                    w = float(np.sqrt(float(cnt) / pair_tot) * max(np.log(max(lift, 1.0)), 0.1))
+                else:
+                    w = float(cnt) / pair_tot
+                vec[(0, int(k_sym))] = w
+            # Cross-transition neighborhood (Pre(m) for Post(T) members)
+            if cross_tot > 0.0:
+                for k_sym, cnt in cross_map.most_common(15):
+                    if int(k_sym) == trig:
+                        continue
+                    vec[(1, int(k_sym))] = 0.6 * float(np.sqrt(float(cnt) / cross_tot))
+            norm = float(np.sqrt(sum(v * v for v in vec.values())))
+            if norm > 1e-8:
+                for kk in vec:
+                    vec[kk] /= norm
+            eligible.append(int(m))
+            sigs.append(vec)
+
+        n_el = len(eligible)
+        if n_el < 3:
+            return []
+
+        # Compute pairwise sparse cosine similarity matrix
+        sim_mat = np.eye(n_el, dtype=float)
+        for i in range(n_el):
+            si = sigs[i]
+            for j in range(i + 1, n_el):
+                sj = sigs[j]
+                dot = sum(v * sj[k] for k, v in si.items() if k in sj)
+                sim_mat[i, j] = sim_mat[j, i] = float(dot)
+
+        # Only split if behavioral divergence inside this virtual node is genuine
+        off_diag = sim_mat[np.triu_indices(n_el, k=1)]
+        if len(off_diag) == 0 or (1.0 - float(off_diag.min())) < float(min_split_dissimilarity):
+            return []
+
+        # Deterministic furthest-point medoid seeding + assignment on behavioral cosine distance
+        k_sub = min(max(int(max_splits), 2), n_el)
+        # Pick medoid seeds maximizing minimum distance (1 - sim)
+        medoids = [int(np.argmin(sim_mat.mean(axis=1)))]
+        while len(medoids) < k_sub:
+            max_sim_to_med = sim_mat[:, medoids].max(axis=1)
+            cand = int(np.argmin(max_sim_to_med))
+            if (1.0 - float(max_sim_to_med[cand])) < float(min_split_dissimilarity):
+                break
+            medoids.append(cand)
+        if len(medoids) < 2:
+            return []
+
+        # Assign every eligible member to its most behaviorally similar medoid
+        assign = np.argmax(sim_mat[:, medoids], axis=1)
+        groups: Dict[int, List[int]] = defaultdict(list)
+        for idx_m, g_id in enumerate(assign):
+            groups[int(g_id)].append(eligible[idx_m])
+
+        children: List[VirtualNode] = []
+        for sub_idx, (_g, mems) in enumerate(sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))):
+            cid = f"{node.node_id}#sub{sub_idx}"
+            mset = frozenset(mems)
+            mweights = {m: node.member_weights.get(m, 1.0) for m in mems}
+            child = VirtualNode(
+                node_id=cid,
+                direction=node.direction,
+                kind="refined",
+                triggers=node.triggers,
+                members=mset,
+                member_weights=mweights,
+                parents={node.node_id},
+            )
+            node.children.add(cid)
+            self._register_node(child)
+            children.append(child)
+        return children
 
     def derive_intersection(self, node_id_a: str, node_id_b: str) -> Optional[VirtualNode]:
         """Derive a multi-parent intersection child virtual node ``V_A ∩ V_B``."""
