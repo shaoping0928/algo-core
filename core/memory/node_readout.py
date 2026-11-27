@@ -45,7 +45,7 @@ class NodeReadoutMixin:
         is_lt = []
         thresholds = []
 
-        def compile_obj(obj):
+        def compile_ast(obj):
             if isinstance(obj, Primitive):
                 key = (obj.dim, obj.magnitude, obj.op, obj.threshold)
                 idx = prim_index.get(key)
@@ -59,21 +59,72 @@ class NodeReadoutMixin:
                 return ("prim", idx)
             if isinstance(obj, Composite):
                 if obj.op not in ("and", "or"):
-                    return ("fallback", obj)
-                return (obj.op, tuple(compile_obj(c) for c in obj.children))
-            return ("fallback", obj)
+                    return ("fallback", id(obj), obj)
+                flat = []
+                for c in obj.children:
+                    cc = compile_ast(c)
+                    if cc[0] == obj.op:
+                        flat.extend(cc[1])
+                    else:
+                        flat.append(cc)
+                if not flat:
+                    return ("false",)
+                if len(flat) == 1:
+                    return flat[0]
+                return (obj.op, tuple(flat))
+            return ("fallback", id(obj), obj)
 
-        entries = [
-            None if node_id not in self._feature_objects
-            else compile_obj(self._feature_objects[node_id])
-            for node_id in self._feature_all
-        ]
+        ops = []
+        slot_memo = {}
+
+        def lower_ast(ast):
+            key = ast if ast[0] != "fallback" else ("fallback", ast[1])
+            cached_slot = slot_memo.get(key)
+            if cached_slot is not None:
+                return cached_slot
+            kind = ast[0]
+            if kind == "prim":
+                op = ("prim", ast[1])
+            elif kind == "false":
+                op = ("false", None)
+            elif kind == "fallback":
+                op = ("fallback", ast[2])
+            else:
+                children = ast[1]
+                if all(c[0] == "prim" for c in children):
+                    p_idxs = [c[1] for c in children]
+                    if len(p_idxs) == 2:
+                        op = (f"{kind}2_p", p_idxs[0], p_idxs[1])
+                    elif len(p_idxs) == 3:
+                        op = (f"{kind}3_p", p_idxs[0], p_idxs[1], p_idxs[2])
+                    else:
+                        op = (f"{kind}_p", np.asarray(p_idxs, dtype=np.intp))
+                else:
+                    c_slots = tuple(lower_ast(c) for c in children)
+                    op = (f"{kind}_s", c_slots)
+            slot_idx = len(ops)
+            ops.append(op)
+            slot_memo[key] = slot_idx
+            return slot_idx
+
+        out_map = []
+        for node_id in self._feature_all:
+            if node_id not in self._feature_objects:
+                out_map.append(None)
+                continue
+            ast = compile_ast(self._feature_objects[node_id])
+            if ast[0] == "prim":
+                out_map.append(("prim", ast[1]))
+            else:
+                out_map.append(("slot", lower_ast(ast)))
+
         result = (
             np.asarray(dims, dtype=np.intp),
             np.asarray(is_abs, dtype=bool),
             np.asarray(is_lt, dtype=bool),
             np.asarray(thresholds, dtype=float),
-            tuple(entries),
+            tuple(ops),
+            tuple(out_map),
         )
         self._store_readout_cache("feature_plan", result)
         return result
@@ -89,7 +140,7 @@ class NodeReadoutMixin:
         obs = np.asarray(obs, dtype=float)
         if self.pairwise_features:
             obs = expand_observation(obs)
-        dims, is_abs, is_lt, thresholds, entries = self._compiled_feature_plan()
+        dims, is_abs, is_lt, thresholds, ops, out_map = self._compiled_feature_plan()
         n = len(obs)
         if dims.size:
             vals = obs[:, dims]
@@ -103,29 +154,45 @@ class NodeReadoutMixin:
         else:
             pmasks = None
 
-        def eval_entry(entry):
-            kind, payload = entry
-            if kind == "prim":
-                return pmasks[:, payload]
-            if kind == "and":
-                if not payload:
-                    return np.zeros(n, dtype=bool)
-                out = eval_entry(payload[0])
-                for child in payload[1:]:
-                    out = out & eval_entry(child)
-                return out
-            if kind == "or":
-                if not payload:
-                    return np.zeros(n, dtype=bool)
-                out = eval_entry(payload[0])
-                for child in payload[1:]:
-                    out = out | eval_entry(child)
-                return out
-            return payload.mask(obs)
+        buf = [None] * len(ops)
+        for idx, op in enumerate(ops):
+            kind = op[0]
+            if kind == "and2_p":
+                buf[idx] = pmasks[:, op[1]] & pmasks[:, op[2]]
+            elif kind == "and3_p":
+                buf[idx] = pmasks[:, op[1]] & pmasks[:, op[2]] & pmasks[:, op[3]]
+            elif kind == "and_p":
+                buf[idx] = pmasks[:, op[1]].all(axis=1)
+            elif kind == "or2_p":
+                buf[idx] = pmasks[:, op[1]] | pmasks[:, op[2]]
+            elif kind == "or3_p":
+                buf[idx] = pmasks[:, op[1]] | pmasks[:, op[2]] | pmasks[:, op[3]]
+            elif kind == "or_p":
+                buf[idx] = pmasks[:, op[1]].any(axis=1)
+            elif kind == "and_s":
+                c_slots = op[1]
+                out = buf[c_slots[0]]
+                for cs in c_slots[1:]:
+                    out = out & buf[cs]
+                buf[idx] = out
+            elif kind == "or_s":
+                c_slots = op[1]
+                out = buf[c_slots[0]]
+                for cs in c_slots[1:]:
+                    out = out | buf[cs]
+                buf[idx] = out
+            elif kind == "prim":
+                buf[idx] = pmasks[:, op[1]]
+            elif kind == "false":
+                buf[idx] = np.zeros(n, dtype=bool)
+            else:
+                buf[idx] = op[1].mask(obs)
 
         return [
-            None if entry is None else eval_entry(entry)
-            for entry in entries
+            None if target is None else (
+                pmasks[:, target[1]] if target[0] == "prim" else buf[target[1]]
+            )
+            for target in out_map
         ]
 
     def _active_feature_roots(self, state) -> List[str]:
@@ -1539,9 +1606,25 @@ class NodeReadoutMixin:
         distances += proto_norm
         np.maximum(distances, 0.0, out=distances)
         count = min(self.soft_neighbors, distances.shape[1])
-        indices = np.argpartition(distances, count - 1, axis=1)[:, :count]
-        nearest = np.take_along_axis(distances, indices, axis=1)
-        nearest_min = nearest.min(axis=1)
+        n_q = distances.shape[0]
+        if count == 1:
+            indices = np.argmin(distances, axis=1)[:, None]
+            nearest = distances[np.arange(n_q)[:, None], indices]
+            nearest_min = nearest[:, 0]
+        elif count <= 8 and distances.shape[1] > count * 2:
+            rows = np.arange(n_q)
+            indices = np.empty((n_q, count), dtype=np.intp)
+            nearest = np.empty((n_q, count), dtype=distances.dtype)
+            for j in range(count):
+                col = np.argmin(distances, axis=1)
+                indices[:, j] = col
+                nearest[:, j] = distances[rows, col]
+                distances[rows, col] = np.inf
+            nearest_min = nearest[:, 0]
+        else:
+            indices = np.argpartition(distances, count - 1, axis=1)[:, :count]
+            nearest = np.take_along_axis(distances, indices, axis=1)
+            nearest_min = nearest.min(axis=1)
         inv_2sigma2 = -0.5 / (self.soft_sigma * self.soft_sigma)
         weights = np.exp(inv_2sigma2 * nearest)
         total = weights.sum(axis=1, keepdims=True)

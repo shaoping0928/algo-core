@@ -764,32 +764,34 @@ class RegimeContinuationEvaluator:
         base_scale = float(getattr(summarizer, "kernel_scale_", 1.0))
         self._kernel_sigma2 = max(base_scale * (self.kernel_tau ** 2), 1e-6)
 
-    def _squared_distances(self, obs_view: np.ndarray) -> np.ndarray:
+    def _squared_distances_with_z(
+        self, obs_view: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         z = self.summarizer._standardize(obs_view)
         z_norm = np.einsum("ij,ij->i", z, z)[:, None]
         d2 = z @ self._center_t_neg2
         d2 += z_norm
         d2 += self._center_norm
         np.maximum(d2, 0.0, out=d2)
-        return d2
+        return z, d2
 
-    def continuation_risk_batch(self, observations: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Return ``(risk_array, supported_mask)`` for a batch of observations.
+    def _squared_distances(self, obs_view: np.ndarray) -> np.ndarray:
+        return self._squared_distances_with_z(obs_view)[1]
 
-        Unsupported / OOD observations receive ``baseline_risk`` (neutral relative
-        to the prior) and ``supported_mask=False`` so callers never treat OOD
-        states as artificially safe.
-        """
+    def _continuation_risk_with_route(
+        self, observations: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]]:
         obs = np.asarray(observations, dtype=float)
         if obs.ndim == 1:
             obs = obs.reshape(1, -1)
         n = len(obs)
         if n == 0:
-            return np.zeros(0, dtype=float), np.zeros(0, dtype=bool)
+            return np.zeros(0, dtype=float), np.zeros(0, dtype=bool), None
         obs_view = obs[:, :self.summarizer.obs_dim_]
-        d2 = self._squared_distances(obs_view)
+        z, d2 = self._squared_distances_with_z(obs_view)
         regimes = np.argmin(d2, axis=1)
         min_d2 = d2[np.arange(n), regimes]
+        in_rad = np.isfinite(z).all(axis=1) & (min_d2 <= self._ood_radius_sq)
         finite = np.isfinite(obs_view).all(axis=1) & np.isfinite(min_d2)
         supported = (
             finite
@@ -825,7 +827,35 @@ class RegimeContinuationEvaluator:
             )
             raw_risks = (weights * r_sub).sum(axis=1)
         risks = np.where(supported, raw_risks, self._baseline_risk)
+        return risks, supported, (z, regimes, in_rad)
+
+    def continuation_risk_batch(self, observations: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Return ``(risk_array, supported_mask)`` for a batch of observations.
+
+        Unsupported / OOD observations receive ``baseline_risk`` (neutral relative
+        to the prior) and ``supported_mask=False`` so callers never treat OOD
+        states as artificially safe.
+        """
+        risks, supported, _ = self._continuation_risk_with_route(observations)
         return risks, supported
+
+    def _decision_penalties_with_route(
+        self, observations: np.ndarray,
+    ) -> Tuple[np.ndarray, float, bool, Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]]:
+        risks, supported, route = self._continuation_risk_with_route(observations)
+        n = len(risks)
+        if n == 0:
+            return risks, 0.0, False, route
+        coverage = float(supported.mean())
+        if not np.any(supported) or coverage < self.min_decision_coverage:
+            return np.zeros(n, dtype=float), coverage, False, route
+        if self.ood_policy == "neutral_mean" and not np.all(supported):
+            fill = float(risks[supported].mean())
+            risks = np.where(supported, risks, fill)
+        elif self.ood_policy == "conservative" and not np.all(supported):
+            fill = float(risks[supported].max())
+            risks = np.where(supported, risks, fill)
+        return risks, coverage, True, route
 
     def decision_penalties(self, observations: np.ndarray) -> Tuple[np.ndarray, float, bool]:
         """Score one decision's candidate batch with coverage-gated abstention.
@@ -834,20 +864,8 @@ class RegimeContinuationEvaluator:
         below ``min_decision_coverage`` (or no candidate is supported), returns
         zeros and ``active=False`` so the fine planner decides unimpeded.
         """
-        risks, supported = self.continuation_risk_batch(observations)
-        n = len(risks)
-        if n == 0:
-            return risks, 0.0, False
-        coverage = float(supported.mean())
-        if not np.any(supported) or coverage < self.min_decision_coverage:
-            return np.zeros(n, dtype=float), coverage, False
-        if self.ood_policy == "neutral_mean" and not np.all(supported):
-            fill = float(risks[supported].mean())
-            risks = np.where(supported, risks, fill)
-        elif self.ood_policy == "conservative" and not np.all(supported):
-            fill = float(risks[supported].max())
-            risks = np.where(supported, risks, fill)
-        return risks, coverage, True
+        penalties, coverage, active, _ = self._decision_penalties_with_route(observations)
+        return penalties, coverage, active
 
     def as_stage_value_callback(self, stats: Optional[dict] = None):
         """Return a ``stage_value(states, sequences) -> penalties`` callback."""
@@ -1096,16 +1114,23 @@ class OnlineRegimeContinuationUpdater:
     ):
         """Return a live callback delegating to the latest ``self.evaluator``."""
         def callback(states, _sequences):
-            penalties, coverage, active = self.evaluator.decision_penalties(states)
+            use_fm = (
+                self.failure_memory is not None
+                and self.failure_memory_weight > 0.0
+            )
+            if use_fm and self.failure_memory.summarizer is self.evaluator.summarizer:
+                penalties, coverage, active, route = (
+                    self.evaluator._decision_penalties_with_route(states)
+                )
+            else:
+                penalties, coverage, active = self.evaluator.decision_penalties(states)
+                route = None
             if stats is not None:
                 stats["decisions"] = int(stats.get("decisions", 0)) + 1
                 stats["active"] = int(stats.get("active", 0)) + int(active)
                 stats["abstained"] = int(stats.get("abstained", 0)) + int(not active)
                 stats["coverage_sum"] = float(stats.get("coverage_sum", 0.0)) + coverage
-            if (
-                self.failure_memory is not None
-                and self.failure_memory_weight > 0.0
-            ):
+            if use_fm:
                 cur_sig = (
                     var_signature_getter()
                     if var_signature_getter is not None
@@ -1115,7 +1140,9 @@ class OnlineRegimeContinuationUpdater:
                     penalties
                     + self.failure_memory_weight
                     * self.failure_memory.hazard_batch(
-                        states, var_signature=cur_sig,
+                        states,
+                        var_signature=cur_sig,
+                        precomputed_route=route,
                     )
                 )
             if self.stage_abstain_gate is not None:

@@ -71,7 +71,11 @@ class TrunkPointFailureMemory:
         ]
         self._safe_lists: List[List[np.ndarray]] = [[] for _ in range(self.n_trunk)]
         self._fail_arrs: List[Optional[np.ndarray]] = [None] * self.n_trunk
+        self._fail_norms: List[Optional[np.ndarray]] = [None] * self.n_trunk
+        self._fail_t_neg2: List[Optional[np.ndarray]] = [None] * self.n_trunk
         self._safe_arrs: List[Optional[np.ndarray]] = [None] * self.n_trunk
+        self._safe_norms: List[Optional[np.ndarray]] = [None] * self.n_trunk
+        self._safe_t_neg2: List[Optional[np.ndarray]] = [None] * self.n_trunk
         self.total_failures = 0
 
     def _route_trunk_batch(
@@ -92,8 +96,24 @@ class TrunkPointFailureMemory:
     def _rebuild_leaf(self, tid: int) -> None:
         fl = self._fail_lists[tid]
         sl = self._safe_lists[tid]
-        self._fail_arrs[tid] = np.asarray(fl, dtype=float) if fl else None
-        self._safe_arrs[tid] = np.asarray(sl, dtype=float) if sl else None
+        if fl:
+            fa = np.asarray(fl, dtype=float)
+            self._fail_arrs[tid] = fa
+            self._fail_norms[tid] = np.einsum("ij,ij->i", fa, fa)[None, :]
+            self._fail_t_neg2[tid] = np.ascontiguousarray(-2.0 * fa.T)
+        else:
+            self._fail_arrs[tid] = None
+            self._fail_norms[tid] = None
+            self._fail_t_neg2[tid] = None
+        if sl:
+            sa = np.asarray(sl, dtype=float)
+            self._safe_arrs[tid] = sa
+            self._safe_norms[tid] = np.einsum("ij,ij->i", sa, sa)[None, :]
+            self._safe_t_neg2[tid] = np.ascontiguousarray(-2.0 * sa.T)
+        else:
+            self._safe_arrs[tid] = None
+            self._safe_norms[tid] = None
+            self._safe_t_neg2[tid] = None
 
     def ingest_rows(
         self,
@@ -166,6 +186,7 @@ class TrunkPointFailureMemory:
         self,
         states: np.ndarray,
         var_signature: Optional[np.ndarray] = None,
+        precomputed_route: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     ) -> np.ndarray:
         """Return localized smooth terminal-hazard ratio in ``[0, 1)``."""
         arr = np.asarray(states, dtype=float)
@@ -174,38 +195,49 @@ class TrunkPointFailureMemory:
         n = len(arr)
         if n == 0 or self.total_failures == 0:
             return np.zeros(n, dtype=float)
-        z_arr, trunk_arr, in_rad = self._route_trunk_batch(
-            arr[:, :self.summarizer.obs_dim_],
-        )
+        if precomputed_route is not None:
+            z_arr, trunk_arr, in_rad = precomputed_route
+        else:
+            z_arr, trunk_arr, in_rad = self._route_trunk_batch(
+                arr[:, :self.summarizer.obs_dim_],
+            )
         out = np.zeros(n, dtype=float)
+        if not np.any(in_rad):
+            return out
         inv_2s2 = -0.5 / self._sigma2
         sim_fn = None
         if var_signature is not None:
             from node_variables import variable_similarity
             sim_fn = variable_similarity
-        for tid in np.unique(trunk_arr):
-            f_arr = self._fail_arrs[int(tid)]
-            if f_arr is None:
+        for tid in np.unique(trunk_arr[in_rad]):
+            tid_i = int(tid)
+            f_t_neg2 = self._fail_t_neg2[tid_i]
+            if f_t_neg2 is None:
                 continue
-            mask = (trunk_arr == tid) & in_rad
-            if not np.any(mask):
-                continue
+            mask = (trunk_arr == tid_i) & in_rad
             zq = z_arr[mask]
-            df2 = np.sum((zq[:, None, :] - f_arr[None, :, :]) ** 2, axis=2)
+            zq_norm = np.einsum("ij,ij->i", zq, zq)[:, None]
+            df2 = zq @ f_t_neg2
+            df2 += zq_norm
+            df2 += self._fail_norms[tid_i]
+            np.maximum(df2, 0.0, out=df2)
             if sim_fn is not None:
                 vw = np.asarray(
                     [
                         sim_fn(var_signature, fs, sigma=self.var_sigma)
-                        for fs in self._fail_sigs[int(tid)]
+                        for fs in self._fail_sigs[tid_i]
                     ],
                     dtype=float,
                 )
                 kf = (np.exp(inv_2s2 * df2) * vw[None, :]).sum(axis=1)
             else:
                 kf = np.exp(inv_2s2 * df2).sum(axis=1)
-            s_arr = self._safe_arrs[int(tid)]
-            if s_arr is not None:
-                ds2 = np.sum((zq[:, None, :] - s_arr[None, :, :]) ** 2, axis=2)
+            s_t_neg2 = self._safe_t_neg2[tid_i]
+            if s_t_neg2 is not None:
+                ds2 = zq @ s_t_neg2
+                ds2 += zq_norm
+                ds2 += self._safe_norms[tid_i]
+                np.maximum(ds2, 0.0, out=ds2)
                 ks = np.exp(inv_2s2 * ds2).sum(axis=1)
             else:
                 ks = np.zeros(len(zq), dtype=float)
