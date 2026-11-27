@@ -178,8 +178,22 @@
     - **零调参全新未见 240 局（`eval 260–299`）**：`base_2x3_b4` `344.0 (med 232.0, 812p)` → **`dual_adapt_audit` `375.4 (+31.4, med 232.0, 903p +91 / +11.2%, 60W/134T/46L)`**（`seed 100: +55.3, 101: +130.3, 104: +90.9`），增益不衰减反扩大；
     - 负对照归档：`2×2` 起步（低于 `lag+3` 下界，`-199.0`）、跨深度均值摊薄置信度（`-31.9 ~ -39.6`）、带离线 `pain` 权重 `1.0` 的 `B=8` 加宽（`-124.3 ~ -185.3`）均已否决并定位根因。
   - **回归测试**：[tests/test_stage_regime.py](file:///c:/workspace/code/algo_core/tests/test_stage_regime.py) 新增 `TestAdaptiveSearchControllerAndPlanner`（锁定因果外层 LCB、自检止损、递减阈值必终止、分位自校准、非激活态逐位退回 `chained_shallow_result` 及 `decision_action` 接线）。
-- [ ] **Phase 12 — 后续可选方向（默认栈仍不变，按需推进）**：
-  - 在 `cap=5000` 完整 benchmark 口径上验证 `Chain Adaptive + OnlineRegimeContinuationUpdater + TrunkPointFailureMemory + DynamicsClassNode + SourceAbstainGate` 的长尾上限；
+- [x] **Phase 12 — 质量瓶颈解剖与在线 EMA `ControllableFeatureDemand`（2026-11-27 完成）**：
+  - **Phase 11 后 180 局定量死因解剖（6 种子 × 30 世界，`mean=367.6`）**：
+    - 反事实可救率：`t-6` `50.6%`、`t-9` `75.0%`、`t-12` `83.9%`（`33.3%` 锁死在 `t-12..t-6`，`50.6%` 在 `t-6` 仍可救）；`ood_death_rate` 5/6 种子为 `0.0%`，`90–100%` 死局反复落在冻结 16 格树的同 3–4 个叶子里；
+    - 锁定 5.5× 跨种子鸿沟（`seed 104 = 885` vs `seed 102/105 = 158–192`）的三大离线冻结源：`ControllableFeatureDemand` 离线偏置（`seed 105` `env_center` 完全反号、`seed 102` 训练期零过障）、冻结 `survival_tree` 倒挂/粗颗粒、冷启动世界模型外推误差。
+  - **三项 ROI 依次验证（严格留强去弱）**：
+    - **ROI #1 重大突破 — `OnlineFeatureDemandUpdater`（保留冻结可控维掩码，每 4 局用在线滑动窗 12k 帧的真实长存活安全包络以 `ema_alpha=0.30` 平滑更新中心与权重，并将未死亡截断局纳入安全态）**：
+      - **600 局全量确认（`eval 200–299`, `cap=1200`）**：Phase 11 冠军 `370.0 (med 232.0, 2220p, 2.89 ms/f)` → **`roi1_ema30` `446.4 (+76.4 / +20.6%, med 312.0 +80.0, 2795p +575 / +25.9%, 2.89 ms/f 零额外开销, 257W/204T/139L)`**；全部 6 个种子均突破 `306+`（弱种子翻倍：`seed 102: 182.6 → 307.5`, `seed 103: 288.1 → 584.1`, `seed 105: 160.9 → 306.5`）；
+      - **全程未碰 240 局样本外确认（`eval 260–299`）**：`375.4 (med 232.0, 903p)` → **`451.7 (+76.3, med 312.0, 1132p +229 / +25.4%, 122W/52T/66L)`**（`seed 102: 189.3 → 388.8`, `seed 103: 190.9 → 432.1`, `seed 105: 131.2 → 448.6` `3.42×`！）；
+    - **ROI #2 负对照否决（360 局）**：中途在线重拟 `survival_tree`（`-22.8`）、高发死叶局部细分裂（`-50.4`）与加重 2 帧边界失败核（`-13.3`）均不如保持冻结划分树 + 轻权重平滑点核，不合入；
+    - **ROI #3 负对照否决（360 局）**：固定单世界上默认开启 `DynamicsClassNode`（`-5.6 ~ -23.0`）不如冻结线性世界模型，保留为变物理场景专用 opt-in（`--world-variables`）。
+  - **主程序 opt-in 接线（默认关闭，默认栈逐位不变）**：
+    - [core/stage_regime.py](file:///c:/workspace/code/algo_core/core/stage_regime.py) 新增 `OnlineFeatureDemandUpdater`；
+    - [core/substrate_nodes.py](file:///c:/workspace/code/algo_core/core/substrate_nodes.py) 新增 `--chain-demand-online-every`（默认 `0`，推荐 `4`）、`--chain-demand-ema`（默认 `0.30`）、`--chain-demand-online-frames`（默认 `12000`）、`--chain-demand-min-frames`（默认 `600`）；
+    - [tests/test_stage_regime.py](file:///c:/workspace/code/algo_core/tests/test_stage_regime.py) 新增在线需求偏置自愈、截断长局安全纳入与滑窗上限单测。
+- [ ] **Phase 13 — 后续可选方向（默认栈仍不变，按需推进）**：
+  - 在 `cap=5000` 完整 benchmark 口径上验证 `Chain Adaptive + OnlineFeatureDemandUpdater + OnlineRegimeContinuationUpdater + TrunkPointFailureMemory + SourceAbstainGate` 的长尾上限；
   - 将抽象类节点进一步扩展至“关系型/对称特征类模板”（跨观测通道共享边界/接近关系模板）及长程多世界变量树先验召回。
 
 ## P0：多视窗状态转移机制重设计（当前主线）

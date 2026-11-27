@@ -2154,6 +2154,156 @@ class ControllableFeatureDemand:
         )
 
 
+class OnlineFeatureDemandUpdater:
+    """Strictly task-agnostic online EMA updater for :class:`ControllableFeatureDemand`.
+
+    Keeps the learned structural controllability mask fixed while smoothly
+    updating the safe-envelope midpoint, halfwidth, and alignment weights from
+    a bounded sliding window of realized online episodes.  Non-terminal capped
+    episodes contribute to safe survival states without polluting terminal
+    failure states.
+    """
+
+    def __init__(
+        self,
+        base_demand: ControllableFeatureDemand,
+        update_every: int = 4,
+        ema_alpha: float = 0.30,
+        max_online_frames: int = 12000,
+        min_online_frames: int = 600,
+    ):
+        if not base_demand.fitted:
+            raise ValueError("base_demand must be fitted")
+        if int(update_every) < 1:
+            raise ValueError("update_every must be positive")
+        if not 0.0 < float(ema_alpha) <= 1.0:
+            raise ValueError("ema_alpha must be in (0, 1]")
+        if int(max_online_frames) < 1:
+            raise ValueError("max_online_frames must be positive")
+        if int(min_online_frames) < 1:
+            raise ValueError("min_online_frames must be positive")
+
+        self.update_every = int(update_every)
+        self.ema_alpha = float(ema_alpha)
+        self.max_online_frames = int(max_online_frames)
+        self.min_online_frames = int(min_online_frames)
+
+        self.obs_dim_ = int(base_demand.obs_dim_)
+        self.controllable_ = np.asarray(base_demand.controllable_, dtype=float).copy()
+        self.env_center_ = np.asarray(base_demand.env_center_, dtype=float).copy()
+        self.env_halfwidth_ = np.asarray(base_demand.env_halfwidth_, dtype=float).copy()
+        self.demand_weights_ = np.asarray(base_demand.demand_weights_, dtype=float).copy()
+        self._inv_scaled_w = self.demand_weights_ / self.env_halfwidth_
+        self.envelope_low_q = float(base_demand.envelope_low_q)
+        self.envelope_high_q = float(base_demand.envelope_high_q)
+        self.survival_top_q = float(base_demand.survival_top_q)
+        self.imminent_steps = float(base_demand.imminent_steps)
+
+        self._online_chunks: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        self._online_frames: int = 0
+        self.episodes_seen: int = 0
+        self.updates: int = 0
+
+    def distance_batch(self, states: np.ndarray) -> np.ndarray:
+        """Weighted normalized L1 distance to the latest online safe-envelope center."""
+        arr = np.asarray(states, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if len(arr) == 0:
+            return np.zeros(0, dtype=float)
+        view = arr[:, :self.obs_dim_]
+        return np.abs(view - self.env_center_[None, :]) @ self._inv_scaled_w
+
+    def record_episode_rows(self, ep_rows: Sequence[Mapping]) -> bool:
+        """Ingest one realized episode and EMA-update the safe envelope on cadence."""
+        if not ep_rows:
+            return False
+        arr = np.asarray(
+            [row["obs"] for row in ep_rows], dtype=float
+        )[:, :self.obs_dim_]
+        n = len(arr)
+        is_term = bool(ep_rows[-1].get("done", False))
+        rem = np.arange(n, 0, -1, dtype=float) + (0.0 if is_term else float(n))
+        dead = (rem <= self.imminent_steps) if is_term else np.zeros(n, dtype=bool)
+
+        self._online_chunks.append((arr, rem, dead))
+        self._online_frames += n
+        while self._online_frames > self.max_online_frames and len(self._online_chunks) > 1:
+            dropped = self._online_chunks.pop(0)
+            self._online_frames -= len(dropped[0])
+        self.episodes_seen += 1
+
+        if (
+            self.episodes_seen % self.update_every != 0
+            or self._online_frames < self.min_online_frames
+        ):
+            return False
+
+        s_all = np.vstack([chunk[0] for chunk in self._online_chunks])
+        rem_all = np.concatenate([chunk[1] for chunk in self._online_chunks])
+        dead_mask = np.concatenate([chunk[2] for chunk in self._online_chunks])
+
+        y_val = np.log1p(rem_all)
+        q_cut = float(np.quantile(y_val, self.survival_top_q))
+        safe_states = s_all[y_val >= q_cut]
+        if len(safe_states) < 16:
+            return False
+        q_lo = np.quantile(safe_states, self.envelope_low_q, axis=0)
+        q_hi = np.quantile(safe_states, self.envelope_high_q, axis=0)
+        new_center = 0.5 * (q_lo + q_hi)
+        new_hw = np.maximum(0.5 * (q_hi - q_lo), 1e-4)
+
+        dead_states = s_all[dead_mask]
+        d = self.obs_dim_
+        align_gain = np.zeros(d, dtype=float)
+        fail_contrast = np.zeros(d, dtype=float)
+        for j in range(d):
+            if self.controllable_[j] <= 0.0:
+                continue
+            closeness = -np.abs(s_all[:, j] - new_center[j])
+            if np.std(closeness) > 1e-9 and np.std(y_val) > 1e-9:
+                r = float(np.corrcoef(closeness, y_val)[0, 1])
+                if math.isfinite(r):
+                    align_gain[j] = max(0.0, r)
+            if len(dead_states) > 0:
+                d_dead = float(np.mean(np.abs(dead_states[:, j] - new_center[j])))
+                d_safe = float(np.mean(np.abs(safe_states[:, j] - new_center[j])))
+                fail_contrast[j] = max(0.0, (d_dead - d_safe) / float(new_hw[j]))
+        raw_w = np.where(
+            self.controllable_ > 0.0,
+            align_gain * (align_gain + fail_contrast),
+            0.0,
+        )
+        tot_w = float(raw_w.sum())
+        new_w = raw_w / tot_w if tot_w > 1e-9 else self.demand_weights_.copy()
+
+        alpha = self.ema_alpha
+        self.env_center_ = (1.0 - alpha) * self.env_center_ + alpha * new_center
+        self.env_halfwidth_ = np.maximum(
+            (1.0 - alpha) * self.env_halfwidth_ + alpha * new_hw, 1e-4,
+        )
+        w_mix = (1.0 - alpha) * self.demand_weights_ + alpha * new_w
+        w_sum = float(w_mix.sum())
+        if w_sum > 1e-9:
+            self.demand_weights_ = w_mix / w_sum
+        self._inv_scaled_w = self.demand_weights_ / self.env_halfwidth_
+        self.updates += 1
+        return True
+
+    def snapshot(self) -> dict:
+        return dict(
+            update_every=int(self.update_every),
+            ema_alpha=float(self.ema_alpha),
+            max_online_frames=int(self.max_online_frames),
+            min_online_frames=int(self.min_online_frames),
+            episodes_seen=int(self.episodes_seen),
+            online_frames=int(self._online_frames),
+            updates=int(self.updates),
+            env_center=tuple(round(float(c), 4) for c in self.env_center_),
+            demand_weights=tuple(round(float(w), 4) for w in self.demand_weights_),
+        )
+
+
 class AdaptiveSearchController:
     """Strictly task-agnostic dual-confidence controller for adaptive segmented search.
 

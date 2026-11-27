@@ -937,6 +937,67 @@ class TestAdaptiveSearchControllerAndPlanner(unittest.TestCase):
         self.assertIn(act, (0, 1))
         self.assertEqual(ctrl_fast.tier_counts[0], 2)
 
+    def test_online_feature_demand_updater_heals_biased_center_and_respects_bounds(self):
+        from stage_regime import ControllableFeatureDemand, OnlineFeatureDemandUpdater
+
+        # Synthetic 3D system: dim 0 controllable, dim 1 uncontrollable noise, dim 2 monotonic clock
+        rng = np.random.default_rng(7)
+        base_rows = []
+        for ep in range(12):
+            x0 = float(rng.uniform(0.3, 0.7))  # Biased offline bootstrap centered around +0.5
+            for t in range(30):
+                x0_n = x0 + (0.05 if t % 2 == 0 else -0.05)
+                base_rows.append(dict(
+                    episode=ep,
+                    obs=np.asarray([x0, float(rng.normal(0.0, 0.1)), float(t)]),
+                    next_obs=np.asarray([x0_n, float(rng.normal(0.0, 0.1)), float(t + 1)]),
+                    history=np.asarray([float(t % 2)]),
+                    done=(t == 29),
+                ))
+                x0 = x0_n
+
+        class _MockWorld:
+            def predict(self, st, hist):
+                nxt = st.copy()
+                nxt[:, 0] += np.where(hist[:, -1] > 0.5, 0.25, -0.25)
+                nxt[:, 2] += 1.0
+                return nxt
+
+        class _MockAgent:
+            action_space = (0, 1)
+
+        base_dem = ControllableFeatureDemand().fit_rows(_MockWorld(), _MockAgent(), base_rows, lag=0)
+        self.assertGreater(float(base_dem.env_center_[0]), 0.2)
+
+        upd = OnlineFeatureDemandUpdater(
+            base_dem, update_every=2, ema_alpha=0.30, max_online_frames=400, min_online_frames=100,
+        )
+        # Before reaching min_online_frames, distance_batch matches frozen base_dem bit-for-bit
+        probe = np.asarray([[-0.5, 0.0, 10.0], [0.5, 0.0, 10.0]], dtype=float)
+        np.testing.assert_allclose(upd.distance_batch(probe), base_dem.distance_batch(probe), atol=1e-12)
+
+        # Feed online episodes whose true long-surviving corridor is centered around x0 = -0.5
+        for ep in range(8):
+            ep_rows = []
+            # Mix capped long safe episodes (done=False around -0.5) and short failing ones (near +0.8)
+            is_safe_ep = (ep % 2 == 0)
+            length = 90 if is_safe_ep else 20
+            for t in range(length):
+                val = float(rng.normal(-0.5, 0.08)) if is_safe_ep else float(0.8 + 0.02 * t)
+                ep_rows.append(dict(
+                    episode=100 + ep,
+                    obs=np.asarray([val, float(rng.normal(0.0, 0.1)), float(t)]),
+                    next_obs=np.asarray([val, float(rng.normal(0.0, 0.1)), float(t + 1)]),
+                    done=(not is_safe_ep and t == length - 1),
+                ))
+            upd.record_episode_rows(ep_rows)
+
+        snap = upd.snapshot()
+        self.assertGreaterEqual(snap["updates"], 2)
+        self.assertLessEqual(snap["online_frames"], 400)
+        # Center must have moved substantially from biased +0.5 toward true safe corridor -0.5
+        self.assertLess(float(upd.env_center_[0]), float(base_dem.env_center_[0]) - 0.3)
+
 
 if __name__ == "__main__":
     unittest.main()

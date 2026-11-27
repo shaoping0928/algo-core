@@ -4427,6 +4427,10 @@ def run_seed(task):
     chain_hops = int(task.get("chain_hops", 3))
     chain_beam_width = int(task.get("chain_beam_width", 2))
     chain_demand_weight = float(task.get("chain_demand_weight", 0.10))
+    chain_demand_online_every = int(task.get("chain_demand_online_every", 0))
+    chain_demand_ema = float(task.get("chain_demand_ema", 0.30))
+    chain_demand_online_frames = int(task.get("chain_demand_online_frames", 12000))
+    chain_demand_min_frames = int(task.get("chain_demand_min_frames", 600))
     chain_adaptive = bool(task.get("chain_adaptive", False))
     chain_max_hops = int(task.get("chain_max_hops", 5))
     chain_wide_beam_width = int(task.get("chain_wide_beam_width", 6))
@@ -4529,6 +4533,7 @@ def run_seed(task):
     regime_stage_value = None
     regime_stats = None
     feature_demand = None
+    online_feature_demand = None
     heuristic_demand_cb = None
     adaptive_controller = None
     online_episode_id = 0
@@ -4537,6 +4542,7 @@ def run_seed(task):
             AdaptiveSearchController,
             CalibratedRegimeTransitionModel,
             ControllableFeatureDemand,
+            OnlineFeatureDemandUpdater,
             OnlineRegimeContinuationUpdater,
             RegimeContinuationEvaluator,
             StageRegimeSummarizer,
@@ -4622,7 +4628,17 @@ def run_seed(task):
             feature_demand = ControllableFeatureDemand().fit_rows(
                 world, agent, training_rows, lag=lag,
             )
-            heuristic_demand_cb = feature_demand.distance_batch
+            if chain_demand_online_every > 0:
+                online_feature_demand = OnlineFeatureDemandUpdater(
+                    feature_demand,
+                    update_every=chain_demand_online_every,
+                    ema_alpha=chain_demand_ema,
+                    max_online_frames=chain_demand_online_frames,
+                    min_online_frames=chain_demand_min_frames,
+                )
+                heuristic_demand_cb = online_feature_demand.distance_batch
+            else:
+                heuristic_demand_cb = feature_demand.distance_batch
         if decision == "chained" and chain_adaptive:
             adaptive_controller = AdaptiveSearchController(
                 conf_threshold=chain_conf_threshold,
@@ -4658,7 +4674,10 @@ def run_seed(task):
                         if regime_online_updater is not None else None
                     )
                     adaptive_controller.begin_episode(stage_gate)
-                record_online = regime_online_updater is not None
+                record_online = (
+                    regime_online_updater is not None
+                    or online_feature_demand is not None
+                )
                 frames, actions, ep_rows = evaluate(
                     seed, eval_world, agent, cap=cap, horizon=horizon, lag=lag,
                     step_stride=step_stride,
@@ -4695,15 +4714,18 @@ def run_seed(task):
                     adaptive_controller.record_episode(int(frames))
                 if record_online:
                     online_episode_id += 1
-                    regime_online_updater.record_episode_rows(
-                        ep_rows,
-                        lag=lag,
-                        var_signature=(
-                            world_var_node.world_signature()
-                            if world_var_node is not None else None
-                        ),
-                    )
-                    regime_evaluator = regime_online_updater.evaluator
+                    if regime_online_updater is not None:
+                        regime_online_updater.record_episode_rows(
+                            ep_rows,
+                            lag=lag,
+                            var_signature=(
+                                world_var_node.world_signature()
+                                if world_var_node is not None else None
+                            ),
+                        )
+                        regime_evaluator = regime_online_updater.evaluator
+                    if online_feature_demand is not None:
+                        online_feature_demand.record_episode_rows(ep_rows)
                 rows.append(dict(
                     train_seed=seed,
                     eval_seed=int(eval_seed),
@@ -4764,6 +4786,10 @@ def run_seed(task):
                 adaptive_search=(
                     adaptive_controller.snapshot()
                     if adaptive_controller is not None else None
+                ),
+                online_demand=(
+                    online_feature_demand.snapshot()
+                    if online_feature_demand is not None else None
                 ),
             )
             if regime_evaluator is not None else None
@@ -4875,6 +4901,17 @@ def main():
     parser.add_argument("--chain-demand-weight", type=float, default=0.10,
                         help="weight on learned controllable feature demand "
                              "(heuristic pruning ONLY, separate from final objective)")
+    parser.add_argument("--chain-demand-online-every", type=int, default=0,
+                        help="online EMA refit cadence (episodes) for "
+                             "ControllableFeatureDemand safe envelope "
+                             "(0 = frozen offline demand, recommended 4)")
+    parser.add_argument("--chain-demand-ema", type=float, default=0.30,
+                        help="EMA smoothing factor in (0, 1] for online "
+                             "ControllableFeatureDemand updates")
+    parser.add_argument("--chain-demand-online-frames", type=int, default=12000,
+                        help="sliding frame window for online demand updates")
+    parser.add_argument("--chain-demand-min-frames", type=int, default=600,
+                        help="minimum online frames before first demand update")
     parser.add_argument("--chain-adaptive", action="store_true",
                         help="enable dual-confidence decaying-threshold adaptive "
                              "segmented deepening under --decision chained "
@@ -5353,6 +5390,14 @@ def main():
         raise ValueError("--chain-meta-lcb must be in [0, 1]")
     if not 0.0 <= args.chain_conf_quantile <= 1.0:
         raise ValueError("--chain-conf-quantile must be in [0, 1]")
+    if args.chain_demand_online_every < 0:
+        raise ValueError("--chain-demand-online-every must be non-negative")
+    if not 0.0 < args.chain_demand_ema <= 1.0:
+        raise ValueError("--chain-demand-ema must be in (0, 1]")
+    if args.chain_demand_online_frames < 1:
+        raise ValueError("--chain-demand-online-frames must be positive")
+    if args.chain_demand_min_frames < 1:
+        raise ValueError("--chain-demand-min-frames must be positive")
     if args.lag < 0:
         raise ValueError("--lag must be non-negative")
     if args.pain_horizon < 0:
@@ -5555,6 +5600,10 @@ def main():
             chain_hops=args.chain_hops,
             chain_beam_width=args.chain_beam_width,
             chain_demand_weight=args.chain_demand_weight,
+            chain_demand_online_every=args.chain_demand_online_every,
+            chain_demand_ema=args.chain_demand_ema,
+            chain_demand_online_frames=args.chain_demand_online_frames,
+            chain_demand_min_frames=args.chain_demand_min_frames,
             chain_adaptive=args.chain_adaptive,
             chain_max_hops=args.chain_max_hops,
             chain_wide_beam_width=args.chain_wide_beam_width,
@@ -5884,6 +5933,10 @@ def main():
                 chain_conf_decay=args.chain_conf_decay,
                 chain_meta_lcb=args.chain_meta_lcb,
                 chain_conf_quantile=args.chain_conf_quantile,
+                chain_demand_online_every=args.chain_demand_online_every,
+                chain_demand_ema=args.chain_demand_ema,
+                chain_demand_online_frames=args.chain_demand_online_frames,
+                chain_demand_min_frames=args.chain_demand_min_frames,
             ),
             rows=eval_rows,
             milestones=[
