@@ -520,6 +520,9 @@ def main():
                         help="environment to run: 'flappy', 'cartpole', "
                              "'mountaincar', 'seq[V]', or 'gym:<env_id>' "
                              "(default: flappy)")
+    parser.add_argument("--self-state", action="store_true",
+                        help="append 4D behavior-into-state (self_state) "
+                             "channels to observations")
     args = parser.parse_args()
     if args.fast:
         args.steps = 1500
@@ -722,6 +725,7 @@ def main():
     tasks = [
         dict(
             env=args.env,
+            self_state=args.self_state,
             seed=seed,
             steps=args.steps,
             coverage=args.coverage,

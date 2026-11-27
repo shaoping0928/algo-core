@@ -327,29 +327,38 @@ def evaluate(seed, world, agent, cap=6000, horizon=10, lag=LAG,
     return env.t, actions, transitions
 
 
-def _resolve_env_factory(env_name: str, lag: int, cap: int):
+def _resolve_env_factory(env_name: str, lag: int, cap: int, self_state: bool = False):
     """Resolve a CLI ``--env`` name into an ``env_factory`` (or ``None`` for Flappy)."""
     name = str(env_name or "flappy").strip()
     low = name.lower()
+    factory = None
     if low == "flappy":
-        return None
-    if low == "cartpole":
+        if not self_state:
+            return None
+        from latent_world import latent
+        factory = latent[int(lag)]
+    elif low == "cartpole":
         from cartpole_env import make_cartpole_factory
-        return make_cartpole_factory(lag=lag, cap=cap)
-    if low == "mountaincar":
+        factory = make_cartpole_factory(lag=lag, cap=cap)
+    elif low == "mountaincar":
         from mountaincar_env import make_mountaincar_factory
-        return make_mountaincar_factory(lag=lag, cap=cap)
-    if low == "seq" or (low.startswith("seq") and low[3:].isdigit()):
+        factory = make_mountaincar_factory(lag=lag, cap=cap)
+    elif low == "seq" or (low.startswith("seq") and low[3:].isdigit()):
         from symbolic_seq_env import make_symbolic_seq_factory
         vocab = int(low[3:]) if len(low) > 3 else 64
-        return make_symbolic_seq_factory(vocab_size=vocab, lag=lag, cap=cap)
-    if low.startswith("gym:"):
+        factory = make_symbolic_seq_factory(vocab_size=vocab, lag=lag, cap=cap)
+    elif low.startswith("gym:"):
         gym_id = name.split(":", 1)[1].strip()
         if not gym_id:
             raise ValueError("gym:<env_id> requires a non-empty environment id")
         from gym_adapter import make_gym_factory
-        return make_gym_factory(gym_id, lag=lag, cap=cap)
-    raise ValueError(f"unsupported --env {env_name!r}; expected 'flappy', 'cartpole', or 'gym:<env_id>'")
+        factory = make_gym_factory(gym_id, lag=lag, cap=cap)
+    else:
+        raise ValueError(f"unsupported --env {env_name!r}; expected 'flappy', 'cartpole', or 'gym:<env_id>'")
+    if self_state:
+        from self_state import wrap_env_factory_with_self_state
+        factory = wrap_env_factory_with_self_state(factory)
+    return factory
 
 
 def run_seed(task):
@@ -363,6 +372,7 @@ def run_seed(task):
     """
     seed = int(task["seed"])
     env_name = str(task.get("env", "flappy"))
+    self_state = bool(task.get("self_state", False))
     steps = int(task.get("steps", 5000))
     coverage = float(task.get("coverage", 0.1))
     cap = int(task.get("cap", 6000))
@@ -371,7 +381,9 @@ def run_seed(task):
     horizon = int(task.get("horizon", 10))
     epochs = int(task.get("epochs", 5))
     lag = int(task.get("lag", LAG))
-    env_factory = _resolve_env_factory(env_name, lag=lag, cap=cap)
+    env_factory = _resolve_env_factory(
+        env_name, lag=lag, cap=cap, self_state=self_state,
+    )
     component_kinds = tuple(task.get("component_kinds", ()))
     component_min_count = int(task.get("component_min_count", 8))
     max_components = int(task.get("max_components", 128))
