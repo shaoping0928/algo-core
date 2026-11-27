@@ -35,6 +35,10 @@ class TemporaryContextMemory:
         anchor_decay: float = 0.97,
         cache_decay: float = 0.992,
         max_anchors: int = 24,
+        max_compounds: int = 1500,
+        min_compound_pmi: float = 2.5,
+        corroboration_singleton_scale: float = 0.22,
+        max_recent: int = 96,
     ):
         self.vocab_size = max(int(vocab_size), 2)
         self.assoc_window = max(int(assoc_window), 2)
@@ -43,21 +47,28 @@ class TemporaryContextMemory:
         self.anchor_decay = float(anchor_decay)
         self.cache_decay = float(cache_decay)
         self.max_anchors = max(int(max_anchors), 4)
+        self.max_compounds = max(int(max_compounds), 0)
+        self.min_compound_pmi = float(min_compound_pmi)
+        self.corroboration_singleton_scale = float(np.clip(corroboration_singleton_scale, 0.0, 1.0))
+        self.max_recent = max(int(max_recent), 16)
 
         self.salience_: Optional[np.ndarray] = None
         self.assoc_graph_: Dict[int, List[Tuple[int, float]]] = {}
+        self.assoc_graph_compound_: Dict[Tuple[int, int], List[Tuple[int, float]]] = {}
         self._salience_cutoff: float = 0.0
 
         # Temporary episode state (reset per passage/episode)
-        self._anchors: Dict[int, float] = {}
+        self._anchors: Dict[Tuple[int, ...], float] = {}
         self._ep_unigram: Dict[int, float] = {}
         self._ep_bigram: Dict[int, Dict[int, float]] = defaultdict(dict)
         self._ep_trigram: Dict[Tuple[int, int], Dict[int, float]] = defaultdict(dict)
+        self._direct_field: np.ndarray = np.zeros(self.vocab_size, dtype=float)
         self._field: np.ndarray = np.zeros(self.vocab_size, dtype=float)
         self._root_field: np.ndarray = np.zeros(self.vocab_size, dtype=float)
         self._recent: List[int] = []
         self._steps: int = 0
         self._last_source: str = "external"
+        self._field_dirty: bool = False
 
     def fit_associations(
         self,
@@ -130,7 +141,109 @@ class TemporaryContextMemory:
             top = scored[: self.top_assoc_per_sym]
             max_w = max(w_val for w_val, _, _ in top)
             self.assoc_graph_[a] = [(b, float(w_val / max(max_w, 1e-8))) for w_val, b, _ in top]
+
+        # Data-driven high-PMI 2-symbol compound chunk discovery (zero task/language rules)
+        self.assoc_graph_compound_ = {}
+        if self.max_compounds > 0 and n >= 4:
+            both_c = is_content[arr[:-1]] & is_content[arr[1:]]
+            pair_pos = np.flatnonzero(both_c)
+            if len(pair_pos) > 0:
+                a_p = arr[pair_pos].astype(np.int64)
+                b_p = arr[pair_pos + 1].astype(np.int64)
+                codes = a_p * int(v) + b_p
+                uniq_codes, code_cnts = np.unique(codes, return_counts=True)
+                min_pair_cnt = max(self.min_cooc * 2, 6)
+                keep_mask = code_cnts >= min_pair_cnt
+                cand_pairs = []
+                inv_n = 1.0 / max(float(n - 1), 1.0)
+                for code_val, cnt_val in zip(uniq_codes[keep_mask].tolist(), code_cnts[keep_mask].tolist()):
+                    ai = int(code_val // v)
+                    bi = int(code_val % v)
+                    if ai == bi:
+                        continue
+                    pmi_ab = float(np.log((float(cnt_val) * inv_n) / max(float(p_global[ai] * p_global[bi]), 1e-14)))
+                    if pmi_ab >= self.min_compound_pmi:
+                        cand_pairs.append((pmi_ab * float(np.log1p(cnt_val)), (ai, bi)))
+                cand_pairs.sort(key=lambda item: item[0], reverse=True)
+                top_compounds = set(pair for _, pair in cand_pairs[: self.max_compounds])
+                if top_compounds:
+                    comp_cooc: Dict[Tuple[int, int], Counter] = defaultdict(Counter)
+                    # Scan occurrences of discovered compound pairs (strided for speed)
+                    for p_idx in pair_pos[::st]:
+                        pos = int(p_idx)
+                        pair_k = (int(arr[pos]), int(arr[pos + 1]))
+                        if pair_k not in top_compounds:
+                            continue
+                        lo = max(0, pos - w)
+                        hi = min(n, pos + w + 2)
+                        win = arr[lo:hi]
+                        uniq_nb = np.unique(win[is_content[win]])
+                        ck = comp_cooc[pair_k]
+                        a0, b0 = pair_k
+                        for nb in uniq_nb:
+                            ni = int(nb)
+                            if ni != a0 and ni != b0:
+                                ck[ni] += 1
+                    for pair_k, cmap in comp_cooc.items():
+                        c_tot = float(sum(cmap.values()))
+                        if c_tot < float(self.min_cooc):
+                            continue
+                        sc_list = []
+                        for nb, cnt in cmap.items():
+                            if cnt < self.min_cooc:
+                                continue
+                            pmi_nb = float(np.log((float(cnt) / c_tot) / max(float(p_global[nb]), 1e-12)))
+                            if pmi_nb > 0.5:
+                                sc_list.append((pmi_nb * float(np.log1p(cnt)), int(nb)))
+                        if not sc_list:
+                            continue
+                        sc_list.sort(key=lambda item: item[0], reverse=True)
+                        top_nb = sc_list[: self.top_assoc_per_sym]
+                        mw = max(wv for wv, _ in top_nb)
+                        self.assoc_graph_compound_[pair_k] = [
+                            (nb, float(wv / max(mw, 1e-8))) for wv, nb in top_nb
+                        ]
         return self
+
+    @property
+    def recent_history(self) -> List[int]:
+        return self._recent
+
+    def _rebuild_corroborated_field(self) -> None:
+        """Compute live spreading field with multi-anchor corroboration (POMDP disambiguation)."""
+        self._field.fill(0.0)
+        # Direct sensory observations always carry unattenuated self-evidence
+        np.copyto(self._field, self._direct_field)
+        if not self._anchors:
+            self._field_dirty = False
+            return
+
+        spread_sum: Dict[int, float] = {}
+        spread_sup: Dict[int, int] = {}
+        n_anchors = len(self._anchors)
+        for anchor_key, a_weight in self._anchors.items():
+            if len(anchor_key) == 2:
+                edges = self.assoc_graph_compound_.get(anchor_key, ())
+            else:
+                edges = self.assoc_graph_.get(anchor_key[0], ())
+            for nb, edge_w in edges:
+                spread_sum[nb] = spread_sum.get(nb, 0.0) + float(a_weight) * float(edge_w)
+                spread_sup[nb] = spread_sup.get(nb, 0) + 1
+
+        attenuate_single = (n_anchors >= 3)
+        s_scale = self.corroboration_singleton_scale
+        for nb, val in spread_sum.items():
+            sup = spread_sup.get(nb, 1)
+            if attenuate_single and sup <= 1 and self._direct_field[nb] <= 1e-8:
+                # Single lone cue with zero corroboration from rest of context -> attenuate
+                self._field[nb] += val * s_scale
+            elif sup >= 2:
+                # Corroborated by multiple distinct cues -> full strength + mild consensus boost
+                bonus = min(1.0 + 0.15 * float(sup - 2), 1.45)
+                self._field[nb] += val * bonus
+            else:
+                self._field[nb] += val
+        self._field_dirty = False
 
     def reset(self) -> None:
         """Clear all temporary episode state."""
@@ -138,14 +251,18 @@ class TemporaryContextMemory:
         self._ep_unigram.clear()
         self._ep_bigram.clear()
         self._ep_trigram.clear()
+        self._direct_field.fill(0.0)
         self._field.fill(0.0)
         self._root_field.fill(0.0)
         self._recent.clear()
         self._steps = 0
         self._last_source = "external"
+        self._field_dirty = False
 
     def pin_root_context(self) -> None:
         """Snapshot the current active field as persistent episode root summary."""
+        if self._field_dirty:
+            self._rebuild_corroborated_field()
         np.copyto(self._root_field, self._field)
 
     def pin_stage_anchors(self, anchor_weights: Dict[int, float], *, spread_scale: float = 0.5) -> None:
@@ -168,6 +285,8 @@ class TemporaryContextMemory:
 
     def effective_field(self, root_blend: float = 0.45) -> np.ndarray:
         """Return live decaying working-memory field blended with pinned root summary."""
+        if self._field_dirty:
+            self._rebuild_corroborated_field()
         r_max = float(self._root_field.max())
         if r_max <= 1e-6:
             return self._field
@@ -205,54 +324,64 @@ class TemporaryContextMemory:
         sym = int(symbol)
         if sym <= 0 or sym >= self.vocab_size:
             self._recent.append(0)
+            if len(self._recent) > self.max_recent:
+                self._recent = self._recent[-self.max_recent :]
             self._steps += 1
             return
 
         # 1. Decay temporary episodic cache & anchor field
         ad = self.anchor_decay
         cd = self.cache_decay
-        self._field *= ad
+        self._direct_field *= ad
         if self._anchors:
             for k in list(self._anchors.keys()):
                 self._anchors[k] *= ad
                 if self._anchors[k] < 1e-3:
                     del self._anchors[k]
+        self._field_dirty = True
 
         # 2. Update episodic local cache ONLY from verified external observations
         #    (prevents self-generated tokens from creating episodic echo loops)
+        prev1 = self._recent[-1] if len(self._recent) >= 1 else 0
         if not is_self:
-            if len(self._recent) >= 1 and self._recent[-1] > 0:
-                p1 = self._recent[-1]
-                bmap = self._ep_bigram[p1]
+            if prev1 > 0:
+                bmap = self._ep_bigram[prev1]
                 for k in list(bmap.keys()):
                     bmap[k] *= cd
                 bmap[sym] = bmap.get(sym, 0.0) + 1.0
-            if len(self._recent) >= 2 and self._recent[-1] > 0 and self._recent[-2] > 0:
-                key2 = (self._recent[-2], self._recent[-1])
+            if len(self._recent) >= 2 and prev1 > 0 and self._recent[-2] > 0:
+                key2 = (self._recent[-2], prev1)
                 tmap = self._ep_trigram[key2]
                 for k in list(tmap.keys()):
                     tmap[k] *= cd
                 tmap[sym] = tmap.get(sym, 0.0) + 1.0
             self._ep_unigram[sym] = self._ep_unigram.get(sym, 0.0) * cd + 1.0
 
-        # 3. Spread activation if sym is a salient content anchor
+        # 3. Register salient content anchor (prefer discovered high-PMI 2-symbol compound!)
         is_c = getattr(self, "_is_content", None)
         sal = float(self.salience_[sym]) if self.salience_ is not None else 1.0
         spread_mul = float(np.clip(self_spread_weight, 0.0, 1.0)) if is_self else 1.0
         if (is_c is None or bool(is_c[sym])) and spread_mul > 0.0:
-            self._anchors[sym] = min(self._anchors.get(sym, 0.0) + spread_mul * sal, 5.0)
-            self._field[sym] += 0.5 * spread_mul * sal
-            for nb, w in self.assoc_graph_.get(sym, ()):
-                self._field[nb] += spread_mul * w * sal
+            self._direct_field[sym] += 0.55 * spread_mul * sal
+            pair_k = (prev1, sym) if prev1 > 0 else None
+            if pair_k is not None and pair_k in self.assoc_graph_compound_:
+                # Replace/upgrade isolated prev1 cue with its tight compound chunk (prev1, sym)
+                prev_sal = float(self.salience_[prev1]) if self.salience_ is not None else 1.0
+                comp_sal = 0.5 * (prev_sal + sal) * 1.25
+                self._anchors.pop((prev1,), None)
+                self._anchors[pair_k] = min(self._anchors.get(pair_k, 0.0) + spread_mul * comp_sal, 6.0)
+            else:
+                self._anchors[(sym,)] = min(self._anchors.get((sym,), 0.0) + spread_mul * sal, 5.0)
             # Prune anchors to bounded capacity
             if len(self._anchors) > self.max_anchors:
                 keep = sorted(self._anchors.items(), key=lambda kv: kv[1], reverse=True)[: self.max_anchors]
                 self._anchors = dict(keep)
 
         self._recent.append(sym)
-        if len(self._recent) > 8:
-            self._recent = self._recent[-8:]
+        if len(self._recent) > self.max_recent:
+            self._recent = self._recent[-self.max_recent :]
         self._steps += 1
+        self._rebuild_corroborated_field()
 
     def episodic_cache_probs(self, ctx_tokens: Sequence[int]) -> Dict[int, float]:
         """Return online probability distribution from the current episode's local cache."""
@@ -327,6 +456,8 @@ class TemporaryContextMemory:
 
     def active_field_top(self, itos: Sequence[str], top_n: int = 12) -> List[Tuple[str, float]]:
         """Inspect the top currently activated symbols in temporary working memory."""
+        if self._field_dirty:
+            self._rebuild_corroborated_field()
         f_max = float(self._field.max())
         if f_max <= 1e-6:
             return []

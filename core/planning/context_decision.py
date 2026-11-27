@@ -35,6 +35,7 @@ import numpy as np
 
 from class_policy import ClassLevelSequencePolicy
 from compression_tree import HierarchicalStageTree, LearnedDrillDownPolicy
+from recency_kernel import LearnedRecencyLagKernel
 from temp_context import TemporaryContextMemory
 from virtual_node_dag import BidirectionalVirtualNodeDAG
 
@@ -117,6 +118,8 @@ class ContextDrivenDecisionController:
         lookahead_pmi_alpha: float = 0.35,
         lookahead_anchor_weight: float = 0.25,
         lookahead_stagnation_weight: float = 0.65,
+        recency_kernel: Optional[LearnedRecencyLagKernel] = None,
+        recency_strength: float = 0.85,
     ):
         self.class_policy = class_policy
         self.virtual_dag = virtual_dag
@@ -144,6 +147,8 @@ class ContextDrivenDecisionController:
         self.lookahead_pmi_alpha = float(lookahead_pmi_alpha)
         self.lookahead_anchor_weight = float(lookahead_anchor_weight)
         self.lookahead_stagnation_weight = float(lookahead_stagnation_weight)
+        self.recency_kernel = recency_kernel
+        self.recency_strength = float(recency_strength)
 
         self._anchor_state: Optional[np.ndarray] = None
         self._tree_root_slots: Dict[int, float] = {}
@@ -257,6 +262,7 @@ class ContextDrivenDecisionController:
         slow_state: Optional[np.ndarray] = None,
         *,
         k: int = 8,
+        recent_history: Optional[Sequence[int]] = None,
     ) -> Tuple[List[int], np.ndarray, Dict[str, float]]:
         """Compute context-driven top-k candidate distribution + telemetry."""
         prev1 = int(ctx_tokens[-1]) if len(ctx_tokens) > 0 else 0
@@ -333,6 +339,17 @@ class ContextDrivenDecisionController:
                                 )
                                 bridged += 1
 
+        # 4. Self-learned recency-lag modulation (excitation or inhibition purely from data)
+        if self.recency_kernel is not None and self.recency_strength > 0.0:
+            hist_src = (
+                recent_history
+                if recent_history is not None
+                else (self.temp_memory.recent_history if self.temp_memory.recent_history else ctx_tokens)
+            )
+            score_map = self.recency_kernel.modulate_scores(
+                hist_src, score_map, strength=self.recency_strength,
+            )
+
         ranked = sorted(score_map.items(), key=lambda kv: (kv[1], -kv[0]), reverse=True)[: max(int(k), 1)]
         acts = [a for a, _ in ranked]
         out_p = np.asarray([p for _, p in ranked], dtype=float)
@@ -372,6 +389,14 @@ class ContextDrivenDecisionController:
             return acts1[:k], probs1[:k] / max(float(probs1[:k].sum()), 1e-12), info
 
         base_ctx = [int(x) for x in ctx_tokens[-6:]]
+        base_hist = [
+            int(x)
+            for x in (
+                self.temp_memory.recent_history
+                if self.temp_memory.recent_history
+                else ctx_tokens
+            )[-80:]
+        ]
         eff_field = self.temp_memory.effective_field(root_blend=0.45)
         f_max = max(float(eff_field.max()), 1e-8)
         gl_probs = self.class_policy.feature_map.global_probs_
@@ -413,7 +438,7 @@ class ContextDrivenDecisionController:
                 stag_pen = self.lookahead_stagnation_weight * max(1.0 - min(disp, 1.0), 0.0)
             return pmi_term + f_bonus + a_bonus - stag_pen
 
-        # Beam entries: (cum_score, first_action, rolled_ctx, rolled_slow)
+        # Beam entries: (cum_score, first_action, rolled_ctx, rolled_hist, rolled_slow)
         beam = []
         prev0 = base_ctx[-1] if base_ctx else 0
         for a, p in zip(acts1[:bw], probs1[:bw]):
@@ -422,12 +447,14 @@ class ContextDrivenDecisionController:
                 if slow_state is not None else None
             )
             sc0 = _step_utility(prev0, int(a), float(p), slow_state, h_next)
-            beam.append((sc0, int(a), base_ctx + [int(a)], h_next))
+            beam.append((sc0, int(a), base_ctx + [int(a)], base_hist + [int(a)], h_next))
 
         for _step in range(1, d):
             next_beam = []
-            for sc, first_a, r_ctx, r_h in beam:
-                a_sub, p_sub, _ = self.decide_distribution(r_ctx, r_h, k=bw)
+            for sc, first_a, r_ctx, r_hist, r_h in beam:
+                a_sub, p_sub, _ = self.decide_distribution(
+                    r_ctx, r_h, k=bw, recent_history=r_hist,
+                )
                 prev_r = r_ctx[-1] if r_ctx else 0
                 for a2, p2 in zip(a_sub[:bw], p_sub[:bw]):
                     h2 = (
@@ -439,6 +466,7 @@ class ContextDrivenDecisionController:
                         sc + 0.75 * u2,
                         first_a,
                         r_ctx + [int(a2)],
+                        r_hist + [int(a2)],
                         h2,
                     ))
             next_beam.sort(key=lambda item: item[0], reverse=True)
@@ -446,7 +474,7 @@ class ContextDrivenDecisionController:
 
         # Aggregate best lookahead path score per first action
         best_by_first: Dict[int, float] = {}
-        for sc, first_a, _rc, _rh in beam:
+        for sc, first_a, _rc, _rhi, _rh in beam:
             if first_a not in best_by_first or sc > best_by_first[first_a]:
                 best_by_first[first_a] = sc
 
