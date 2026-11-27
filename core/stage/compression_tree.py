@@ -233,6 +233,102 @@ def _coherence_confidence(children: Sequence[StageTreeNode]) -> float:
     return float(np.clip(child_conf * (0.5 * tightness + 0.5 * purity), 0.05, 1.0))
 
 
+class LearnedDrillDownPolicy:
+    """Task-agnostic mental-action policy deciding ``USE_PARENT`` vs ``DRILL_DOWN``.
+
+    Replaces a hand-coded ``conf_threshold`` by learning the net utility
+    advantage of drilling down from real feedback:
+        ``adv = (reward_drill - reward_parent) - step_cost * extra_nodes``
+    conditioned on a 5D internal mental state:
+        ``[1.0, node.confidence, query_sim, level_norm, budget_frac]``.
+    """
+
+    def __init__(self, step_cost: float = 0.01, lr: float = 0.15, ridge: float = 1e-3):
+        self.step_cost = float(step_cost)
+        self.lr = float(lr)
+        self.ridge = float(ridge)
+        # Mild neutral initialization: slightly prefers parent when confidence is high
+        self.weights = np.array([0.05, -0.10, 0.0, 0.0, -0.05], dtype=float)
+        self.updates = 0
+        self.total_drills = 0
+        self.total_parent_stops = 0
+
+    @staticmethod
+    def features(
+        node: StageTreeNode,
+        sim: float,
+        max_level: int,
+        budget_frac: float,
+    ) -> np.ndarray:
+        lvl_norm = float(node.level) / float(max(max_level, 1))
+        return np.asarray(
+            [1.0, float(node.confidence), float(sim), lvl_norm, float(budget_frac)],
+            dtype=float,
+        )
+
+    def predict_drill_advantage(
+        self,
+        node: StageTreeNode,
+        sim: float,
+        max_level: int,
+        budget_frac: float,
+    ) -> float:
+        x = self.features(node, sim, max_level, budget_frac)
+        return float(np.dot(self.weights, x))
+
+    def should_drill(
+        self,
+        node: StageTreeNode,
+        sim: float,
+        max_level: int,
+        budget_frac: float,
+        *,
+        explore_eps: float = 0.0,
+        rng: Optional[np.random.RandomState] = None,
+    ) -> bool:
+        if not node.children:
+            return False
+        if explore_eps > 0.0 and rng is not None and float(rng.rand()) < float(explore_eps):
+            decision = bool(rng.rand() < 0.5)
+        else:
+            decision = self.predict_drill_advantage(node, sim, max_level, budget_frac) > 0.0
+        if decision:
+            self.total_drills += 1
+        else:
+            self.total_parent_stops += 1
+        return decision
+
+    def update(
+        self,
+        node: StageTreeNode,
+        sim: float,
+        max_level: int,
+        budget_frac: float,
+        *,
+        reward_parent: float,
+        reward_drill: float,
+        extra_nodes: int,
+    ) -> float:
+        """Online gradient update from observed utility gain minus compute cost."""
+        x = self.features(node, sim, max_level, budget_frac)
+        target_adv = (float(reward_drill) - float(reward_parent)) - self.step_cost * float(extra_nodes)
+        pred = float(np.dot(self.weights, x))
+        err = target_adv - pred
+        step = self.lr / (1.0 + 0.01 * float(self.updates))
+        self.weights = (1.0 - step * self.ridge) * self.weights + step * err * x
+        self.updates += 1
+        return float(err)
+
+    def snapshot(self) -> dict:
+        return dict(
+            updates=int(self.updates),
+            step_cost=float(self.step_cost),
+            weights=[round(float(v), 4) for v in self.weights],
+            total_drills=int(self.total_drills),
+            total_parent_stops=int(self.total_parent_stops),
+        )
+
+
 class HierarchicalStageTree:
     """Multi-level stage compression tree with top-down confidence-gated attention."""
 
@@ -329,6 +425,94 @@ class HierarchicalStageTree:
 
         return cls(roots=current, leaves=leaves)
 
+    @classmethod
+    def build_from_continuous_stages(
+        cls,
+        stages: Sequence,
+        *,
+        branch_factor: int = 4,
+    ) -> "HierarchicalStageTree":
+        """Build the same hierarchical tree directly from ``StageRegimeSummarizer`` stages.
+
+        Works unmodified on any continuous-control trajectory (e.g., Flappy,
+        CartPole, MountainCar) with zero text-specific assumptions.
+        """
+        bf = max(int(branch_factor), 2)
+        next_id = 0
+        leaves: List[StageTreeNode] = []
+        for st in stages:
+            mean_st = np.asarray(st.mean_state, dtype=float)
+            delta_st = np.asarray(st.delta_state, dtype=float)
+            # Self-discovered continuous role slots: top-3 most active state dims
+            top_dims = np.argsort(-np.abs(mean_st))[: min(3, len(mean_st))]
+            slots = tuple(
+                RoleSlotEntry(
+                    role_id=int(r_i),
+                    symbol=int(d),
+                    salience=float(abs(mean_st[int(d)])),
+                    confidence=1.0,
+                )
+                for r_i, d in enumerate(top_dims)
+            )
+            rel_delta = float(np.linalg.norm(delta_st)) / max(float(np.linalg.norm(mean_st)), 1e-6)
+            leaf_conf = float(np.clip(np.exp(-0.5 * rel_delta), 0.1, 1.0))
+            leaves.append(StageTreeNode(
+                node_id=next_id,
+                level=0,
+                regime=int(st.regime),
+                start=int(st.start),
+                end=int(st.end),
+                duration=int(st.duration),
+                entry_state=np.asarray(st.entry_state, dtype=np.float32),
+                mean_state=mean_st.astype(np.float32),
+                delta_state=delta_st.astype(np.float32),
+                slots=slots,
+                confidence=leaf_conf,
+                children=(),
+            ))
+            next_id += 1
+
+        if not leaves:
+            return cls(roots=(), leaves=())
+
+        current: List[StageTreeNode] = leaves
+        level = 1
+        while len(current) > bf:
+            parents: List[StageTreeNode] = []
+            for i in range(0, len(current), bf):
+                group = tuple(current[i : i + bf])
+                durs = np.asarray([c.duration for c in group], dtype=float)
+                w = durs / max(float(durs.sum()), 1.0)
+                mean_st = np.sum(
+                    np.vstack([c.mean_state for c in group]) * w[:, None],
+                    axis=0,
+                ).astype(np.float32)
+                entry_st = group[0].entry_state
+                exit_st = group[-1].entry_state + group[-1].delta_state
+                delta_st = (exit_st - entry_st).astype(np.float32)
+                reg_dur: Dict[int, float] = {}
+                for c in group:
+                    reg_dur[c.regime] = reg_dur.get(c.regime, 0.0) + float(c.duration)
+                dom_regime = max(reg_dur.items(), key=lambda kv: kv[1])[0]
+                parents.append(StageTreeNode(
+                    node_id=next_id,
+                    level=level,
+                    regime=int(dom_regime),
+                    start=group[0].start,
+                    end=group[-1].end,
+                    duration=int(sum(c.duration for c in group)),
+                    entry_state=entry_st,
+                    mean_state=mean_st,
+                    delta_state=delta_st,
+                    slots=_merge_child_slots(group),
+                    confidence=_coherence_confidence(group),
+                    children=group,
+                ))
+                next_id += 1
+            current = parents
+            level += 1
+        return cls(roots=current, leaves=leaves)
+
     @staticmethod
     def _state_similarity(query: np.ndarray, node: StageTreeNode) -> float:
         q = np.asarray(query, dtype=float).reshape(-1)
@@ -346,13 +530,13 @@ class HierarchicalStageTree:
         conf_threshold: float = 0.78,
         rel_threshold: float = 0.35,
         top_k: int = 2,
+        policy: Optional[LearnedDrillDownPolicy] = None,
     ) -> Tuple[List[Tuple[StageTreeNode, float]], Dict[str, int]]:
         """Top-down confidence-gated attention over the stage compression tree.
 
-        Starts at ``self.roots``; if a selected node's ``confidence`` and
-        query relevance are both high, returns that parent directly without
-        expanding its children. Otherwise drills down selectively into the
-        most relevant children to retrieve finer details.
+        When ``policy`` (a :class:`LearnedDrillDownPolicy`) is provided, the
+        ``USE_PARENT`` vs ``DRILL_DOWN`` decision is made by the learned
+        mental-action policy instead of a fixed ``conf_threshold``.
         """
         if not self.roots:
             return [], dict(nodes_visited=0, leaves_total=0, drill_downs=0, parent_hits=0)
@@ -361,6 +545,7 @@ class HierarchicalStageTree:
         drill_downs = 0
         parent_hits = 0
         results: List[Tuple[StageTreeNode, float]] = []
+        total_leaves = max(len(self.leaves), 1)
 
         frontier: List[StageTreeNode] = list(self.roots)
         while frontier:
@@ -374,15 +559,22 @@ class HierarchicalStageTree:
 
             next_frontier: List[StageTreeNode] = []
             for sim, node in selected:
-                # Use parent directly if it has no children OR if summary confidence
-                # and relevance are already sufficient.
-                if (
-                    not node.children
-                    or (node.confidence >= float(conf_threshold) and sim >= float(rel_threshold))
-                ):
+                if not node.children:
                     results.append((node, float(sim)))
-                    if node.children:
-                        parent_hits += 1
+                    continue
+                if policy is not None:
+                    budget_frac = float(visited) / float(total_leaves)
+                    do_drill = policy.should_drill(
+                        node, sim, self.max_level, budget_frac,
+                    )
+                else:
+                    do_drill = not (
+                        node.confidence >= float(conf_threshold)
+                        and sim >= float(rel_threshold)
+                    )
+                if not do_drill:
+                    results.append((node, float(sim)))
+                    parent_hits += 1
                 else:
                     drill_downs += 1
                     next_frontier.extend(node.children)

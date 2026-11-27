@@ -59,6 +59,44 @@ class StageCompressionTreeTests(unittest.TestCase):
         self.assertGreater(stats_detail["drill_downs"], 0)
         self.assertEqual(hits_detail[0][0].level, 0)
 
+    def test_learned_drill_down_policy_and_continuous_tree_isomorphism(self):
+        from types import SimpleNamespace
+        from compression_tree import HierarchicalStageTree, LearnedDrillDownPolicy
+
+        # Synthetic continuous-control stages (task-agnostic, zero text symbols)
+        stages = []
+        for i in range(12):
+            regime = 0 if i < 6 else 1
+            base = np.array([1.0, 0.2, -0.1, 0.0]) if regime == 0 else np.array([-1.0, 0.8, 0.5, 0.1])
+            jitter = np.array([0.05 * (i % 3), 0.0, 0.0, 0.0])
+            stages.append(SimpleNamespace(
+                regime=regime,
+                start=i * 10,
+                end=(i + 1) * 10 - 1,
+                duration=10,
+                entry_state=base + jitter,
+                mean_state=base + jitter,
+                delta_state=np.array([0.05, 0.0, 0.0, 0.0]),
+            ))
+        tree = HierarchicalStageTree.build_from_continuous_stages(stages, branch_factor=3)
+        self.assertGreaterEqual(tree.max_level, 1)
+        self.assertLess(len(tree.roots), len(tree.leaves))
+
+        # Train LearnedDrillDownPolicy: low-conf node gets high drill reward, high-conf gets 0 gain
+        pol = LearnedDrillDownPolicy(step_cost=0.05, lr=0.3)
+        low_node = SimpleNamespace(level=1, confidence=0.2, children=(1, 2, 3))
+        high_node = SimpleNamespace(level=1, confidence=0.95, children=(1, 2, 3))
+        for _ in range(40):
+            pol.update(low_node, 0.5, 2, 0.2, reward_parent=0.2, reward_drill=0.9, extra_nodes=3)
+            pol.update(high_node, 0.9, 2, 0.2, reward_parent=0.9, reward_drill=0.9, extra_nodes=3)
+        self.assertTrue(pol.should_drill(low_node, 0.5, 2, 0.2))
+        self.assertFalse(pol.should_drill(high_node, 0.9, 2, 0.2))
+
+        # Attend using the learned mental-action policy (no fixed conf_threshold!)
+        hits, stats = tree.attend(np.array([1.0, 0.2, -0.1, 0.0]), policy=pol, top_k=2)
+        self.assertGreater(len(hits), 0)
+        self.assertLessEqual(stats["nodes_visited"], len(tree.leaves))
+
 
 if __name__ == "__main__":
     unittest.main()
