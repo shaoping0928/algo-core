@@ -71,33 +71,36 @@ class ContextDrivenDecisionController:
         self.bridge_weight = float(bridge_weight)
         self.top_active_targets = max(int(top_active_targets), 4)
 
-    def _local_pair_prob(self, prev1: int, target: int) -> float:
+    def _local_pair_prob_and_lift(self, prev1: int, target: int) -> Tuple[float, float]:
         post = self.class_policy.local_index._postings.get((-1, int(prev1)))
         if not post:
-            return 0.0
+            return 0.0, 0.0
         tot = self.class_policy.local_index._key_totals.get((-1, int(prev1)), 0.0)
         if tot <= 0.0:
-            return 0.0
+            return 0.0, 0.0
         bucket = post.get(int(target))
         if bucket is None:
-            return 0.0
-        return max(float(bucket[0]) - 0.5, 0.0) / float(tot)
+            return 0.0, 0.0
+        p_loc = max(float(bucket[0]) - 0.5, 0.0) / float(tot)
+        gl = self.class_policy.feature_map.global_probs_
+        g_p = float(gl[int(target)]) if gl is not None and int(target) < len(gl) else 1e-4
+        lift = p_loc / max(g_p, 1e-8)
+        return p_loc, lift
 
     def _collect_active_node_strengths(
         self,
         slow_state: Optional[np.ndarray],
     ) -> Tuple[Dict[int, float], Dict[str, int]]:
-        """Merge temporary working-memory field with compression-tree attended role slots."""
+        """Merge temporary working-memory field (including root summary) with tree slots."""
         strengths: Dict[int, float] = {}
         tree_stats = dict(nodes_visited=0, leaves_total=0, drill_downs=0, parent_hits=0)
 
-        field = self.temp_memory._field
+        field = self.temp_memory.effective_field(root_blend=0.45)
         f_max = float(field.max())
         if f_max > 1e-6:
             inv_f = 1.0 / f_max
-            top_idx = np.argpartition(-field, min(self.top_active_targets, len(field) - 1))[
-                : self.top_active_targets
-            ]
+            k_cap = min(self.top_active_targets, len(field) - 1)
+            top_idx = np.argpartition(-field, k_cap)[:k_cap]
             for idx in top_idx:
                 i = int(idx)
                 val = float(field[i]) * inv_f
@@ -175,11 +178,12 @@ class ContextDrivenDecisionController:
             for goal_sym, strength in top_active:
                 if goal_sym == prev1:
                     continue
-                # 3a. Direct 1-step legal activation from short-term context
-                p_loc = self._local_pair_prob(prev1, goal_sym)
+                # 3a. Direct 1-step legal activation scored by PMI lift (avoids high-freq suppression)
+                p_loc, lift = self._local_pair_prob_and_lift(prev1, goal_sym)
                 in_post = (fnode is not None and goal_sym in fnode.members)
-                if p_loc > 1e-4 or in_post:
-                    add_mass = w_inj * float(strength) * max(float(np.sqrt(max(p_loc, 1e-3))), 0.08)
+                if (p_loc > 0.0 and lift >= 1.2) or in_post:
+                    lift_factor = float(np.log1p(max(lift, 1.0))) / 3.0
+                    add_mass = w_inj * float(strength) * min(lift_factor, 1.5)
                     score_map[goal_sym] = score_map.get(goal_sym, 0.0) + add_mass
                     injected += 1
                 # 3b. 2-step goal-directed bridge: prev1 -> bridge -> goal_sym
@@ -187,10 +191,11 @@ class ContextDrivenDecisionController:
                 if bridges:
                     for b_sym, _bw in bridges[:2]:
                         if b_sym > 0 and b_sym != prev1:
-                            p_b = self._local_pair_prob(prev1, b_sym)
-                            if p_b > 1e-4:
+                            p_b, lift_b = self._local_pair_prob_and_lift(prev1, b_sym)
+                            if p_b > 0.0 and lift_b >= 1.2:
+                                lb_factor = float(np.log1p(max(lift_b, 1.0))) / 3.0
                                 score_map[b_sym] = score_map.get(b_sym, 0.0) + (
-                                    w_br * float(strength) * float(np.sqrt(p_b))
+                                    w_br * float(strength) * min(lb_factor, 1.5)
                                 )
                                 bridged += 1
 

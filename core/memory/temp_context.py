@@ -54,6 +54,7 @@ class TemporaryContextMemory:
         self._ep_bigram: Dict[int, Dict[int, float]] = defaultdict(dict)
         self._ep_trigram: Dict[Tuple[int, int], Dict[int, float]] = defaultdict(dict)
         self._field: np.ndarray = np.zeros(self.vocab_size, dtype=float)
+        self._root_field: np.ndarray = np.zeros(self.vocab_size, dtype=float)
         self._recent: List[int] = []
         self._steps: int = 0
 
@@ -137,8 +138,24 @@ class TemporaryContextMemory:
         self._ep_bigram.clear()
         self._ep_trigram.clear()
         self._field.fill(0.0)
+        self._root_field.fill(0.0)
         self._recent.clear()
         self._steps = 0
+
+    def pin_root_context(self) -> None:
+        """Snapshot the current active field as persistent episode root summary."""
+        np.copyto(self._root_field, self._field)
+
+    def effective_field(self, root_blend: float = 0.45) -> np.ndarray:
+        """Return live decaying working-memory field blended with pinned root summary."""
+        r_max = float(self._root_field.max())
+        if r_max <= 1e-6:
+            return self._field
+        l_max = float(self._field.max())
+        rb = float(np.clip(root_blend, 0.0, 1.0))
+        live_norm = self._field / l_max if l_max > 1e-6 else self._field
+        root_norm = self._root_field / r_max
+        return (1.0 - rb) * live_norm + rb * root_norm
 
     def observe(self, symbol: int) -> None:
         """Ingest one observed symbol into temporary working memory."""
@@ -243,14 +260,15 @@ class TemporaryContextMemory:
             for s, ep_p in ep_probs.items():
                 p_map[s] = p_map.get(s, 0.0) + cl * ep_p
 
-        # Inject top spreading-activation field symbols if they are strong
-        f_max = float(self._field.max())
+        # Modulate candidate probabilities using live + pinned root working-memory field
+        eff_field = self.effective_field(root_blend=0.45)
+        f_max = float(eff_field.max())
         if float(field_beta) > 0.0 and f_max > 1e-6:
             inv_f = 1.0 / f_max
             fb = float(field_beta)
             for a in list(p_map.keys()):
                 if a > 0:
-                    act_norm = float(self._field[a]) * inv_f
+                    act_norm = float(eff_field[a]) * inv_f
                     p_map[a] *= float(np.exp(fb * act_norm))
 
         ranked = sorted(p_map.items(), key=lambda kv: (kv[1], -kv[0]), reverse=True)[: max(len(c_list), extra_pool_k)]
