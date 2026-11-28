@@ -23,6 +23,41 @@
 - **GPU 计算底座**：**AMD Radeon RX 9070 XT（`gfx1201`，32 CUs，13.53 GB VRAM）**，通过零外部依赖原生 Windows `OpenCL.dll` 驱动（[core/compute/opencl_gpu.py](core/compute/opencl_gpu.py)）。当前 `32×32` 寄存器分块 SGEMM 实测 **`5.60 TFLOPS`**，支持全量 64M token 流常驻独立显存零拷贝 BPTT（注：Windows 任务管理器需在 GPU 视图切换为 `Compute_0 / Compute_1` 及「专用 GPU 内存」观察）。
 - **语料路径**：`C:\workspace\code\data\wiki_zhihu\corpus.txt`（中文维基 + 知乎混合语料）。
 
+### 2.1b 主要启动命令与输入 / 输出目录
+
+> 以下命令均在仓库根 `c:\workspace\code\algo_core` 下用 PowerShell 执行；`$PY = C:\workspace\code\.venv-ft\Scripts\python.exe`。脚本内路径为硬编码常量（脚本顶部），换机器请先改 `ROOT / corpus_path / ckpt_*`。
+
+| 用途 | 命令 | 耗时 / 资源 |
+|---|---|---|
+| **核心单测（42 条）** | `& $PY -m unittest tests/test_context_integrator.py tests/test_scalability_and_arbitration.py tests/test_circuit_gpu.py tests/test_policy_pool.py tests/test_structural_memory.py tests/test_recency_kernel.py tests/test_context_decision.py tests/test_temp_context.py tests/test_sequence_stage.py tests/test_class_policy.py tests/test_virtual_node_dag.py -v` | ~15s，需 GPU 的用例会自动使用 OpenCL |
+| **64M 符号层从零构建**（16M seed + 3×16M 流式摄取 + 保存检查点） | `& $PY scripts/lm/train_and_eval_64m_full_v3.py` | ~10 min，RSS ≤ 8.6 GB；覆盖写 `checkpoints/wiki_zhihu_64m_v2000.pkl.gz` |
+| **64M 2 层 SSM 训练 + `@260M` 评测 + P1/P2/P3 续写**（当前冠军流程，需先有上面的符号层检查点） | `& $PY scripts/lm/train_and_eval_64m_2layer_ssm.py` | ~14 min（训练 718s，吞吐 ~178 ktok/s）；RSS ≤ 9.6 GB，显存 ~2.3 GB；训练完成后**覆盖写**同一检查点 |
+| **仅评测续写**（加载已有检查点，不训练） | `& $PY scripts/lm/eval_64m_ssm_rollouts.py` | ~1.5 min |
+| **256M 全量构建 / 评测**（可选，对照上限） | `& $PY scripts/lm/train_and_eval_256m.py` | ~9 min，RSS ≤ 11.5 GB；写 `checkpoints/wiki_zhihu_256m_v2000.pkl.gz` |
+| **长任务提示** | 以上脚本均会持续 print 日志；建议后台运行并将输出重定向，如 `& $PY scripts/lm/train_and_eval_64m_2layer_ssm.py *> results/lm_run_$(Get-Date -f yyyyMMdd_HHmm).log` | — |
+
+**输入**
+- 语料：`C:\workspace\code\data\wiki_zhihu\corpus.txt`（字符级，词表 `V=2000` 由前 16M 字符按频次构建，`<UNK>=0`）；训练区间 `[0, 64M)`，评测区间偏移 `260,000,000`（取 20,000 字，使用 `ev[5000:11000]`，`n=5876`），**禁止用于训练**。
+- 检查点：`checkpoints/wiki_zhihu_64m_v2000.pkl.gz`（默认；`StructuralSubstrateBundle.load(path)`）。
+
+**输出**
+- 检查点目录：`checkpoints/`（`wiki_zhihu_{4m,16m,64m,256m}_v2000.pkl.gz`，64M 当前 `256.95 MB`，含 2 层 SSM）。
+- 评测与续写结果：当前脚本仅打印到 stdout（`Ablation`、`UnionBlend` 扫 `alpha`、τ 谱、P1/P2/P3 续写），**无结构化结果文件**；建议将日志重定向到 `results/`（见上表），并在认领任务时把关键指标回填本文件。
+- 单次实验的临时/一次性脚本请放各自 agent 的 scratch 目录，不要入库；可复用脚本放 `scripts/lm/`。
+
+**最小代码调用（复用检查点做续写/评测）**
+```python
+import sys, os
+ROOT = r"c:\workspace\code\algo_core"; sys.path.insert(0, ROOT)
+for dp, _, _ in os.walk(os.path.join(ROOT, "core")):
+    if "__pycache__" not in dp: sys.path.insert(0, dp)
+from substrate_bundle import StructuralSubstrateBundle
+b = StructuralSubstrateBundle.load(os.path.join(ROOT, "checkpoints", "wiki_zhihu_64m_v2000.pkl.gz"))
+ctrl = b.make_controller(use_arbitrator=True, lookahead_depth=2, lookahead_beam=5)  # 2 层 SSM 默认 stateful_weight=0.60
+ctrl.stateful_weight = 0.65; ctrl.self_stateful_beta = 0.0   # 当前冠军口径
+```
+详细续写循环（`decide_with_lookahead` + 温度 0.65 采样 + `observe(source="self")`）见 `scripts/lm/eval_64m_ssm_rollouts.py`。
+
 ### 2.2 现役代码架构速查
 | 模块路径 | 职责 | 关键类 / 入口 |
 |---|---|---|
