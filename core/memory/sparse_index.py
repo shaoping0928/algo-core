@@ -11,7 +11,9 @@ sparse active-feature inverted postings:
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import heapq
+import os
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -85,23 +87,138 @@ class SparseFeatureActionIndex:
         self._global_scores[act] += score
         self.total_updates += 1
 
+    @staticmethod
+    def _count_shard(
+        s_list: List[int],
+        start: int,
+        end: int,
+        ctx_len: int,
+    ) -> Tuple[Dict[Tuple[int, ...], Dict[int, float]], Dict[Tuple[int, ...], float], Counter]:
+        """Fast thread-local counting of nested suffix keys on slice ``[start, end)``."""
+        postings: Dict[Tuple[int, ...], Dict[int, float]] = {}
+        key_totals: Dict[Tuple[int, ...], float] = {}
+        g_counts: Counter = Counter()
+        c = ctx_len
+        for pos in range(start, end):
+            act = s_list[pos]
+            g_counts[act] += 1
+            # Order 1
+            fk1 = (-1, s_list[pos - 1])
+            d1 = postings.get(fk1)
+            if d1 is None:
+                postings[fk1] = {act: 1.0}
+                key_totals[fk1] = 1.0
+            else:
+                d1[act] = d1.get(act, 0.0) + 1.0
+                key_totals[fk1] += 1.0
+            # Orders 2..ctx_len
+            if c >= 2:
+                fk2 = (12, s_list[pos - 2], s_list[pos - 1])
+                d2 = postings.get(fk2)
+                if d2 is None:
+                    postings[fk2] = {act: 1.0}
+                    key_totals[fk2] = 1.0
+                else:
+                    d2[act] = d2.get(act, 0.0) + 1.0
+                    key_totals[fk2] += 1.0
+            if c >= 3:
+                fk3 = (13, s_list[pos - 3], s_list[pos - 2], s_list[pos - 1])
+                d3 = postings.get(fk3)
+                if d3 is None:
+                    postings[fk3] = {act: 1.0}
+                    key_totals[fk3] = 1.0
+                else:
+                    d3[act] = d3.get(act, 0.0) + 1.0
+                    key_totals[fk3] += 1.0
+            if c >= 4:
+                for order in range(4, c + 1):
+                    fko = (10 + order,) + tuple(s_list[pos - order : pos])
+                    do = postings.get(fko)
+                    if do is None:
+                        postings[fko] = {act: 1.0}
+                        key_totals[fko] = 1.0
+                    else:
+                        do[act] = do.get(act, 0.0) + 1.0
+                        key_totals[fko] += 1.0
+        return postings, key_totals, g_counts
+
     def fit_token_stream(
         self,
         tokens: Sequence[int],
         *,
         ctx_len: int = 4,
+        n_workers: int = 1,
     ) -> "SparseFeatureActionIndex":
-        """Directly index nested suffix n-gram keys -> next token from a token stream."""
+        """Directly index nested suffix n-gram keys -> next token (supports no-GIL multi-core sharding)."""
         arr = np.asarray(tokens, dtype=np.int32).reshape(-1)
+        n = len(arr)
         c = max(int(ctx_len), 1)
-        for pos in range(c, len(arr)):
-            t_m1 = int(arr[pos - 1])
-            keys: List[Tuple[int, ...]] = [(-1, t_m1)]
-            for order in range(2, c + 1):
-                suffix = tuple(int(x) for x in arr[pos - order : pos])
-                keys.append((10 + order,) + suffix)
-            self.update(None, int(arr[pos]), dopamine=1.0, pain=0.0, sparse_keys=keys)
+        if n <= c:
+            return self
+        s_list = arr.tolist()
+        nw = max(int(n_workers), 1)
+        if nw <= 1 or (n - c) < 100_000:
+            shard_results = [self._count_shard(s_list, c, n, c)]
+        else:
+            nw = min(nw, max(os.cpu_count() or 1, 1), 12)
+            span = n - c
+            step = (span + nw - 1) // nw
+            ranges = [
+                (c + i * step, min(c + (i + 1) * step, n))
+                for i in range(nw)
+                if c + i * step < n
+            ]
+            with ThreadPoolExecutor(max_workers=len(ranges)) as ex:
+                futs = [ex.submit(self._count_shard, s_list, s0, s1, c) for s0, s1 in ranges]
+                shard_results = [f.result() for f in futs]
+
+        # Exact lossless merge of shard counts into self._postings / self._key_totals
+        post_main = self._postings
+        kt_main = self._key_totals
+        gc_main = self._global_counts
+        gs_main = self._global_scores
+        for sh_post, sh_kt, sh_gc in shard_results:
+            for fk, d_act in sh_post.items():
+                dst = post_main[fk]
+                for act, cnt in d_act.items():
+                    bkt = dst.get(act)
+                    if bkt is None:
+                        dst[act] = [cnt, cnt]
+                    else:
+                        bkt[0] += cnt
+                        bkt[1] += cnt
+                kt_main[fk] += sh_kt[fk]
+            for act, cnt in sh_gc.items():
+                gc_main[act] += cnt
+                gs_main[act] += float(cnt)
+                self.total_updates += int(cnt)
         return self
+
+    def prune_under_pressure(self, pressure: float) -> int:
+        """Evict lowest-count sparse postings proportionally to memory pressure ``p in [0, 1]``."""
+        p = float(np.clip(pressure, 0.0, 1.0))
+        if p <= 0.0 or not self._postings:
+            return 0
+        # Convex eviction threshold: gentle (min_cnt=1) at low pressure, aggressive at high pressure
+        min_cnt = 1.0 if p < 0.25 else (2.0 if p < 0.55 else (4.0 if p < 0.80 else 8.0))
+        evicted = 0
+        for fk in list(self._postings.keys()):
+            # Preserve order-1 keys longer than high-order tail keys
+            is_high_order = (len(fk) >= 3 and fk[0] >= 12)
+            thresh = min_cnt if is_high_order else max(min_cnt * 0.5, 1.0)
+            post = self._postings[fk]
+            removed_mass = 0.0
+            for act in list(post.keys()):
+                if post[act][0] <= thresh:
+                    removed_mass += post[act][0]
+                    del post[act]
+                    evicted += 1
+            if not post:
+                del self._postings[fk]
+                self._key_totals.pop(fk, None)
+            elif removed_mass > 0.0:
+                self._key_totals[fk] = max(self._key_totals.get(fk, 0.0) - removed_mass, 0.0)
+        return evicted
 
     def _propose_interpolated_ad(
         self,

@@ -35,6 +35,7 @@ import numpy as np
 
 from class_policy import ClassLevelSequencePolicy
 from compression_tree import HierarchicalStageTree, LearnedDrillDownPolicy
+from hierarchical_arbitrator import HierarchicalOnlineArbitrator
 from recency_kernel import LearnedRecencyLagKernel
 from structural_memory import HierarchicalChunkMemory, StructuralFrameMemory
 from temp_context import TemporaryContextMemory
@@ -125,6 +126,7 @@ class ContextDrivenDecisionController:
         chunk_weight: float = 0.38,
         frame_memory: Optional[StructuralFrameMemory] = None,
         frame_weight: float = 0.18,
+        arbitrator: Optional[HierarchicalOnlineArbitrator] = None,
     ):
         self.class_policy = class_policy
         self.virtual_dag = virtual_dag
@@ -158,6 +160,7 @@ class ContextDrivenDecisionController:
         self.chunk_weight = float(chunk_weight)
         self.frame_memory = frame_memory
         self.frame_weight = float(frame_weight)
+        self.arbitrator = arbitrator
 
         self._anchor_state: Optional[np.ndarray] = None
         self._tree_root_slots: Dict[int, float] = {}
@@ -265,18 +268,18 @@ class ContextDrivenDecisionController:
 
         return strengths, tree_stats
 
-    def decide_distribution(
+    def _compute_expert_maps(
         self,
         ctx_tokens: Sequence[int],
-        slow_state: Optional[np.ndarray] = None,
+        slow_state: Optional[np.ndarray],
         *,
         k: int = 8,
         recent_history: Optional[Sequence[int]] = None,
-    ) -> Tuple[List[int], np.ndarray, Dict[str, float]]:
-        """Compute context-driven top-k candidate distribution + telemetry."""
+    ) -> Tuple[List[Dict[int, float]], float, float, Dict[str, float]]:
+        """Compute calibrated probability maps for the 4 orthogonal memory experts."""
         prev1 = int(ctx_tokens[-1]) if len(ctx_tokens) > 0 else 0
-        # 1. Long-term structural proposal (ClassPolicy + <=2-gram legality)
-        cand, probs = self.class_policy.propose_next_symbols(
+        # Expert 0: Base ClassLevelSequencePolicy + Post(prev1)
+        cand0, probs0 = self.class_policy.propose_next_symbols(
             ctx_tokens,
             slow_state,
             k=max(int(k) * 2, 16),
@@ -284,40 +287,35 @@ class ContextDrivenDecisionController:
             local_weight=self.local_weight,
             semantic_gamma=self.semantic_gamma,
         )
-        # Forward virtual node coherence boost from Post(prev1)
         fnode = self.virtual_dag.forward_node(prev1) if prev1 > 0 else None
         if fnode is not None:
-            probs = np.array(
-                [float(pr) * (1.25 if int(a) in fnode.members else 1.0) for a, pr in zip(cand, probs)],
+            probs0 = np.array(
+                [float(pr) * (1.25 if int(a) in fnode.members else 1.0) for a, pr in zip(cand0, probs0)],
                 dtype=float,
             )
-            p_s = float(probs.sum())
+            p_s = float(probs0.sum())
             if p_s > 0.0:
-                probs /= p_s
+                probs0 /= p_s
+        base_map: Dict[int, float] = {int(a): float(p) for a, p in zip(cand0, probs0) if int(a) > 0}
 
-        # Compute normalized local entropy in [0, 1] to gate context steering
-        p_clip = np.clip(probs, 1e-12, 1.0)
-        ent = float(-np.sum(p_clip * np.log(p_clip))) / max(float(np.log(len(probs))), 1e-6)
+        p_clip = np.clip(probs0, 1e-12, 1.0)
+        ent = float(-np.sum(p_clip * np.log(p_clip))) / max(float(np.log(len(probs0))), 1e-6)
         ent_gate = float(np.clip(ent, 0.15, 1.0))
 
-        # 2. Episodic cache + spreading-field modulation on existing pool
-        #    When recency_kernel is active, gate episodic cache by long-term novelty
-        #    to avoid double-counting known transitions that recency_kernel already models.
+        # Expert 1: Working Memory (corroborated field + novelty-gated cache + active PMI + 2-step bridge)
         use_nov_cache = bool(self.recency_kernel is not None and self.recency_kernel._fitted)
-        cand, probs = self.temp_memory.apply_to_candidates(
-            ctx_tokens, cand, probs,
+        cand1, probs1 = self.temp_memory.apply_to_candidates(
+            ctx_tokens, cand0, probs0,
             field_beta=self.field_beta * ent_gate,
             cache_lambda=self.cache_lambda,
             extra_pool_k=max(int(k) * 2, 16),
             novelty_gated_cache=use_nov_cache,
         )
-        score_map: Dict[int, float] = {int(a): float(p) for a, p in zip(cand, probs) if int(a) > 0}
+        wm_map: Dict[int, float] = {int(a): float(p) for a, p in zip(cand1, probs1) if int(a) > 0}
 
-        # 3. Active Context Injection & Bidirectional 2-Step Bridge Steering
         active_strengths, tree_stats = self._collect_active_node_strengths(slow_state)
         injected = 0
         bridged = 0
-        # Self-learned per-class context gate (zero hand-coded singleton/grammar rules)
         content_gate = 1.0
         if self.learned_class_gate is not None:
             cids, cprobs = self.class_policy.predict_next_classes(ctx_tokens, top_c=8)
@@ -331,15 +329,13 @@ class ContextDrivenDecisionController:
             for goal_sym, strength in top_active:
                 if goal_sym == prev1:
                     continue
-                # 3a. Direct 1-step legal activation scored by PMI lift (avoids high-freq suppression)
                 p_loc, lift = self._local_pair_prob_and_lift(prev1, goal_sym)
                 in_post = (fnode is not None and goal_sym in fnode.members)
                 if (p_loc > 0.0 and lift >= 1.2) or in_post:
                     lift_factor = float(np.log1p(max(lift, 1.0))) / 3.0
                     add_mass = w_inj * float(strength) * min(lift_factor, 1.5)
-                    score_map[goal_sym] = score_map.get(goal_sym, 0.0) + add_mass
+                    wm_map[goal_sym] = wm_map.get(goal_sym, 0.0) + add_mass
                     injected += 1
-                # 3b. 2-step goal-directed bridge: prev1 -> bridge -> goal_sym
                 bridges = self.virtual_dag.bridge_lookup(prev1, goal_sym)
                 if bridges:
                     for b_sym, _bw in bridges[:2]:
@@ -347,20 +343,22 @@ class ContextDrivenDecisionController:
                             p_b, lift_b = self._local_pair_prob_and_lift(prev1, b_sym)
                             if p_b > 0.0 and lift_b >= 1.2:
                                 lb_factor = float(np.log1p(max(lift_b, 1.0))) / 3.0
-                                score_map[b_sym] = score_map.get(b_sym, 0.0) + (
+                                wm_map[b_sym] = wm_map.get(b_sym, 0.0) + (
                                     w_br * float(strength) * min(lb_factor, 1.5)
                                 )
                                 bridged += 1
 
-        # 4. Higher-Order Structural Memory (recursive chunks + directional open frames)
+        # Expert 2: Higher-Order Recursive Chunks + Abstract Chunk-Class Grammar + Skip Schemas
         hist_src = (
             recent_history
             if recent_history is not None
             else (self.temp_memory.recent_history if self.temp_memory.recent_history else ctx_tokens)
         )
+        chunk_map: Dict[int, float] = {}
         chunk_intra = 0.0
         chunk_inter = 0.0
-        if self.chunk_memory is not None and self.chunk_memory._fitted and self.chunk_weight > 0.0:
+        chunk_conf = 0.0
+        if self.chunk_memory is not None and self.chunk_memory._fitted:
             ch_acts, ch_probs, ch_info = self.chunk_memory.predict_next_atoms(
                 hist_src,
                 slow_state=slow_state,
@@ -371,48 +369,28 @@ class ContextDrivenDecisionController:
             chunk_intra = float(ch_info.get("intra_mass", 0.0))
             chunk_inter = float(ch_info.get("inter_mass", 0.0))
             chunk_conf = float(ch_info.get("chunk_conf", 0.5))
-            if len(ch_acts) > 0:
-                sm_sum = float(sum(score_map.values()))
-                if sm_sum > 0.0:
-                    inv_sm = 1.0 / sm_sum
-                    for a in list(score_map.keys()):
-                        score_map[a] *= inv_sm
-                cw = float(np.clip(self.chunk_weight * (0.20 + 0.80 * chunk_conf), 0.0, 0.85))
-                for a in list(score_map.keys()):
-                    score_map[a] *= (1.0 - cw)
-                for a, p_ch in zip(ch_acts, ch_probs):
-                    ai = int(a)
-                    if ai > 0:
-                        score_map[ai] = score_map.get(ai, 0.0) + cw * float(p_ch)
+            for a, p_ch in zip(ch_acts, ch_probs):
+                ai = int(a)
+                if ai > 0 and float(p_ch) > 0.0:
+                    chunk_map[ai] = float(p_ch)
 
+        # Expert 3: Directional Non-Adjacent Frame Register
+        frame_map: Dict[int, float] = {}
         frame_hits = 0
-        if self.frame_memory is not None and self.frame_memory._fitted and self.frame_weight > 0.0:
+        if self.frame_memory is not None and self.frame_memory._fitted:
             closers = self.frame_memory.predict_closers_for_history(hist_src)
             if closers:
-                fw = float(self.frame_weight) * ent_gate
                 for c_sym, f_str in closers.items():
                     if c_sym <= 0 or c_sym == prev1:
                         continue
                     p_loc, lift = self._local_pair_prob_and_lift(prev1, c_sym) if prev1 > 0 else (0.0, 1.0)
-                    if c_sym in score_map or p_loc > 0.0 or f_str >= 1.5:
+                    if c_sym in wm_map or p_loc > 0.0 or f_str >= 1.5:
                         leg_scale = 0.5 + 0.5 * min(float(lift) / 2.0, 1.5) if p_loc > 0.0 else 0.75
-                        add_f = fw * min(float(f_str) / 3.0, 1.5) * leg_scale
-                        score_map[c_sym] = score_map.get(c_sym, 0.0) + add_f
+                        frame_map[c_sym] = min(float(f_str) / 3.0, 1.5) * leg_scale
                         frame_hits += 1
 
-        # 5. Self-learned recency-lag modulation (excitation or inhibition purely from data)
-        if self.recency_kernel is not None and self.recency_strength > 0.0:
-            score_map = self.recency_kernel.modulate_scores(
-                hist_src, score_map, strength=self.recency_strength,
-            )
-
-        ranked = sorted(score_map.items(), key=lambda kv: (kv[1], -kv[0]), reverse=True)[: max(int(k), 1)]
-        acts = [a for a, _ in ranked]
-        out_p = np.asarray([p for _, p in ranked], dtype=float)
-        out_sum = float(out_p.sum())
-        if out_sum > 0.0:
-            out_p /= out_sum
-        info = dict(
+        meta = dict(
+            entropy=ent,
             entropy_gate=ent_gate,
             content_gate=content_gate,
             active_injected=float(injected),
@@ -421,9 +399,106 @@ class ContextDrivenDecisionController:
             lookahead_depth=float(self.lookahead_depth),
             chunk_intra=chunk_intra,
             chunk_inter=chunk_inter,
+            chunk_conf=chunk_conf,
             frame_closers=float(frame_hits),
         )
+        return [base_map, wm_map, chunk_map, frame_map], ent, ent_gate, meta
+
+    def decide_distribution(
+        self,
+        ctx_tokens: Sequence[int],
+        slow_state: Optional[np.ndarray] = None,
+        *,
+        k: int = 8,
+        recent_history: Optional[Sequence[int]] = None,
+    ) -> Tuple[List[int], np.ndarray, Dict[str, float]]:
+        """Compute context-driven top-k candidate distribution + telemetry."""
+        hist_src = (
+            recent_history
+            if recent_history is not None
+            else (self.temp_memory.recent_history if self.temp_memory.recent_history else ctx_tokens)
+        )
+        expert_maps, ent, ent_gate, info = self._compute_expert_maps(
+            ctx_tokens, slow_state, k=k, recent_history=hist_src,
+        )
+        _base_map, wm_map, chunk_map, frame_map = expert_maps
+
+        if self.arbitrator is not None:
+            # Cross-episode hierarchical online arbitration over the 4 orthogonal memory experts
+            chunk_conf = float(info.get("chunk_conf", 0.5))
+            exp_confs = (1.0, 1.0, 0.25 + 0.75 * chunk_conf, ent_gate)
+            score_map, regime, _w = self.arbitrator.blend_experts(
+                expert_maps, ent, expert_confidences=exp_confs,
+            )
+            info["arb_regime"] = float(regime)
+            rec_str = self.arbitrator.recency_strength_for_regime(regime)
+        else:
+            # Standard direct composition path (preserves full backward compatibility)
+            score_map = dict(wm_map)
+            if chunk_map and self.chunk_weight > 0.0:
+                sm_sum = float(sum(score_map.values()))
+                if sm_sum > 0.0:
+                    inv_sm = 1.0 / sm_sum
+                    for a in list(score_map.keys()):
+                        score_map[a] *= inv_sm
+                chunk_conf = float(info.get("chunk_conf", 0.5))
+                cw = float(np.clip(self.chunk_weight * (0.20 + 0.80 * chunk_conf), 0.0, 0.85))
+                for a in list(score_map.keys()):
+                    score_map[a] *= (1.0 - cw)
+                for a, p_ch in chunk_map.items():
+                    score_map[a] = score_map.get(a, 0.0) + cw * p_ch
+            if frame_map and self.frame_weight > 0.0:
+                fw = float(self.frame_weight) * ent_gate
+                for c_sym, f_val in frame_map.items():
+                    score_map[c_sym] = score_map.get(c_sym, 0.0) + fw * f_val
+            rec_str = self.recency_strength
+
+        # 5. Self-learned recency-lag modulation (excitation or inhibition purely from data)
+        if self.recency_kernel is not None and rec_str > 0.0:
+            score_map = self.recency_kernel.modulate_scores(
+                hist_src, score_map, strength=rec_str,
+            )
+
+        ranked = sorted(score_map.items(), key=lambda kv: (kv[1], -kv[0]), reverse=True)[: max(int(k), 1)]
+        acts = [a for a, _ in ranked]
+        out_p = np.asarray([p for _, p in ranked], dtype=float)
+        out_sum = float(out_p.sum())
+        if out_sum > 0.0:
+            out_p /= out_sum
         return acts, out_p, info
+
+    def learn_arbitrator_step(
+        self,
+        ctx_tokens: Sequence[int],
+        slow_state: Optional[np.ndarray],
+        actual_target: int,
+        *,
+        k: int = 8,
+        recent_history: Optional[Sequence[int]] = None,
+    ) -> bool:
+        """Feed real target outcome into ``HierarchicalOnlineArbitrator`` (cross-episode consolidation)."""
+        if self.arbitrator is None or int(actual_target) <= 0:
+            return False
+        tgt = int(actual_target)
+        hist_src = (
+            recent_history
+            if recent_history is not None
+            else (self.temp_memory.recent_history if self.temp_memory.recent_history else ctx_tokens)
+        )
+        expert_maps, ent, _ent_gate, _meta = self._compute_expert_maps(
+            ctx_tokens, slow_state, k=k, recent_history=hist_src,
+        )
+        rec_adv = 0.0
+        if self.recency_kernel is not None and self.recency_kernel._fitted:
+            blended, _r, _w = self.arbitrator.blend_experts(expert_maps, ent)
+            if blended:
+                mod_on = self.recency_kernel.modulate_scores(hist_src, blended, strength=0.85)
+                sc_off = self.arbitrator._expert_score(blended, tgt, k=k)
+                sc_on = self.arbitrator._expert_score(mod_on, tgt, k=k)
+                rec_adv = sc_on - sc_off
+        return self.arbitrator.record_step(
+            expert_maps, ent, tgt, recency_advantage=rec_adv, k=k,
+        )
 
     def decide_with_lookahead(
         self,

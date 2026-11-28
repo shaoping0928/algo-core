@@ -64,7 +64,7 @@ class ClassLevelSequencePolicy:
         self.class_members_: Dict[int, np.ndarray] = {}
         self.class_emit_probs_: Dict[int, np.ndarray] = {}
 
-    def fit(self, tokens: Sequence[int]) -> "ClassLevelSequencePolicy":
+    def fit(self, tokens: Sequence[int], *, n_workers: int = 1) -> "ClassLevelSequencePolicy":
         arr = np.clip(
             np.asarray(tokens, dtype=np.int32).reshape(-1), 0, self.vocab_size - 1,
         )
@@ -117,11 +117,17 @@ class ClassLevelSequencePolicy:
 
         # 3. Fit class-level transition policy P(C_t | C_{t-4}..C_{t-1})
         class_stream = sym_to_cls[arr]
-        self.class_index.fit_token_stream(class_stream, ctx_len=self.class_ctx_len)
+        self.class_index.fit_token_stream(class_stream, ctx_len=self.class_ctx_len, n_workers=n_workers)
 
         # 4. Fit short local pairing index (<=2-gram only, no 4/5-gram surface rails)
-        self.local_index.fit_token_stream(arr, ctx_len=self.local_ctx_len)
+        self.local_index.fit_token_stream(arr, ctx_len=self.local_ctx_len, n_workers=n_workers)
         return self
+
+    def prune_under_pressure(self, pressure: float) -> int:
+        """Prune sparse transition postings under memory pressure."""
+        ev = self.class_index.prune_under_pressure(pressure)
+        ev += self.local_index.prune_under_pressure(pressure * 0.75)
+        return ev
 
     def predict_next_classes(
         self,

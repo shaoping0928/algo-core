@@ -6,6 +6,8 @@ venv/
 .venv-t/
 results/
 *.pkl
+*.pkl.gz
+checkpoints/
 consume-*.json
 span-decision-*.json
 multiview-*.json

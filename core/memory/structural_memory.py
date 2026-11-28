@@ -105,7 +105,7 @@ class HierarchicalChunkMemory:
             i += 1
         return np.asarray(out, dtype=np.int32)
 
-    def fit(self, tokens: Sequence[int]) -> "HierarchicalChunkMemory":
+    def fit(self, tokens: Sequence[int], *, n_workers: int = 1) -> "HierarchicalChunkMemory":
         """Recursively discover high-PMI structural chunks and fit chunk-level transitions."""
         arr = np.clip(
             np.asarray(tokens, dtype=np.int32).reshape(-1),
@@ -192,14 +192,14 @@ class HierarchicalChunkMemory:
         self.chunk_index = SparseFeatureActionIndex(
             tuple(range(self.n_total_units)), prior_weight=0.0,
         )
-        self.chunk_index.fit_token_stream(cur_stream, ctx_len=self.chunk_ctx_len)
+        self.chunk_index.fit_token_stream(cur_stream, ctx_len=self.chunk_ctx_len, n_workers=n_workers)
 
         # Fit abstract Chunk-Class Grammar (Non-Terminals) + Skip-Slot Construction Schemas
-        self._fit_chunk_class_abstraction(cur_stream)
+        self._fit_chunk_class_abstraction(cur_stream, n_workers=n_workers)
         self._fitted = True
         return self
 
-    def _fit_chunk_class_abstraction(self, cur_stream: np.ndarray) -> None:
+    def _fit_chunk_class_abstraction(self, cur_stream: np.ndarray, *, n_workers: int = 1) -> None:
         """Cluster discovered chunks by left/right distributional context into abstract classes."""
         self.chunk_to_class_ = None
         self.chunk_class_index = None
@@ -292,7 +292,7 @@ class HierarchicalChunkMemory:
         self.chunk_class_index = SparseFeatureActionIndex(
             tuple(range(max_cc + 1)), prior_weight=0.0,
         )
-        self.chunk_class_index.fit_token_stream(cc_stream, ctx_len=self.chunk_class_ctx_len)
+        self.chunk_class_index.fit_token_stream(cc_stream, ctx_len=self.chunk_class_ctx_len, n_workers=n_workers)
 
         # Fit Skip-Slot Construction Schemas: (prev2_anchor_unit, prev1_slot_class) -> next_unit
         if len(cur_stream) >= 4:
@@ -542,6 +542,30 @@ class HierarchicalChunkMemory:
             rows.append((tot_cnt, cc, sample_txt))
         rows.sort(reverse=True)
         return [(cc, txt) for _, cc, txt in rows[:top_classes]]
+
+    def prune_under_pressure(self, pressure: float) -> int:
+        """Evict low-utility chunk postings and tail skip-slot schemas under memory pressure."""
+        p = float(np.clip(pressure, 0.0, 1.0))
+        if p <= 0.0:
+            return 0
+        evicted = 0
+        if self.chunk_index is not None:
+            evicted += self.chunk_index.prune_under_pressure(p)
+        if self.chunk_class_index is not None:
+            evicted += self.chunk_class_index.prune_under_pressure(p * 0.7)
+        if self.skip_schemas_ and p >= 0.30:
+            keep_frac = max(1.0 - 0.75 * p, 0.15)
+            keep_n = max(int(len(self.skip_schemas_) * keep_frac), 64)
+            if len(self.skip_schemas_) > keep_n:
+                # Keep schemas with highest peak transition confidence
+                ranked = sorted(
+                    self.skip_schemas_.items(),
+                    key=lambda kv: max((pr for _, pr in kv[1]), default=0.0),
+                    reverse=True,
+                )
+                evicted += len(self.skip_schemas_) - keep_n
+                self.skip_schemas_ = dict(ranked[:keep_n])
+        return evicted
 
     def top_discovered_chunks(self, itos: Sequence[str], top_n: int = 20) -> List[Tuple[str, int]]:
         """Inspect the highest-count discovered multi-symbol chunks."""

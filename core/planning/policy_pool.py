@@ -301,3 +301,21 @@ class PolicyPopulationManager:
             active_mean=round(float(inc.mean), 4),
             active_lcb=round(float(inc.lcb(self.z_score)), 4),
         )
+
+    def prune_under_pressure(self, pressure: float) -> int:
+        """Tighten pool capacity and evict lowest-LCB non-active policies under memory pressure."""
+        p = float(np.clip(pressure, 0.0, 1.0))
+        if p <= 0.0 or len(self.pool) <= 2:
+            return 0
+        target_cap = max(int(round(self.max_pool_size * (1.0 - 0.75 * p))), 2)
+        evicted = 0
+        while len(self.pool) > target_cap:
+            cands = [st for pid, st in self.pool.items() if pid != self.active_id]
+            if not cands:
+                break
+            worst = min(cands, key=lambda st: (st.lcb(self.z_score), st.trials))
+            del self.pool[worst.spec.policy_id]
+            self.total_evictions += 1
+            self.eviction_log.append((self.step_count, worst.spec.policy_id, f"memory_pressure_{p:.2f}"))
+            evicted += 1
+        return evicted

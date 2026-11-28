@@ -485,3 +485,45 @@ class TemporaryContextMemory:
             return []
         idxs = np.argsort(-self._field)[:top_n]
         return [(itos[int(i)], float(self._field[int(i)] / f_max)) for i in idxs if self._field[int(i)] > 0.0]
+
+    def prune_under_pressure(self, pressure: float) -> int:
+        """Accelerate forgetting and evict low-weight episodic/associative entries under memory pressure."""
+        p = float(np.clip(pressure, 0.0, 1.0))
+        if p <= 0.0:
+            return 0
+        evicted = 0
+        # 1. Stronger decay / anchor pruning as pressure rises
+        keep_anchors = max(int(round(self.max_anchors * (1.0 - 0.65 * p))), 4)
+        if len(self._anchors) > keep_anchors:
+            evicted += len(self._anchors) - keep_anchors
+            top_a = sorted(self._anchors.items(), key=lambda kv: kv[1], reverse=True)[:keep_anchors]
+            self._anchors = dict(top_a)
+            self._field_dirty = True
+
+        # 2. Prune weak episodic bigram/trigram cache entries
+        min_ep_w = 0.25 + 1.75 * p
+        for bmap_owner in (self._ep_bigram, self._ep_trigram):
+            for key in list(bmap_owner.keys()):
+                inner = bmap_owner[key]
+                for s in list(inner.keys()):
+                    if inner[s] < min_ep_w:
+                        del inner[s]
+                        evicted += 1
+                if not inner:
+                    del bmap_owner[key]
+
+        # 3. Under high pressure (>=0.5), trim tail of long-term associative edges & compounds
+        if p >= 0.50:
+            keep_edges = max(int(round(self.top_assoc_per_sym * (1.0 - 0.55 * p))), 4)
+            for a in list(self.assoc_graph_.keys()):
+                edges = self.assoc_graph_[a]
+                if len(edges) > keep_edges:
+                    evicted += len(edges) - keep_edges
+                    self.assoc_graph_[a] = edges[:keep_edges]
+            if p >= 0.70 and len(self.assoc_graph_compound_) > 128:
+                keep_c = max(int(len(self.assoc_graph_compound_) * (1.0 - 0.5 * p)), 128)
+                keys = list(self.assoc_graph_compound_.keys())
+                for k in keys[keep_c:]:
+                    del self.assoc_graph_compound_[k]
+                    evicted += 1
+        return evicted
