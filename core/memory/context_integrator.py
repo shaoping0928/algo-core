@@ -69,6 +69,7 @@ class ContextualIntegrator:
         self.forward_graph_: Dict[int, List[Tuple[int, float]]] = {}
         self.unit_entry_atom_: np.ndarray = np.arange(self.n_units, dtype=np.int32)
         self.unit_len_: np.ndarray = np.ones(self.n_units, dtype=np.int32)
+        self.unit_atoms_: Dict[int, Tuple[int, ...]] = {}
 
         # Accumulators for streaming incremental ingestion
         self._unit_counts: np.ndarray = np.zeros(self.n_units, dtype=np.float64)
@@ -83,6 +84,9 @@ class ContextualIntegrator:
         self._realized: Dict[int, float] = {}         # realization count in self-mode
         self._last_ext_atom: int = 0                  # for upgrading prefix atom -> completed chunk
         self._mismatch_streak: int = 0                # empirical topic-shift detector in continuous streams
+        self._committed_atoms: Tuple[int, ...] = ()   # active whole-chunk commitment (prevents half-chunk splices!)
+        self._commit_pos: int = 0
+        self._commit_strength: float = 0.0
         self._step: int = 0
         self._dirty: bool = True
         self._cached_unit_scores: Dict[int, float] = {}
@@ -99,12 +103,15 @@ class ContextualIntegrator:
         for u in range(min(self.vocab_size, self.n_units)):
             entry[u] = u
             ulen[u] = 1
+        self.unit_atoms_ = {}
         if chunk_to_atoms is not None:
             for cid, atoms in chunk_to_atoms.items():
                 ci = int(cid)
                 if 0 <= ci < self.n_units and atoms:
                     entry[ci] = int(atoms[0])
                     ulen[ci] = len(atoms)
+                    if len(atoms) >= 2:
+                        self.unit_atoms_[ci] = tuple(int(a) for a in atoms)
         self.unit_entry_atom_ = entry
         self.unit_len_ = ulen
 
@@ -284,6 +291,9 @@ class ContextualIntegrator:
         self._realized.clear()
         self._last_ext_atom = 0
         self._mismatch_streak = 0
+        self._committed_atoms = ()
+        self._commit_pos = 0
+        self._commit_strength = 0.0
         self._step = 0
         self._dirty = True
         self._cached_unit_scores.clear()
@@ -478,6 +488,52 @@ class ContextualIntegrator:
         if self._dirty:
             self._recompute_intersection()
         return self._cached_atom_scores
+
+    def update_chunk_commitment(self, emitted_atom: int, *, is_self: bool = False) -> None:
+        """Advance or initiate whole-chunk commitment when a context-promoted entry atom fires.
+
+        Prevents half-chunk prefix splices (e.g. starting chunk ``(a, b)`` because context
+        demanded it, then drifting into ``(a, x)`` on the next step). Purely task-agnostic!
+        """
+        a = int(emitted_atom)
+        if not is_self or a <= 0:
+            self._committed_atoms = ()
+            self._commit_pos = 0
+            self._commit_strength = 0.0
+            return
+
+        # 1. If already inside an active multi-symbol chunk commitment, advance or clear
+        if self._committed_atoms and self._commit_pos < len(self._committed_atoms):
+            if a == self._committed_atoms[self._commit_pos]:
+                self._commit_pos += 1
+                if self._commit_pos >= len(self._committed_atoms):
+                    self._committed_atoms = ()
+                    self._commit_pos = 0
+                    self._commit_strength = 0.0
+                return
+            # Trajectory diverged -> release old commitment cleanly
+            self._committed_atoms = ()
+            self._commit_pos = 0
+            self._commit_strength = 0.0
+
+        # 2. Check if ``a`` was promoted by a high-confidence multi-symbol context chunk
+        if self._dirty:
+            self._recompute_intersection()
+        top_u = self._cached_atom_top_unit.get(a, 0)
+        llr_a = self._cached_atom_scores.get(a, 0.0)
+        u_atoms_map = getattr(self, "unit_atoms_", None)
+        if top_u >= self.vocab_size and llr_a >= 0.75 and u_atoms_map is not None:
+            atoms = u_atoms_map.get(top_u)
+            if atoms and len(atoms) >= 2 and atoms[0] == a:
+                self._committed_atoms = atoms
+                self._commit_pos = 1
+                self._commit_strength = float(min(llr_a, 2.5))
+
+    def committed_continuation(self) -> Tuple[int, float]:
+        """Return ``(expected_next_atom, commitment_strength)`` if mid-chunk, else ``(0, 0.0)``."""
+        if self._committed_atoms and self._commit_pos < len(self._committed_atoms):
+            return int(self._committed_atoms[self._commit_pos]), float(self._commit_strength)
+        return 0, 0.0
 
     def active_slots_snapshot(self, top_k: int = 16) -> List[Tuple[int, float]]:
         """Return currently retained persistent episode context slots."""

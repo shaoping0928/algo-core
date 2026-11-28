@@ -1,31 +1,23 @@
-"""Persistent In-Place Selective State-Space & 2nd-Order Context-Gated Policy (GPU-Accelerated).
+"""Persistent In-Place Selective State-Space & 2-Layer Residual Context-Gated Policy (RX 9070 XT GPU).
 
 Implements continuous, coherent state-space dynamics where each observed or
 self-emitted symbol **modifies an already-existing multi-timescale node state
-in-place** (never rebuilding from scratch), with **input-selective entity-locking**
-and **2nd-order multiplicative context-gated transitions** accelerated natively on
-OpenCL GPUs (e.g., AMD Radeon RX 9070 XT ``gfx1201``):
-
-  - **In-Place Selective Multi-Scale RC Node State**:
-      * Local trajectory ``x_loc = [e_cur, e_prev, h_fast]`` (3D)
-      * Persistent context ``z_ctx = [h_mid, h_slow, h_chunk, h_ent, h_diff]`` (5D)
-      * **Selective Entity-Lock Channel ``h_ent``**: input-dependent write/retain
-        gate ``delta(u)`` derived from empirical self-information (IDF salience)
-        + self-learned RC persistence: high-information entities lock into
-        ``h_ent`` while high-frequency glue tokens pass ``h_ent`` through
-        nearly untouched (computed in C via exact log-depth associative parallel
-        prefix scan!).
-  - **2nd-Order Context-Gated Bilinear Transition Layer**:
-      ``a_t = tanh(x_loc @ P_loc + b_loc)``
-      ``g_t = sigmoid(z_ctx @ P_ctx + b_ctx)``
-      ``q_t = a_t * g_t``
-      ``logits(y) = x_loc @ W_loc + z_ctx @ W_ctx + q_t @ W_q + b_out``
-  - **Exact Counterfactual Conditional Context PMI**:
-      ``Delta_ctx(y | x_loc, z_ctx) = log P(y | x_loc, z_ctx) - log P(y | x_loc, 0)``
-  - **Native RX 9070 XT OpenCL GPU Training Engine**:
-    Keeps all weights and AdamW moments permanently in VRAM, executing tiled
-    SGEMM + fused Softmax/Cross-Entropy + Gated Bilinear Fwd/Bwd + AdamW
-    updates on-device with zero intermediate PCIe roundtrips.
+in-place** (never rebuilding from scratch), with:
+  1. **Jointly Fine-Tuned Local Embeddings ``E_dyn`` (e.g. 64-dim)** trained
+     end-to-end on RX 9070 XT GPU alongside centered distributional anchors;
+  2. **Selective Entity-Lock RC State ``h_ent``**: input-dependent write gates
+     ``delta(u)`` (IDF salience + learned ``R*C`` persistence) via exact
+     parallel associative prefix scan (Mamba/S5-style recurrence);
+  3. **2-Layer Residual Context-Gated Bilinear Transitions**:
+       * Layer 1: ``Q1 = tanh(x_loc @ P_loc + b_loc) * sigmoid(z_ctx @ P_ctx + b_ctx)``
+       * Layer 2: ``Q2 = Q1 + tanh(Q1 @ P_h2 + b_h2) * sigmoid(z_ctx @ P_ctx2 + b_ctx2)``
+       * Readout: ``logits = x_loc @ W_loc + z_ctx @ W_ctx + Q2 @ W_q + b_out``
+  4. **Exact Counterfactual Conditional Context PMI**:
+       ``Delta_ctx(y | x_loc, z_ctx) = log P(y | x_loc, z_ctx) - log P(y | x_loc, 0)``
+  5. **Native OpenCL GPU Training Engine**:
+     Keeps all 13 parameter tensors + AdamW moments permanently in VRAM,
+     running tiled SGEMM, fused residual gates, Softmax/CE, embedding gather/
+     reduce, and AdamW updates on-device.
 
 Strictly task-agnostic: operates solely on discrete symbol/chunk IDs and
 distributional embeddings (zero language rules or word segmenters).
@@ -135,13 +127,7 @@ def _selective_associative_scan(
     h0: Optional[np.ndarray] = None,
     max_horizon: int = 512,
 ) -> np.ndarray:
-    """Exact log-depth parallel associative scan for input-selective state-space recurrence:
-
-        ``H[t] = (1 - a * delta[t]) * H[t-1] + (a * delta[t]) * X[t]``
-
-    Glue tokens (small ``delta[t] ~ 0.01``) pass ``H[t-1]`` through virtually untouched,
-    while salient entities (``delta[t] ~ 0.9``) lock directly into ``H[t]``!
-    """
+    """Exact log-depth parallel associative scan for input-selective state-space recurrence."""
     n = X.shape[0]
     if n == 0:
         return np.empty_like(X, dtype=np.float32)
@@ -172,7 +158,14 @@ def _log_softmax_1d(logits: np.ndarray) -> np.ndarray:
 
 
 class StatefulContextPolicy:
-    """In-place selective multi-scale 2nd-order context-gated policy with RX 9070 XT GPU training."""
+    """In-place selective 2-layer residual context-gated policy with RX 9070 XT GPU training."""
+
+    _PARAM_NAMES: Tuple[str, ...] = (
+        "E_dyn",
+        "P_loc", "b_loc", "P_ctx", "b_ctx",
+        "P_h2", "b_h2", "P_ctx2", "b_ctx2",
+        "W_loc", "W_ctx", "W_q", "b_out",
+    )
 
     def __init__(
         self,
@@ -186,7 +179,7 @@ class StatefulContextPolicy:
         gamma_slow: float = 0.982,
         gamma_chunk: float = 0.94,
         entity_alpha: float = 0.22,
-        lr: float = 0.012,
+        lr: float = 0.010,
         weight_decay: float = 1e-5,
         batch_size: int = 2048,
         use_gpu: bool = True,
@@ -211,18 +204,23 @@ class StatefulContextPolicy:
         self.ctx_dim = 5 * self.embed_dim
         self.feat_dim = self.loc_dim + self.ctx_dim + 1
 
-        # Embeddings & data-driven selective entity write gates [V] in [0.01, 1.0]
+        # Fixed distributional anchors (for exact Kogge-Stone/selective scans) + trainable E_dyn!
         self.atom_emb_: Optional[np.ndarray] = None
         self.chunk_emb_: Optional[np.ndarray] = None
         self.write_gate_: np.ndarray = np.full(self.vocab_size, 0.5, dtype=np.float32)
         self.write_gate_[0] = 0.0
         self.sym_to_class_: Optional[np.ndarray] = None
 
-        # 2nd-order Context-Gated Bilinear Transition parameters
+        # 13 Trainable Parameters: Dynamic Embeddings + 2-Layer Residual Context-Gated Network
+        self.E_dyn_: Optional[np.ndarray] = None           # [V, D]
         self.P_loc_: Optional[np.ndarray] = None           # [3D, R]
         self.b_loc_: Optional[np.ndarray] = None           # [R]
         self.P_ctx_: Optional[np.ndarray] = None           # [5D, R]
         self.b_ctx_: Optional[np.ndarray] = None           # [R]
+        self.P_h2_: Optional[np.ndarray] = None            # [R, R]
+        self.b_h2_: Optional[np.ndarray] = None            # [R]
+        self.P_ctx2_: Optional[np.ndarray] = None          # [5D, R]
+        self.b_ctx2_: Optional[np.ndarray] = None          # [R]
         self.W_loc_: Optional[np.ndarray] = None           # [3D, V]
         self.W_ctx_: Optional[np.ndarray] = None           # [5D, V]
         self.W_q_: Optional[np.ndarray] = None             # [R, V]
@@ -285,10 +283,24 @@ class StatefulContextPolicy:
     def _init_params(self) -> None:
         rng = np.random.RandomState(self.seed & 0xFFFFFFFF)
         ld, cd, r, v = self.loc_dim, self.ctx_dim, self.gate_dim, self.vocab_size
+        # Warm-start trainable E_dyn from mean-centered distributional embeddings!
+        if self.atom_emb_ is not None:
+            self.E_dyn_ = self.atom_emb_.copy().astype(np.float32)
+        else:
+            self.E_dyn_ = (rng.randn(v, self.embed_dim) * 0.1).astype(np.float32)
+            self.E_dyn_[0] = 0.0
+
         self.P_loc_ = (rng.randn(ld, r) * np.sqrt(1.0 / max(ld, 1))).astype(np.float32)
         self.b_loc_ = np.zeros(r, dtype=np.float32)
         self.P_ctx_ = (rng.randn(cd, r) * np.sqrt(1.0 / max(cd, 1))).astype(np.float32)
         self.b_ctx_ = np.full(r, 0.5, dtype=np.float32)
+
+        # Residual Layer 2 initialized small so training starts smoothly from Layer 1
+        self.P_h2_ = (rng.randn(r, r) * np.sqrt(0.35 / max(r, 1))).astype(np.float32)
+        self.b_h2_ = np.zeros(r, dtype=np.float32)
+        self.P_ctx2_ = (rng.randn(cd, r) * np.sqrt(0.5 / max(cd, 1))).astype(np.float32)
+        self.b_ctx2_ = np.zeros(r, dtype=np.float32)
+
         self.W_loc_ = np.zeros((ld, v), dtype=np.float32)
         self.W_ctx_ = np.zeros((cd, v), dtype=np.float32)
         self.W_q_ = np.zeros((r, v), dtype=np.float32)
@@ -307,7 +319,6 @@ class StatefulContextPolicy:
         sym_to_class: Optional[np.ndarray] = None,
         rc_persistence: Optional[np.ndarray] = None,
     ) -> None:
-        """Store mean-centered unit-norm atom embeddings, chunk embeddings, & selective write gates."""
         ae = np.asarray(atom_embeddings, dtype=np.float32)
         if ae.shape[0] < self.vocab_size:
             pad = np.zeros((self.vocab_size, ae.shape[1]), dtype=np.float32)
@@ -358,7 +369,6 @@ class StatefulContextPolicy:
         self.state = self._make_zero_state()
 
     def _fit_write_gates_from_stream(self, arr: np.ndarray) -> None:
-        """Compute purely data-driven selective entity write gates from token IDF salience."""
         cnts = np.bincount(arr, minlength=self.vocab_size).astype(np.float64)
         cnts[0] = 0.0
         tot = max(float(cnts.sum()), 1.0)
@@ -368,18 +378,16 @@ class StatefulContextPolicy:
         if np.any(nz):
             p10 = float(np.percentile(idf[nz], 10))
             p90 = float(np.percentile(idf[nz], 90))
-            # Smooth sigmoid-like mapping: top ultra-common glue tokens -> ~0.02, rare entities -> ~1.0
             span = max(p90 - p10, 0.5)
             norm = np.clip((idf - p10) / span, 0.0, 1.0)
             wg = (0.015 + 0.985 * (norm ** 1.6)).astype(np.float32)
-            # Blend with any previously configured RC persistence if non-uniform
             if float(np.std(self.write_gate_[1:])) > 0.05:
                 wg = np.clip(0.65 * wg + 0.35 * self.write_gate_, 0.015, 1.0).astype(np.float32)
             wg[0] = 0.0
             self.write_gate_ = wg
 
     # ------------------------------------------------------------------
-    # Native RX 9070 XT OpenCL GPU Training Engine
+    # Native RX 9070 XT OpenCL 2-Layer Residual + Dynamic-Embed GPU Engine
     # ------------------------------------------------------------------
 
     def _ensure_gpu_trainer(self, batch_size: int) -> bool:
@@ -387,7 +395,12 @@ class StatefulContextPolicy:
             return False
         if self._gpu is None:
             acc = OpenCLAccelerator()
-            if acc.available and acc._k_sgemm is not None and acc._k_softmax_ce is not None:
+            if (
+                acc.available
+                and acc._k_sgemm is not None
+                and acc._k_res_fwd is not None
+                and acc._k_emb_gather is not None
+            ):
                 self._gpu = acc
             else:
                 return False
@@ -398,18 +411,9 @@ class StatefulContextPolicy:
 
         self.close_gpu()
         ld, cd, r, v = self.loc_dim, self.ctx_dim, self.gate_dim, self.vocab_size
-        params = {
-            "P_loc": self.P_loc_,
-            "b_loc": self.b_loc_,
-            "P_ctx": self.P_ctx_,
-            "b_ctx": self.b_ctx_,
-            "W_loc": self.W_loc_,
-            "W_ctx": self.W_ctx_,
-            "W_q": self.W_q_,
-            "b_out": self.b_out_,
-        }
         bufs: Dict[str, object] = {}
-        for name, arr in params.items():
+        for name in self._PARAM_NAMES:
+            arr = getattr(self, f"{name}_")
             assert arr is not None
             bufs[f"p_{name}"] = g.create_buffer_from_array(arr)
             bufs[f"g_{name}"] = g.create_empty_buffer(arr.nbytes)
@@ -418,18 +422,32 @@ class StatefulContextPolicy:
             bufs[f"m_{name}"] = g.create_buffer_from_array(m0 if m0 is not None else np.zeros_like(arr))
             bufs[f"v_{name}"] = g.create_buffer_from_array(v0 if v0 is not None else np.zeros_like(arr))
 
-        # Batch activation & gradient scratchpads resident in VRAM
+        # Batch activation & gradient scratchpads permanently in VRAM
         bufs["Xl"] = g.create_empty_buffer(bs * ld * 4)
+        bufs["dXl"] = g.create_empty_buffer(bs * ld * 4)
         bufs["Zc"] = g.create_empty_buffer(bs * cd * 4)
+        bufs["tok_cur"] = g.create_empty_buffer(bs * 4)
+        bufs["tok_prev"] = g.create_empty_buffer(bs * 4)
         bufs["yb"] = g.create_empty_buffer(bs * 4)
+
         bufs["A_pre"] = g.create_empty_buffer(bs * r * 4)
         bufs["G_pre"] = g.create_empty_buffer(bs * r * 4)
         bufs["A"] = g.create_empty_buffer(bs * r * 4)
         bufs["G"] = g.create_empty_buffer(bs * r * 4)
-        bufs["Q"] = g.create_empty_buffer(bs * r * 4)
+        bufs["Q1"] = g.create_empty_buffer(bs * r * 4)
+
+        bufs["H2_pre"] = g.create_empty_buffer(bs * r * 4)
+        bufs["G2_pre"] = g.create_empty_buffer(bs * r * 4)
+        bufs["H2"] = g.create_empty_buffer(bs * r * 4)
+        bufs["G2"] = g.create_empty_buffer(bs * r * 4)
+        bufs["Q2"] = g.create_empty_buffer(bs * r * 4)
+
         bufs["logits"] = g.create_empty_buffer(bs * v * 4)
         bufs["losses"] = g.create_empty_buffer(bs * 4)
-        bufs["dQ"] = g.create_empty_buffer(bs * r * 4)
+        bufs["dQ2"] = g.create_empty_buffer(bs * r * 4)
+        bufs["dH2_pre"] = g.create_empty_buffer(bs * r * 4)
+        bufs["dG2_pre"] = g.create_empty_buffer(bs * r * 4)
+        bufs["dQ1"] = g.create_empty_buffer(bs * r * 4)
         bufs["dA_pre"] = g.create_empty_buffer(bs * r * 4)
         bufs["dG_pre"] = g.create_empty_buffer(bs * r * 4)
 
@@ -443,59 +461,98 @@ class StatefulContextPolicy:
             return
         g = self._gpu
         g.finish()
-        for name in ("P_loc", "b_loc", "P_ctx", "b_ctx", "W_loc", "W_ctx", "W_q", "b_out"):
+        for name in self._PARAM_NAMES:
             arr = getattr(self, f"{name}_")
             g.read_buffer(self._gpu_bufs[f"p_{name}"], arr)
 
-    def _gpu_train_batch(self, Xl: np.ndarray, Zc: np.ndarray, yb: np.ndarray, *, read_loss: bool = False) -> float:
+    def _gpu_train_batch(
+        self,
+        Xl: np.ndarray,
+        Zc: np.ndarray,
+        tok_cur: np.ndarray,
+        tok_prev: np.ndarray,
+        yb: np.ndarray,
+        *,
+        read_loss: bool = False,
+    ) -> float:
         g = self._gpu
         assert g is not None
         bufs = self._gpu_bufs
         m_b = int(Xl.shape[0])
-        ld, cd, r, v = self.loc_dim, self.ctx_dim, self.gate_dim, self.vocab_size
+        d, ld, cd, r, v = self.embed_dim, self.loc_dim, self.ctx_dim, self.gate_dim, self.vocab_size
 
         g.write_buffer(bufs["Xl"], Xl)
         g.write_buffer(bufs["Zc"], Zc)
+        g.write_buffer(bufs["tok_cur"], tok_cur)
+        g.write_buffer(bufs["tok_prev"], tok_prev)
         g.write_buffer(bufs["yb"], yb)
 
-        # Forward: A_pre = Xl @ P_loc, G_pre = Zc @ P_ctx, Q = tanh(A_pre+b) * sigmoid(G_pre+b)
+        # 0. Gather live trainable E_dyn[tok_cur], E_dyn[tok_prev] into Xl[:, 0:2D] on GPU!
+        g.launch_embed_gather_2(m_b, d, ld, bufs["tok_cur"], bufs["tok_prev"], bufs["p_E_dyn"], bufs["Xl"])
+
+        # 1. Layer 1: Q1 = tanh(Xl @ P_loc + b_loc) * sigmoid(Zc @ P_ctx + b_ctx)
         g.launch_sgemm(m_b, r, ld, bufs["Xl"], bufs["p_P_loc"], bufs["A_pre"], beta=0.0)
         g.launch_sgemm(m_b, r, cd, bufs["Zc"], bufs["p_P_ctx"], bufs["G_pre"], beta=0.0)
         g.launch_gated_bilinear_fwd(
             m_b, r, bufs["A_pre"], bufs["p_b_loc"], bufs["G_pre"], bufs["p_b_ctx"],
-            bufs["A"], bufs["G"], bufs["Q"],
+            bufs["A"], bufs["G"], bufs["Q1"],
         )
-        # Logits = Xl @ W_loc + Zc @ W_ctx + Q @ W_q  (accumulated directly in VRAM!)
+
+        # 2. Layer 2 (Residual): Q2 = Q1 + tanh(Q1 @ P_h2 + b_h2) * sigmoid(Zc @ P_ctx2 + b_ctx2)
+        g.launch_sgemm(m_b, r, r, bufs["Q1"], bufs["p_P_h2"], bufs["H2_pre"], beta=0.0)
+        g.launch_sgemm(m_b, r, cd, bufs["Zc"], bufs["p_P_ctx2"], bufs["G2_pre"], beta=0.0)
+        g.launch_res_gated_fwd(
+            m_b, r, bufs["Q1"], bufs["H2_pre"], bufs["p_b_h2"], bufs["G2_pre"], bufs["p_b_ctx2"],
+            bufs["H2"], bufs["G2"], bufs["Q2"],
+        )
+
+        # 3. Readout logits + fused Softmax/CE/dL
         g.launch_sgemm(m_b, v, ld, bufs["Xl"], bufs["p_W_loc"], bufs["logits"], beta=0.0)
         g.launch_sgemm(m_b, v, cd, bufs["Zc"], bufs["p_W_ctx"], bufs["logits"], beta=1.0)
-        g.launch_sgemm(m_b, v, r, bufs["Q"], bufs["p_W_q"], bufs["logits"], beta=1.0)
-
-        # Fused Softmax + Cross-Entropy + in-place dL = (probs - onehot) / m_b
+        g.launch_sgemm(m_b, v, r, bufs["Q2"], bufs["p_W_q"], bufs["logits"], beta=1.0)
         g.launch_softmax_ce_grad(m_b, v, bufs["p_b_out"], bufs["yb"], bufs["logits"], bufs["losses"])
 
-        # Backward GEMMs: dW_loc = Xl.T @ dL, dW_ctx = Zc.T @ dL, dW_q = Q.T @ dL
+        # 4. Readout backward
         g.launch_sgemm(ld, v, m_b, bufs["Xl"], bufs["logits"], bufs["g_W_loc"], transA=True, beta=0.0)
         g.launch_sgemm(cd, v, m_b, bufs["Zc"], bufs["logits"], bufs["g_W_ctx"], transA=True, beta=0.0)
-        g.launch_sgemm(r, v, m_b, bufs["Q"], bufs["logits"], bufs["g_W_q"], transA=True, beta=0.0)
+        g.launch_sgemm(r, v, m_b, bufs["Q2"], bufs["logits"], bufs["g_W_q"], transA=True, beta=0.0)
         g.launch_col_sum(m_b, v, bufs["logits"], bufs["g_b_out"])
+        g.launch_sgemm(m_b, r, v, bufs["logits"], bufs["p_W_q"], bufs["dQ2"], transB=True, beta=0.0)
 
-        # Backprop through 2nd-order bilinear gate: dQ = dL @ W_q.T
-        g.launch_sgemm(m_b, r, v, bufs["logits"], bufs["p_W_q"], bufs["dQ"], transB=True, beta=0.0)
-        g.launch_gated_bilinear_bwd(m_b, r, bufs["dQ"], bufs["A"], bufs["G"], bufs["dA_pre"], bufs["dG_pre"])
+        # 5. Layer 2 residual backward: dQ1 = dQ2 + dH2_pre @ P_h2.T
+        g.launch_res_gated_bwd(m_b, r, bufs["dQ2"], bufs["H2"], bufs["G2"], bufs["dH2_pre"], bufs["dG2_pre"])
+        g.launch_sgemm(r, r, m_b, bufs["Q1"], bufs["dH2_pre"], bufs["g_P_h2"], transA=True, beta=0.0)
+        g.launch_sgemm(cd, r, m_b, bufs["Zc"], bufs["dG2_pre"], bufs["g_P_ctx2"], transA=True, beta=0.0)
+        g.launch_col_sum(m_b, r, bufs["dH2_pre"], bufs["g_b_h2"])
+        g.launch_col_sum(m_b, r, bufs["dG2_pre"], bufs["g_b_ctx2"])
+        # dQ1 = dH2_pre @ P_h2.T + dQ2 (use dQ2 copy via beta=1? Reuse dQ1 cleanly: dQ1 = dH2_pre @ P_h2.T + 1.0*dQ2!)
+        # Note: compute dQ1 = dH2_pre @ P_h2.T (beta=0) then add dQ2 via SGEMM? Easier: write dQ1 into dQ2 in-place!
+        g.launch_sgemm(m_b, r, r, bufs["dH2_pre"], bufs["p_P_h2"], bufs["dQ2"], transB=True, beta=1.0)
+
+        # 6. Layer 1 backward (dQ2 now holds exact dQ1 = dQ2_in + dH2_pre @ P_h2.T!)
+        g.launch_gated_bilinear_bwd(m_b, r, bufs["dQ2"], bufs["A"], bufs["G"], bufs["dA_pre"], bufs["dG_pre"])
         g.launch_sgemm(ld, r, m_b, bufs["Xl"], bufs["dA_pre"], bufs["g_P_loc"], transA=True, beta=0.0)
         g.launch_sgemm(cd, r, m_b, bufs["Zc"], bufs["dG_pre"], bufs["g_P_ctx"], transA=True, beta=0.0)
         g.launch_col_sum(m_b, r, bufs["dA_pre"], bufs["g_b_loc"])
         g.launch_col_sum(m_b, r, bufs["dG_pre"], bufs["g_b_ctx"])
 
-        # Fused on-device AdamW updates for all 8 parameter tensors
+        # 7. Embedding gradient: dXl = dL @ W_loc.T + dA_pre @ P_loc.T -> deterministic reduce into g_E_dyn!
+        g.launch_sgemm(m_b, ld, v, bufs["logits"], bufs["p_W_loc"], bufs["dXl"], transB=True, beta=0.0)
+        g.launch_sgemm(m_b, ld, r, bufs["dA_pre"], bufs["p_P_loc"], bufs["dXl"], transB=True, beta=1.0)
+        g.launch_embed_grad_reduce_2(
+            m_b, v, d, ld, bufs["tok_cur"], bufs["tok_prev"], bufs["dXl"], bufs["g_E_dyn"],
+        )
+
+        # 8. On-device AdamW for all 13 parameter tensors
         self._adam_t += 1
         lr_cur = self.lr / float(np.sqrt(1.0 + 0.0010 * self._adam_t))
         bc1 = 1.0 - (0.9 ** self._adam_t)
         bc2 = 1.0 - (0.999 ** self._adam_t)
         step_main = float(lr_cur * np.sqrt(bc2) / max(bc1, 1e-8))
-        step_gate = step_main * 0.80
+        step_gate = step_main * 0.75
+        step_emb = step_main * 0.65
         wd_main = float(1.0 - lr_cur * self.weight_decay)
-        wd_gate = float(1.0 - (lr_cur * 0.80) * self.weight_decay)
+        wd_gate = float(1.0 - (lr_cur * 0.75) * self.weight_decay)
 
         for name, n_el, stp, wds in [
             ("W_loc", ld * v, step_main, wd_main),
@@ -506,6 +563,11 @@ class StatefulContextPolicy:
             ("b_loc", r, step_gate, 1.0),
             ("P_ctx", cd * r, step_gate, wd_gate),
             ("b_ctx", r, step_gate, 1.0),
+            ("P_h2", r * r, step_gate, wd_gate),
+            ("b_h2", r, step_gate, 1.0),
+            ("P_ctx2", cd * r, step_gate, wd_gate),
+            ("b_ctx2", r, step_gate, 1.0),
+            ("E_dyn", v * d, step_emb, wd_gate),
         ]:
             g.launch_adamw_update(
                 n_el, stp, wds,
@@ -520,7 +582,7 @@ class StatefulContextPolicy:
         return 0.0
 
     # ------------------------------------------------------------------
-    # CPU Fallback Optimizer & Unified Streaming Training Driver
+    # Exact CPU Fallback Optimizer & Unified Streaming Training Driver
     # ------------------------------------------------------------------
 
     def _adam_step_cpu(self, name: str, param: np.ndarray, grad: np.ndarray, lr_cur: float) -> None:
@@ -543,20 +605,36 @@ class StatefulContextPolicy:
             param *= np.float32(1.0 - lr_cur * self.weight_decay)
         param -= step_size * (m / (np.sqrt(v) + np.float32(1e-7)))
 
-    def _cpu_train_batch(self, Xl: np.ndarray, Zc: np.ndarray, yb: np.ndarray) -> float:
+    def _cpu_train_batch(
+        self,
+        Xl: np.ndarray,
+        Zc: np.ndarray,
+        tok_cur: np.ndarray,
+        tok_prev: np.ndarray,
+        yb: np.ndarray,
+    ) -> float:
         m_b = int(Xl.shape[0])
+        d = self.embed_dim
+        Xl = Xl.copy()
+        Xl[:, 0:d] = self.E_dyn_[tok_cur]
+        Xl[:, d : 2 * d] = self.E_dyn_[tok_prev]
+
         A = np.tanh(Xl @ self.P_loc_ + self.b_loc_)
         G = _sigmoid(Zc @ self.P_ctx_ + self.b_ctx_)
-        Q = A * G
-        logits = (Xl @ self.W_loc_) + (Zc @ self.W_ctx_) + (Q @ self.W_q_) + self.b_out_
+        Q1 = A * G
+
+        H2 = np.tanh(Q1 @ self.P_h2_ + self.b_h2_)
+        G2 = _sigmoid(Zc @ self.P_ctx2_ + self.b_ctx2_)
+        Q2 = Q1 + H2 * G2
+
+        logits = (Xl @ self.W_loc_) + (Zc @ self.W_ctx_) + (Q2 @ self.W_q_) + self.b_out_
         logits[:, 0] = -1e4
         l_max = logits.max(axis=1, keepdims=True)
         ex = np.exp(np.clip(logits - l_max, -30.0, 0.0))
         probs = ex / np.maximum(ex.sum(axis=1, keepdims=True), 1e-12)
 
         row_idx = np.arange(m_b)
-        p_true = np.clip(probs[row_idx, yb], 1e-9, 1.0)
-        loss_val = float(-np.mean(np.log(p_true)))
+        loss_val = float(-np.mean(np.log(np.clip(probs[row_idx, yb], 1e-9, 1.0))))
 
         dL = probs
         dL[row_idx, yb] -= 1.0
@@ -564,15 +642,30 @@ class StatefulContextPolicy:
 
         dW_loc = Xl.T @ dL
         dW_ctx = Zc.T @ dL
-        dW_q = Q.T @ dL
+        dW_q = Q2.T @ dL
         db_out = dL.sum(axis=0)
-        dQ = dL @ self.W_q_.T
-        dA_pre = dQ * G * (np.float32(1.0) - A * A)
-        dG_pre = dQ * A * G * (np.float32(1.0) - G)
+        dQ2 = dL @ self.W_q_.T
+
+        dH2_pre = dQ2 * G2 * (np.float32(1.0) - H2 * H2)
+        dG2_pre = dQ2 * H2 * G2 * (np.float32(1.0) - G2)
+        dP_h2 = Q1.T @ dH2_pre
+        db_h2 = dH2_pre.sum(axis=0)
+        dP_ctx2 = Zc.T @ dG2_pre
+        db_ctx2 = dG2_pre.sum(axis=0)
+
+        dQ1 = dQ2 + dH2_pre @ self.P_h2_.T
+        dA_pre = dQ1 * G * (np.float32(1.0) - A * A)
+        dG_pre = dQ1 * A * G * (np.float32(1.0) - G)
         dP_loc = Xl.T @ dA_pre
         db_loc = dA_pre.sum(axis=0)
         dP_ctx = Zc.T @ dG_pre
         db_ctx = dG_pre.sum(axis=0)
+
+        dXl = (dL @ self.W_loc_.T) + (dA_pre @ self.P_loc_.T)
+        dE_dyn = np.zeros_like(self.E_dyn_)
+        np.add.at(dE_dyn, tok_cur, dXl[:, 0:d])
+        np.add.at(dE_dyn, tok_prev, dXl[:, d : 2 * d])
+        dE_dyn[0] = 0.0
 
         self._adam_t += 1
         lr_cur = self.lr / float(np.sqrt(1.0 + 0.0010 * self._adam_t))
@@ -580,10 +673,16 @@ class StatefulContextPolicy:
         self._adam_step_cpu("W_ctx", self.W_ctx_, dW_ctx, lr_cur)
         self._adam_step_cpu("W_q", self.W_q_, dW_q, lr_cur)
         self._adam_step_cpu("b_out", self.b_out_, db_out, lr_cur)
-        self._adam_step_cpu("P_loc", self.P_loc_, dP_loc, lr_cur * 0.80)
-        self._adam_step_cpu("b_loc", self.b_loc_, db_loc, lr_cur * 0.80)
-        self._adam_step_cpu("P_ctx", self.P_ctx_, dP_ctx, lr_cur * 0.80)
-        self._adam_step_cpu("b_ctx", self.b_ctx_, db_ctx, lr_cur * 0.80)
+        self._adam_step_cpu("P_loc", self.P_loc_, dP_loc, lr_cur * 0.75)
+        self._adam_step_cpu("b_loc", self.b_loc_, db_loc, lr_cur * 0.75)
+        self._adam_step_cpu("P_ctx", self.P_ctx_, dP_ctx, lr_cur * 0.75)
+        self._adam_step_cpu("b_ctx", self.b_ctx_, db_ctx, lr_cur * 0.75)
+        self._adam_step_cpu("P_h2", self.P_h2_, dP_h2, lr_cur * 0.75)
+        self._adam_step_cpu("b_h2", self.b_h2_, db_h2, lr_cur * 0.75)
+        self._adam_step_cpu("P_ctx2", self.P_ctx2_, dP_ctx2, lr_cur * 0.75)
+        self._adam_step_cpu("b_ctx2", self.b_ctx2_, db_ctx2, lr_cur * 0.75)
+        self._adam_step_cpu("E_dyn", self.E_dyn_, dE_dyn, lr_cur * 0.65)
+        self.E_dyn_[0] = 0.0
         self.total_samples += m_b
         return loss_val
 
@@ -618,7 +717,6 @@ class StatefulContextPolicy:
 
         st = max(int(sample_stride), max((n - 2) // max(int(max_samples), 1000), 1))
         bs = self.batch_size
-        # Use RX 9070 XT GPU whenever batch workload is substantial (n >= 32k)
         on_gpu = (n >= 32_000) and self._ensure_gpu_trainer(bs)
         if not on_gpu:
             self.train_backend = "cpu"
@@ -634,7 +732,7 @@ class StatefulContextPolicy:
             h_s0 = np.zeros(d, dtype=np.float32)
             h_c0 = np.zeros(d, dtype=np.float32)
             h_e0 = np.zeros(d, dtype=np.float32)
-            prev_last_emb = np.zeros(d, dtype=np.float32)
+            prev_last_tok = 0
 
             for start in range(0, n - 2, block_size):
                 end = min(start + block_size, n - 1)
@@ -643,26 +741,20 @@ class StatefulContextPolicy:
                     break
                 blk = arr[start:end]
                 targets = arr[start + 1 : end + 1]
-                X = ae[blk]
-                X_prev = np.empty_like(X)
-                X_prev[0] = prev_last_emb
-                X_prev[1:] = X[:-1]
-                prev_last_emb = X[-1].copy()
+                blk_prev = np.empty_like(blk)
+                blk_prev[0] = prev_last_tok
+                blk_prev[1:] = blk[:-1]
+                prev_last_tok = int(blk[-1])
 
+                X = ae[blk]
                 if a2c is not None and len(ce) > self.vocab_size:
                     X_ch = X.copy()
-                    if start == 0:
-                        pairs_a = blk[:-1].tolist()
-                        pairs_b = blk[1:].tolist()
-                        offset_p = 1
-                    else:
-                        pairs_a = arr[start - 1 : end - 1].tolist()
-                        pairs_b = blk.tolist()
-                        offset_p = 0
+                    pairs_a = blk_prev.tolist()
+                    pairs_b = blk.tolist()
                     c_arr = np.asarray([a2c.get((a, b), 0) for a, b in zip(pairs_a, pairs_b)], dtype=np.int32)
                     hit = c_arr >= self.vocab_size
                     if np.any(hit):
-                        X_ch[np.flatnonzero(hit) + offset_p] = ce[c_arr[hit]]
+                        X_ch[hit] = ce[c_arr[hit]]
                 else:
                     X_ch = X
 
@@ -680,8 +772,12 @@ class StatefulContextPolicy:
                     continue
                 sel = idx[valid_m]
                 y_all = t_sub[valid_m]
+                tc_all = blk[sel]
+                tp_all = blk_prev[sel]
 
-                X_loc_all = np.concatenate([X[sel], X_prev[sel], H_f[sel]], axis=1)
+                # Xl[:, 0:2D] will be filled live from trainable E_dyn[tc], E_dyn[tp]!
+                X_loc_all = np.empty((len(sel), self.loc_dim), dtype=np.float32)
+                X_loc_all[:, 2 * d : 3 * d] = H_f[sel]
                 Z_ctx_all = np.concatenate([H_m[sel], H_s[sel], H_c[sel], H_e[sel], H_f[sel] - H_m[sel]], axis=1)
 
                 n_sel = len(sel)
@@ -692,16 +788,18 @@ class StatefulContextPolicy:
                         continue
                     Xl = np.ascontiguousarray(X_loc_all[b0:b1], dtype=np.float32)
                     Zc = np.ascontiguousarray(Z_ctx_all[b0:b1], dtype=np.float32)
+                    tc = np.ascontiguousarray(tc_all[b0:b1], dtype=np.int32)
+                    tp = np.ascontiguousarray(tp_all[b0:b1], dtype=np.int32)
                     yb = np.ascontiguousarray(y_all[b0:b1], dtype=np.int32)
                     b_counter += 1
                     if on_gpu:
                         read_l = (b_counter % 25 == 0)
-                        lv = self._gpu_train_batch(Xl, Zc, yb, read_loss=read_l)
+                        lv = self._gpu_train_batch(Xl, Zc, tc, tp, yb, read_loss=read_l)
                         if read_l:
                             loss_acc += lv
                             loss_cnt += 1
                     else:
-                        loss_acc += self._cpu_train_batch(Xl, Zc, yb)
+                        loss_acc += self._cpu_train_batch(Xl, Zc, tc, tp, yb)
                         loss_cnt += 1
 
         if on_gpu:
@@ -762,7 +860,7 @@ class StatefulContextPolicy:
         return self
 
     # ------------------------------------------------------------------
-    # Live IN-PLACE Selective State Evolution & 2nd-Order Readout
+    # Live IN-PLACE Selective State Evolution & 2-Layer Residual Readout
     # ------------------------------------------------------------------
 
     def reset_state(self) -> None:
@@ -780,7 +878,6 @@ class StatefulContextPolicy:
         chunk_id: int = 0,
         is_self: bool = False,
     ) -> PersistentContextState:
-        """Modify an EXISTING ``PersistentContextState`` strictly in-place with selective entity lock."""
         if self.atom_emb_ is None:
             return st
         sym = int(symbol)
@@ -788,28 +885,27 @@ class StatefulContextPolicy:
             st.steps += 1
             return st
 
-        e_a = self.atom_emb_[sym]
+        e_anchor = self.atom_emb_[sym]
+        e_dyn = self.E_dyn_[sym] if self.E_dyn_ is not None else e_anchor
         if chunk_id >= self.vocab_size and self.chunk_emb_ is not None and chunk_id < len(self.chunk_emb_):
             e_c = self.chunk_emb_[chunk_id]
         else:
-            e_c = e_a
+            e_c = e_anchor
 
         gf, gm, gs, gc = self.gamma_fast, self.gamma_mid, self.gamma_slow, self.gamma_chunk
-        # Input-selective entity write gate: glue words ~0.003 (virtually zero overwrite!),
-        # rare high-info entities ~0.22 (locks cleanly into h_ent!)
         w_ent = float(self.entity_alpha) * float(self.write_gate_[sym])
         if is_self:
             gs = min(0.992, gs + 0.010)
-            w_ent *= 0.35  # self-emitted words modify h_ent gently, preserving external prompt entities!
+            w_ent *= 0.35
             if st.slow_anchor is None and st.steps >= 4:
                 st.slow_anchor = st.h_slow.copy()
                 st.ent_anchor = st.h_ent.copy()
 
         st.e_prev = st.e_cur
-        st.e_cur = e_a
-        st.h_fast = gf * st.h_fast + (1.0 - gf) * e_a
-        st.h_mid = gm * st.h_mid + (1.0 - gm) * e_a
-        st.h_slow = gs * st.h_slow + (1.0 - gs) * e_a
+        st.e_cur = e_dyn
+        st.h_fast = gf * st.h_fast + (1.0 - gf) * e_anchor
+        st.h_mid = gm * st.h_mid + (1.0 - gm) * e_anchor
+        st.h_slow = gs * st.h_slow + (1.0 - gs) * e_anchor
         st.h_chunk = gc * st.h_chunk + (1.0 - gc) * e_c
         st.h_ent = (1.0 - w_ent) * st.h_ent + w_ent * e_c
         st.steps += 1
@@ -841,11 +937,25 @@ class StatefulContextPolicy:
         assert self.P_loc_ is not None and self.W_loc_ is not None and self.W_q_ is not None and self.b_out_ is not None
         a_h = np.tanh(x_loc @ self.P_loc_ + self.b_loc_)
         if z_ctx is None:
-            g_h = _sigmoid(self.b_ctx_)
-            logits = (x_loc @ self.W_loc_) + ((a_h * g_h) @ self.W_q_) + self.b_out_
+            g1 = _sigmoid(self.b_ctx_)
+            q1 = a_h * g1
+            if self.P_h2_ is not None:
+                h2 = np.tanh(q1 @ self.P_h2_ + self.b_h2_)
+                g2 = _sigmoid(self.b_ctx2_)
+                q2 = q1 + h2 * g2
+            else:
+                q2 = q1
+            logits = (x_loc @ self.W_loc_) + (q2 @ self.W_q_) + self.b_out_
         else:
-            g_h = _sigmoid(z_ctx @ self.P_ctx_ + self.b_ctx_)
-            logits = (x_loc @ self.W_loc_) + (z_ctx @ self.W_ctx_) + ((a_h * g_h) @ self.W_q_) + self.b_out_
+            g1 = _sigmoid(z_ctx @ self.P_ctx_ + self.b_ctx_)
+            q1 = a_h * g1
+            if self.P_h2_ is not None:
+                h2 = np.tanh(q1 @ self.P_h2_ + self.b_h2_)
+                g2 = _sigmoid(z_ctx @ self.P_ctx2_ + self.b_ctx2_)
+                q2 = q1 + h2 * g2
+            else:
+                q2 = q1
+            logits = (x_loc @ self.W_loc_) + (z_ctx @ self.W_ctx_) + (q2 @ self.W_q_) + self.b_out_
         logits[0] = -1e4
         return logits.astype(np.float32, copy=False)
 
@@ -902,7 +1012,8 @@ class StatefulContextPolicy:
 
     def param_bytes(self) -> int:
         tot = 0
-        for arr in (self.P_loc_, self.b_loc_, self.P_ctx_, self.b_ctx_, self.W_loc_, self.W_ctx_, self.W_q_, self.b_out_):
+        for name in self._PARAM_NAMES:
+            arr = getattr(self, f"{name}_", None)
             if arr is not None:
                 tot += int(arr.nbytes)
         return tot

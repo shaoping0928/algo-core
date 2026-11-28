@@ -500,6 +500,8 @@ class TemporaryContextMemory:
             else:
                 matched_u = [sym]
             if ci is not None and matched_u:
+                if hasattr(ci, "update_chunk_commitment"):
+                    ci.update_chunk_commitment(sym, is_self=is_self)
                 ci.observe_units(matched_u, source=source, replaced_atoms=replaced)
             if sp is not None:
                 sp.observe(sym, chunk_id=top_chunk_id, source=source)

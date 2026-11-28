@@ -338,6 +338,105 @@ __kernel void adamw_update_kernel(
     float p = param[gid] * wd_scale - lr_step * (m / (sqrt(v) + 1e-7f));
     param[gid] = p;
 }
+
+// Residual 2nd-layer context-gated forward: H2 = tanh(H2_pre + b_h2), G2 = sigmoid(G2_pre + b_ctx2), Q2 = Q1 + H2 * G2
+__kernel void res_gated_fwd_kernel(
+    const int B,
+    const int R,
+    __global const float* Q1,
+    __global const float* H2_pre,
+    __global const float* b_h2,
+    __global const float* G2_pre,
+    __global const float* b_ctx2,
+    __global float* H2_out,
+    __global float* G2_out,
+    __global float* Q2_out
+) {
+    int gid = get_global_id(0);
+    int tot = B * R;
+    if (gid >= tot) return;
+    int c = gid % R;
+    float h2 = tanh(H2_pre[gid] + b_h2[c]);
+    float g_in = clamp(G2_pre[gid] + b_ctx2[c], -16.0f, 16.0f);
+    float g2 = 1.0f / (1.0f + exp(-g_in));
+    H2_out[gid] = h2;
+    G2_out[gid] = g2;
+    Q2_out[gid] = Q1[gid] + h2 * g2;
+}
+
+// Residual 2nd-layer backward: dH2_pre, dG2_pre from dQ2 (dQ1_res is added via separate SGEMM beta=1)
+__kernel void res_gated_bwd_kernel(
+    const int B,
+    const int R,
+    __global const float* dQ2,
+    __global const float* H2,
+    __global const float* G2,
+    __global float* dH2_pre,
+    __global float* dG2_pre
+) {
+    int gid = get_global_id(0);
+    int tot = B * R;
+    if (gid >= tot) return;
+    float dq = dQ2[gid];
+    float h = H2[gid];
+    float g = G2[gid];
+    dH2_pre[gid] = dq * g * (1.0f - h * h);
+    dG2_pre[gid] = dq * h * g * (1.0f - g);
+}
+
+// Gather dynamic trainable embeddings E_dyn[tok_cur], E_dyn[tok_prev] into Xl[:, 0:2D]
+__kernel void embed_gather_2_kernel(
+    const int B,
+    const int D,
+    const int loc_dim,
+    __global const int* tok_cur,
+    __global const int* tok_prev,
+    __global const float* E_dyn,
+    __global float* Xl
+) {
+    int gid = get_global_id(0);
+    int tot = B * D;
+    if (gid >= tot) return;
+    int r = gid / D;
+    int d = gid - r * D;
+    int c0 = tok_cur[r];
+    int c1 = tok_prev[r];
+    int base = r * loc_dim;
+    Xl[base + d] = E_dyn[c0 * D + d];
+    Xl[base + D + d] = E_dyn[c1 * D + d];
+}
+
+// Deterministic (no atomic contention!) per-vocab-row gather-reduce gradient for E_dyn[V, D]
+__kernel void embed_grad_reduce_2_kernel(
+    const int B,
+    const int V,
+    const int D,
+    const int loc_dim,
+    __global const int* tok_cur,
+    __global const int* tok_prev,
+    __global const float* dXl,
+    __global float* dE_dyn
+) {
+    int gid = get_global_id(0);
+    int tot = V * D;
+    if (gid >= tot) return;
+    int v = gid / D;
+    int d = gid - v * D;
+    if (v == 0) {
+        dE_dyn[gid] = 0.0f;
+        return;
+    }
+    float acc = 0.0f;
+    for (int r = 0; r < B; ++r) {
+        if (tok_cur[r] == v) {
+            acc += dXl[r * loc_dim + d];
+        }
+        if (tok_prev[r] == v) {
+            acc += dXl[r * loc_dim + D + d];
+        }
+    }
+    dE_dyn[gid] = acc;
+}
 """
 
 
@@ -363,6 +462,10 @@ class OpenCLAccelerator:
         self._k_softmax_ce = None
         self._k_col_sum = None
         self._k_adamw = None
+        self._k_res_fwd = None
+        self._k_res_bwd = None
+        self._k_emb_gather = None
+        self._k_emb_grad = None
         self._init_opencl(prefer_vendor=prefer_vendor)
 
     def _init_opencl(self, prefer_vendor: str = "AMD") -> None:
@@ -482,6 +585,10 @@ class OpenCLAccelerator:
         k_sm_ce = ocl.clCreateKernel(prog, b"softmax_ce_grad_kernel", ctypes.byref(err))
         k_col_s = ocl.clCreateKernel(prog, b"col_sum_kernel", ctypes.byref(err))
         k_adamw = ocl.clCreateKernel(prog, b"adamw_update_kernel", ctypes.byref(err))
+        k_res_fwd = ocl.clCreateKernel(prog, b"res_gated_fwd_kernel", ctypes.byref(err))
+        k_res_bwd = ocl.clCreateKernel(prog, b"res_gated_bwd_kernel", ctypes.byref(err))
+        k_emb_g = ocl.clCreateKernel(prog, b"embed_gather_2_kernel", ctypes.byref(err))
+        k_emb_gr = ocl.clCreateKernel(prog, b"embed_grad_reduce_2_kernel", ctypes.byref(err))
 
         self._ocl = ocl
         self._ctx = ctx
@@ -496,6 +603,10 @@ class OpenCLAccelerator:
         self._k_softmax_ce = k_sm_ce
         self._k_col_sum = k_col_s
         self._k_adamw = k_adamw
+        self._k_res_fwd = k_res_fwd
+        self._k_res_bwd = k_res_bwd
+        self._k_emb_gather = k_emb_g
+        self._k_emb_grad = k_emb_gr
         self.platform_name = pname
         self.device_name = dname
         self.compute_units = cu_val
@@ -858,6 +969,122 @@ class OpenCLAccelerator:
         rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_adamw, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
         if rc != 0:
             raise RuntimeError(f"clEnqueueNDRangeKernel(adamw) failed: {rc}")
+
+    def launch_res_gated_fwd(
+        self,
+        B: int,
+        R: int,
+        b_Q1: ctypes.c_void_p,
+        b_H2_pre: ctypes.c_void_p,
+        b_bh2: ctypes.c_void_p,
+        b_G2_pre: ctypes.c_void_p,
+        b_bctx2: ctypes.c_void_p,
+        b_H2: ctypes.c_void_p,
+        b_G2: ctypes.c_void_p,
+        b_Q2: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(B) * int(R)
+        self._set_args(self._k_res_fwd, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(R), 4),
+            (ctypes.c_void_p(b_Q1), vp),
+            (ctypes.c_void_p(b_H2_pre), vp),
+            (ctypes.c_void_p(b_bh2), vp),
+            (ctypes.c_void_p(b_G2_pre), vp),
+            (ctypes.c_void_p(b_bctx2), vp),
+            (ctypes.c_void_p(b_H2), vp),
+            (ctypes.c_void_p(b_G2), vp),
+            (ctypes.c_void_p(b_Q2), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_res_fwd, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(res_fwd) failed: {rc}")
+
+    def launch_res_gated_bwd(
+        self,
+        B: int,
+        R: int,
+        b_dQ2: ctypes.c_void_p,
+        b_H2: ctypes.c_void_p,
+        b_G2: ctypes.c_void_p,
+        b_dH2_pre: ctypes.c_void_p,
+        b_dG2_pre: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(B) * int(R)
+        self._set_args(self._k_res_bwd, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(R), 4),
+            (ctypes.c_void_p(b_dQ2), vp),
+            (ctypes.c_void_p(b_H2), vp),
+            (ctypes.c_void_p(b_G2), vp),
+            (ctypes.c_void_p(b_dH2_pre), vp),
+            (ctypes.c_void_p(b_dG2_pre), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_res_bwd, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(res_bwd) failed: {rc}")
+
+    def launch_embed_gather_2(
+        self,
+        B: int,
+        D: int,
+        loc_dim: int,
+        b_tok_cur: ctypes.c_void_p,
+        b_tok_prev: ctypes.c_void_p,
+        b_Edyn: ctypes.c_void_p,
+        b_Xl: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(B) * int(D)
+        self._set_args(self._k_emb_gather, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(D), 4),
+            (ctypes.c_int32(loc_dim), 4),
+            (ctypes.c_void_p(b_tok_cur), vp),
+            (ctypes.c_void_p(b_tok_prev), vp),
+            (ctypes.c_void_p(b_Edyn), vp),
+            (ctypes.c_void_p(b_Xl), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_emb_gather, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(emb_gather) failed: {rc}")
+
+    def launch_embed_grad_reduce_2(
+        self,
+        B: int,
+        V: int,
+        D: int,
+        loc_dim: int,
+        b_tok_cur: ctypes.c_void_p,
+        b_tok_prev: ctypes.c_void_p,
+        b_dXl: ctypes.c_void_p,
+        b_dEdyn: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(V) * int(D)
+        self._set_args(self._k_emb_grad, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(V), 4),
+            (ctypes.c_int32(D), 4),
+            (ctypes.c_int32(loc_dim), 4),
+            (ctypes.c_void_p(b_tok_cur), vp),
+            (ctypes.c_void_p(b_tok_prev), vp),
+            (ctypes.c_void_p(b_dXl), vp),
+            (ctypes.c_void_p(b_dEdyn), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_emb_grad, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(emb_grad) failed: {rc}")
 
     def info(self) -> dict:
         return dict(

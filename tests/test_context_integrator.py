@@ -217,15 +217,45 @@ class ContextualIntegratorTests(unittest.TestCase):
         if sp_gpu._ensure_gpu_trainer(64):
             Xl = rng.randn(64, sp_cpu.loc_dim).astype(np.float32) * 0.2
             Zc = rng.randn(64, sp_cpu.ctx_dim).astype(np.float32) * 0.2
+            tc = rng.randint(1, 64, size=64, dtype=np.int32)
+            tp = rng.randint(1, 64, size=64, dtype=np.int32)
             yb = rng.randint(1, 64, size=64, dtype=np.int32)
             for _ in range(3):
-                lc = sp_cpu._cpu_train_batch(Xl, Zc, yb)
-                lg = sp_gpu._gpu_train_batch(Xl, Zc, yb, read_loss=True)
+                lc = sp_cpu._cpu_train_batch(Xl, Zc, tc, tp, yb)
+                lg = sp_gpu._gpu_train_batch(Xl, Zc, tc, tp, yb, read_loss=True)
                 self.assertAlmostEqual(lc, lg, places=3)
             sp_gpu._sync_weights_from_gpu()
-            self.assertTrue(np.allclose(sp_cpu.W_q_, sp_gpu.W_q_, atol=2e-4))
-            self.assertTrue(np.allclose(sp_cpu.P_ctx_, sp_gpu.P_ctx_, atol=2e-4))
+            for pname in ("E_dyn_", "P_loc_", "P_ctx_", "P_h2_", "P_ctx2_", "W_q_"):
+                self.assertTrue(
+                    np.allclose(getattr(sp_cpu, pname), getattr(sp_gpu, pname), atol=3e-4),
+                    msg=f"GPU/CPU mismatch on {pname}",
+                )
             sp_gpu.close_gpu()
+
+    def test_whole_chunk_commitment_prevents_half_chunk_splice(self):
+        # Verify ContextualIntegrator commits to completing multi-symbol chunk (20, 21)
+        # once its context-promoted entry atom 20 is emitted in self-mode, and clears after 21.
+        ci = ContextualIntegrator(n_units=45, vocab_size=40, forward_window=20, min_cooc=2, min_pmi=0.2)
+        chunk_to_atoms = {i: (i,) for i in range(40)}
+        chunk_to_atoms[40] = (20, 21)
+        ci._configure_unit_metadata(chunk_to_atoms)
+        ci.forward_graph_ = {10: [(40, 2.0)], 11: [(40, 2.0)]}
+        ci.unit_salience_ = np.ones(45, dtype=np.float32)
+        ci.is_salient_ = np.ones(45, dtype=bool)
+        ci.is_salient_[0] = False
+        ci._fitted = True
+
+        ci.reset()
+        ci.observe_units([10, 11], source="external")
+        ci.update_chunk_commitment(20, is_self=True)
+        nxt_a, c_str = ci.committed_continuation()
+        self.assertEqual(nxt_a, 21)
+        self.assertGreater(c_str, 0.5)
+
+        # Emitting expected atom 21 completes and clears the commitment
+        ci.update_chunk_commitment(21, is_self=True)
+        nxt_after, _ = ci.committed_continuation()
+        self.assertEqual(nxt_after, 0)
 
 
 if __name__ == "__main__":
