@@ -26,7 +26,7 @@ import numpy as np
 
 @dataclass
 class PolicySpec:
-    """Parameter genome of a candidate decision strategy."""
+    """Parameter genome of a candidate decision strategy across all memory layers."""
 
     policy_id: int
     local_weight: float = 0.50
@@ -35,10 +35,28 @@ class PolicySpec:
     cache_lambda: float = 0.35
     active_inject_weight: float = 0.20
     bridge_weight: float = 0.12
+    recency_strength: float = 0.85
+    chunk_weight: float = 0.35
+    frame_weight: float = 0.15
     content_class_gate: bool = True
     lookahead_depth: int = 1
     parent_id: Optional[int] = None
     born_step: int = 0
+
+
+def apply_spec_to_controller(spec: PolicySpec, ctrl) -> None:
+    """Apply a ``PolicySpec`` genome directly onto a ``ContextDrivenDecisionController``."""
+    ctrl.local_weight = float(spec.local_weight)
+    ctrl.semantic_gamma = float(spec.semantic_gamma)
+    ctrl.field_beta = float(spec.field_beta)
+    ctrl.cache_lambda = float(spec.cache_lambda)
+    ctrl.active_inject_weight = float(spec.active_inject_weight)
+    ctrl.bridge_weight = float(spec.bridge_weight)
+    ctrl.recency_strength = float(spec.recency_strength)
+    ctrl.chunk_weight = float(spec.chunk_weight)
+    ctrl.frame_weight = float(spec.frame_weight)
+    ctrl.content_class_gate = bool(spec.content_class_gate)
+    ctrl.lookahead_depth = max(int(spec.lookahead_depth), 1)
 
 
 @dataclass
@@ -116,13 +134,29 @@ class PolicyPopulationManager:
         self.total_evictions = 0
         self.eviction_log: List[Tuple[int, int, str]] = []
 
-        # Seed initial diverse founder population (depth 1, depth 2, gated vs ungated)
+        # Seed diverse founder population spanning all structural & working-memory layers
         self.pool: Dict[int, PolicyStats] = {}
         founders = [
-            dict(active_inject_weight=0.0, bridge_weight=0.0, content_class_gate=True, lookahead_depth=1),
-            dict(active_inject_weight=0.22, bridge_weight=0.12, content_class_gate=True, lookahead_depth=1),
-            dict(active_inject_weight=0.22, bridge_weight=0.12, content_class_gate=True, lookahead_depth=2),
-            dict(active_inject_weight=0.35, bridge_weight=0.20, content_class_gate=False, lookahead_depth=2),
+            dict(
+                active_inject_weight=0.0, bridge_weight=0.0,
+                recency_strength=0.0, chunk_weight=0.0, frame_weight=0.0,
+                content_class_gate=True, lookahead_depth=1,
+            ),
+            dict(
+                active_inject_weight=0.25, bridge_weight=0.14,
+                recency_strength=0.85, chunk_weight=0.0, frame_weight=0.0,
+                content_class_gate=True, lookahead_depth=1,
+            ),
+            dict(
+                active_inject_weight=0.25, bridge_weight=0.14,
+                recency_strength=0.85, chunk_weight=0.30, frame_weight=0.12,
+                content_class_gate=True, lookahead_depth=1,
+            ),
+            dict(
+                active_inject_weight=0.30, bridge_weight=0.18,
+                recency_strength=0.65, chunk_weight=0.50, frame_weight=0.22,
+                content_class_gate=True, lookahead_depth=min(2, self.max_lookahead_depth),
+            ),
         ]
         for cfg in founders:
             spec = PolicySpec(policy_id=self._alloc_id(), born_step=0, **cfg)
@@ -158,12 +192,15 @@ class PolicyPopulationManager:
         gate = (not parent_a.content_class_gate) if self.rng.rand() < 0.25 else parent_a.content_class_gate
         spec = PolicySpec(
             policy_id=self._alloc_id(),
-            local_weight=_mut(parent_a.local_weight, parent_b.local_weight, 0.2, 0.8, 0.08),
+            local_weight=_mut(parent_a.local_weight, parent_b.local_weight, 0.2, 0.85, 0.08),
             semantic_gamma=_mut(parent_a.semantic_gamma, parent_b.semantic_gamma, 0.5, 2.5, 0.25),
             field_beta=_mut(parent_a.field_beta, parent_b.field_beta, 0.2, 1.8, 0.20),
             cache_lambda=_mut(parent_a.cache_lambda, parent_b.cache_lambda, 0.05, 0.55, 0.08),
             active_inject_weight=_mut(parent_a.active_inject_weight, parent_b.active_inject_weight, 0.0, 0.50, 0.08),
             bridge_weight=_mut(parent_a.bridge_weight, parent_b.bridge_weight, 0.0, 0.30, 0.05),
+            recency_strength=_mut(parent_a.recency_strength, parent_b.recency_strength, 0.0, 1.40, 0.16),
+            chunk_weight=_mut(parent_a.chunk_weight, parent_b.chunk_weight, 0.0, 0.70, 0.10),
+            frame_weight=_mut(parent_a.frame_weight, parent_b.frame_weight, 0.0, 0.45, 0.06),
             content_class_gate=gate,
             lookahead_depth=depth,
             parent_id=parent_a.policy_id,
@@ -257,6 +294,10 @@ class PolicyPopulationManager:
             active_gate=bool(inc.spec.content_class_gate),
             active_inj=round(float(inc.spec.active_inject_weight), 3),
             active_br=round(float(inc.spec.bridge_weight), 3),
+            active_recency=round(float(inc.spec.recency_strength), 3),
+            active_chunk=round(float(inc.spec.chunk_weight), 3),
+            active_frame=round(float(inc.spec.frame_weight), 3),
+            active_local=round(float(inc.spec.local_weight), 3),
             active_mean=round(float(inc.mean), 4),
             active_lcb=round(float(inc.lcb(self.z_score)), 4),
         )
