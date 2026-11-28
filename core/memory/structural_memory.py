@@ -105,7 +105,13 @@ class HierarchicalChunkMemory:
             i += 1
         return np.asarray(out, dtype=np.int32)
 
-    def fit(self, tokens: Sequence[int], *, n_workers: int = 1) -> "HierarchicalChunkMemory":
+    def fit(
+        self,
+        tokens: Sequence[int],
+        *,
+        n_workers: int = 1,
+        min_high_order_count: int = 1,
+    ) -> "HierarchicalChunkMemory":
         """Recursively discover high-PMI structural chunks and fit chunk-level transitions."""
         arr = np.clip(
             np.asarray(tokens, dtype=np.int32).reshape(-1),
@@ -192,14 +198,53 @@ class HierarchicalChunkMemory:
         self.chunk_index = SparseFeatureActionIndex(
             tuple(range(self.n_total_units)), prior_weight=0.0,
         )
-        self.chunk_index.fit_token_stream(cur_stream, ctx_len=self.chunk_ctx_len, n_workers=n_workers)
+        self.chunk_index.fit_token_stream(
+            cur_stream, ctx_len=self.chunk_ctx_len,
+            n_workers=n_workers, min_high_order_count=min_high_order_count,
+        )
 
         # Fit abstract Chunk-Class Grammar (Non-Terminals) + Skip-Slot Construction Schemas
-        self._fit_chunk_class_abstraction(cur_stream, n_workers=n_workers)
+        self._fit_chunk_class_abstraction(
+            cur_stream, n_workers=n_workers, min_high_order_count=min_high_order_count,
+        )
         self._fitted = True
         return self
 
-    def _fit_chunk_class_abstraction(self, cur_stream: np.ndarray, *, n_workers: int = 1) -> None:
+    def ingest_chunk(
+        self,
+        tokens: Sequence[int],
+        *,
+        n_workers: int = 4,
+        min_high_order_count: int = 2,
+    ) -> "HierarchicalChunkMemory":
+        """Incrementally parse and ingest a new token chunk into chunk & chunk-class indices."""
+        if not self._fitted or self.chunk_index is None:
+            return self.fit(tokens, n_workers=n_workers)
+        cur = np.clip(np.asarray(tokens, dtype=np.int32).reshape(-1), 0, self.vocab_size - 1)
+        for pair_map in self.level_merges_:
+            cur = self._merge_stream_once(cur, pair_map)
+        if len(cur) <= max(self.chunk_ctx_len, self.chunk_class_ctx_len):
+            return self
+        self.chunk_counts_ += np.bincount(cur, minlength=self.n_total_units).astype(float)
+        self.chunk_index.fit_token_stream(
+            cur, ctx_len=self.chunk_ctx_len,
+            n_workers=n_workers, min_high_order_count=min_high_order_count,
+        )
+        if self.chunk_class_index is not None and self.chunk_to_class_ is not None:
+            cc_stream = self.chunk_to_class_[cur]
+            self.chunk_class_index.fit_token_stream(
+                cc_stream, ctx_len=self.chunk_class_ctx_len,
+                n_workers=n_workers, min_high_order_count=min_high_order_count,
+            )
+        return self
+
+    def _fit_chunk_class_abstraction(
+        self,
+        cur_stream: np.ndarray,
+        *,
+        n_workers: int = 1,
+        min_high_order_count: int = 1,
+    ) -> None:
         """Cluster discovered chunks by left/right distributional context into abstract classes."""
         self.chunk_to_class_ = None
         self.chunk_class_index = None
@@ -292,7 +337,10 @@ class HierarchicalChunkMemory:
         self.chunk_class_index = SparseFeatureActionIndex(
             tuple(range(max_cc + 1)), prior_weight=0.0,
         )
-        self.chunk_class_index.fit_token_stream(cc_stream, ctx_len=self.chunk_class_ctx_len, n_workers=n_workers)
+        self.chunk_class_index.fit_token_stream(
+            cc_stream, ctx_len=self.chunk_class_ctx_len,
+            n_workers=n_workers, min_high_order_count=min_high_order_count,
+        )
 
         # Fit Skip-Slot Construction Schemas: (prev2_anchor_unit, prev1_slot_class) -> next_unit
         if len(cur_stream) >= 4:

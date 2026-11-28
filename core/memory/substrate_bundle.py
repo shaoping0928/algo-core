@@ -97,12 +97,14 @@ class StructuralSubstrateBundle:
         min_chunk_pair = max(min(n_toks // 150_000, 25), 5)
         min_frame_pair = max(min(n_toks // 150_000, 25), 5)
 
+        fit_min_ho = 2 if (post_fit_noise_prune and n_toks >= 500_000) else 1
+
         def _fit_class_policy():
             t = time.perf_counter()
             obj = ClassLevelSequencePolicy(
                 vocab_size=vocab_size, n_classes=n_classes, n_singletons=n_singletons,
                 feature_dim=feature_dim, window=3, seed=seed,
-            ).fit(arr, n_workers=inner_workers)
+            ).fit(arr, n_workers=inner_workers, min_high_order_count=fit_min_ho)
             timings["class_policy"] = round(time.perf_counter() - t, 2)
             return obj
 
@@ -133,7 +135,7 @@ class StructuralSubstrateBundle:
                 enable_chunk_classes=True, n_chunk_classes=n_chunk_classes,
                 n_singleton_chunks=min(32, max(vocab_size // 10, 4)),
                 chunk_class_ctx_len=3, min_schema_count=max(min_chunk_pair // 2, 4), seed=seed,
-            ).fit(arr, n_workers=inner_workers)
+            ).fit(arr, n_workers=inner_workers, min_high_order_count=fit_min_ho)
             timings["chunk_memory"] = round(time.perf_counter() - t, 2)
             return obj
 
@@ -292,9 +294,41 @@ class StructuralSubstrateBundle:
     def govern_memory(self, max_bytes: int = 16 * (1024 ** 3), *, rss_bytes: Optional[int] = None) -> dict:
         """Run memory-pressure governance across all memory reserves in this bundle."""
         gov = MemoryBudgetGovernor(max_bytes=max_bytes)
-        rep = gov.govern([self.class_policy, self.chunk_memory, self.temp_memory], rss_bytes=rss_bytes)
+        rep = gov.govern([self.class_policy, self.chunk_memory, self.virtual_dag, self.temp_memory], rss_bytes=rss_bytes)
         self.metadata["last_memory_governor"] = rep
         return rep
+
+    def ingest_stream_chunk(
+        self,
+        tokens: Sequence[int],
+        *,
+        n_workers: int = 8,
+        max_memory_bytes: int = 16 * (1024 ** 3),
+        min_high_order_count: int = 2,
+    ) -> Dict[str, Any]:
+        """Incrementally ingest an additional macro-chunk in parallel under strict memory governance."""
+        t0 = time.perf_counter()
+        arr = np.clip(np.asarray(tokens, dtype=np.int32).reshape(-1), 0, self.vocab_size - 1)
+        nw_each = max(int(n_workers) // 2, 1)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f1 = ex.submit(
+                self.class_policy.ingest_chunk, arr,
+                n_workers=nw_each, min_high_order_count=min_high_order_count,
+            )
+            f2 = ex.submit(
+                self.chunk_memory.ingest_chunk, arr,
+                n_workers=nw_each, min_high_order_count=min_high_order_count,
+            )
+            f1.result()
+            f2.result()
+        self.metadata["train_tokens"] = int(self.metadata.get("train_tokens", 0)) + len(arr)
+        mem_rep = self.govern_memory(max_bytes=max_memory_bytes)
+        return dict(
+            chunk_tokens=len(arr),
+            total_tokens=int(self.metadata["train_tokens"]),
+            seconds=round(time.perf_counter() - t0, 2),
+            memory=mem_rep,
+        )
 
     def save(self, path: str, *, compresslevel: int = 1) -> Dict[str, Any]:
         """Atomically serialize this trained bundle to a reusable compressed checkpoint file."""

@@ -118,6 +118,35 @@ class ScalabilityAndArbitrationTests(unittest.TestCase):
             self.assertEqual(acts1, acts2)
             self.assertTrue(np.allclose(probs1, probs2, atol=1e-6))
 
+    def test_bitpacked_index_matches_shard_count_and_streaming_chunk_ingest(self):
+        from sparse_index import SparseFeatureActionIndex
+        from substrate_bundle import StructuralSubstrateBundle
+
+        rng = np.random.RandomState(99)
+        tokens = rng.randint(1, 50, size=25_000, dtype=np.int32)
+        # Bit-packed path (default for small vocab + ctx_len=4)
+        idx_bp = SparseFeatureActionIndex(tuple(range(50)), prior_weight=0.0).fit_token_stream(
+            tokens, ctx_len=4, n_workers=4, min_high_order_count=1,
+        )
+        # Direct Python shard reference
+        sh_p, sh_kt, sh_gc = SparseFeatureActionIndex._count_shard(tokens.tolist(), 4, len(tokens), 4)
+        self.assertEqual(idx_bp.total_updates, sum(sh_gc.values()))
+        self.assertEqual(set(idx_bp._key_totals.keys()), set(sh_kt.keys()))
+        for fk in list(sh_kt.keys())[:200]:
+            self.assertAlmostEqual(idx_bp._key_totals[fk], sh_kt[fk], places=6)
+
+        # Streaming chunk ingestion on StructuralSubstrateBundle
+        seq1 = np.tile(np.asarray([1, 2, 10, 11, 12, 20, 21], dtype=np.int32), 80)
+        seq2 = np.tile(np.asarray([1, 2, 10, 11, 12, 20, 21], dtype=np.int32), 80)
+        bun = StructuralSubstrateBundle.fit_parallel(
+            seq1, vocab_size=30, n_workers=2, n_classes=6, n_singletons=2,
+            feature_dim=8, max_chunks_per_level=24, n_chunk_classes=6, build_stage_model=False, seed=3,
+        )
+        tot_before = bun.class_policy.class_index.total_updates
+        rep = bun.ingest_stream_chunk(seq2, n_workers=2, min_high_order_count=1)
+        self.assertEqual(rep["total_tokens"], len(seq1) + len(seq2))
+        self.assertGreater(bun.class_policy.class_index.total_updates, tot_before)
+
 
 if __name__ == "__main__":
     unittest.main()

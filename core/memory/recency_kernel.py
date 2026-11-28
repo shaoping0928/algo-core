@@ -196,7 +196,10 @@ class LearnedRecencyLagKernel:
                 if not post:
                     return 0.0
                 bkt = post.get(next_s)
-                return float(bkt[0]) / float(tot) if bkt is not None else 0.0
+                if bkt is None:
+                    return 0.0
+                cnt = float(bkt[0]) if isinstance(bkt, list) else float(bkt)
+                return cnt / float(tot)
             assert fallback_bg is not None and fallback_tot is not None
             tot = fallback_tot.get(prev_s, 0.0)
             if tot <= 0.0:

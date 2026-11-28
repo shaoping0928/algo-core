@@ -261,7 +261,12 @@ class HierarchicalSequenceStageModel:
             tot = totals.get(fk, 0.0)
             if tot > 0.0:
                 bucket = postings[fk].get(int(tokens[i]))
-                cnt = bucket[0] if bucket is not None else 0.0
+                if bucket is None:
+                    cnt = 0.0
+                elif isinstance(bucket, list):
+                    cnt = float(bucket[0])
+                else:
+                    cnt = float(bucket)
                 p = (cnt + 0.5) / (tot + 1.0)
             else:
                 p = 1.0 / float(self.vocab_size)

@@ -219,7 +219,8 @@ class ContextDrivenDecisionController:
         bucket = post.get(int(target))
         if bucket is None:
             return 0.0, 0.0
-        p_loc = max(float(bucket[0]) - 0.5, 0.0) / float(tot)
+        b_cnt = float(bucket[0]) if isinstance(bucket, list) else float(bucket)
+        p_loc = max(b_cnt - 0.5, 0.0) / float(tot)
         gl = self.class_policy.feature_map.global_probs_
         g_p = float(gl[int(target)]) if gl is not None and int(target) < len(gl) else 1e-4
         lift = p_loc / max(g_p, 1e-8)
