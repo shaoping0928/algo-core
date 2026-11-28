@@ -74,10 +74,20 @@ class ClassLevelSequencePolicy:
         arr = np.clip(
             np.asarray(tokens, dtype=np.int32).reshape(-1), 0, self.vocab_size - 1,
         )
-        # 1. Learn distributional features for every symbol
+        # 1. Learn distributional features for every symbol + mean-centered isotropic view
+        #    (removes shared embedding-cone anisotropy so cosine discriminates topics!)
         self.feature_map.fit(arr)
         emb = self.feature_map.embeddings_
         counts = np.bincount(arr, minlength=self.vocab_size).astype(float)
+        valid_e = (np.arange(self.vocab_size) > 0) & (counts > 0)
+        if np.any(valid_e):
+            self.emb_mean_ = emb[valid_e].mean(axis=0).astype(np.float32)
+        else:
+            self.emb_mean_ = np.zeros(emb.shape[1], dtype=np.float32)
+        ec = emb.astype(np.float32) - self.emb_mean_[None, :]
+        ec_n = np.maximum(np.linalg.norm(ec, axis=1, keepdims=True), 1e-8)
+        self.emb_centered_norm_ = (ec / ec_n).astype(np.float32)
+        self.emb_centered_norm_[0] = 0.0
 
         # 2. Data-driven split: top-frequency skeleton symbols become singleton
         #    classes so they do not form a giant black-hole cluster; remaining
@@ -200,7 +210,9 @@ class ClassLevelSequencePolicy:
         if self.sym_to_class_ is None or self.feature_map.embeddings_ is None:
             raise RuntimeError("fit ClassLevelSequencePolicy before predicting")
         cls_ids, cls_probs = self.predict_next_classes(ctx_tokens, top_c=top_c)
-        emb = self.feature_map.embeddings_
+        emb = getattr(self, "emb_centered_norm_", None)
+        if emb is None:
+            emb = self.feature_map.embeddings_
 
         # Precompute normalized slow-state direction for semantic emission
         g_u = None
@@ -270,7 +282,10 @@ class ClassLevelSequencePolicy:
         if sym_i <= 0 or sym_i >= self.vocab_size:
             return h_vec
         a = min(self.ema_alpha * float(self.feature_map.salience_[sym_i]), 0.4)
-        return ((1.0 - a) * h_vec + a * self.feature_map.embeddings_[sym_i]).astype(np.float32)
+        e_mat = getattr(self, "emb_centered_norm_", None)
+        if e_mat is None:
+            e_mat = self.feature_map.embeddings_
+        return ((1.0 - a) * h_vec + a * e_mat[sym_i]).astype(np.float32)
 
     def inspect_classes(self, itos: Sequence[str], n_show: int = 12, top_m: int = 12) -> List[Tuple[int, int, List[str]]]:
         """Return ``[(class_id, size, top_member_chars)]`` sorted by class size."""

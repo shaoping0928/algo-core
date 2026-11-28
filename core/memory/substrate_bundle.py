@@ -27,6 +27,7 @@ import numpy as np
 from class_policy import ClassLevelSequencePolicy
 from compression_tree import HierarchicalStageTree, LearnedDrillDownPolicy, SelfDiscoveredRoleExtractor
 from context_decision import ContextDrivenDecisionController, LearnedClassContextGate
+from context_integrator import ContextualIntegrator
 from hierarchical_arbitrator import HierarchicalOnlineArbitrator
 from memory_governor import MemoryBudgetGovernor, current_rss_bytes
 from recency_kernel import LearnedRecencyLagKernel
@@ -52,6 +53,7 @@ class StructuralSubstrateBundle:
     stage_model: Optional[HierarchicalSequenceStageModel] = None
     role_extractor: Optional[SelfDiscoveredRoleExtractor] = None
     drill_policy: Optional[LearnedDrillDownPolicy] = None
+    context_integrator: Optional[ContextualIntegrator] = None
     vocab: Optional[Dict[str, int]] = None
     itos: Optional[List[str]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -193,12 +195,45 @@ class StructuralSubstrateBundle:
             fm = _fit_frames()
             stage_model, role_ext, drill_pol = _fit_stage()
 
-        # Phase 2: Fit unbiased recency-lag saturation kernel reusing pol classes & local index
-        t_rec = time.perf_counter()
-        rec_kern = LearnedRecencyLagKernel(
-            vocab_size=vocab_size, n_classes=pol.n_classes,
-        ).fit(arr, sym_to_class=pol.sym_to_class_, local_index=pol.local_index, max_samples=120_000)
-        timings["recency_kernel"] = round(time.perf_counter() - t_rec, 2)
+        # Phase 2: Fit unbiased recency-lag saturation kernel & chunk-level ContextualIntegrator concurrently
+        def _fit_recency():
+            t = time.perf_counter()
+            obj = LearnedRecencyLagKernel(
+                vocab_size=vocab_size, n_classes=pol.n_classes,
+            ).fit(arr, sym_to_class=pol.sym_to_class_, local_index=pol.local_index, max_samples=120_000)
+            timings["recency_kernel"] = round(time.perf_counter() - t, 2)
+            return obj
+
+        def _fit_ctx_integrator():
+            t = time.perf_counter()
+            parsed = cm.parse_stream(arr)
+            ci = ContextualIntegrator(
+                n_units=cm.n_total_units,
+                vocab_size=vocab_size,
+                forward_window=48,
+                top_targets_per_cue=48,
+                min_cooc=max(min_cooc, 3),
+                min_pmi=0.85,
+            ).fit_unit_stream(
+                parsed,
+                chunk_to_atoms=cm.chunk_to_atoms_,
+                stride=max(tcm_stride, 2),
+                max_centers=600_000,
+            )
+            timings["context_integrator"] = round(time.perf_counter() - t, 2)
+            return ci
+
+        if outer_workers > 1:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                f_rec = ex.submit(_fit_recency)
+                f_ci = ex.submit(_fit_ctx_integrator)
+                rec_kern = f_rec.result()
+                ctx_int = f_ci.result()
+        else:
+            rec_kern = _fit_recency()
+            ctx_int = _fit_ctx_integrator()
+
+        tcm.attach_context_integrator(ctx_int, cm)
 
         # Phase 3: Optional built-in tail-noise pruning (cuts ~80% count=1 high-order noise
         #          while preserving or slightly improving held-out accuracy) + 16GB governance
@@ -210,7 +245,7 @@ class StructuralSubstrateBundle:
             noise_evicted += dag.prune_under_pressure(p_np)
             import gc as _gc
             _gc.collect()
-        mem_report = governor.govern([pol, cm, dag, tcm])
+        mem_report = governor.govern([pol, cm, dag, tcm, ctx_int])
         total_wall = round(time.perf_counter() - t_start, 2)
 
         bundle = cls(
@@ -226,6 +261,7 @@ class StructuralSubstrateBundle:
             stage_model=stage_model,
             role_extractor=role_ext,
             drill_policy=drill_pol,
+            context_integrator=ctx_int,
             vocab=vocab,
             itos=list(itos) if itos is not None else None,
             metadata=dict(
@@ -289,12 +325,16 @@ class StructuralSubstrateBundle:
             frame_memory=self.frame_memory,
             frame_weight=0.15,
             arbitrator=self.arbitrator if use_arbitrator else None,
+            context_integrator=self.context_integrator,
         )
 
     def govern_memory(self, max_bytes: int = 16 * (1024 ** 3), *, rss_bytes: Optional[int] = None) -> dict:
         """Run memory-pressure governance across all memory reserves in this bundle."""
         gov = MemoryBudgetGovernor(max_bytes=max_bytes)
-        rep = gov.govern([self.class_policy, self.chunk_memory, self.virtual_dag, self.temp_memory], rss_bytes=rss_bytes)
+        targets = [self.class_policy, self.chunk_memory, self.virtual_dag, self.temp_memory]
+        if self.context_integrator is not None:
+            targets.append(self.context_integrator)
+        rep = gov.govern(targets, rss_bytes=rss_bytes)
         self.metadata["last_memory_governor"] = rep
         return rep
 
@@ -310,15 +350,21 @@ class StructuralSubstrateBundle:
         t0 = time.perf_counter()
         arr = np.clip(np.asarray(tokens, dtype=np.int32).reshape(-1), 0, self.vocab_size - 1)
         nw_each = max(int(n_workers) // 2, 1)
+
+        def _ingest_chunks_and_ctx():
+            parsed = self.chunk_memory.parse_stream(arr)
+            self.chunk_memory.ingest_chunk(
+                arr, n_workers=nw_each, min_high_order_count=min_high_order_count,
+            )
+            if self.context_integrator is not None:
+                self.context_integrator.ingest_unit_chunk(parsed, stride=4, max_centers=300_000)
+
         with ThreadPoolExecutor(max_workers=2) as ex:
             f1 = ex.submit(
                 self.class_policy.ingest_chunk, arr,
                 n_workers=nw_each, min_high_order_count=min_high_order_count,
             )
-            f2 = ex.submit(
-                self.chunk_memory.ingest_chunk, arr,
-                n_workers=nw_each, min_high_order_count=min_high_order_count,
-            )
+            f2 = ex.submit(_ingest_chunks_and_ctx)
             f1.result()
             f2.result()
         self.metadata["train_tokens"] = int(self.metadata.get("train_tokens", 0)) + len(arr)

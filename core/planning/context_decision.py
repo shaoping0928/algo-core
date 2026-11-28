@@ -128,6 +128,9 @@ class ContextDrivenDecisionController:
         frame_weight: float = 0.18,
         arbitrator: Optional[HierarchicalOnlineArbitrator] = None,
         circuit_diff_weight: float = 0.60,
+        context_integrator: Optional[object] = None,
+        context_fusion_beta: float = 0.42,
+        self_context_beta: float = 1.25,
     ):
         self.class_policy = class_policy
         self.virtual_dag = virtual_dag
@@ -163,6 +166,13 @@ class ContextDrivenDecisionController:
         self.frame_weight = float(frame_weight)
         self.arbitrator = arbitrator
         self.circuit_diff_weight = float(circuit_diff_weight)
+        self.context_integrator = (
+            context_integrator
+            if context_integrator is not None
+            else getattr(temp_memory, "_context_integrator", None)
+        )
+        self.context_fusion_beta = float(context_fusion_beta)
+        self.self_context_beta = float(self_context_beta)
 
         self._anchor_state: Optional[np.ndarray] = None
         self._tree_root_slots: Dict[int, float] = {}
@@ -472,6 +482,36 @@ class ContextDrivenDecisionController:
                 excitation_scale=(0.20 if is_self_mode else 1.0),
             )
 
+        # 5b. Multi-Cue Long-Range Contextual Integration (Content-Gated Bayes Posterior Fusion):
+        #     Gated by BOTH local entropy (open slots) AND learned_class_gate (content vs
+        #     skeleton slots) so long-range context steers content concepts without ever
+        #     corrupting grammatical function-word slots.
+        ci = self.context_integrator
+        if ci is not None and getattr(ci, "_fitted", False):
+            atom_llr = ci.contextual_atom_llr()
+            if atom_llr:
+                prev1_ctx = int(ctx_tokens[-1]) if len(ctx_tokens) > 0 else 0
+                c_gate = float(info.get("content_gate", 1.0))
+                base_beta = self.self_context_beta if is_self_mode else self.context_fusion_beta
+                eff_beta = float(base_beta) * float(ent_gate ** 1.25) * float(np.clip(c_gate, 0.10, 1.0))
+                if eff_beta > 0.02:
+                    # Context-first candidate pool expansion at open content slots
+                    # (strictly gated by fluent local transition lift >= 1.0)
+                    if prev1_ctx > 0 and ent_gate >= 0.35 and c_gate >= 0.30 and score_map:
+                        min_base = min(score_map.values())
+                        top_ctx = sorted(atom_llr.items(), key=lambda kv: kv[1], reverse=True)[:28]
+                        for c_atom, c_llr in top_ctx:
+                            if c_atom > 0 and c_atom != prev1_ctx and c_atom not in score_map and c_llr >= 0.60:
+                                p_loc, lift = self._local_pair_prob_and_lift(prev1_ctx, c_atom)
+                                if p_loc > 0.0 and lift >= 1.0:
+                                    score_map[c_atom] = max(min(p_loc * 0.45, min_base * 1.4), min_base * 0.35)
+                    # Bayesian posterior re-weighting: P(y | L, C) \propto P(y | L) * exp(beta(H, G) * E_ctx(y))
+                    cap_exp = 2.4 if is_self_mode else 1.5
+                    for a in list(score_map.keys()):
+                        llr_a = atom_llr.get(a, 0.0)
+                        if llr_a > 0.0:
+                            score_map[a] *= float(np.exp(min(eff_beta * llr_a, cap_exp)))
+
         # 6. Electronic Circuit Differentiator (high-pass V_diff = V_cap - V_int):
         #    propels unexpressed context neighbors (V_diff > 0) and naturally adapts
         #    downward on integrator-saturated nodes (V_diff < 0) without artificial bans.
@@ -601,6 +641,11 @@ class ContextDrivenDecisionController:
         gl_probs = self.class_policy.feature_map.global_probs_
         anchor = self._anchor_state
         anchor_norm = float(np.linalg.norm(anchor)) if anchor is not None else 0.0
+        ci_llr = (
+            self.context_integrator.contextual_atom_llr()
+            if (self.context_integrator is not None and getattr(self.context_integrator, "_fitted", False))
+            else {}
+        )
 
         def _step_utility(
             prev_sym: int,
@@ -627,7 +672,9 @@ class ContextDrivenDecisionController:
             else:
                 f_bonus = 0.18 * float(eff_field[sym]) / f_max if sym > 0 else 0.0
             if branch_vdiff is not None and 0 < sym < len(branch_vdiff):
-                f_bonus += 0.25 * float(np.clip(branch_vdiff[sym], -1.8, 1.2))
+                f_bonus += 0.28 * float(np.clip(branch_vdiff[sym], -2.0, 1.2))
+            if ci_llr and sym in ci_llr:
+                f_bonus += 0.38 * min(float(ci_llr[sym]), 3.0)
             # 3. Persistent macro-topic anchor alignment
             a_bonus = 0.0
             if anchor is not None and anchor_norm > 1e-8 and next_h is not None and len(next_h) == len(anchor):

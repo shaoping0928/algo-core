@@ -304,6 +304,14 @@ class TemporaryContextMemory:
         cf = getattr(self, "circuit_field", None)
         if cf is not None:
             cf.reset()
+        ci = getattr(self, "_context_integrator", None)
+        if ci is not None:
+            ci.reset()
+
+    def attach_context_integrator(self, context_integrator: object, chunk_memory: object) -> None:
+        """Bind a ``ContextualIntegrator`` + ``HierarchicalChunkMemory`` for live chunk-slot updates."""
+        self._context_integrator = context_integrator
+        self._chunk_memory_ref = chunk_memory
 
     def pin_root_context(self) -> None:
         """Snapshot the current active field as persistent episode root summary."""
@@ -464,6 +472,22 @@ class TemporaryContextMemory:
         if len(self._recent) > self.max_recent:
             self._recent = self._recent[-self.max_recent :]
         self._steps += 1
+        # Feed live matched chunk unit (or salient atom) into persistent ContextualIntegrator
+        ci = getattr(self, "_context_integrator", None)
+        if ci is not None:
+            cm_ref = getattr(self, "_chunk_memory_ref", None)
+            replaced: List[int] = []
+            if cm_ref is not None and hasattr(cm_ref, "match_suffix_units"):
+                matched_u = cm_ref.match_suffix_units(self._recent[-6:])
+                if matched_u and matched_u[0] >= self.vocab_size:
+                    # A multi-symbol chunk just completed -> upgrade its constituent prefix atoms
+                    atoms_c = cm_ref.chunk_to_atoms_.get(matched_u[0], ())
+                    if len(atoms_c) >= 2:
+                        replaced = [int(a) for a in atoms_c[:-1]]
+            else:
+                matched_u = [sym]
+            if matched_u:
+                ci.observe_units(matched_u, source=source, replaced_atoms=replaced)
         self._rebuild_corroborated_field()
 
     def episodic_cache_probs(self, ctx_tokens: Sequence[int]) -> Dict[int, float]:

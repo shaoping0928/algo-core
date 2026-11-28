@@ -210,6 +210,33 @@ class HierarchicalChunkMemory:
         self._fitted = True
         return self
 
+    def parse_stream(self, tokens: Sequence[int]) -> np.ndarray:
+        """Parse an atomic token stream into hierarchical chunk unit IDs."""
+        cur = np.clip(np.asarray(tokens, dtype=np.int32).reshape(-1), 0, self.vocab_size - 1)
+        for pair_map in self.level_merges_:
+            cur = self._merge_stream_once(cur, pair_map)
+        return cur
+
+    def match_suffix_units(self, recent_atoms: Sequence[int]) -> List[int]:
+        """Return matched chunk unit IDs ending at ``recent_atoms[-1]`` (longest first + atom)."""
+        n = len(recent_atoms)
+        if n == 0:
+            return []
+        last_a = int(recent_atoms[-1])
+        if last_a <= 0 or last_a >= self.vocab_size:
+            return []
+        matched: List[int] = []
+        max_l = min(self.max_chunk_len, n)
+        a2c = self.atoms_to_chunk_
+        for length in range(max_l, 1, -1):
+            key = tuple(int(x) for x in recent_atoms[n - length : n])
+            cid = a2c.get(key)
+            if cid is not None and cid >= self.vocab_size:
+                matched.append(int(cid))
+        if not matched:
+            matched.append(last_a)
+        return matched
+
     def ingest_chunk(
         self,
         tokens: Sequence[int],
@@ -219,10 +246,8 @@ class HierarchicalChunkMemory:
     ) -> "HierarchicalChunkMemory":
         """Incrementally parse and ingest a new token chunk into chunk & chunk-class indices."""
         if not self._fitted or self.chunk_index is None:
-            return self.fit(tokens, n_workers=n_workers)
-        cur = np.clip(np.asarray(tokens, dtype=np.int32).reshape(-1), 0, self.vocab_size - 1)
-        for pair_map in self.level_merges_:
-            cur = self._merge_stream_once(cur, pair_map)
+            return self.fit(tokens, n_workers=n_workers, min_high_order_count=min_high_order_count)
+        cur = self.parse_stream(tokens)
         if len(cur) <= max(self.chunk_ctx_len, self.chunk_class_ctx_len):
             return self
         self.chunk_counts_ += np.bincount(cur, minlength=self.n_total_units).astype(float)
