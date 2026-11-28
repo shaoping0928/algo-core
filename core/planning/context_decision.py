@@ -116,15 +116,15 @@ class ContextDrivenDecisionController:
         learned_class_gate: Optional[LearnedClassContextGate] = None,
         lookahead_depth: int = 1,
         lookahead_beam: int = 4,
-        lookahead_pmi_alpha: float = 0.35,
+        lookahead_pmi_alpha: float = 0.18,
         lookahead_anchor_weight: float = 0.25,
         lookahead_stagnation_weight: float = 0.65,
         recency_kernel: Optional[LearnedRecencyLagKernel] = None,
         recency_strength: float = 0.85,
         chunk_memory: Optional[HierarchicalChunkMemory] = None,
-        chunk_weight: float = 0.45,
+        chunk_weight: float = 0.38,
         frame_memory: Optional[StructuralFrameMemory] = None,
-        frame_weight: float = 0.25,
+        frame_weight: float = 0.18,
     ):
         self.class_policy = class_policy
         self.virtual_dag = virtual_dag
@@ -362,13 +362,16 @@ class ContextDrivenDecisionController:
         chunk_inter = 0.0
         if self.chunk_memory is not None and self.chunk_memory._fitted and self.chunk_weight > 0.0:
             ch_acts, ch_probs, ch_info = self.chunk_memory.predict_next_atoms(
-                hist_src, k=max(int(k) * 2, 16),
+                hist_src,
+                slow_state=slow_state,
+                atom_embeddings=self.class_policy.feature_map.embeddings_,
+                local_prob_fn=self._local_pair_prob_and_lift,
+                k=max(int(k) * 2, 16),
             )
             chunk_intra = float(ch_info.get("intra_mass", 0.0))
             chunk_inter = float(ch_info.get("inter_mass", 0.0))
             chunk_conf = float(ch_info.get("chunk_conf", 0.5))
             if len(ch_acts) > 0:
-                # Normalize score_map before convex interpolation with chunk distribution
                 sm_sum = float(sum(score_map.values()))
                 if sm_sum > 0.0:
                     inv_sm = 1.0 / sm_sum
@@ -466,14 +469,16 @@ class ContextDrivenDecisionController:
             prev_h: Optional[np.ndarray],
             next_h: Optional[np.ndarray],
         ) -> float:
-            # 1. Conditional PMI information progress: log P(a|ctx) - alpha * log P_global(a)
+            # 1. Conditional PMI information progress with floored marginal (1e-3):
+            #    penalizes ubiquitous zero-info sinks (g_p ~ 0.05) without over-rewarding
+            #    ultra-rare idioms (g_p ~ 1e-4) over regular content symbols.
             ll = float(np.log(max(float(prob), 1e-9)))
             g_p = (
                 float(gl_probs[sym])
                 if gl_probs is not None and 0 <= sym < len(gl_probs)
                 else 1e-3
             )
-            pmi_term = ll - self.lookahead_pmi_alpha * float(np.log(max(g_p, 1e-6)))
+            pmi_term = ll - self.lookahead_pmi_alpha * float(np.log(max(g_p, 1e-3)))
             # 2. Active working-memory + stage-tree field alignment
             f_bonus = 0.18 * float(eff_field[sym]) / f_max if sym > 0 else 0.0
             # 3. Persistent macro-topic anchor alignment

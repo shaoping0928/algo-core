@@ -122,6 +122,48 @@ class HigherOrderStructuralMemoryTests(unittest.TestCase):
         self.assertEqual(acts[0], 20, f"Expected delayed closer 20, got {acts} ({info})")
         self.assertGreater(info["frame_closers"], 0.0)
 
+    def test_chunk_class_abstraction_generalizes_to_unseen_skip_slot_composition(self):
+        from structural_memory import HierarchicalChunkMemory
+
+        # Three interchangeable 2-atom middle macro-options: (10,11), (12,13), (14,15)
+        # Training ONLY sees:
+        #   Anchor 5 + { (10,11), (12,13) } -> Goal (20,21)
+        #   Anchor 6 + { (10,11), (12,13), (14,15) } -> Goal (22,23)
+        #   Shared neutral frame 7 + { (10,11), (12,13), (14,15) } -> 8
+        # NEVER SEEN IN TRAINING: Anchor 5 + (14,15) -> must generalize via skip-slot schema to 20!
+        rng = np.random.RandomState(13)
+        seq = []
+        for _ in range(180):
+            r = rng.rand()
+            if r < 0.30:
+                mid = [10, 11] if rng.rand() < 0.5 else [12, 13]
+                seq.extend([1, 5] + mid + [20, 21, 1])
+            elif r < 0.65:
+                mid = [[10, 11], [12, 13], [14, 15]][int(rng.randint(3))]
+                seq.extend([1, 6] + mid + [22, 23, 1])
+            else:
+                mid = [[10, 11], [12, 13], [14, 15]][int(rng.randint(3))]
+                seq.extend([1, 7] + mid + [8, 1])
+            seq.extend([int(rng.randint(2, 5))])
+        tokens = np.asarray(seq, dtype=np.int32)
+
+        cm = HierarchicalChunkMemory(
+            vocab_size=30, max_levels=1, max_chunks_per_level=32,
+            min_pair_count=10, min_pmi=1.2, max_chunk_len=2, chunk_ctx_len=2,
+            enable_chunk_classes=True, n_chunk_classes=6, n_singleton_chunks=6,
+            min_schema_count=5, seed=7,
+        ).fit(tokens)
+
+        self.assertIsNotNone(cm.chunk_to_class_)
+        self.assertGreater(len(cm.skip_schemas_), 0)
+        # All three middle macros should be discovered chunks
+        for pair in ((10, 11), (12, 13), (14, 15)):
+            self.assertIn(pair, cm.atoms_to_chunk_)
+        # Zero-shot unseen composition [1, 5, 14, 15] -> skip-slot schema (5, CC_MID) boosts 20!
+        acts_zs, probs_zs, info_zs = cm.predict_next_atoms([1, 5, 14, 15], k=6)
+        self.assertIn(20, acts_zs[:3], f"Expected zero-shot schema target 20 in top-3, got {acts_zs} ({info_zs})")
+        self.assertGreater(info_zs["class_mass"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
