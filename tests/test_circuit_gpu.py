@@ -103,6 +103,82 @@ class CircuitFieldAndGPUTests(unittest.TestCase):
         finally:
             cf.close()
 
+    def test_gpu_beam_engine_matches_cpu_across_multi_depth_forks(self):
+        from circuit_field import ElectronicCircuitNodeField
+        from opencl_gpu import OpenCLAccelerator
+
+        acc = OpenCLAccelerator()
+        if not acc.available:
+            self.skipTest("No OpenCL GPU available on this host")
+
+        rng = np.random.RandomState(19)
+        n_nodes = 256
+        assoc = {
+            i: [(int((i + s) % n_nodes), float(rng.uniform(0.1, 0.7))) for s in (1, 5, 17)]
+            for i in range(n_nodes)
+        }
+        vcap0 = rng.uniform(0.0, 1.0, size=(1, n_nodes)).astype(np.float32)
+        vint0 = rng.uniform(0.0, 0.5, size=(1, n_nodes)).astype(np.float32)
+
+        cf_cpu = ElectronicCircuitNodeField(n_nodes, batch_size=1, use_gpu=False)
+        cf_gpu = ElectronicCircuitNodeField(n_nodes, batch_size=1, use_gpu=True, accelerator=acc)
+        try:
+            cf_cpu.set_sparse_coupling(assoc)
+            cf_gpu.set_sparse_coupling(assoc)
+            eng_c = cf_cpu.get_beam_engine(max_branches=32)
+            eng_g = cf_gpu.get_beam_engine(max_branches=32)
+            eng_c.seed_root(vcap0, vint0)
+            eng_g.seed_root(vcap0, vint0)
+
+            # Depth 1: 1 -> 8 branches
+            p1 = [0] * 8
+            a1 = [10, 20, 30, 40, 50, 60, 70, 80]
+            s1 = [1.2, 0.0, 0.9, 1.5, 0.0, 1.1, 0.8, 1.3]
+            vd_c1, vo_c1 = eng_c.fork_and_step(p1, a1, s1, n_parent_active=1)
+            vd_g1, vo_g1 = eng_g.fork_and_step(p1, a1, s1, n_parent_active=1)
+            self.assertTrue(np.allclose(vd_c1, vd_g1, atol=1e-4))
+            self.assertTrue(np.allclose(vo_c1, vo_g1, atol=1e-4))
+
+            # Depth 2: 8 -> 24 branches
+            p2 = [i % 8 for i in range(24)]
+            a2 = [int((i * 7 + 3) % n_nodes) for i in range(24)]
+            s2 = [float(0.0 if i % 3 == 0 else 1.0) for i in range(24)]
+            vd_c2, vo_c2 = eng_c.fork_and_step(p2, a2, s2, n_parent_active=8)
+            vd_g2, vo_g2 = eng_g.fork_and_step(p2, a2, s2, n_parent_active=8)
+            self.assertTrue(np.allclose(vd_c2, vd_g2, atol=1e-4))
+            self.assertTrue(np.allclose(vo_c2, vo_g2, atol=1e-4))
+        finally:
+            cf_gpu.close()
+
+    def test_decide_with_lookahead_runs_multi_branch_circuit_on_gpu(self):
+        from class_policy import ClassLevelSequencePolicy
+        from context_decision import ContextDrivenDecisionController
+        from temp_context import TemporaryContextMemory
+        from virtual_node_dag import BidirectionalVirtualNodeDAG
+
+        seq = []
+        for _ in range(40):
+            seq.extend([1, 2, 3, 1, 2, 3, 10, 11, 12, 13, 14, 1, 2])
+            seq.extend([1, 2, 3, 1, 2, 3, 20, 21, 22, 23, 24, 1, 2])
+        tokens = np.asarray(seq, dtype=np.int32)
+        pol = ClassLevelSequencePolicy(vocab_size=30, n_classes=6, n_singletons=3, feature_dim=8, window=3, seed=7).fit(tokens)
+        dag = BidirectionalVirtualNodeDAG(vocab_size=30, min_trigger_count=5, min_pair_count=3, min_lift=1.1).fit_sequence(tokens)
+        tcm = TemporaryContextMemory(vocab_size=30, assoc_window=6, min_cooc=2).fit_associations(tokens, stride=1)
+        cf = tcm.enable_circuit_field(use_gpu=True)
+        try:
+            ctrl = ContextDrivenDecisionController(pol, dag, tcm, lookahead_depth=3, lookahead_beam=4)
+            tcm.reset()
+            for s in (10, 11, 12):
+                tcm.observe(s, source="external")
+            acts, probs, info = ctrl.decide_with_lookahead([10, 11, 12], k=4, depth=3, beam_width=4)
+            self.assertEqual(acts[0], 13)
+            self.assertAlmostEqual(float(probs.sum()), 1.0, places=5)
+            self.assertEqual(info["lookahead_depth"], 3.0)
+            if cf.gpu is not None:
+                self.assertEqual(info["beam_circuit_gpu"], 1.0)
+        finally:
+            cf.close()
+
 
 if __name__ == "__main__":
     unittest.main()

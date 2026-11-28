@@ -98,6 +98,59 @@ __kernel void csr_spmv_batch_kernel(
     }
     y_out[gid] = acc;
 }
+
+__kernel void circuit_beam_branch_kernel(
+    const int batch_size,
+    const int n_nodes,
+    const float dt,
+    const float alpha_int,
+    const float realize_gain,
+    const float w_cap,
+    const float w_int,
+    const float w_diff,
+    __global const int* parent_idx,
+    __global const int* action_sym,
+    __global const float* action_sal,
+    __global const float* I_spread,
+    __global const float* R_arr,
+    __global const float* C_arr,
+    __global const float* V_cap_in,
+    __global const float* V_int_in,
+    __global float* V_cap_out,
+    __global float* V_int_out,
+    __global float* V_diff_out,
+    __global float* V_out
+) {
+    int gid = get_global_id(0);
+    int total = batch_size * n_nodes;
+    if (gid >= total) return;
+    int b = gid / n_nodes;
+    int node = gid - b * n_nodes;
+    int p = parent_idx[b];
+    int p_gid = p * n_nodes + node;
+
+    float r = fmax(R_arr[node], 1e-4f);
+    float c = fmax(C_arr[node], 1e-4f);
+    float decay = fmax(1.0f - (dt / (r * c)), 0.0f);
+    float inv_c = dt / c;
+
+    float vc = decay * V_cap_in[p_gid] + inv_c * I_spread[p_gid];
+    float vi = (1.0f - alpha_int) * V_int_in[p_gid] + alpha_int * vc;
+
+    int act = action_sym[b];
+    float sal = action_sal[b];
+    if (node == act && sal > 0.0f) {
+        vi += realize_gain * fmax(sal, 0.5f);
+        vc *= 0.72f;
+    }
+
+    float vd = vc - vi;
+    float raw = w_cap * vc + w_int * vi + w_diff * vd;
+    V_cap_out[gid] = vc;
+    V_int_out[gid] = vi;
+    V_diff_out[gid] = vd;
+    V_out[gid] = tanh(raw);
+}
 """
 
 
@@ -116,6 +169,7 @@ class OpenCLAccelerator:
         self._prog = None
         self._k_circuit = None
         self._k_spmv = None
+        self._k_beam = None
         self._init_opencl(prefer_vendor=prefer_vendor)
 
     def _init_opencl(self, prefer_vendor: str = "AMD") -> None:
@@ -226,6 +280,9 @@ class OpenCLAccelerator:
         k_spmv = ocl.clCreateKernel(prog, b"csr_spmv_batch_kernel", ctypes.byref(err))
         if err.value != 0 or not k_spmv:
             return
+        k_beam = ocl.clCreateKernel(prog, b"circuit_beam_branch_kernel", ctypes.byref(err))
+        if err.value != 0 or not k_beam:
+            return
 
         self._ocl = ocl
         self._ctx = ctx
@@ -233,6 +290,7 @@ class OpenCLAccelerator:
         self._prog = prog
         self._k_circuit = k_circ
         self._k_spmv = k_spmv
+        self._k_beam = k_beam
         self.platform_name = pname
         self.device_name = dname
         self.compute_units = cu_val
@@ -347,6 +405,69 @@ class OpenCLAccelerator:
         rc = ocl.clEnqueueNDRangeKernel(self._queue, k, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
         if rc != 0:
             raise RuntimeError(f"clEnqueueNDRangeKernel(spmv) failed: {rc}")
+        if sync:
+            ocl.clFinish(self._queue)
+
+    def launch_beam_branch_step(
+        self,
+        batch_size: int,
+        n_nodes: int,
+        dt: float,
+        alpha_int: float,
+        realize_gain: float,
+        w_cap: float,
+        w_int: float,
+        w_diff: float,
+        b_parent_idx: ctypes.c_void_p,
+        b_action_sym: ctypes.c_void_p,
+        b_action_sal: ctypes.c_void_p,
+        b_ispread: ctypes.c_void_p,
+        b_r: ctypes.c_void_p,
+        b_c: ctypes.c_void_p,
+        b_vcap_in: ctypes.c_void_p,
+        b_vint_in: ctypes.c_void_p,
+        b_vcap_out: ctypes.c_void_p,
+        b_vint_out: ctypes.c_void_p,
+        b_vdiff_out: ctypes.c_void_p,
+        b_vout: ctypes.c_void_p,
+        *,
+        sync: bool = False,
+    ) -> None:
+        ocl = self._ocl
+        k = self._k_beam
+        total = int(batch_size) * int(n_nodes)
+        vp_sz = ctypes.sizeof(ctypes.c_void_p)
+        args = [
+            (ctypes.c_int32(batch_size), 4),
+            (ctypes.c_int32(n_nodes), 4),
+            (ctypes.c_float(dt), 4),
+            (ctypes.c_float(alpha_int), 4),
+            (ctypes.c_float(realize_gain), 4),
+            (ctypes.c_float(w_cap), 4),
+            (ctypes.c_float(w_int), 4),
+            (ctypes.c_float(w_diff), 4),
+            (ctypes.c_void_p(b_parent_idx), vp_sz),
+            (ctypes.c_void_p(b_action_sym), vp_sz),
+            (ctypes.c_void_p(b_action_sal), vp_sz),
+            (ctypes.c_void_p(b_ispread), vp_sz),
+            (ctypes.c_void_p(b_r), vp_sz),
+            (ctypes.c_void_p(b_c), vp_sz),
+            (ctypes.c_void_p(b_vcap_in), vp_sz),
+            (ctypes.c_void_p(b_vint_in), vp_sz),
+            (ctypes.c_void_p(b_vcap_out), vp_sz),
+            (ctypes.c_void_p(b_vint_out), vp_sz),
+            (ctypes.c_void_p(b_vdiff_out), vp_sz),
+            (ctypes.c_void_p(b_vout), vp_sz),
+        ]
+        for idx, (val, sz) in enumerate(args):
+            rc = ocl.clSetKernelArg(k, idx, sz, ctypes.byref(val))
+            if rc != 0:
+                raise RuntimeError(f"clSetKernelArg(beam:{idx}) failed: {rc}")
+        gs = ctypes.c_size_t(((total + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = ocl.clEnqueueNDRangeKernel(self._queue, k, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(beam) failed: {rc}")
         if sync:
             ocl.clFinish(self._queue)
 

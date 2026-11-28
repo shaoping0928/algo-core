@@ -82,6 +82,7 @@ class ElectronicCircuitNodeField:
         state = self.__dict__.copy()
         state["gpu"] = None
         state["_bufs"] = {}
+        state["_beam_engine"] = None
         state["backend"] = "cpu"
         return state
 
@@ -293,5 +294,183 @@ class ElectronicCircuitNodeField:
             for k, arr in (("V_cap", self.V_cap), ("V_int", self.V_int), ("V_diff", self.V_diff), ("V_out", self.V_out)):
                 self.gpu.write_buffer(self._bufs[k], arr)
 
+    def get_beam_engine(self, max_branches: int = 64) -> "ElectronicCircuitBeamEngine":
+        """Return (or lazily create) a persistent GPU/CPU multi-branch lookahead engine."""
+        eng = getattr(self, "_beam_engine", None)
+        if eng is None or eng.max_branches < int(max_branches):
+            if eng is not None:
+                eng.close()
+            eng = ElectronicCircuitBeamEngine(self, max_branches=max(int(max_branches), 32))
+            self._beam_engine = eng
+        return eng
+
     def close(self) -> None:
+        eng = getattr(self, "_beam_engine", None)
+        if eng is not None:
+            eng.close()
+            self._beam_engine = None
         self._release_gpu_buffers()
+
+
+class ElectronicCircuitBeamEngine:
+    """Persistent ping-pong multi-branch dynamical circuit engine for parallel beam lookahead.
+
+    Evolves ``B`` hypothetical lookahead branches simultaneously on GPU (AMD RX 9070 XT
+    via ``circuit_beam_branch_kernel`` + ``csr_spmv_batch_kernel``) or CPU (NumPy),
+    preserving zero-copy parent->child branch gathering across arbitrary depth ``d``.
+    """
+
+    def __init__(self, field: ElectronicCircuitNodeField, *, max_branches: int = 64, realize_gain: float = 0.65):
+        self.field = field
+        self.n_nodes = field.n_nodes
+        self.max_branches = max(int(max_branches), 8)
+        self.realize_gain = float(realize_gain)
+        self.gpu: Optional[OpenCLAccelerator] = field.gpu
+        self.backend: str = field.backend
+
+        # Ping-pong host arrays (also used as CPU backend & GPU readback buffers)
+        self._vcap_a = np.zeros((self.max_branches, self.n_nodes), dtype=np.float32)
+        self._vint_a = np.zeros((self.max_branches, self.n_nodes), dtype=np.float32)
+        self._vcap_b = np.zeros((self.max_branches, self.n_nodes), dtype=np.float32)
+        self._vint_b = np.zeros((self.max_branches, self.n_nodes), dtype=np.float32)
+        self._vdiff = np.zeros((self.max_branches, self.n_nodes), dtype=np.float32)
+        self._vout = np.zeros((self.max_branches, self.n_nodes), dtype=np.float32)
+        self._ping: int = 0  # 0 -> read from A, write to B; 1 -> read from B, write to A
+
+        self._gbufs: Dict[str, object] = {}
+        if self.gpu is not None:
+            self._alloc_gpu_beam_buffers()
+
+    def _alloc_gpu_beam_buffers(self) -> None:
+        assert self.gpu is not None
+        g = self.gpu
+        z_f = np.zeros((self.max_branches, self.n_nodes), dtype=np.float32)
+        z_i = np.zeros(self.max_branches, dtype=np.int32)
+        z_s = np.zeros(self.max_branches, dtype=np.float32)
+        self._gbufs["vcap_a"] = g.create_buffer_from_array(z_f)
+        self._gbufs["vint_a"] = g.create_buffer_from_array(z_f)
+        self._gbufs["vcap_b"] = g.create_buffer_from_array(z_f)
+        self._gbufs["vint_b"] = g.create_buffer_from_array(z_f)
+        self._gbufs["ispread"] = g.create_buffer_from_array(z_f)
+        self._gbufs["vdiff"] = g.create_buffer_from_array(z_f)
+        self._gbufs["vout"] = g.create_buffer_from_array(z_f)
+        self._gbufs["parent_idx"] = g.create_buffer_from_array(z_i, read_only=False)
+        self._gbufs["action_sym"] = g.create_buffer_from_array(z_i, read_only=False)
+        self._gbufs["action_sal"] = g.create_buffer_from_array(z_s, read_only=False)
+
+    def seed_root(self, v_cap_root: np.ndarray, v_int_root: np.ndarray) -> None:
+        """Load the current live single-stream circuit state into branch slot 0."""
+        vc0 = np.ascontiguousarray(v_cap_root, dtype=np.float32).reshape(1, self.n_nodes)
+        vi0 = np.ascontiguousarray(v_int_root, dtype=np.float32).reshape(1, self.n_nodes)
+        self._ping = 0
+        self._vcap_a[0] = vc0[0]
+        self._vint_a[0] = vi0[0]
+        if self.gpu is not None:
+            # Write only the first row [1, N] directly to offset 0 of GPU buffer A
+            self.gpu.write_buffer(self._gbufs["vcap_a"], vc0)
+            self.gpu.write_buffer(self._gbufs["vint_a"], vi0)
+
+    def fork_and_step(
+        self,
+        parent_indices: Sequence[int],
+        action_syms: Sequence[int],
+        action_sals: Sequence[float],
+        *,
+        n_parent_active: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Fork ``B`` child branches from ``n_parent_active`` parents and advance RC/Int/Diff + CSR spread."""
+        b_cnt = len(parent_indices)
+        if b_cnt <= 0:
+            return np.zeros((0, self.n_nodes), dtype=np.float32), np.zeros((0, self.n_nodes), dtype=np.float32)
+        if b_cnt > self.max_branches:
+            raise ValueError(f"Requested {b_cnt} branches exceeds max_branches={self.max_branches}")
+
+        p_arr = np.ascontiguousarray(parent_indices, dtype=np.int32)
+        a_arr = np.ascontiguousarray(action_syms, dtype=np.int32)
+        s_arr = np.ascontiguousarray(action_sals, dtype=np.float32)
+        p_act = max(int(n_parent_active), int(p_arr.max()) + 1)
+        f = self.field
+        has_graph = (f._csr_row_ptr is not None)
+
+        if self.gpu is not None and f._bufs:
+            g = self.gpu
+            if self._ping == 0:
+                vc_in, vi_in = self._gbufs["vcap_a"], self._gbufs["vint_a"]
+                vc_out, vi_out = self._gbufs["vcap_b"], self._gbufs["vint_b"]
+            else:
+                vc_in, vi_in = self._gbufs["vcap_b"], self._gbufs["vint_b"]
+                vc_out, vi_out = self._gbufs["vcap_a"], self._gbufs["vint_a"]
+
+            g.write_buffer(self._gbufs["parent_idx"], p_arr)
+            g.write_buffer(self._gbufs["action_sym"], a_arr)
+            g.write_buffer(self._gbufs["action_sal"], s_arr)
+
+            if has_graph and "row_ptr" in f._bufs:
+                g.launch_spmv_batch(
+                    p_act, self.n_nodes,
+                    f._bufs["row_ptr"], f._bufs["col_idx"], f._bufs["vals"],
+                    vc_in, self._gbufs["ispread"], sync=False,
+                )
+            else:
+                g.write_buffer(self._gbufs["ispread"], np.zeros((p_act, self.n_nodes), dtype=np.float32))
+
+            g.launch_beam_branch_step(
+                b_cnt, self.n_nodes,
+                f.dt, f.alpha_int, self.realize_gain, f.w_cap, f.w_int, f.w_diff,
+                self._gbufs["parent_idx"], self._gbufs["action_sym"], self._gbufs["action_sal"],
+                self._gbufs["ispread"], f._bufs["R"], f._bufs["C"],
+                vc_in, vi_in, vc_out, vi_out, self._gbufs["vdiff"], self._gbufs["vout"],
+                sync=True,
+            )
+            vd_slice = np.empty((b_cnt, self.n_nodes), dtype=np.float32)
+            vo_slice = np.empty((b_cnt, self.n_nodes), dtype=np.float32)
+            g.read_buffer(self._gbufs["vdiff"], vd_slice)
+            g.read_buffer(self._gbufs["vout"], vo_slice)
+            self._ping ^= 1
+            return vd_slice, vo_slice
+
+        # Exact NumPy CPU parity path
+        if self._ping == 0:
+            vc_in_arr, vi_in_arr = self._vcap_a, self._vint_a
+            vc_out_arr, vi_out_arr = self._vcap_b, self._vint_b
+        else:
+            vc_in_arr, vi_in_arr = self._vcap_b, self._vint_b
+            vc_out_arr, vi_out_arr = self._vcap_a, self._vint_a
+
+        if has_graph:
+            i_sp = np.zeros((p_act, self.n_nodes), dtype=np.float32)
+            rp, ci, vl = f._csr_row_ptr, f._csr_col_idx, f._csr_vals
+            src_vc = vc_in_arr[:p_act]
+            for row in range(self.n_nodes):
+                s0, e0 = int(rp[row]), int(rp[row + 1])
+                if s0 < e0:
+                    i_sp[:, row] = src_vc[:, ci[s0:e0]] @ vl[s0:e0]
+        else:
+            i_sp = np.zeros((p_act, self.n_nodes), dtype=np.float32)
+
+        r = np.maximum(f.R, 1e-4)[None, :]
+        c = np.maximum(f.C, 1e-4)[None, :]
+        decay = np.maximum(1.0 - (f.dt / (r * c)), 0.0)
+        inv_c = f.dt / c
+
+        vc_next = decay * vc_in_arr[p_arr] + inv_c * i_sp[p_arr]
+        vi_next = (1.0 - f.alpha_int) * vi_in_arr[p_arr] + f.alpha_int * vc_next
+        for b_i in range(b_cnt):
+            act = int(a_arr[b_i])
+            sal = float(s_arr[b_i])
+            if 0 <= act < self.n_nodes and sal > 0.0:
+                vi_next[b_i, act] += self.realize_gain * max(sal, 0.5)
+                vc_next[b_i, act] *= 0.72
+        vd_next = vc_next - vi_next
+        vo_next = np.tanh(f.w_cap * vc_next + f.w_int * vi_next + f.w_diff * vd_next).astype(np.float32)
+
+        vc_out_arr[:b_cnt] = vc_next.astype(np.float32, copy=False)
+        vi_out_arr[:b_cnt] = vi_next.astype(np.float32, copy=False)
+        self._ping ^= 1
+        return vd_next.astype(np.float32, copy=False), vo_next
+
+    def close(self) -> None:
+        if self.gpu is not None:
+            for b in self._gbufs.values():
+                self.gpu.release_buffer(b)
+        self._gbufs.clear()

@@ -413,6 +413,7 @@ class ContextDrivenDecisionController:
         *,
         k: int = 8,
         recent_history: Optional[Sequence[int]] = None,
+        vdiff_override: Optional[np.ndarray] = None,
     ) -> Tuple[List[int], np.ndarray, Dict[str, float]]:
         """Compute context-driven top-k candidate distribution + telemetry."""
         hist_src = (
@@ -464,10 +465,17 @@ class ContextDrivenDecisionController:
         # 6. Electronic Circuit Differentiator (high-pass V_diff = V_cap - V_int):
         #    propels unexpressed context neighbors (V_diff > 0) and naturally adapts
         #    downward on integrator-saturated nodes (V_diff < 0) without artificial bans.
-        v_diff = self.temp_memory.circuit_differentiator()
+        v_diff = (
+            vdiff_override
+            if vdiff_override is not None
+            else self.temp_memory.circuit_differentiator()
+        )
         if v_diff is not None and self.circuit_diff_weight > 0.0:
             dw = float(self.circuit_diff_weight)
-            is_self_mode = (getattr(self.temp_memory, "_last_source", "external") == "self")
+            is_self_mode = (
+                vdiff_override is not None
+                or getattr(self.temp_memory, "_last_source", "external") == "self"
+            )
             eff_dw = dw if is_self_mode else (0.25 * dw)
             for a in list(score_map.keys()):
                 if 0 < a < len(v_diff):
@@ -559,6 +567,8 @@ class ContextDrivenDecisionController:
             prob: float,
             prev_h: Optional[np.ndarray],
             next_h: Optional[np.ndarray],
+            branch_vdiff: Optional[np.ndarray] = None,
+            branch_vout: Optional[np.ndarray] = None,
         ) -> float:
             # 1. Conditional PMI information progress with floored marginal (1e-3):
             #    penalizes ubiquitous zero-info sinks (g_p ~ 0.05) without over-rewarding
@@ -570,8 +580,13 @@ class ContextDrivenDecisionController:
                 else 1e-3
             )
             pmi_term = ll - self.lookahead_pmi_alpha * float(np.log(max(g_p, 1e-3)))
-            # 2. Active working-memory + stage-tree field alignment
-            f_bonus = 0.18 * float(eff_field[sym]) / f_max if sym > 0 else 0.0
+            # 2. Branch-specific evolved GPU circuit field + active working-memory alignment
+            if branch_vout is not None and 0 < sym < len(branch_vout):
+                f_bonus = 0.22 * max(float(branch_vout[sym]), 0.0)
+            else:
+                f_bonus = 0.18 * float(eff_field[sym]) / f_max if sym > 0 else 0.0
+            if branch_vdiff is not None and 0 < sym < len(branch_vdiff):
+                f_bonus += 0.25 * float(np.clip(branch_vdiff[sym], -1.8, 1.2))
             # 3. Persistent macro-topic anchor alignment
             a_bonus = 0.0
             if anchor is not None and anchor_norm > 1e-8 and next_h is not None and len(next_h) == len(anchor):
@@ -590,43 +605,93 @@ class ContextDrivenDecisionController:
                 stag_pen = self.lookahead_stagnation_weight * max(1.0 - min(disp, 1.0), 0.0)
             return pmi_term + f_bonus + a_bonus - stag_pen
 
-        # Beam entries: (cum_score, first_action, rolled_ctx, rolled_hist, rolled_slow)
+        # Optional GPU/CPU parallel multi-branch ElectronicCircuitBeamEngine
+        cf = getattr(self.temp_memory, "circuit_field", None)
+        beam_eng = None
+        vd_cur: Optional[np.ndarray] = None
+        vo_cur: Optional[np.ndarray] = None
+        keep_cap = max(bw * 2, 6)
+        sal_arr = self.temp_memory.salience_
+        is_c_arr = getattr(self.temp_memory, "_is_content", None)
+
+        def _sym_sal(sym_id: int) -> float:
+            if sym_id <= 0 or (is_c_arr is not None and sym_id < len(is_c_arr) and not bool(is_c_arr[sym_id])):
+                return 0.0
+            if sal_arr is not None and sym_id < len(sal_arr):
+                return float(sal_arr[sym_id])
+            return 1.0
+
+        root_vdiff = cf.V_diff[0] if cf is not None else None
+        root_vout = cf.V_out[0] if cf is not None else None
+
+        # Beam entries: (cum_score, first_action, rolled_ctx, rolled_hist, rolled_slow, gpu_slot_id)
         beam = []
         prev0 = base_ctx[-1] if base_ctx else 0
-        for a, p in zip(acts1[:bw], probs1[:bw]):
+        first_acts = [int(a) for a in acts1[:bw]]
+        first_probs = [float(p) for p in probs1[:bw]]
+        for slot_i, (a, p) in enumerate(zip(first_acts, first_probs)):
             h_next = (
                 self.class_policy.update_slow_state(slow_state, a)
                 if slow_state is not None else None
             )
-            sc0 = _step_utility(prev0, int(a), float(p), slow_state, h_next)
-            beam.append((sc0, int(a), base_ctx + [int(a)], base_hist + [int(a)], h_next))
+            sc0 = _step_utility(prev0, a, p, slow_state, h_next, root_vdiff, root_vout)
+            beam.append((sc0, a, base_ctx + [a], base_hist + [a], h_next, slot_i))
+
+        if cf is not None and len(beam) > 0:
+            beam_eng = cf.get_beam_engine(max_branches=max(keep_cap, len(beam), 32))
+            beam_eng.seed_root(cf.V_cap[0], cf.V_int[0])
+            # Single fused GPU kernel evolves all first-step branches simultaneously!
+            vd_cur, vo_cur = beam_eng.fork_and_step(
+                [0] * len(beam),
+                [b_ent[1] for b_ent in beam],
+                [_sym_sal(b_ent[1]) for b_ent in beam],
+                n_parent_active=1,
+            )
 
         for _step in range(1, d):
             next_beam = []
-            for sc, first_a, r_ctx, r_hist, r_h in beam:
+            n_parents_cur = len(beam)
+            for sc, first_a, r_ctx, r_hist, r_h, p_slot in beam:
+                b_vd = vd_cur[p_slot] if (vd_cur is not None and p_slot < len(vd_cur)) else None
+                b_vo = vo_cur[p_slot] if (vo_cur is not None and p_slot < len(vo_cur)) else None
                 a_sub, p_sub, _ = self.decide_distribution(
-                    r_ctx, r_h, k=bw, recent_history=r_hist,
+                    r_ctx, r_h, k=bw, recent_history=r_hist, vdiff_override=b_vd,
                 )
                 prev_r = r_ctx[-1] if r_ctx else 0
                 for a2, p2 in zip(a_sub[:bw], p_sub[:bw]):
+                    ai2 = int(a2)
                     h2 = (
-                        self.class_policy.update_slow_state(r_h, a2)
+                        self.class_policy.update_slow_state(r_h, ai2)
                         if r_h is not None else None
                     )
-                    u2 = _step_utility(prev_r, int(a2), float(p2), r_h, h2)
+                    u2 = _step_utility(prev_r, ai2, float(p2), r_h, h2, b_vd, b_vo)
                     next_beam.append((
                         sc + 0.75 * u2,
                         first_a,
-                        r_ctx + [int(a2)],
-                        r_hist + [int(a2)],
+                        r_ctx + [ai2],
+                        r_hist + [ai2],
                         h2,
+                        p_slot,
+                        ai2,
                     ))
             next_beam.sort(key=lambda item: item[0], reverse=True)
-            beam = next_beam[: max(bw * 2, 6)]
+            top_nb = next_beam[:keep_cap]
+            if beam_eng is not None and (_step + 1) < d and top_nb:
+                # Single fused GPU launch forks & evolves all surviving child branches for next depth!
+                vd_cur, vo_cur = beam_eng.fork_and_step(
+                    [item[5] for item in top_nb],
+                    [item[6] for item in top_nb],
+                    [_sym_sal(item[6]) for item in top_nb],
+                    n_parent_active=n_parents_cur,
+                )
+            beam = [
+                (item[0], item[1], item[2], item[3], item[4], new_slot)
+                for new_slot, item in enumerate(top_nb)
+            ]
 
         # Aggregate best lookahead path score per first action
         best_by_first: Dict[int, float] = {}
-        for sc, first_a, _rc, _rhi, _rh in beam:
+        for sc, first_a, _rc, _rhi, _rh, _sl in beam:
             if first_a not in best_by_first or sc > best_by_first[first_a]:
                 best_by_first[first_a] = sc
 
@@ -643,6 +708,7 @@ class ContextDrivenDecisionController:
         out_p = np.exp(logits)
         out_p /= max(float(out_p.sum()), 1e-12)
         info["lookahead_depth"] = float(d)
+        info["beam_circuit_gpu"] = 1.0 if (beam_eng is not None and beam_eng.gpu is not None) else 0.0
         return [a for _, a in top], out_p, info
 
     def learn_gate_step(
