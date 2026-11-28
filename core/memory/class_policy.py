@@ -188,7 +188,7 @@ class ClassLevelSequencePolicy:
         keys: List[Tuple[int, ...]] = [(-1, c_toks[-1])]
         for order in range(2, len(c_toks) + 1):
             keys.append((10 + order,) + tuple(c_toks[-order:]))
-        return self.class_index.propose_with_probs(None, k=top_c, sparse_keys=keys)
+        return self.class_index.propose_cached(keys, k=top_c)
 
     def propose_next_symbols(
         self,
@@ -228,7 +228,7 @@ class ClassLevelSequencePolicy:
             lkeys: List[Tuple[int, ...]] = [(-1, lc[-1])]
             for order in range(2, len(lc) + 1):
                 lkeys.append((10 + order,) + tuple(lc[-order:]))
-            lcand, lprobs = self.local_index.propose_with_probs(None, k=64, sparse_keys=lkeys)
+            lcand, lprobs = self.local_index.propose_cached(lkeys, k=64)
             for a, p in zip(lcand, lprobs):
                 if a > 0 and p > 0.0:
                     local_map[int(a)] = float(p)

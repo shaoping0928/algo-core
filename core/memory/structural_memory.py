@@ -237,6 +237,96 @@ class HierarchicalChunkMemory:
             matched.append(last_a)
         return matched
 
+    @property
+    def n_multi_chunks(self) -> int:
+        """Number of discovered multi-atom chunks (unit IDs >= vocab_size)."""
+        return max(int(self.n_total_units) - int(self.vocab_size), 0)
+
+    def match_stream_chunks(self, tokens: Sequence[int], *, slice_len: int = 4_000_000) -> np.ndarray:
+        """Vectorized per-position longest multi-atom chunk match for dual-stream SSM input.
+
+        Returns an ``int32`` array ``out`` of the same length as ``tokens``, where:
+          - ``out[i] == 0`` if no multi-atom chunk ends at position ``i``;
+          - ``out[i] == cid - vocab_size + 1`` for the longest matching multi-atom chunk
+            ``cid >= vocab_size`` ending at position ``i`` (exact match with ``match_suffix_units``).
+        """
+        arr = np.clip(np.asarray(tokens, dtype=np.int32).reshape(-1), 0, self.vocab_size - 1)
+        n = len(arr)
+        out = np.zeros(n, dtype=np.int32)
+        if n < 2 or self.n_multi_chunks <= 0:
+            return out
+
+        v = int(self.vocab_size)
+        v_u64 = np.uint64(v)
+        max_l = max(int(self.max_chunk_len), 2)
+        by_len: Dict[int, List[Tuple[Tuple[int, ...], int]]] = defaultdict(list)
+        for atoms_t, cid in self.atoms_to_chunk_.items():
+            L = len(atoms_t)
+            if 2 <= L <= max_l and cid >= v and all(0 < a < v for a in atoms_t):
+                by_len[L].append((atoms_t, int(cid - v + 1)))
+
+        if not by_len:
+            return out
+
+        can_pack = (v <= 50_000) and (max_l <= 4)
+        if not can_pack:
+            # Exact fallback for unusual huge vocab or very long chunks
+            a2c = self.atoms_to_chunk_
+            a_list = arr.tolist()
+            for i in range(1, n):
+                if a_list[i] <= 0:
+                    continue
+                ml = min(max_l, i + 1)
+                for L in range(ml, 1, -1):
+                    cid = a2c.get(tuple(a_list[i - L + 1 : i + 1]))
+                    if cid is not None and cid >= v:
+                        out[i] = int(cid - v + 1)
+                        break
+            return out
+
+        # Pre-sort uint64 packed keys per chunk length (ascending L so longer matches win!)
+        tables: List[Tuple[int, np.ndarray, np.ndarray]] = []
+        for L in sorted(by_len.keys()):
+            items = by_len[L]
+            codes = np.empty(len(items), dtype=np.uint64)
+            lids = np.empty(len(items), dtype=np.int32)
+            for idx_k, (atoms_t, lid) in enumerate(items):
+                c = np.uint64(0)
+                for a in atoms_t:
+                    c = c * v_u64 + np.uint64(a)
+                codes[idx_k] = c
+                lids[idx_k] = lid
+            order = np.argsort(codes)
+            tables.append((L, codes[order], lids[order]))
+
+        # Process stream in bounded slices to keep temporary RAM < 100 MB even on 64M+ streams
+        step = max(int(slice_len), max_l + 1)
+        for s0 in range(0, n, step):
+            lo = max(0, s0 - (max_l - 1))
+            hi = min(n, s0 + step)
+            sub = arr[lo:hi]
+            m = len(sub)
+            for L, scodes, slids in tables:
+                if m < L:
+                    continue
+                valid = sub[: m - L + 1] > 0
+                c_vec = sub[: m - L + 1].astype(np.uint64)
+                for off in range(1, L):
+                    sl = sub[off : m - L + 1 + off]
+                    valid &= sl > 0
+                    c_vec = c_vec * v_u64 + sl.astype(np.uint64)
+                idx = np.searchsorted(scodes, c_vec)
+                in_b = valid & (idx < len(scodes))
+                safe_idx = np.where(in_b, idx, 0)
+                hit = in_b & (scodes[safe_idx] == c_vec)
+                if np.any(hit):
+                    hit_pos = np.flatnonzero(hit) + (L - 1) + lo
+                    # Only write positions inside [s0, hi)
+                    in_win = hit_pos >= s0
+                    if np.any(in_win):
+                        out[hit_pos[in_win]] = slids[safe_idx[hit][in_win]]
+        return out
+
     def ingest_chunk(
         self,
         tokens: Sequence[int],
@@ -443,9 +533,7 @@ class HierarchicalChunkMemory:
         c_keys = self._chunk_keys(c_ctx)
         if len(c_ctx) >= 2 and c_keys[-1] in self.chunk_index._postings:
             has_ho_inter = True
-        c_cand, c_probs = self.chunk_index.propose_with_probs(
-            None, k=top_chunks, sparse_keys=c_keys,
-        )
+        c_cand, c_probs = self.chunk_index.propose_cached(c_keys, k=top_chunks)
         for cid, pr in zip(c_cand, c_probs):
             ci = int(cid)
             p_val = float(pr)
@@ -468,9 +556,7 @@ class HierarchicalChunkMemory:
                 cc_keys = self._chunk_keys(cc_tail)
                 if len(cc_tail) >= 2 and cc_keys[-1] in self.chunk_class_index._postings:
                     has_ho_class = True
-                cc_cand, cc_probs = self.chunk_class_index.propose_with_probs(
-                    None, k=12, sparse_keys=cc_keys,
-                )
+                cc_cand, cc_probs = self.chunk_class_index.propose_cached(cc_keys, k=12)
                 g_u = None
                 if slow_state is not None and atom_embeddings is not None:
                     gn = float(np.linalg.norm(slow_state))
@@ -533,8 +619,8 @@ class HierarchicalChunkMemory:
             if before_tail:
                 before_chunks = self.parse_sequence(before_tail)
                 b_ctx = before_chunks[-self.chunk_ctx_len :]
-                b_cand, b_probs = self.chunk_index.propose_with_probs(
-                    None, k=max(top_chunks, 32), sparse_keys=self._chunk_keys(b_ctx),
+                b_cand, b_probs = self.chunk_index.propose_cached(
+                    self._chunk_keys(b_ctx), k=max(top_chunks, 32),
                 )
                 b_prob_map = {int(c): float(p) for c, p in zip(b_cand, b_probs)}
                 if self.chunk_class_index is not None and self.chunk_to_class_ is not None:
@@ -544,9 +630,7 @@ class HierarchicalChunkMemory:
                         if 0 <= c < len(self.chunk_to_class_)
                     ]
                     if bcc and bcc[-1] > 0:
-                        bc_c, bc_p = self.chunk_class_index.propose_with_probs(
-                            None, k=16, sparse_keys=self._chunk_keys(bcc),
-                        )
+                        bc_c, bc_p = self.chunk_class_index.propose_cached(self._chunk_keys(bcc), k=16)
                         b_cc_map = {int(cc): float(p) for cc, p in zip(bc_c, bc_p)}
 
             tot_c_prior = max(float(sum(self.chunk_counts_[cid] for _, cid in conts)), 1.0)

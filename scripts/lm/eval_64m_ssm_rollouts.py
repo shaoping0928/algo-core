@@ -65,7 +65,10 @@ print(
     flush=True,
 )
 
-for alpha in (0.45,):
+alpha = float(bundle.metadata.get("union_blend_alpha_dev", 0.45))
+alpha_source = "saved @257M dev selection" if "union_blend_alpha_dev" in bundle.metadata else "legacy fixed fallback"
+print(f"Using UnionBlend alpha={alpha:.2f} ({alpha_source})", flush=True)
+for alpha in (alpha,):
     print(f"\n=== 64M LearnableStateSpacePolicy (H=512, T=48 BPTT) + UnionBlend (alpha={alpha:.2f}, self_stateful_beta=0.0) ===", flush=True)
     for p_idx, (label, sp_pos) in enumerate(test_list, 1):
         p_toks = [int(x) for x in ev[sp_pos:sp_pos + 60]]

@@ -2,12 +2,99 @@
 from __future__ import annotations
 
 import os
+import pickle
 import tempfile
 import unittest
+from unittest.mock import patch
 import numpy as np
 
 
 class ScalabilityAndArbitrationTests(unittest.TestCase):
+    def test_cached_sparse_proposal_matches_uncached_and_returns_independent_results(self):
+        from sparse_index import SparseFeatureActionIndex
+
+        index = SparseFeatureActionIndex(range(8)).fit_token_stream([1, 2, 3, 1, 2, 4], ctx_len=2)
+        keys = [(-1, 2), (12, 1, 2)]
+        expected, expected_probs = index.propose_with_probs(None, 4, sparse_keys=keys)
+        with patch.object(index, "_propose_interpolated_ad", wraps=index._propose_interpolated_ad) as query:
+            ranked, probs = index.propose_cached(keys, 4)
+            self.assertEqual(ranked, expected)
+            np.testing.assert_array_equal(probs, expected_probs)
+            ranked.clear()
+            probs.fill(-1)
+            ranked, probs = index.propose_cached(keys, 4)
+            self.assertEqual(ranked, expected)
+            np.testing.assert_array_equal(probs, expected_probs)
+            self.assertEqual(query.call_count, 1)
+            index.propose_cached(keys, 2)
+            index.propose_cached(keys, 4, discount=0.25)
+            self.assertEqual(query.call_count, 3)
+
+        reloaded = pickle.loads(pickle.dumps(index))
+        ranked, probs = reloaded.propose_cached(keys, 4)
+        self.assertEqual(ranked, expected)
+        np.testing.assert_array_equal(probs, expected_probs)
+
+    def test_cached_sparse_proposal_refreshes_after_index_mutations(self):
+        from sparse_index import SparseFeatureActionIndex
+
+        index = SparseFeatureActionIndex(range(8)).fit_token_stream([1, 2, 3, 1, 2, 4], ctx_len=2)
+        keys = [(-1, 2), (12, 1, 2)]
+
+        def check_refresh(previous_probs):
+            ranked, probs = index.propose_cached(keys, 4)
+            expected, expected_probs = index.propose_with_probs(None, 4, sparse_keys=keys)
+            self.assertEqual(ranked, expected)
+            np.testing.assert_array_equal(probs, expected_probs)
+            self.assertFalse(np.array_equal(probs, previous_probs))
+            return probs
+
+        _, before = index.propose_cached(keys, 4)
+        self.assertGreater(index.prune_under_pressure(0.20), 0)
+        before = check_refresh(before)
+        index.update(None, 5, dopamine=1.0, sparse_keys=keys)
+        before = check_refresh(before)
+        index.fit_token_stream([1, 2, 6] * 4, ctx_len=2)
+        check_refresh(before)
+
+    def test_packed_sparse_proposal_preserves_scores_ties_and_fallback(self):
+        from sparse_index import SparseFeatureActionIndex
+
+        index = SparseFeatureActionIndex(range(512))
+        short, long, weighted = (-1, 2), (12, 1, 2), (12, 3, 2)
+        for action in range(1, 401):
+            index.update(None, action, dopamine=1.0, sparse_keys=[short])
+        for action in range(3, 401, 3):
+            for _ in range(action % 5 + 1):
+                index.update(None, action, dopamine=1.0, sparse_keys=[long])
+        index.update(None, 3, dopamine=0.5, sparse_keys=[weighted])
+
+        scalar = index._propose_interpolated_ad
+        with patch.object(index, "_propose_interpolated_ad", wraps=scalar) as fallback:
+            for keys, k, discount in (([short], 12, 0.5), ([short, long], 25, 0.75),
+                                     ([short, long], 7, 0.0), ([short, long], 12, 2.5)):
+                with self.subTest(keys=keys, k=k, discount=discount):
+                    expected, expected_probs = scalar(keys, k, discount)
+                    actual, probs = index.propose_cached(keys, k, discount)
+                    self.assertEqual(actual, expected)
+                    np.testing.assert_array_equal(probs, expected_probs)
+            fallback.assert_not_called()
+
+            for keys, k in (([short, weighted], 10), ([short], 480), ([(-1, 8)], 24)):
+                expected, expected_probs = scalar(keys, k)
+                actual, probs = index.propose_cached(keys, k)
+                self.assertEqual(actual, expected)
+                np.testing.assert_array_equal(probs, expected_probs)
+            self.assertEqual(fallback.call_count, 3)
+
+        for _ in range(10):
+            index.update(None, 401, dopamine=1.0, sparse_keys=[short])
+        expected, expected_probs = scalar([short], 12)
+        actual, probs = index.propose_cached([short], 12)
+        self.assertEqual(actual, expected)
+        self.assertIn(401, actual)
+        np.testing.assert_array_equal(probs, expected_probs)
+
     def test_parallel_sharded_sparse_index_is_exact_match_with_serial(self):
         from sparse_index import SparseFeatureActionIndex
 

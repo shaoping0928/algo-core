@@ -82,6 +82,10 @@ class StructuralSubstrateBundle:
         noise_prune_pressure: float = 0.22,
         use_learnable_ssm: bool = False,
         ssm_hidden_dim: int = 512,
+        ssm_num_layers: int = 2,
+        ssm_fw_dim: int = 0,
+        ssm_use_dual_chunks: bool = False,
+        ssm_bptt_len: int = 96,
         seed: int = 42,
     ) -> "StructuralSubstrateBundle":
         """Build all multi-layer memory reserves concurrently across CPU cores under memory governance."""
@@ -231,17 +235,22 @@ class StructuralSubstrateBundle:
         def _fit_stateful_policy():
             t = time.perf_counter()
             if use_learnable_ssm:
+                c_vocab = (cm.n_multi_chunks + 1) if (ssm_use_dual_chunks and cm.n_multi_chunks > 0) else 0
+                c_stream = cm.match_stream_chunks(arr) if c_vocab > 0 else None
                 sp = LearnableStateSpacePolicy(
                     vocab_size=vocab_size,
                     embed_dim=pol.feature_map.embeddings_.shape[1],
                     hidden_dim=int(ssm_hidden_dim),
-                    num_layers=2,
-                    bptt_len=96,
+                    num_layers=int(ssm_num_layers),
+                    fw_dim=int(ssm_fw_dim),
+                    chunk_vocab_size=c_vocab,
+                    bptt_len=int(ssm_bptt_len),
                     batch_streams=256,
                     use_gpu=True,
                     seed=seed,
                 ).fit_stream(
                     arr,
+                    chunk_ids=c_stream,
                     init_embeddings=pol.feature_map.embeddings_,
                     epochs=1,
                 )
@@ -411,7 +420,12 @@ class StructuralSubstrateBundle:
         def _ingest_stateful():
             if self.stateful_policy is not None:
                 if isinstance(self.stateful_policy, LearnableStateSpacePolicy):
-                    self.stateful_policy.ingest_chunk(arr, epochs=1)
+                    c_stream = (
+                        self.chunk_memory.match_stream_chunks(arr)
+                        if getattr(self.stateful_policy, "chunk_vocab_size", 0) > 0
+                        else None
+                    )
+                    self.stateful_policy.ingest_chunk(arr, chunk_ids=c_stream, epochs=1)
                 else:
                     self.stateful_policy.ingest_chunk(
                         arr, chunk_memory=self.chunk_memory, sample_stride=4, max_samples=2_000_000,

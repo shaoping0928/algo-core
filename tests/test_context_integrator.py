@@ -11,6 +11,7 @@ for dp, _, _ in os.walk(os.path.join(ROOT, "core")):
 
 from context_integrator import ContextualIntegrator
 from learnable_ssm_policy import LearnableStateSpacePolicy
+from structural_memory import HierarchicalChunkMemory
 from substrate_bundle import StructuralSubstrateBundle
 
 
@@ -264,8 +265,8 @@ class ContextualIntegratorTests(unittest.TestCase):
         emb = rng.randn(V, D).astype(np.float32) * 0.5
         emb[0] = 0.0
 
-        # 1. Exact CPU vs OpenCL GPU 8-step BPTT parity for BOTH 1-layer (7 tensors) & 2-layer (11 tensors)
-        for n_lay in (1, 2):
+        # 1. Exact CPU vs OpenCL GPU 8-step BPTT parity for 1-layer, 2-layer, & 3-layer
+        for n_lay in (1, 2, 3):
             m_cpu = LearnableStateSpacePolicy(
                 vocab_size=V, embed_dim=D, hidden_dim=H, num_layers=n_lay, bptt_len=T, batch_streams=B,
                 lr=0.005, use_gpu=False, seed=13,
@@ -277,14 +278,21 @@ class ContextualIntegratorTests(unittest.TestCase):
             m_cpu.init_params(init_embeddings=emb)
             m_gpu.init_params(init_embeddings=emb)
             if m_gpu._ensure_gpu_trainer(B, T):
+                self.assertIsNotNone(
+                    m_gpu._gpu._k_gru_proj_fused,
+                    msg="OpenCL BPTT parity test must exercise the fused recurrent forward kernel",
+                )
                 s1_cpu = np.zeros((B, H), dtype=np.float32)
-                s2_cpu = np.zeros((B, H), dtype=np.float32) if n_lay == 2 else None
+                s2_cpu = np.zeros((B, H), dtype=np.float32) if n_lay >= 2 else None
+                s3_cpu = np.zeros((B, H), dtype=np.float32) if n_lay >= 3 else None
                 for step in range(3):
                     t_in = rng.randint(0, V, size=(T, B), dtype=np.int32)
                     t_tg = rng.randint(0, V, size=(T, B), dtype=np.int32)
                     t_tg[0, 0] = 0
                     t_tg[-1, -1] = 0
-                    lc, s1_cpu, s2_cpu = m_cpu._cpu_bptt_step(t_in, t_tg, s_init=s1_cpu, s2_init=s2_cpu)
+                    lc, s1_cpu, s2_cpu, s3_cpu, _ = m_cpu._cpu_bptt_step(
+                        t_in, t_tg, s_init=s1_cpu, s2_init=s2_cpu, s3_init=s3_cpu,
+                    )
                     lg = m_gpu._gpu_bptt_step(t_in, t_tg, reset_hidden=(step == 0), read_loss=True)
                     self.assertAlmostEqual(lc, lg, places=3)
                 m_gpu._sync_weights_from_gpu()
@@ -329,6 +337,132 @@ class ContextualIntegratorTests(unittest.TestCase):
             pred_map = pol.predict_symbol_map(state=child, k=4)
             best_sym = max(pred_map.items(), key=lambda kv: kv[1])[0]
             self.assertEqual(best_sym, expected_tgt, msg=f"Failed 16-step memory for cue={cue}: {pred_map}")
+
+    def test_fast_weight_gpu_cpu_parity_and_oneshot_associative_recall(self):
+        rng = np.random.RandomState(29)
+        V, D, H, B, T = 40, 16, 32, 16, 10
+        emb = rng.randn(V, D).astype(np.float32) * 0.5
+        emb[0] = 0.0
+
+        # 1. Exact GPU vs CPU BPTT parity for Fast-Weight + Dual-Stream Chunk + 2L/3L
+        for n_lay, fw_d, c_voc in ((2, 16, 20), (3, 32, 0), (1, 24, 12)):
+            m_cpu = LearnableStateSpacePolicy(
+                vocab_size=V, embed_dim=D, hidden_dim=H,
+                num_layers=n_lay, fw_dim=fw_d, chunk_vocab_size=c_voc,
+                bptt_len=T, batch_streams=B, lr=0.005, use_gpu=False, seed=23,
+            )
+            m_gpu = LearnableStateSpacePolicy(
+                vocab_size=V, embed_dim=D, hidden_dim=H,
+                num_layers=n_lay, fw_dim=fw_d, chunk_vocab_size=c_voc,
+                bptt_len=T, batch_streams=B, lr=0.005, use_gpu=True, seed=23,
+            )
+            m_cpu.init_params(init_embeddings=emb)
+            m_gpu.init_params(init_embeddings=emb)
+            if m_gpu._ensure_gpu_trainer(B, T):
+                s1 = np.zeros((B, H), dtype=np.float32)
+                s2 = np.zeros((B, H), dtype=np.float32) if n_lay >= 2 else None
+                s3 = np.zeros((B, H), dtype=np.float32) if n_lay >= 3 else None
+                M_c = np.zeros((B, fw_d, fw_d), dtype=np.float32)
+                for step in range(3):
+                    t_in = rng.randint(0, V, size=(T, B), dtype=np.int32)
+                    t_tg = rng.randint(0, V, size=(T, B), dtype=np.int32)
+                    t_tg[0, 0] = 0
+                    c_in = rng.randint(0, c_voc, size=(T, B), dtype=np.int32) if c_voc > 0 else None
+                    lc, s1, s2, s3, M_c = m_cpu._cpu_bptt_step(
+                        t_in, t_tg, s_init=s1, s2_init=s2, s3_init=s3, M_init=M_c, chk_in=c_in,
+                    )
+                    lg = m_gpu._gpu_bptt_step(
+                        t_in, t_tg, chk_in=c_in, reset_hidden=(step == 0), read_loss=True,
+                    )
+                    self.assertAlmostEqual(lc, lg, places=3, msg=f"Loss mismatch L={n_lay} fw={fw_d} C={c_voc}")
+                m_gpu._sync_weights_from_gpu()
+                for pname in m_cpu._param_names:
+                    attr = f"{pname}_"
+                    diff = float(np.max(np.abs(getattr(m_cpu, attr) - getattr(m_gpu, attr))))
+                    self.assertTrue(
+                        np.allclose(getattr(m_cpu, attr), getattr(m_gpu, attr), atol=5e-4),
+                        msg=f"FW-BPTT(L={n_lay},fw={fw_d},C={c_voc}) GPU/CPU mismatch on {attr}: max_diff={diff:.6f}",
+                    )
+                m_gpu.close_gpu()
+
+        # 2. One-Shot Associative Recall benchmark: random key->value bindings per episode
+        #    Keys in {1..6}, Values in {7..12}, Distractors in {13..16}, Sep=17.
+        #    Static weights can only get 1/6 (16.7%); fast-weight M_t must learn one-shot recall!
+        seq: list[int] = []
+        keys_pool = np.arange(1, 7, dtype=np.int32)
+        vals_pool = np.arange(7, 13, dtype=np.int32)
+        for _ in range(1800):
+            ks = rng.choice(keys_pool, size=3, replace=False).tolist()
+            vs = rng.choice(vals_pool, size=3, replace=False).tolist()
+            for k_i, v_i in zip(ks, vs):
+                seq.extend([k_i, v_i])
+            seq.extend([13, 14, 15, 16, 13, 14, 15, 16])
+            q_idx = int(rng.randint(0, 3))
+            seq.extend([17, ks[q_idx], vs[q_idx], 17])
+
+        pol = LearnableStateSpacePolicy(
+            vocab_size=20, embed_dim=16, hidden_dim=48,
+            num_layers=1, fw_dim=24, bptt_len=36, batch_streams=16, lr=0.012, use_gpu=True, seed=7,
+        )
+        pol.fit_stream(seq, epochs=24)
+        pol.close_gpu()
+
+        # Evaluate on 40 fresh unseen random episodes + verify strict in-place M_t & non-mutating fork_step
+        hits = 0
+        for ep in range(40):
+            ks = rng.choice(keys_pool, size=3, replace=False).tolist()
+            vs = rng.choice(vals_pool, size=3, replace=False).tolist()
+            q_idx = ep % 3
+            pol.reset_state()
+            st_id = id(pol.state)
+            for k_i, v_i in zip(ks, vs):
+                pol.observe(k_i)
+                pol.observe(v_i)
+            for d_tok in (13, 14, 15, 16, 13, 14, 15, 16, 17):
+                pol.observe(d_tok)
+            M_snap = pol.state.M.copy()
+            child = pol.fork_step(pol.state, ks[q_idx])
+            self.assertEqual(id(pol.state), st_id)
+            self.assertTrue(np.allclose(pol.state.M, M_snap))
+            self.assertFalse(np.allclose(child.M, M_snap))
+            pred_map = pol.predict_symbol_map(state=child, k=4)
+            best_sym = max(pred_map.items(), key=lambda kv: kv[1])[0]
+            if best_sym == vs[q_idx]:
+                hits += 1
+        self.assertGreaterEqual(hits, 34, msg=f"One-shot associative recall too low: {hits}/40")
+
+    def test_dual_stream_chunk_matching_exact_equivalence(self):
+        # Verify HierarchicalChunkMemory.match_stream_chunks matches match_suffix_units at every step
+        rng = np.random.RandomState(41)
+        motifs = [
+            [2, 3, 4], [5, 6, 7, 8], [9, 10], [11, 12, 13], [14, 15],
+        ]
+        stream: list[int] = []
+        for _ in range(400):
+            m = motifs[int(rng.randint(0, len(motifs)))]
+            stream.extend(m)
+            if rng.rand() < 0.25:
+                stream.append(int(rng.randint(0, 18)))
+        cm = HierarchicalChunkMemory(
+            vocab_size=20, max_levels=2, max_chunks_per_level=24,
+            min_pair_count=4, min_pmi=0.8, max_chunk_len=4,
+            enable_chunk_classes=False, seed=41,
+        ).fit(stream)
+        self.assertGreater(cm.n_multi_chunks, 0)
+
+        test_seq = stream[:260]
+        vec_out = cm.match_stream_chunks(test_seq, slice_len=37)
+        self.assertEqual(len(vec_out), len(test_seq))
+        expected = np.zeros(len(test_seq), dtype=np.int32)
+        for i in range(len(test_seq)):
+            mu = cm.match_suffix_units(test_seq[max(0, i - 5) : i + 1])
+            if mu and mu[0] >= cm.vocab_size:
+                expected[i] = int(mu[0] - cm.vocab_size + 1)
+        self.assertTrue(
+            np.array_equal(vec_out, expected),
+            msg=f"Mismatch positions: {np.flatnonzero(vec_out != expected)[:10].tolist()}",
+        )
+        self.assertGreater(int(np.count_nonzero(vec_out)), 50)
 
 
 if __name__ == "__main__":

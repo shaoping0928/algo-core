@@ -6,6 +6,40 @@ import numpy as np
 
 
 class CircuitFieldAndGPUTests(unittest.TestCase):
+    def test_sgemm_transposed_tiles_respect_offsets_and_partial_tiles(self):
+        from opencl_gpu import OpenCLAccelerator
+
+        gpu = OpenCLAccelerator()
+        if not gpu.available:
+            self.skipTest("No OpenCL GPU available on this host")
+
+        rng = np.random.RandomState(29)
+        m, n, k = 35, 19, 21
+        a_offset, c_offset = 7, 11
+        a = rng.standard_normal((m, k)).astype(np.float32)
+        b = rng.standard_normal((k, n)).astype(np.float32)
+        c = rng.standard_normal(c_offset + m * n + 3).astype(np.float32)
+        expected = c.copy()
+        expected[c_offset:-3] = 0.75 * (a @ b).ravel() + 0.25 * c[c_offset:-3]
+        for trans_a in (False, True):
+            for trans_b in (False, True):
+                with self.subTest(trans_a=trans_a, trans_b=trans_b):
+                    a_storage = np.concatenate((np.zeros(a_offset, np.float32), (a.T if trans_a else a).ravel()))
+                    b_storage = np.ascontiguousarray(b.T if trans_b else b)
+                    b_a = gpu.create_buffer_from_array(a_storage, read_only=True)
+                    b_b = gpu.create_buffer_from_array(b_storage, read_only=True)
+                    b_c = gpu.create_buffer_from_array(c)
+                    try:
+                        gpu.launch_sgemm(
+                            m, n, k, b_a, b_b, b_c, transA=trans_a, transB=trans_b,
+                            alpha=0.75, beta=0.25, a_offset=a_offset, c_offset=c_offset,
+                        )
+                        actual = gpu.read_buffer(b_c, np.empty_like(c))
+                        np.testing.assert_allclose(actual, expected, atol=5e-4, rtol=0.0)
+                    finally:
+                        for buffer in (b_a, b_b, b_c):
+                            gpu.release_buffer(buffer)
+
     def test_circuit_element_physics_capacitor_integrator_differentiator(self):
         from circuit_field import ElectronicCircuitNodeField
 

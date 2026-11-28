@@ -161,10 +161,14 @@ __kernel void sgemm_tiled_kernel(
     const int transB,
     const float alpha,
     const float beta,
+    const int a_offset,
+    const int c_offset,
     __global const float* A,
     __global const float* B,
     __global float* C
 ) {
+    A += a_offset;
+    C += c_offset;
     __local float As[32][17];
     __local float Bs[16][33];
     int lx = get_local_id(0);
@@ -179,16 +183,25 @@ __kernel void sgemm_tiled_kernel(
     for (int t = 0; t < n_tiles; ++t) {
         int a_k = t * 16 + lx;
         int b_k = t * 16 + ly;
-        if (a_k < K) {
-            As[ly][lx] = (row0 < M) ? ((transA == 0) ? A[row0 * K + a_k] : A[a_k * M + row0]) : 0.0f;
-            As[ly + 16][lx] = (row1 < M) ? ((transA == 0) ? A[row1 * K + a_k] : A[a_k * M + row1]) : 0.0f;
+        if (transA) {
+            // Swap the load coordinates so adjacent lanes read adjacent rows in A^T.
+            int src_row = get_group_id(1) * 32 + lx;
+            As[lx][ly] = (src_row < M && b_k < K) ? A[b_k * M + src_row] : 0.0f;
+            As[lx + 16][ly] = (src_row + 16 < M && b_k < K) ? A[b_k * M + src_row + 16] : 0.0f;
+        } else if (a_k < K) {
+            As[ly][lx] = (row0 < M) ? A[row0 * K + a_k] : 0.0f;
+            As[ly + 16][lx] = (row1 < M) ? A[row1 * K + a_k] : 0.0f;
         } else {
             As[ly][lx] = 0.0f;
             As[ly + 16][lx] = 0.0f;
         }
-        if (b_k < K) {
-            Bs[ly][lx] = (col0 < N) ? ((transB == 0) ? B[b_k * N + col0] : B[col0 * K + b_k]) : 0.0f;
-            Bs[ly][lx + 16] = (col1 < N) ? ((transB == 0) ? B[b_k * N + col1] : B[col1 * K + b_k]) : 0.0f;
+        if (transB) {
+            int src_col = get_group_id(0) * 32 + ly;
+            Bs[lx][ly] = (src_col < N && a_k < K) ? B[src_col * K + a_k] : 0.0f;
+            Bs[lx][ly + 16] = (src_col + 16 < N && a_k < K) ? B[(src_col + 16) * K + a_k] : 0.0f;
+        } else if (b_k < K) {
+            Bs[ly][lx] = (col0 < N) ? B[b_k * N + col0] : 0.0f;
+            Bs[ly][lx + 16] = (col1 < N) ? B[b_k * N + col1] : 0.0f;
         } else {
             Bs[ly][lx] = 0.0f;
             Bs[ly][lx + 16] = 0.0f;
@@ -511,16 +524,17 @@ __kernel void embed_grad_reduce_1_kernel(
 }
 
 // Fused Gated RC / CuDNN-GRU-v2 forward step at timestep t for B parallel streams
-// Xg_all: [T, B, 3H], Sg_t: [B, 3H], s_prev: [B, H], s_all: [T, B, H], cache_zrh: [T, B, 3H]
+// Xg_all/Sg_all/cache_zrh: [T, B, 3H], s_cur: [B, H], s_prev_all/s_all: [T, B, H]
 __kernel void gru_step_fwd_kernel(
     const int B,
     const int H,
     const int t,
     __global const float* Xg_all,
-    __global const float* Sg_t,
+    __global const float* Sg_all,
     __global const float* b_x,
     __global const float* b_s,
-    __global const float* s_prev,
+    __global float* s_cur,
+    __global float* s_prev_all,
     __global float* s_all,
     __global float* cache_zrh
 ) {
@@ -531,22 +545,103 @@ __kernel void gru_step_fwd_kernel(
     int h = gid - b * H;
     int H3 = 3 * H;
     int xg_base = (t * B + b) * H3;
-    int sg_base = b * H3;
-
-    float z_pre = clamp(Xg_all[xg_base + h] + Sg_t[sg_base + h] + b_x[h] + b_s[h], -16.0f, 16.0f);
-    float r_pre = clamp(Xg_all[xg_base + H + h] + Sg_t[sg_base + H + h] + b_x[H + h] + b_s[H + h], -16.0f, 16.0f);
+    float z_pre = clamp(Xg_all[xg_base + h] + Sg_all[xg_base + h] + b_x[h] + b_s[h], -16.0f, 16.0f);
+    float r_pre = clamp(Xg_all[xg_base + H + h] + Sg_all[xg_base + H + h] + b_x[H + h] + b_s[H + h], -16.0f, 16.0f);
     float z = 1.0f / (1.0f + exp(-z_pre));
     float r = 1.0f / (1.0f + exp(-r_pre));
 
-    float sg_h = Sg_t[sg_base + 2 * H + h] + b_s[2 * H + h];
+    float sg_h = Sg_all[xg_base + 2 * H + h] + b_s[2 * H + h];
     float h_tilde = tanh(Xg_all[xg_base + 2 * H + h] + b_x[2 * H + h] + r * sg_h);
-    float sp = s_prev[b * H + h];
+    float sp = s_cur[gid];
     float s_new = (1.0f - z) * sp + z * h_tilde;
 
-    s_all[(t * B + b) * H + h] = s_new;
+    int state_index = t * tot + gid;
+    s_prev_all[state_index] = sp;
+    s_all[state_index] = s_new;
+    s_cur[gid] = s_new;
     cache_zrh[xg_base + h] = z;
     cache_zrh[xg_base + H + h] = r;
     cache_zrh[xg_base + 2 * H + h] = h_tilde;
+}
+
+inline void gru_projection_fused_store(
+    const int B, const int H, const int T, const int t, const int b, const int h,
+    const float gz, const float gr, const float gh,
+    __global const float* Xg, __global const float* bx, __global const float* bs,
+    __global float* cur, __global float* prev_all, __global float* state_all,
+    __global float* Sg, __global float* cache
+) {
+    const int H3 = 3 * H;
+    const int gidx = (t * B + b) * H3;
+    const int sidx = (t * B + b) * H + h;
+    const float sp = (t == 0) ? cur[b * H + h] : state_all[sidx - B * H];
+    Sg[gidx + h] = gz;
+    Sg[gidx + H + h] = gr;
+    Sg[gidx + 2 * H + h] = gh;
+    const float z_pre = clamp(Xg[gidx + h] + gz + bx[h] + bs[h], -16.0f, 16.0f);
+    const float r_pre = clamp(Xg[gidx + H + h] + gr + bx[H + h] + bs[H + h], -16.0f, 16.0f);
+    const float z = 1.0f / (1.0f + exp(-z_pre));
+    const float r = 1.0f / (1.0f + exp(-r_pre));
+    const float h_tilde = tanh(Xg[gidx + 2 * H + h] + bx[2 * H + h] + r * (gh + bs[2 * H + h]));
+    const float s_new = (1.0f - z) * sp + z * h_tilde;
+    prev_all[sidx] = sp;
+    state_all[sidx] = s_new;
+    if (t == T - 1) cur[b * H + h] = s_new;
+    cache[gidx + h] = z;
+    cache[gidx + H + h] = r;
+    cache[gidx + 2 * H + h] = h_tilde;
+}
+
+// Recurrent projection + GRU update in one launch. The prior state for t>0 is
+// read from the completed state slice, avoiding cross-workgroup read/write races.
+__kernel void gru_projection_fused_kernel(
+    const int B, const int H, const int T, const int t,
+    __global const float* Xg, __global const float* U,
+    __global const float* bx, __global const float* bs,
+    __global float* cur, __global float* prev_all, __global float* state_all,
+    __global float* Sg, __global float* cache
+) {
+    __local float As[32][17];
+    __local float Bz[16][33], Br[16][33], Bh[16][33];
+    const int lx = get_local_id(0), ly = get_local_id(1);
+    const int col0 = get_group_id(0) * 32 + lx, col1 = col0 + 16;
+    const int row0 = get_group_id(1) * 32 + ly, row1 = row0 + 16;
+    const int H3 = 3 * H;
+    float z00 = 0.0f, z01 = 0.0f, z10 = 0.0f, z11 = 0.0f;
+    float r00 = 0.0f, r01 = 0.0f, r10 = 0.0f, r11 = 0.0f;
+    float h00 = 0.0f, h01 = 0.0f, h10 = 0.0f, h11 = 0.0f;
+    const int n_tiles = (H + 15) / 16;
+    for (int tile = 0; tile < n_tiles; ++tile) {
+        const int ak = tile * 16 + lx, bk = tile * 16 + ly;
+        const int prev_base = (t == 0) ? 0 : (t - 1) * B * H;
+        As[ly][lx] = (row0 < B && ak < H) ? ((t == 0) ? cur[row0 * H + ak] : state_all[prev_base + row0 * H + ak]) : 0.0f;
+        As[ly + 16][lx] = (row1 < B && ak < H) ? ((t == 0) ? cur[row1 * H + ak] : state_all[prev_base + row1 * H + ak]) : 0.0f;
+        Bz[ly][lx] = (bk < H && col0 < H) ? U[bk * H3 + col0] : 0.0f;
+        Bz[ly][lx + 16] = (bk < H && col1 < H) ? U[bk * H3 + col1] : 0.0f;
+        Br[ly][lx] = (bk < H && col0 < H) ? U[bk * H3 + H + col0] : 0.0f;
+        Br[ly][lx + 16] = (bk < H && col1 < H) ? U[bk * H3 + H + col1] : 0.0f;
+        Bh[ly][lx] = (bk < H && col0 < H) ? U[bk * H3 + 2 * H + col0] : 0.0f;
+        Bh[ly][lx + 16] = (bk < H && col1 < H) ? U[bk * H3 + 2 * H + col1] : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const float a0 = As[ly][k], a1 = As[ly + 16][k];
+            const float bz0 = Bz[k][lx], bz1 = Bz[k][lx + 16];
+            const float br0 = Br[k][lx], br1 = Br[k][lx + 16];
+            const float bh0 = Bh[k][lx], bh1 = Bh[k][lx + 16];
+            z00 = fma(a0, bz0, z00); z01 = fma(a0, bz1, z01);
+            z10 = fma(a1, bz0, z10); z11 = fma(a1, bz1, z11);
+            r00 = fma(a0, br0, r00); r01 = fma(a0, br1, r01);
+            r10 = fma(a1, br0, r10); r11 = fma(a1, br1, r11);
+            h00 = fma(a0, bh0, h00); h01 = fma(a0, bh1, h01);
+            h10 = fma(a1, bh0, h10); h11 = fma(a1, bh1, h11);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (row0 < B && col0 < H) gru_projection_fused_store(B, H, T, t, row0, col0, z00, r00, h00, Xg, bx, bs, cur, prev_all, state_all, Sg, cache);
+    if (row0 < B && col1 < H) gru_projection_fused_store(B, H, T, t, row0, col1, z01, r01, h01, Xg, bx, bs, cur, prev_all, state_all, Sg, cache);
+    if (row1 < B && col0 < H) gru_projection_fused_store(B, H, T, t, row1, col0, z10, r10, h10, Xg, bx, bs, cur, prev_all, state_all, Sg, cache);
+    if (row1 < B && col1 < H) gru_projection_fused_store(B, H, T, t, row1, col1, z11, r11, h11, Xg, bx, bs, cur, prev_all, state_all, Sg, cache);
 }
 
 // Fused Gated RC / CuDNN-GRU-v2 backward step at timestep t for B parallel streams
@@ -557,7 +652,7 @@ __kernel void gru_step_bwd_kernel(
     __global const float* dS_out_all,
     __global const float* dS_carry,
     __global const float* cache_zrh,
-    __global const float* s_prev,
+    __global const float* s_prev_all,
     __global const float* Sg_all,
     __global const float* b_s,
     __global float* dXg_all,
@@ -577,7 +672,7 @@ __kernel void gru_step_bwd_kernel(
     float z = cache_zrh[tb_3h + h];
     float r = cache_zrh[tb_3h + H + h];
     float ht = cache_zrh[tb_3h + 2 * H + h];
-    float sp = s_prev[b * H + h];
+    float sp = s_prev_all[tb_h];
     float sg_h = Sg_all[tb_3h + 2 * H + h] + b_s[2 * H + h];
 
     float dz_pre = ds * (ht - sp) * z * (1.0f - z);
@@ -666,6 +761,419 @@ __kernel void vec_add_kernel(
     if (gid >= n_total) return;
     out[gid] = a[gid] + b[gid];
 }
+
+// Offset elementwise addition: out[out_off + i] = a[a_off + i] + b[b_off + i]
+__kernel void vec_add_offset_kernel(
+    const int n_total,
+    const int a_off,
+    const int b_off,
+    const int out_off,
+    __global const float* a,
+    __global const float* b,
+    __global float* out
+) {
+    int gid = get_global_id(0);
+    if (gid >= n_total) return;
+    out[out_off + gid] = a[a_off + gid] + b[b_off + gid];
+}
+
+// Zero-copy on-GPU slice of [T, B] time-major single int32 stream (e.g. aligned chunk IDs)
+__kernel void slice_stream_1_kernel(
+    const int B,
+    const int T,
+    const int stream_len,
+    const int s0,
+    __global const int* full_stream,
+    __global int* out_slice
+) {
+    int gid = get_global_id(0);
+    int tot = B * T;
+    if (gid >= tot) return;
+    int t = gid / B;
+    int b = gid - t * B;
+    out_slice[gid] = full_stream[b * stream_len + s0 + t];
+}
+
+// Additive dual-stream embedding gather: X[r, d] += E_chunk[chk_ids[r], d] for chk > 0
+__kernel void embed_add_1_kernel(
+    const int N,
+    const int C,
+    const int D,
+    __global const int* chk_ids,
+    __global const float* E_chunk,
+    __global float* X_inout
+) {
+    int gid = get_global_id(0);
+    int tot = N * D;
+    if (gid >= tot) return;
+    int r = gid / D;
+    int d = gid - r * D;
+    int c = chk_ids[r];
+    if (c > 0 && c < C) {
+        X_inout[gid] += E_chunk[c * D + d];
+    }
+}
+
+// Fast-Weight Isotropic Gated Delta-Rule Associative Scan Forward (1 workgroup of 64 threads per stream b, D <= 64).
+// Isotropic scalar decay lam_t preserves exact key-query geometry across arbitrary delays and allows topic flushes!
+__kernel void fast_weight_scan_fwd_kernel(
+    const int B,
+    const int T,
+    const int D,
+    __global const float* K_raw,
+    __global const float* QVG_raw,
+    __global const float* b_k,
+    __global const float* b_qvg,
+    __global float* M_cur,
+    __global float* M_prev_all,
+    __global float* R_hat_all,
+    __global float* fw_cache
+) {
+    int b = get_group_id(0);
+    if (b >= B) return;
+    int tid = get_local_id(0);
+    int QVG_D = 2 * D + 3;
+    int CACHE_D = 5 * D + 6;
+
+    __local float sm_M[64 * 65];
+    __local float sm_k[64];
+    __local float sm_q[64];
+    __local float sm_v[64];
+    __local float sm_r[64];
+    __local float sm_red[64];
+
+    if (tid < D) {
+        int mb = b * D * D;
+        for (int i = 0; i < D; ++i) {
+            sm_M[i * 65 + tid] = M_cur[mb + i * D + tid];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int t = 0; t < T; ++t) {
+        int tb = t * B + b;
+        int qvg_base = tb * QVG_D;
+
+        float kr = (tid < D) ? (K_raw[tb * D + tid] + b_k[tid]) : 0.0f;
+        float qr = (tid < D) ? (QVG_raw[qvg_base + tid] + b_qvg[tid]) : 0.0f;
+        float vr = (tid < D) ? (QVG_raw[qvg_base + D + tid] + b_qvg[D + tid]) : 0.0f;
+
+        sm_red[tid] = kr * kr;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 32) sm_red[tid] += sm_red[tid + 32];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 16) sm_red[tid] += sm_red[tid + 16];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 8) sm_red[tid] += sm_red[tid + 8];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 4) sm_red[tid] += sm_red[tid + 4];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 2) sm_red[tid] += sm_red[tid + 2];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 1) sm_red[tid] += sm_red[tid + 1];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float inv_nk = 1.0f / sqrt(sm_red[0] + 1e-5f);
+
+        sm_red[tid] = qr * qr;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 32) sm_red[tid] += sm_red[tid + 32];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 16) sm_red[tid] += sm_red[tid + 16];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 8) sm_red[tid] += sm_red[tid + 8];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 4) sm_red[tid] += sm_red[tid + 4];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 2) sm_red[tid] += sm_red[tid + 2];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 1) sm_red[tid] += sm_red[tid + 1];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float inv_nq = 1.0f / sqrt(sm_red[0] + 1e-5f);
+
+        float gl = clamp(QVG_raw[qvg_base + 2 * D] + b_qvg[2 * D], -16.0f, 16.0f);
+        float ge = clamp(QVG_raw[qvg_base + 2 * D + 1] + b_qvg[2 * D + 1], -16.0f, 16.0f);
+        float go = clamp(QVG_raw[qvg_base + 2 * D + 2] + b_qvg[2 * D + 2], -16.0f, 16.0f);
+        float lam = 1.0f / (1.0f + exp(-gl));
+        float eta = 1.0f / (1.0f + exp(-ge));
+        float og = 1.0f / (1.0f + exp(-go));
+
+        if (tid < D) {
+            sm_k[tid] = kr * inv_nk;
+            sm_q[tid] = qr * inv_nq;
+            sm_v[tid] = tanh(vr);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        float v_old = 0.0f;
+        float r_j = 0.0f;
+        if (tid < D) {
+            int m_base = tb * D * D;
+            for (int i = 0; i < D; ++i) {
+                float mij = sm_M[i * 65 + tid];
+                M_prev_all[m_base + i * D + tid] = mij;
+                v_old += sm_k[i] * mij;
+            }
+            float delta = sm_v[tid] - lam * v_old;
+            for (int i = 0; i < D; ++i) {
+                float mij_new = lam * sm_M[i * 65 + tid] + eta * sm_k[i] * delta;
+                sm_M[i * 65 + tid] = mij_new;
+                r_j += sm_q[i] * mij_new;
+            }
+            sm_r[tid] = r_j;
+        }
+        sm_red[tid] = (tid < D) ? (r_j * r_j) : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 32) sm_red[tid] += sm_red[tid + 32];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 16) sm_red[tid] += sm_red[tid + 16];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 8) sm_red[tid] += sm_red[tid + 8];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 4) sm_red[tid] += sm_red[tid + 4];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 2) sm_red[tid] += sm_red[tid + 2];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 1) sm_red[tid] += sm_red[tid + 1];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float inv_rms = 1.0f / sqrt(sm_red[0] / (float)D + 1.0f);
+
+        if (tid < D) {
+            float r_hat = sm_r[tid] * inv_rms;
+            R_hat_all[tb * D + tid] = og * r_hat;
+            int cb = tb * CACHE_D;
+            fw_cache[cb + tid] = sm_k[tid];
+            fw_cache[cb + D + tid] = sm_q[tid];
+            fw_cache[cb + 2 * D + tid] = sm_v[tid];
+            fw_cache[cb + 3 * D + tid] = v_old;
+            fw_cache[cb + 4 * D + tid] = r_hat;
+            if (tid == 0) {
+                fw_cache[cb + 5 * D + 0] = inv_nk;
+                fw_cache[cb + 5 * D + 1] = inv_nq;
+                fw_cache[cb + 5 * D + 2] = lam;
+                fw_cache[cb + 5 * D + 3] = eta;
+                fw_cache[cb + 5 * D + 4] = inv_rms;
+                fw_cache[cb + 5 * D + 5] = og;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (tid < D) {
+        int mb = b * D * D;
+        for (int i = 0; i < D; ++i) {
+            M_cur[mb + i * D + tid] = sm_M[i * 65 + tid];
+        }
+    }
+}
+
+// Fast-Weight Isotropic Gated Delta-Rule Associative Scan Backward (1 workgroup of 64 threads/stream, ~19.7 KB LDS).
+__kernel void fast_weight_scan_bwd_kernel(
+    const int B,
+    const int T,
+    const int D,
+    __global const float* dR_hat_all,
+    __global const float* M_prev_all,
+    __global const float* fw_cache,
+    __global float* dK_raw,
+    __global float* dQVG_raw
+) {
+    int b = get_group_id(0);
+    if (b >= B) return;
+    int tid = get_local_id(0);
+    int QVG_D = 2 * D + 3;
+    int CACHE_D = 5 * D + 6;
+
+    __local float sm_dM[64 * 65];
+    __local float sm_k[64];
+    __local float sm_q[64];
+    __local float sm_v[64];
+    __local float sm_vold[64];
+    __local float sm_rhat[64];
+    __local float sm_dr[64];
+    __local float sm_delta[64];
+    __local float sm_dq[64];
+    __local float sm_dk[64];
+    __local float sm_dv[64];
+    __local float sm_dvold[64];
+    __local float sm_red[64];
+
+    if (tid < D) {
+        for (int i = 0; i < D; ++i) {
+            sm_dM[i * 65 + tid] = 0.0f;
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int t = T - 1; t >= 0; --t) {
+        int tb = t * B + b;
+        int cb = tb * CACHE_D;
+        int m_base = tb * D * D;
+
+        float drh_j = 0.0f;
+        if (tid < D) {
+            drh_j = dR_hat_all[tb * D + tid];
+            sm_k[tid] = fw_cache[cb + tid];
+            sm_q[tid] = fw_cache[cb + D + tid];
+            sm_v[tid] = fw_cache[cb + 2 * D + tid];
+            sm_vold[tid] = fw_cache[cb + 3 * D + tid];
+            sm_rhat[tid] = fw_cache[cb + 4 * D + tid];
+        }
+        float inv_nk = fw_cache[cb + 5 * D + 0];
+        float inv_nq = fw_cache[cb + 5 * D + 1];
+        float lam = fw_cache[cb + 5 * D + 2];
+        float eta = fw_cache[cb + 5 * D + 3];
+        float inv_rms = fw_cache[cb + 5 * D + 4];
+        float og = fw_cache[cb + 5 * D + 5];
+
+        sm_red[tid] = (tid < D) ? (drh_j * sm_rhat[tid]) : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 32) sm_red[tid] += sm_red[tid + 32];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 16) sm_red[tid] += sm_red[tid + 16];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 8) sm_red[tid] += sm_red[tid + 8];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 4) sm_red[tid] += sm_red[tid + 4];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 2) sm_red[tid] += sm_red[tid + 2];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 1) sm_red[tid] += sm_red[tid + 1];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float do_tot = sm_red[0];
+        float r_dot = (do_tot * og) / (float)D;
+
+        if (tid < D) {
+            sm_dr[tid] = (og * drh_j - sm_rhat[tid] * r_dot) * inv_rms;
+            sm_delta[tid] = sm_v[tid] - lam * sm_vold[tid];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (tid < D) {
+            float dq_i = 0.0f;
+            float ki = sm_k[tid];
+            int row_off = m_base + tid * D;
+            for (int j = 0; j < D; ++j) {
+                float m_cur = lam * M_prev_all[row_off + j] + eta * ki * sm_delta[j];
+                dq_i += m_cur * sm_dr[j];
+            }
+            sm_dq[tid] = dq_i;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        float deta_part = 0.0f;
+        float dlam_part = 0.0f;
+        if (tid < D) {
+            float dr_j = sm_dr[tid];
+            float u_j = 0.0f;
+            float dlam2_j = 0.0f;
+            for (int i = 0; i < D; ++i) {
+                float dm_ij = sm_dM[i * 65 + tid] + sm_q[i] * dr_j;
+                sm_dM[i * 65 + tid] = dm_ij;
+                u_j += sm_k[i] * dm_ij;
+                dlam2_j += M_prev_all[m_base + i * D + tid] * dm_ij;
+            }
+            float d_delta = eta * u_j;
+            sm_dv[tid] = d_delta;
+            sm_dvold[tid] = -lam * d_delta;
+            deta_part = sm_delta[tid] * u_j;
+            dlam_part = dlam2_j - sm_vold[tid] * d_delta;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (tid < D) {
+            float dk_i = 0.0f;
+            int row_off = m_base + tid * D;
+            int dm_row = tid * 65;
+            for (int j = 0; j < D; ++j) {
+                dk_i += eta * sm_dM[dm_row + j] * sm_delta[j] + M_prev_all[row_off + j] * sm_dvold[j];
+            }
+            sm_dk[tid] = dk_i;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        sm_red[tid] = deta_part;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 32) sm_red[tid] += sm_red[tid + 32];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 16) sm_red[tid] += sm_red[tid + 16];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 8) sm_red[tid] += sm_red[tid + 8];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 4) sm_red[tid] += sm_red[tid + 4];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 2) sm_red[tid] += sm_red[tid + 2];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 1) sm_red[tid] += sm_red[tid + 1];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float deta_tot = sm_red[0];
+
+        sm_red[tid] = dlam_part;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 32) sm_red[tid] += sm_red[tid + 32];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 16) sm_red[tid] += sm_red[tid + 16];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 8) sm_red[tid] += sm_red[tid + 8];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 4) sm_red[tid] += sm_red[tid + 4];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 2) sm_red[tid] += sm_red[tid + 2];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 1) sm_red[tid] += sm_red[tid + 1];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float dlam_tot = sm_red[0];
+
+        sm_red[tid] = (tid < D) ? (sm_dq[tid] * sm_q[tid]) : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 32) sm_red[tid] += sm_red[tid + 32];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 16) sm_red[tid] += sm_red[tid + 16];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 8) sm_red[tid] += sm_red[tid + 8];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 4) sm_red[tid] += sm_red[tid + 4];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 2) sm_red[tid] += sm_red[tid + 2];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 1) sm_red[tid] += sm_red[tid + 1];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float dq_dot = sm_red[0];
+
+        sm_red[tid] = (tid < D) ? (sm_dk[tid] * sm_k[tid]) : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 32) sm_red[tid] += sm_red[tid + 32];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 16) sm_red[tid] += sm_red[tid + 16];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 8) sm_red[tid] += sm_red[tid + 8];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 4) sm_red[tid] += sm_red[tid + 4];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 2) sm_red[tid] += sm_red[tid + 2];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (tid < 1) sm_red[tid] += sm_red[tid + 1];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        float dk_dot = sm_red[0];
+
+        if (tid < D) {
+            float dvold_j = sm_dvold[tid];
+            for (int i = 0; i < D; ++i) {
+                sm_dM[i * 65 + tid] = lam * sm_dM[i * 65 + tid] + sm_k[i] * dvold_j;
+            }
+            dK_raw[tb * D + tid] = (sm_dk[tid] - sm_k[tid] * dk_dot) * inv_nk;
+            int qvg_base = tb * QVG_D;
+            dQVG_raw[qvg_base + tid] = (sm_dq[tid] - sm_q[tid] * dq_dot) * inv_nq;
+            float vj = sm_v[tid];
+            dQVG_raw[qvg_base + D + tid] = sm_dv[tid] * (1.0f - vj * vj);
+            if (tid == 0) {
+                dQVG_raw[qvg_base + 2 * D] = dlam_tot * lam * (1.0f - lam);
+                dQVG_raw[qvg_base + 2 * D + 1] = deta_tot * eta * (1.0f - eta);
+                dQVG_raw[qvg_base + 2 * D + 2] = do_tot * og * (1.0f - og);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+}
 """
 
 
@@ -698,9 +1206,15 @@ class OpenCLAccelerator:
         self._k_emb_gather_1 = None
         self._k_emb_grad_1 = None
         self._k_gru_fwd = None
+        self._k_gru_proj_fused = None
         self._k_gru_bwd = None
         self._k_clip_grad = None
         self._k_copy_slice = None
+        self._k_vec_add_offset = None
+        self._k_slice_stream_1 = None
+        self._k_embed_add_1 = None
+        self._k_fw_fwd = None
+        self._k_fw_bwd = None
         self._init_opencl(prefer_vendor=prefer_vendor)
 
     def _init_opencl(self, prefer_vendor: str = "AMD") -> None:
@@ -827,12 +1341,18 @@ class OpenCLAccelerator:
         k_emb_g1 = ocl.clCreateKernel(prog, b"embed_gather_1_kernel", ctypes.byref(err))
         k_emb_gr1 = ocl.clCreateKernel(prog, b"embed_grad_reduce_1_kernel", ctypes.byref(err))
         k_gru_fwd = ocl.clCreateKernel(prog, b"gru_step_fwd_kernel", ctypes.byref(err))
+        k_gru_proj_fused = ocl.clCreateKernel(prog, b"gru_projection_fused_kernel", ctypes.byref(err))
         k_gru_bwd = ocl.clCreateKernel(prog, b"gru_step_bwd_kernel", ctypes.byref(err))
         k_clip_g = ocl.clCreateKernel(prog, b"clip_grad_kernel", ctypes.byref(err))
         k_cp_sl = ocl.clCreateKernel(prog, b"copy_slice_kernel", ctypes.byref(err))
         k_sl_tok = ocl.clCreateKernel(prog, b"slice_tokens_kernel", ctypes.byref(err))
         k_zero = ocl.clCreateKernel(prog, b"zero_buf_kernel", ctypes.byref(err))
         k_vadd = ocl.clCreateKernel(prog, b"vec_add_kernel", ctypes.byref(err))
+        k_vadd_off = ocl.clCreateKernel(prog, b"vec_add_offset_kernel", ctypes.byref(err))
+        k_sl_s1 = ocl.clCreateKernel(prog, b"slice_stream_1_kernel", ctypes.byref(err))
+        k_emb_add1 = ocl.clCreateKernel(prog, b"embed_add_1_kernel", ctypes.byref(err))
+        k_fw_fwd = ocl.clCreateKernel(prog, b"fast_weight_scan_fwd_kernel", ctypes.byref(err))
+        k_fw_bwd = ocl.clCreateKernel(prog, b"fast_weight_scan_bwd_kernel", ctypes.byref(err))
 
         self._ocl = ocl
         self._ctx = ctx
@@ -854,12 +1374,18 @@ class OpenCLAccelerator:
         self._k_emb_gather_1 = k_emb_g1
         self._k_emb_grad_1 = k_emb_gr1
         self._k_gru_fwd = k_gru_fwd
+        self._k_gru_proj_fused = k_gru_proj_fused
         self._k_gru_bwd = k_gru_bwd
         self._k_clip_grad = k_clip_g
         self._k_copy_slice = k_cp_sl
         self._k_slice_tokens = k_sl_tok
         self._k_zero_buf = k_zero
         self._k_vec_add = k_vadd
+        self._k_vec_add_offset = k_vadd_off
+        self._k_slice_stream_1 = k_sl_s1
+        self._k_embed_add_1 = k_emb_add1
+        self._k_fw_fwd = k_fw_fwd
+        self._k_fw_bwd = k_fw_bwd
         self.platform_name = pname
         self.device_name = dname
         self.compute_units = cu_val
@@ -1072,6 +1598,8 @@ class OpenCLAccelerator:
         alpha: float = 1.0,
         beta: float = 0.0,
         sync: bool = False,
+        a_offset: int = 0,
+        c_offset: int = 0,
     ) -> None:
         vp = ctypes.sizeof(ctypes.c_void_p)
         self._set_args(self._k_sgemm, [
@@ -1082,6 +1610,8 @@ class OpenCLAccelerator:
             (ctypes.c_int32(1 if transB else 0), 4),
             (ctypes.c_float(alpha), 4),
             (ctypes.c_float(beta), 4),
+            (ctypes.c_int32(a_offset), 4),
+            (ctypes.c_int32(c_offset), 4),
             (ctypes.c_void_p(b_A), vp),
             (ctypes.c_void_p(b_B), vp),
             (ctypes.c_void_p(b_C), vp),
@@ -1393,10 +1923,11 @@ class OpenCLAccelerator:
         H: int,
         t: int,
         b_Xg_all: ctypes.c_void_p,
-        b_Sg_t: ctypes.c_void_p,
+        b_Sg_all: ctypes.c_void_p,
         b_bx: ctypes.c_void_p,
         b_bs: ctypes.c_void_p,
-        b_s_prev: ctypes.c_void_p,
+        b_s_cur: ctypes.c_void_p,
+        b_s_prev_all: ctypes.c_void_p,
         b_s_all: ctypes.c_void_p,
         b_cache_zrh: ctypes.c_void_p,
     ) -> None:
@@ -1407,10 +1938,11 @@ class OpenCLAccelerator:
             (ctypes.c_int32(H), 4),
             (ctypes.c_int32(t), 4),
             (ctypes.c_void_p(b_Xg_all), vp),
-            (ctypes.c_void_p(b_Sg_t), vp),
+            (ctypes.c_void_p(b_Sg_all), vp),
             (ctypes.c_void_p(b_bx), vp),
             (ctypes.c_void_p(b_bs), vp),
-            (ctypes.c_void_p(b_s_prev), vp),
+            (ctypes.c_void_p(b_s_cur), vp),
+            (ctypes.c_void_p(b_s_prev_all), vp),
             (ctypes.c_void_p(b_s_all), vp),
             (ctypes.c_void_p(b_cache_zrh), vp),
         ])
@@ -1420,6 +1952,47 @@ class OpenCLAccelerator:
         if rc != 0:
             raise RuntimeError(f"clEnqueueNDRangeKernel(gru_fwd) failed: {rc}")
 
+    def launch_gru_projection_fused(
+        self,
+        B: int,
+        H: int,
+        T: int,
+        t: int,
+        b_Xg_all: ctypes.c_void_p,
+        b_U: ctypes.c_void_p,
+        b_bx: ctypes.c_void_p,
+        b_bs: ctypes.c_void_p,
+        b_s_cur: ctypes.c_void_p,
+        b_s_prev_all: ctypes.c_void_p,
+        b_s_all: ctypes.c_void_p,
+        b_Sg_all: ctypes.c_void_p,
+        b_cache_zrh: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        self._set_args(self._k_gru_proj_fused, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(H), 4),
+            (ctypes.c_int32(T), 4),
+            (ctypes.c_int32(t), 4),
+            (ctypes.c_void_p(b_Xg_all), vp),
+            (ctypes.c_void_p(b_U), vp),
+            (ctypes.c_void_p(b_bx), vp),
+            (ctypes.c_void_p(b_bs), vp),
+            (ctypes.c_void_p(b_s_cur), vp),
+            (ctypes.c_void_p(b_s_prev_all), vp),
+            (ctypes.c_void_p(b_s_all), vp),
+            (ctypes.c_void_p(b_Sg_all), vp),
+            (ctypes.c_void_p(b_cache_zrh), vp),
+        ])
+        gs = (ctypes.c_size_t * 2)(
+            ((int(H) + 31) // 32) * 16,
+            ((int(B) + 31) // 32) * 16,
+        )
+        ls = (ctypes.c_size_t * 2)(16, 16)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_gru_proj_fused, 2, None, gs, ls, 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(gru_projection_fused) failed: {rc}")
+
     def launch_gru_step_bwd(
         self,
         B: int,
@@ -1428,7 +2001,7 @@ class OpenCLAccelerator:
         b_dS_out_all: ctypes.c_void_p,
         b_dS_carry: ctypes.c_void_p,
         b_cache_zrh: ctypes.c_void_p,
-        b_s_prev: ctypes.c_void_p,
+        b_s_prev_all: ctypes.c_void_p,
         b_Sg_all: ctypes.c_void_p,
         b_bs: ctypes.c_void_p,
         b_dXg_all: ctypes.c_void_p,
@@ -1444,7 +2017,7 @@ class OpenCLAccelerator:
             (ctypes.c_void_p(b_dS_out_all), vp),
             (ctypes.c_void_p(b_dS_carry), vp),
             (ctypes.c_void_p(b_cache_zrh), vp),
-            (ctypes.c_void_p(b_s_prev), vp),
+            (ctypes.c_void_p(b_s_prev_all), vp),
             (ctypes.c_void_p(b_Sg_all), vp),
             (ctypes.c_void_p(b_bs), vp),
             (ctypes.c_void_p(b_dXg_all), vp),
@@ -1550,6 +2123,146 @@ class OpenCLAccelerator:
         rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_vec_add, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
         if rc != 0:
             raise RuntimeError(f"clEnqueueNDRangeKernel(vec_add) failed: {rc}")
+
+    def launch_vec_add_offset(
+        self,
+        n_total: int,
+        a_off: int,
+        b_off: int,
+        out_off: int,
+        b_a: ctypes.c_void_p,
+        b_b: ctypes.c_void_p,
+        b_out: ctypes.c_void_p,
+    ) -> None:
+        if n_total <= 0:
+            return
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        self._set_args(self._k_vec_add_offset, [
+            (ctypes.c_int32(n_total), 4),
+            (ctypes.c_int32(a_off), 4),
+            (ctypes.c_int32(b_off), 4),
+            (ctypes.c_int32(out_off), 4),
+            (ctypes.c_void_p(b_a), vp),
+            (ctypes.c_void_p(b_b), vp),
+            (ctypes.c_void_p(b_out), vp),
+        ])
+        gs = ctypes.c_size_t(((int(n_total) + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_vec_add_offset, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(vec_add_offset) failed: {rc}")
+
+    def launch_slice_stream_1(
+        self,
+        B: int,
+        T: int,
+        stream_len: int,
+        s0: int,
+        b_full_stream: ctypes.c_void_p,
+        b_out_slice: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(B) * int(T)
+        self._set_args(self._k_slice_stream_1, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(T), 4),
+            (ctypes.c_int32(stream_len), 4),
+            (ctypes.c_int32(s0), 4),
+            (ctypes.c_void_p(b_full_stream), vp),
+            (ctypes.c_void_p(b_out_slice), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_slice_stream_1, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(slice_stream_1) failed: {rc}")
+
+    def launch_embed_add_1(
+        self,
+        N: int,
+        C: int,
+        D: int,
+        b_chk_ids: ctypes.c_void_p,
+        b_E_chunk: ctypes.c_void_p,
+        b_X_inout: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(N) * int(D)
+        self._set_args(self._k_embed_add_1, [
+            (ctypes.c_int32(N), 4),
+            (ctypes.c_int32(C), 4),
+            (ctypes.c_int32(D), 4),
+            (ctypes.c_void_p(b_chk_ids), vp),
+            (ctypes.c_void_p(b_E_chunk), vp),
+            (ctypes.c_void_p(b_X_inout), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_embed_add_1, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(embed_add_1) failed: {rc}")
+
+    def launch_fast_weight_scan_fwd(
+        self,
+        B: int,
+        T: int,
+        D: int,
+        b_K_raw: ctypes.c_void_p,
+        b_QVG_raw: ctypes.c_void_p,
+        b_bk: ctypes.c_void_p,
+        b_bqvg: ctypes.c_void_p,
+        b_M_cur: ctypes.c_void_p,
+        b_M_prev_all: ctypes.c_void_p,
+        b_R_hat_all: ctypes.c_void_p,
+        b_fw_cache: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        self._set_args(self._k_fw_fwd, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(T), 4),
+            (ctypes.c_int32(D), 4),
+            (ctypes.c_void_p(b_K_raw), vp),
+            (ctypes.c_void_p(b_QVG_raw), vp),
+            (ctypes.c_void_p(b_bk), vp),
+            (ctypes.c_void_p(b_bqvg), vp),
+            (ctypes.c_void_p(b_M_cur), vp),
+            (ctypes.c_void_p(b_M_prev_all), vp),
+            (ctypes.c_void_p(b_R_hat_all), vp),
+            (ctypes.c_void_p(b_fw_cache), vp),
+        ])
+        gs = ctypes.c_size_t(int(B) * 64)
+        ls = ctypes.c_size_t(64)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_fw_fwd, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(fast_weight_scan_fwd) failed: {rc}")
+
+    def launch_fast_weight_scan_bwd(
+        self,
+        B: int,
+        T: int,
+        D: int,
+        b_dR_hat_all: ctypes.c_void_p,
+        b_M_prev_all: ctypes.c_void_p,
+        b_fw_cache: ctypes.c_void_p,
+        b_dK_raw: ctypes.c_void_p,
+        b_dQVG_raw: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        self._set_args(self._k_fw_bwd, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(T), 4),
+            (ctypes.c_int32(D), 4),
+            (ctypes.c_void_p(b_dR_hat_all), vp),
+            (ctypes.c_void_p(b_M_prev_all), vp),
+            (ctypes.c_void_p(b_fw_cache), vp),
+            (ctypes.c_void_p(b_dK_raw), vp),
+            (ctypes.c_void_p(b_dQVG_raw), vp),
+        ])
+        gs = ctypes.c_size_t(int(B) * 64)
+        ls = ctypes.c_size_t(64)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_fw_bwd, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(fast_weight_scan_bwd) failed: {rc}")
 
     def info(self) -> dict:
         return dict(

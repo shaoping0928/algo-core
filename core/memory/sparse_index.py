@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 import heapq
 import os
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -34,6 +35,101 @@ def extract_sparse_features(
     return tuple((int(d), int(round(float(v) / step))) for d, v in enumerate(arr))
 
 
+def _ordered_suffix_keys(keys: Sequence[Tuple[int, ...]]) -> List[Tuple[int, ...]]:
+    suffixes = []
+    for key in keys:
+        if len(key) >= 2 and key[0] == -1:
+            suffixes.append((1, key))
+        elif len(key) >= 3 and key[0] >= 12:
+            suffixes.append((len(key) - 1, key))
+    suffixes.sort(key=lambda item: item[0], reverse=True)
+    return [key for _, key in suffixes]
+
+
+class _PackedSuffixQuery:
+    """Vectorized discounted backoff for broad count postings over dense action IDs."""
+
+    def __init__(self, index: SparseFeatureActionIndex):
+        self._postings = index._postings
+        self._totals = index._key_totals
+        self._size = len(index.action_space)
+        self._row = lru_cache(maxsize=256)(self._pack_row)
+        self._global_mass = np.zeros(self._size, dtype=np.float64)
+        self._global_rate = np.zeros(self._size, dtype=np.float64)
+        total = float(sum(index._global_counts.values()))
+        if total > 0.0:
+            inv_total = 1.0 / total
+            for action, count in index._global_counts.items():
+                if 0 <= action < self._size and count > 0:
+                    self._global_mass[action] = float(count) * inv_total
+                    self._global_rate[action] = max(index._global_scores[action] / float(count), 0.0)
+        self._finite_global_rates = bool(np.isfinite(self._global_rate).all())
+
+    def _pack_row(self, key: Tuple[int, ...]) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        post = self._postings[key]
+        try:
+            actions = np.fromiter(post, dtype=np.intp, count=len(post))
+        except OverflowError:
+            return None
+        if actions.min() < 0 or actions.max() >= self._size:
+            return None
+        try:
+            counts = np.fromiter(post.values(), dtype=np.float64, count=len(post))
+        except (TypeError, ValueError):
+            # Reward-bearing buckets use the scalar reference path.
+            return None
+        return actions, counts
+
+    def propose(
+        self, keys: Sequence[Tuple[int, ...]], k: int, discount: float,
+    ) -> Optional[Tuple[List[int], np.ndarray]]:
+        if not self._finite_global_rates or not 0.0 <= discount < float("inf"):
+            return None
+        rows = []
+        for key in _ordered_suffix_keys(keys):
+            post = self._postings.get(key)
+            total = self._totals.get(key, 0.0)
+            if post and total > 0.0:
+                rows.append((key, len(post), 1.0 / total))
+        if sum(count for _, count, _ in rows) < 256:
+            return None
+
+        scores = np.zeros(self._size, dtype=np.float64)
+        seen = np.zeros(self._size, dtype=bool)
+        weight = 1.0
+        for key, count, inv_total in rows:
+            packed = self._row(key)
+            if packed is None:
+                return None
+            actions, counts = packed
+            discounted = counts - discount
+            keep = discounted > 0.0
+            selected = actions[keep]
+            scores[selected] += weight * (discounted[keep] * inv_total)
+            seen[selected] = True
+            weight *= min((discount * float(count)) * inv_total, 1.0)
+            if weight <= 1e-12:
+                break
+
+        active = np.flatnonzero(seen)
+        if active.size < k:
+            # Sparse queries can introduce new actions from the unigram fallback.
+            return None
+        values = scores[active]
+        if weight > 1e-12:
+            values += (weight * self._global_mass[active]) * self._global_rate[active]
+
+        if active.size > k:
+            cutoff = np.partition(values, -k)[-k]
+            above = np.flatnonzero(values > cutoff)
+            # At the cutoff, choose the smallest action IDs, like the scalar sort.
+            ties = np.flatnonzero(values == cutoff)[: k - len(above)]
+            top = np.concatenate((above, ties))
+            active, values = active[top], values[top]
+        ordered = np.lexsort((active, -values))
+        return active[ordered].tolist(), values[ordered]
+
+
 class SparseFeatureActionIndex:
     """Inverted-postings heuristic action proposer for large discrete action spaces."""
 
@@ -54,6 +150,11 @@ class SparseFeatureActionIndex:
         self._global_counts: Counter = Counter()
         self._global_scores: Dict[int, float] = defaultdict(float)
         self.total_updates = 0
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state.pop("_cached_proposal", None)
+        return state
 
     def update(
         self,
@@ -92,6 +193,7 @@ class SparseFeatureActionIndex:
         self._global_counts[act] += 1
         self._global_scores[act] += score
         self.total_updates += 1
+        self.__dict__.pop("_cached_proposal", None)
 
     @staticmethod
     def _count_shard(
@@ -317,6 +419,7 @@ class SparseFeatureActionIndex:
         if n <= c:
             return self
 
+        self.__dict__.pop("_cached_proposal", None)
         min_v = int(arr.min())
         max_v = int(arr.max())
         bits = max(max_v.bit_length(), 1)
@@ -411,6 +514,7 @@ class SparseFeatureActionIndex:
             # Replace outer dicts cleanly to eliminate CPython hash-table tombstones
             self._postings = new_postings
             self._key_totals = new_totals
+            self.__dict__.pop("_cached_proposal", None)
         return evicted
 
     def _propose_interpolated_ad(
@@ -420,19 +524,10 @@ class SparseFeatureActionIndex:
         discount: float = 0.5,
     ) -> Tuple[List[int], np.ndarray]:
         """Exact top-down Interpolated Absolute Discounting over nested suffix keys."""
-        # Extract nested suffix keys ordered from highest order down to order 1.
-        ordered_keys: List[Tuple[int, Tuple[int, ...]]] = []
-        for fk in sparse_keys:
-            if len(fk) >= 2 and fk[0] == -1:
-                ordered_keys.append((1, fk))
-            elif len(fk) >= 3 and fk[0] >= 12:
-                ordered_keys.append((len(fk) - 1, fk))
-        ordered_keys.sort(key=lambda item: item[0], reverse=True)
-
         probs: Dict[int, float] = defaultdict(float)
         weight = 1.0
         d = float(discount)
-        for _order, fk in ordered_keys:
+        for fk in _ordered_suffix_keys(sparse_keys):
             post = self._postings.get(fk)
             tot = self._key_totals.get(fk, 0.0)
             if not post or tot <= 0.0:
@@ -511,6 +606,38 @@ class SparseFeatureActionIndex:
             return self._propose_interpolated_ad(sparse_keys, k_req, discount=discount)
         ranked = self.propose_one(state, k_req, sparse_keys=None)
         return ranked, np.full(len(ranked), 1.0 / max(len(ranked), 1), dtype=float)
+
+    def propose_cached(
+        self,
+        sparse_keys: Sequence[Tuple[int, ...]],
+        k: int,
+        discount: float = 0.5,
+    ) -> Tuple[List[int], np.ndarray]:
+        """Reuse suffix queries across lookahead branches on the same fitted index."""
+        query = getattr(self, "_cached_proposal", None)
+        if query is None:
+            query = self.__dict__.setdefault(
+                "_cached_proposal", self._build_cached_proposal()
+            )
+        k_req = min(max(int(k), 1), len(self.action_space))
+        ranked, probs = query(tuple(sparse_keys), k_req, float(discount))
+        # Preserve the uncached API's caller-owned results.
+        return ranked.copy(), probs.copy()
+
+    def _build_cached_proposal(self):
+        scalar = self._propose_interpolated_ad
+        size = len(self.action_space)
+        if not 256 <= size <= 65_536 or self.action_space != tuple(range(size)):
+            return lru_cache(maxsize=4096)(scalar)
+
+        packed = _PackedSuffixQuery(self)
+
+        @lru_cache(maxsize=4096)
+        def query(keys, k, discount):
+            result = packed.propose(keys, k, discount)
+            return scalar(keys, k, discount) if result is None else result
+
+        return query
 
     def fit_transitions(self, transitions: Sequence[dict], lag: int = 0) -> "SparseFeatureActionIndex":
         """Bulk-index a list of transition dicts from ``collect``."""

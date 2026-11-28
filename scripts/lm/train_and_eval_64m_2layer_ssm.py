@@ -17,6 +17,7 @@ from memory_governor import current_rss_bytes
 corpus_path = r"C:\workspace\code\data\wiki_zhihu\corpus.txt"
 ckpt_64m = os.path.join(ROOT, "checkpoints", "wiki_zhihu_64m_v2000.pkl.gz")
 TARGET_N = 64_000_000
+DEV_OFFSET = 257_000_000
 EVAL_OFFSET = 260_000_000
 EVAL_LEN = 20_000
 
@@ -34,6 +35,19 @@ emb_cn = bundle.class_policy.emb_centered_norm_
 def encode_text(text: str) -> np.ndarray:
     vget = vocab.get
     return np.fromiter((vget(ch, 0) for ch in text), dtype=np.int32, count=len(text))
+
+def read_encoded_slice(offset: int, length: int) -> np.ndarray:
+    with open(corpus_path, "r", encoding="utf-8", errors="replace") as f:
+        remaining = offset
+        while remaining > 0:
+            chunk = f.read(min(remaining, 16_000_000))
+            if not chunk:
+                raise RuntimeError(f"Corpus ended before offset {offset:,}")
+            remaining -= len(chunk)
+        text = f.read(length)
+    if len(text) != length:
+        raise RuntimeError(f"Expected {length:,} chars at offset {offset:,}, got {len(text):,}")
+    return encode_text(text)
 
 def decode_tokens(seq) -> str:
     return "".join(itos[int(i)] if 0 <= int(i) < len(itos) else "?" for i in seq)
@@ -61,17 +75,9 @@ with open(corpus_path, "r", encoding="utf-8", errors="replace") as f:
     toks_64m = toks_64m[:pos]
 gc.collect()
 
-# Load strictly untouched held-out @260M
-with open(corpus_path, "r", encoding="utf-8", errors="replace") as f:
-    rem = EVAL_OFFSET
-    while rem > 0:
-        rd = f.read(min(rem, 16_000_000))
-        if not rd:
-            break
-        rem -= len(rd)
-    ev_text = f.read(EVAL_LEN)
-ev = encode_text(ev_text)
-del ev_text
+# @257M is development-only for alpha selection. @260M remains sealed for one final report.
+dev = read_encoded_slice(DEV_OFFSET, EVAL_LEN)
+ev = read_encoded_slice(EVAL_OFFSET, EVAL_LEN)
 
 print(
     f"Encoded full 64M stream ({len(toks_64m):,} toks = {toks_64m.nbytes/1024**2:.1f} MB) | "
@@ -115,12 +121,12 @@ print(
     flush=True,
 )
 
-# 3. Inspect BOTH Layer-1 & Layer-2 self-learned RC timescale spectra on untouched @260M!
+# 3. Inspect both learned RC timescale spectra on development-only @257M.
 ssm.reset_state()
 z1_trace, z2_trace = [], []
 h_dim = ssm.hidden_dim
 for i in range(4940, 5600):
-    sym = int(ev[i])
+    sym = int(dev[i])
     x = ssm.E_[sym] if (0 < sym < VOCAB_V) else np.zeros(ssm.embed_dim, dtype=np.float32)
     xg1 = x @ ssm.W_x_ + ssm.b_x_
     sg1 = ssm.state.s @ ssm.U_s_ + ssm.b_s_
@@ -146,112 +152,106 @@ for lname, ztr in [("Layer-1 (Fast/Mid)", z1_trace), ("Layer-2 (Slow Macro)", z2
         flush=True,
     )
 
-# 4. Strict Zero-Overlap Ablation on @260M ev[5000:11000] (n=5876)
+# 4. Select alpha on @257M, then score the frozen choice once on @260M.
 bundle.stateful_policy = ssm
 bundle.temp_memory._stateful_policy = ssm
 
-ctrl_base = bundle.make_controller(use_arbitrator=True)
-ctrl_base.stateful_policy = None
-
-bundle.temp_memory.reset()
-slow = np.zeros(emb_raw.shape[1], dtype=float)
-for i in range(4940, 5000):
-    bundle.temp_memory.observe(int(ev[i]), source="external")
-    slow = bundle.class_policy.update_slow_state(slow, int(ev[i]))
-
 alphas = [0.00, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85]
-stats = {"SSM_2L_ONLY": [0, 0, 0, 0, 0]}
-for al in alphas:
-    stats[f"Union_a={al:.2f}"] = [0, 0, 0, 0, 0]
+def evaluate_blend(tokens: np.ndarray, blend_alphas: list[float], label: str):
+    ctrl_base = bundle.make_controller(use_arbitrator=True)
+    ctrl_base.stateful_policy = None
+    blend_stats = {float(al): [0, 0, 0, 0, 0] for al in blend_alphas}
+    ssm_stats = [0, 0, 0, 0, 0]
+    ssm_ce_sum = 0.0
+    n_eval = 0
 
-ssm_ce_sum = 0.0
-n_ev = 0
-t_eval = time.perf_counter()
+    bundle.temp_memory.reset()
+    slow = np.zeros(emb_raw.shape[1], dtype=float)
+    for warm_sym in tokens[4940:5000]:
+        sym = int(warm_sym)
+        bundle.temp_memory.observe(sym, source="external")
+        slow = bundle.class_policy.update_slow_state(slow, sym)
 
-for i in range(5000, 11000):
-    tgt = int(ev[i])
-    if tgt > 0:
-        ctx = ev[i - 8:i]
-        acts, probs, info = ctrl_base.decide_distribution(ctx, slow, k=16)
+    t_eval = time.perf_counter()
+    for i in range(5000, 11000):
+        tgt = int(tokens[i])
+        if tgt > 0:
+            ctx = tokens[i - 8:i]
+            acts, probs, _ = ctrl_base.decide_distribution(ctx, slow, k=16)
+            s_eff = ssm._effective_readout_vec(ssm.state, self_mode=False)
+            logits = s_eff @ ssm.W_out_ + ssm.b_out_
+            logits[0] = -1e4
+            lmax = float(logits.max())
+            ex = np.exp(np.clip(logits - lmax, -30.0, 0.0))
+            p_full = ex / max(float(ex.sum()), 1e-12)
+            ssm_ce_sum += float(-np.log(max(float(p_full[tgt]), 1e-9)))
 
-        s_eff = ssm._effective_readout_vec(ssm.state, self_mode=False)
-        logits = (s_eff @ ssm.W_out_) + ssm.b_out_
-        logits[0] = -1e4
-        lmax = float(logits.max())
-        ex = np.exp(np.clip(logits - lmax, -30.0, 0.0))
-        p_full = ex / max(float(ex.sum()), 1e-12)
-        ssm_ce_sum += float(-np.log(max(float(p_full[tgt]), 1e-9)))
+            top16 = np.argpartition(-logits, 16)[:16]
+            top16 = top16[np.argsort(-logits[top16])]
+            sm_map = {int(idx): float(p_full[int(idx)]) for idx in top16 if int(idx) > 0}
+            sm_sum = sum(sm_map.values())
+            if sm_sum > 1e-12:
+                sm_map = {a: p / sm_sum for a, p in sm_map.items()}
+            ca_only = [int(idx) for idx in top16[:8]]
+            base_map = {int(a): float(p) for a, p in zip(acts, probs)}
+            n_eval += 1
 
-        top16 = np.argpartition(-logits, 16)[:16]
-        top16 = top16[np.argsort(-logits[top16])]
-        sm_map = {int(idx): float(p_full[int(idx)]) for idx in top16 if int(idx) > 0}
-        sm_sum = sum(sm_map.values())
-        if sm_sum > 1e-12:
-            sm_map = {a: p / sm_sum for a, p in sm_map.items()}
-        ca_only = [int(idx) for idx in top16[:8]]
+            if ca_only[0] == tgt: ssm_stats[0] += 1
+            if tgt in ca_only: ssm_stats[1] += 1
+            if bundle.class_policy.sym_to_class_[ca_only[0]] == bundle.class_policy.sym_to_class_[tgt]: ssm_stats[2] += 1
+            if float(np.dot(emb_norm[ca_only[0]], emb_norm[tgt])) >= 0.45: ssm_stats[3] += 1
+            if float(np.dot(emb_cn[ca_only[0]], emb_cn[tgt])) >= 0.20: ssm_stats[4] += 1
 
-        base_map = {int(a): float(p) for a, p in zip(acts, probs)}
-        n_ev += 1
+            prev1 = int(ctx[-1]) if len(ctx) else 0
+            union_keys = set(base_map)
+            for a, sp_p in sm_map.items():
+                if a in union_keys:
+                    continue
+                p_loc, _ = ctrl_base._local_pair_prob_and_lift(prev1, a) if prev1 > 0 else (0.0, 0.0)
+                if p_loc > 0.0 or sp_p >= 0.03:
+                    union_keys.add(a)
 
-        st0 = stats["SSM_2L_ONLY"]
-        if ca_only[0] == tgt: st0[0] += 1
-        if tgt in ca_only: st0[1] += 1
-        if bundle.class_policy.sym_to_class_[ca_only[0]] == bundle.class_policy.sym_to_class_[tgt]: st0[2] += 1
-        if float(np.dot(emb_norm[ca_only[0]], emb_norm[tgt])) >= 0.45: st0[3] += 1
-        if float(np.dot(emb_cn[ca_only[0]], emb_cn[tgt])) >= 0.20: st0[4] += 1
+            for al in blend_alphas:
+                if al <= 0.0:
+                    ranked = acts[:8]
+                else:
+                    scored = [(a, (1.0-al)*base_map.get(a, 0.0) + al*sm_map.get(a, 0.0)) for a in union_keys]
+                    scored.sort(key=lambda kv: kv[1], reverse=True)
+                    ranked = [a for a, _ in scored[:8]]
+                st = blend_stats[float(al)]
+                if ranked[0] == tgt: st[0] += 1
+                if tgt in ranked: st[1] += 1
+                if bundle.class_policy.sym_to_class_[ranked[0]] == bundle.class_policy.sym_to_class_[tgt]: st[2] += 1
+                if float(np.dot(emb_norm[ranked[0]], emb_norm[tgt])) >= 0.45: st[3] += 1
+                if float(np.dot(emb_cn[ranked[0]], emb_cn[tgt])) >= 0.20: st[4] += 1
 
-        prev1 = int(ctx[-1]) if len(ctx) > 0 else 0
-        union_keys = set(base_map.keys())
-        for a, sp_p in sm_map.items():
-            if a in union_keys:
-                continue
-            p_loc, _ = ctrl_base._local_pair_prob_and_lift(prev1, a) if prev1 > 0 else (0.0, 0.0)
-            if p_loc > 0.0 or sp_p >= 0.03:
-                union_keys.add(a)
+        bundle.temp_memory.observe(tgt, source="external")
+        slow = bundle.class_policy.update_slow_state(slow, tgt)
 
-        for al in alphas:
-            if al <= 0.0:
-                ranked = acts[:8]
-            else:
-                scored = [
-                    (a, (1.0 - al) * base_map.get(a, 0.0) + al * sm_map.get(a, 0.0))
-                    for a in union_keys
-                ]
-                scored.sort(key=lambda kv: kv[1], reverse=True)
-                ranked = [a for a, _ in scored[:8]]
-            st = stats[f"Union_a={al:.2f}"]
-            if ranked[0] == tgt: st[0] += 1
-            if tgt in ranked: st[1] += 1
-            if bundle.class_policy.sym_to_class_[ranked[0]] == bundle.class_policy.sym_to_class_[tgt]: st[2] += 1
-            if float(np.dot(emb_norm[ranked[0]], emb_norm[tgt])) >= 0.45: st[3] += 1
-            if float(np.dot(emb_cn[ranked[0]], emb_cn[tgt])) >= 0.20: st[4] += 1
+    print(f"\n=== {label} ev[5000:11000] (n={n_eval}, {time.perf_counter()-t_eval:.1f}s) ===", flush=True)
+    if n_eval:
+        print(f"  SSM-only CE={ssm_ce_sum/n_eval:.3f} PPL={np.exp(ssm_ce_sum/n_eval):.2f}", flush=True)
+        vals = np.asarray(ssm_stats, dtype=np.float64) / n_eval
+        print(f"  SSM-only Top1/Top8/SameCls/SemAlign/CenteredSem={100*vals}", flush=True)
+        for al in blend_alphas:
+            vals = np.asarray(blend_stats[float(al)], dtype=np.float64) / n_eval
+            print(f"  UnionBlend alpha={al:.2f} Top1/Top8/SameCls/SemAlign/CenteredSem={100*vals}", flush=True)
+    return blend_stats, n_eval
 
-    bundle.temp_memory.observe(tgt, source="external")
-    slow = bundle.class_policy.update_slow_state(slow, tgt)
 
-print(
-    f"\n=== 64M 2-Layer Residual SSM (H=512x2, T=96 BPTT, 2ep) Ablation @260M ev[5000:11000] (n={n_ev}, {time.perf_counter()-t_eval:.1f}s) ===",
-    flush=True,
+dev_stats, dev_n = evaluate_blend(dev, alphas, "Development alpha selection @257M")
+best_al = max(
+    alphas,
+    key=lambda al: 0.5 * dev_stats[float(al)][0] + 0.3 * dev_stats[float(al)][1] + 0.2 * dev_stats[float(al)][2],
 )
-print(f"  SSM_2L_ONLY held-out Cross-Entropy = {ssm_ce_sum/n_ev:.3f} (PPL = {np.exp(ssm_ce_sum/n_ev):.2f})", flush=True)
-best_al = 0.55
-best_score = -1.0
-for key in ["SSM_2L_ONLY"] + [f"Union_a={al:.2f}" for al in alphas]:
-    h1, h8, sc, sa, csa = stats[key]
-    print(
-        f"  64M {key:12s} : Top-1={100*h1/n_ev:5.2f}% | Top-8={100*h8/n_ev:5.2f}% | "
-        f"SameCls={100*sc/n_ev:5.2f}% | SemAlign={100*sa/n_ev:5.2f}% | CenteredSem={100*csa/n_ev:5.2f}%"
-    )
-    if key.startswith("Union_a="):
-        al_v = float(key.split("=")[1])
-        comp = 0.5 * (h1 / n_ev) + 0.3 * (h8 / n_ev) + 0.2 * (sc / n_ev)
-        if comp > best_score:
-            best_score = comp
-            best_al = al_v
+print(f"\n  Frozen alpha selected on @257M dev only: {best_al:.2f} (n={dev_n})", flush=True)
 
-print(f"\n  Selected optimal UnionBlend alpha = {best_al:.2f}", flush=True)
+# @260M is used once, with the development-selected alpha frozen.
+test_stats, test_n = evaluate_blend(ev, [best_al], "Blind quality report @260M")
 
 # 5. Save upgraded 64M checkpoint!
+bundle.metadata["union_blend_alpha_dev"] = float(best_al)
+bundle.metadata["union_blend_selection_offset"] = int(DEV_OFFSET)
 sv = bundle.save(ckpt_64m, compresslevel=1)
 print(
     f"Saved upgraded 64M 2-Layer SSM checkpoint: {sv} | RSS={current_rss_bytes()/(1024**2):.1f} MB",
