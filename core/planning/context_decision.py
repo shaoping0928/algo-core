@@ -127,6 +127,7 @@ class ContextDrivenDecisionController:
         frame_memory: Optional[StructuralFrameMemory] = None,
         frame_weight: float = 0.18,
         arbitrator: Optional[HierarchicalOnlineArbitrator] = None,
+        circuit_diff_weight: float = 0.60,
     ):
         self.class_policy = class_policy
         self.virtual_dag = virtual_dag
@@ -161,6 +162,7 @@ class ContextDrivenDecisionController:
         self.frame_memory = frame_memory
         self.frame_weight = float(frame_weight)
         self.arbitrator = arbitrator
+        self.circuit_diff_weight = float(circuit_diff_weight)
 
         self._anchor_state: Optional[np.ndarray] = None
         self._tree_root_slots: Dict[int, float] = {}
@@ -458,6 +460,20 @@ class ContextDrivenDecisionController:
             score_map = self.recency_kernel.modulate_scores(
                 hist_src, score_map, strength=rec_str,
             )
+
+        # 6. Electronic Circuit Differentiator (high-pass V_diff = V_cap - V_int):
+        #    propels unexpressed context neighbors (V_diff > 0) and naturally adapts
+        #    downward on integrator-saturated nodes (V_diff < 0) without artificial bans.
+        v_diff = self.temp_memory.circuit_differentiator()
+        if v_diff is not None and self.circuit_diff_weight > 0.0:
+            dw = float(self.circuit_diff_weight)
+            is_self_mode = (getattr(self.temp_memory, "_last_source", "external") == "self")
+            eff_dw = dw if is_self_mode else (0.25 * dw)
+            for a in list(score_map.keys()):
+                if 0 < a < len(v_diff):
+                    dv = float(np.clip(v_diff[a], -2.0, 1.2))
+                    if dv != 0.0:
+                        score_map[a] *= float(np.exp(eff_dw * dv))
 
         ranked = sorted(score_map.items(), key=lambda kv: (kv[1], -kv[0]), reverse=True)[: max(int(k), 1)]
         acts = [a for a, _ in ranked]

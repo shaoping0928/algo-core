@@ -69,6 +69,46 @@ class TemporaryContextMemory:
         self._steps: int = 0
         self._last_source: str = "external"
         self._field_dirty: bool = False
+        self.circuit_field = None
+
+    def enable_circuit_field(
+        self,
+        *,
+        use_gpu: bool = True,
+        dt: float = 0.25,
+        init_resistance: float = 4.5,
+        init_capacitance: float = 2.2,
+        alpha_int: float = 0.12,
+        w_cap: float = 0.55,
+        w_int: float = 0.15,
+        w_diff: float = 0.50,
+    ):
+        """Attach a GPU/CPU ``ElectronicCircuitNodeField`` (R/C/Integrator/Differentiator)."""
+        from circuit_field import ElectronicCircuitNodeField
+
+        cf = ElectronicCircuitNodeField(
+            n_nodes=self.vocab_size,
+            batch_size=1,
+            dt=dt,
+            init_resistance=init_resistance,
+            init_capacitance=init_capacitance,
+            alpha_int=alpha_int,
+            w_cap=w_cap,
+            w_int=w_int,
+            w_diff=w_diff,
+            use_gpu=use_gpu,
+        )
+        if self.assoc_graph_:
+            cf.set_sparse_coupling(self.assoc_graph_)
+        self.circuit_field = cf
+        return cf
+
+    def circuit_differentiator(self) -> Optional[np.ndarray]:
+        """Return high-pass differentiator potential ``V_diff = V_cap - V_int`` if enabled."""
+        cf = getattr(self, "circuit_field", None)
+        if cf is None:
+            return None
+        return cf.V_diff[0]
 
     def fit_associations(
         self,
@@ -258,6 +298,9 @@ class TemporaryContextMemory:
         self._steps = 0
         self._last_source = "external"
         self._field_dirty = False
+        cf = getattr(self, "circuit_field", None)
+        if cf is not None:
+            cf.reset()
 
     def pin_root_context(self) -> None:
         """Snapshot the current active field as persistent episode root summary."""
@@ -294,7 +337,14 @@ class TemporaryContextMemory:
         rb = float(np.clip(root_blend, 0.0, 1.0))
         live_norm = self._field / l_max if l_max > 1e-6 else self._field
         root_norm = self._root_field / r_max
-        return (1.0 - rb) * live_norm + rb * root_norm
+        blended = (1.0 - rb) * live_norm + rb * root_norm
+        cf = getattr(self, "circuit_field", None)
+        if cf is not None:
+            c_pos = np.maximum(cf.V_out[0], 0.0)
+            c_max = float(c_pos.max())
+            if c_max > 1e-6:
+                blended = 0.65 * blended + 0.35 * (c_pos / c_max)
+        return blended
 
     def observe(
         self,
@@ -376,6 +426,16 @@ class TemporaryContextMemory:
             if len(self._anchors) > self.max_anchors:
                 keep = sorted(self._anchors.items(), key=lambda kv: kv[1], reverse=True)[: self.max_anchors]
                 self._anchors = dict(keep)
+
+            # Advance electronic circuit node field (R/C/Integrator/Differentiator)
+            cf = getattr(self, "circuit_field", None)
+            if cf is not None:
+                edges = (
+                    self.assoc_graph_compound_[pair_k]
+                    if (pair_k is not None and pair_k in self.assoc_graph_compound_)
+                    else self.assoc_graph_.get(sym, ())
+                )
+                cf.step_single_event(sym, sal, is_self=is_self, assoc_neighbors=edges)
 
         self._recent.append(sym)
         if len(self._recent) > self.max_recent:

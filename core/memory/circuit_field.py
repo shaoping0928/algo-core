@@ -65,6 +65,7 @@ class ElectronicCircuitNodeField:
         self._csr_row_ptr: Optional[np.ndarray] = None
         self._csr_col_idx: Optional[np.ndarray] = None
         self._csr_vals: Optional[np.ndarray] = None
+        self._use_gpu_pref: bool = bool(use_gpu)
 
         # OpenCL GPU backend setup
         self.gpu: Optional[OpenCLAccelerator] = None
@@ -76,6 +77,29 @@ class ElectronicCircuitNodeField:
                 self.gpu = acc
                 self.backend = f"opencl:{acc.device_name}"
                 self._alloc_gpu_state_buffers()
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["gpu"] = None
+        state["_bufs"] = {}
+        state["backend"] = "cpu"
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self.gpu = None
+        self._bufs = {}
+        self.backend = "cpu"
+        if getattr(self, "_use_gpu_pref", False):
+            acc = OpenCLAccelerator()
+            if acc.available:
+                self.gpu = acc
+                self.backend = f"opencl:{acc.device_name}"
+                self._alloc_gpu_state_buffers()
+                if self._csr_row_ptr is not None and self._csr_col_idx is not None and self._csr_vals is not None:
+                    self._bufs["row_ptr"] = acc.create_buffer_from_array(self._csr_row_ptr, read_only=True)
+                    self._bufs["col_idx"] = acc.create_buffer_from_array(self._csr_col_idx, read_only=True)
+                    self._bufs["vals"] = acc.create_buffer_from_array(self._csr_vals, read_only=True)
 
     def _alloc_gpu_state_buffers(self) -> None:
         assert self.gpu is not None
@@ -209,6 +233,65 @@ class ElectronicCircuitNodeField:
             self.V_diff = vd_new.astype(np.float32, copy=False)
             self.V_out = vout.astype(np.float32, copy=False)
         return self.V_cap, self.V_int, self.V_diff, self.V_out
+
+    def step_single_event(
+        self,
+        symbol: int,
+        salience: float,
+        *,
+        is_self: bool = False,
+        assoc_neighbors: Sequence[Tuple[int, float]] = (),
+        realize_gain: float = 0.65,
+    ) -> None:
+        """Fast O(deg + N) single-stream RC/Integrator/Differentiator update for online steps.
+
+        - On ``is_self=False`` (external input): injects charge into ``V_cap[sym]`` and
+          associative neighbors, charging the working-memory capacitor field.
+        - On ``is_self=True`` (self-generated emission): integrates realized charge into
+          ``V_int[sym]`` (so ``V_diff[sym] = V_cap[sym] - V_int[sym]`` naturally adapts
+          downward once expressed) while spreading fresh positive drive to unexpressed
+          associative neighbors (keeping ``V_diff[nb] > 0`` for forward topic progression!).
+        """
+        sym = int(symbol)
+        if sym <= 0 or sym >= self.n_nodes:
+            return
+        r = np.maximum(self.R, 1e-4)
+        c = np.maximum(self.C, 1e-4)
+        decay = np.maximum(1.0 - (self.dt / (r * c)), 0.0)
+        inv_c = self.dt / c
+
+        vc = self.V_cap[0] * decay
+        vi = self.V_int[0] * (1.0 - self.alpha_int) + self.alpha_int * vc
+
+        sal = float(salience)
+        if not is_self:
+            vc[sym] += float(inv_c[sym]) * 0.70 * sal
+            for nb, w in assoc_neighbors:
+                ni = int(nb)
+                if 0 < ni < self.n_nodes:
+                    vc[ni] += float(inv_c[ni]) * float(w) * sal
+        else:
+            # Self-emitted node: charge enters slow integrator (realization / adaptation)
+            # while associative neighbors receive fresh transient drive in capacitor!
+            vi[sym] += float(realize_gain) * max(sal, 0.5)
+            vc[sym] *= 0.72
+            for nb, w in assoc_neighbors:
+                ni = int(nb)
+                if 0 < ni < self.n_nodes and ni != sym:
+                    vc[ni] += float(inv_c[ni]) * 0.45 * float(w) * sal
+
+        vd = vc - vi
+        vout = np.tanh(self.w_cap * vc + self.w_int * vi + self.w_diff * vd)
+        self.V_cap[0] = vc
+        self.V_int[0] = vi
+        self.V_diff[0] = vd
+        self.V_out[0] = vout
+
+    def sync_host_to_gpu(self) -> None:
+        """Push current host circuit states to GPU buffers (for batched GPU lookahead rollouts)."""
+        if self.gpu is not None and self._bufs:
+            for k, arr in (("V_cap", self.V_cap), ("V_int", self.V_int), ("V_diff", self.V_diff), ("V_out", self.V_out)):
+                self.gpu.write_buffer(self._bufs[k], arr)
 
     def close(self) -> None:
         self._release_gpu_buffers()

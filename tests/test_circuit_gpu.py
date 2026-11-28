@@ -64,6 +64,45 @@ class CircuitFieldAndGPUTests(unittest.TestCase):
         finally:
             cf_gpu.close()
 
+    def test_temp_memory_circuit_differentiator_adapts_emitted_and_propels_unexpressed(self):
+        import pickle
+        from temp_context import TemporaryContextMemory
+
+        # Domain A: symbols 10, 11, 12, 13 co-occur closely; frequent glue symbols 1, 2, 3
+        seq = []
+        for _ in range(60):
+            seq.extend([1, 2, 3, 1, 2, 3, 10, 11, 12, 13, 1, 2, 3])
+            seq.extend([1, 2, 3, 1, 2, 3, 20, 21, 22, 23, 1, 2, 3])
+        tokens = np.asarray(seq, dtype=np.int32)
+        tcm = TemporaryContextMemory(vocab_size=30, assoc_window=6, min_cooc=2).fit_associations(tokens, stride=1)
+        cf = tcm.enable_circuit_field(use_gpu=True)
+
+        try:
+            tcm.reset()
+            # External context activates 10 & 11 (charging unexpressed neighbors 12, 13)
+            for s in (10, 11):
+                tcm.observe(s, source="external")
+            vd_ext = tcm.circuit_differentiator()
+            self.assertIsNotNone(vd_ext)
+            self.assertGreater(float(vd_ext[12]), 0.0)
+
+            # Repeated self-emission of 10 integrates realized charge into V_int[10],
+            # driving V_diff[10] negative while keeping unexpressed neighbor 12 positive!
+            for _ in range(4):
+                tcm.observe(10, source="self")
+            vd_self = tcm.circuit_differentiator()
+            self.assertLess(float(vd_self[10]), 0.0)
+            self.assertGreater(float(vd_self[12]), float(vd_self[10]))
+
+            # Verify pickle round-trip safety (GPU buffers cleanly stripped and re-bound)
+            blob = pickle.dumps(tcm)
+            tcm2 = pickle.loads(blob)
+            self.assertIsNotNone(tcm2.circuit_field)
+            self.assertAlmostEqual(float(tcm2.circuit_differentiator()[10]), float(vd_self[10]), places=5)
+            tcm2.circuit_field.close()
+        finally:
+            cf.close()
+
 
 if __name__ == "__main__":
     unittest.main()
