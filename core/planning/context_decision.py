@@ -132,8 +132,8 @@ class ContextDrivenDecisionController:
         context_fusion_beta: float = 0.42,
         self_context_beta: float = 1.25,
         stateful_policy: Optional[object] = None,
-        stateful_weight: float = 0.22,
-        self_stateful_beta: float = 0.85,
+        stateful_weight: float = 0.30,
+        self_stateful_beta: float = 0.90,
     ):
         self.class_policy = class_policy
         self.virtual_dag = virtual_dag
@@ -526,23 +526,34 @@ class ContextDrivenDecisionController:
                         if llr_a > 0.0:
                             score_map[a] *= float(np.exp(min(eff_beta * llr_a, cap_exp)))
 
-        # 5c. Persistent In-Place Multi-Scale Stateful Bayes-Factor Modulation (Product-of-Experts):
-        #     Multiplies syntactically legal candidates by unbiased log(1 + delta_ctx / P_0)
-        #     from the continuously evolved node state z_t — zero unigram double-counting and
-        #     zero illegal-token leakage!
+        # 5c. Persistent In-Place 2nd-Order Context-Gated Conditional PMI (Product-of-Experts):
+        #     Multiplies syntactically legal candidates by exact counterfactual conditional PMI
+        #     log P(y | x_loc, z_ctx) - log P(y | x_loc, 0) from the continuously evolved node
+        #     state — captures 2nd-order (local * context) transition gating with zero unigram
+        #     double-counting and zero illegal-token leakage!
         sp = self.stateful_policy
         if sp is not None and getattr(sp, "_fitted", False) and score_map:
             log_bf = sp.context_log_bayes_factor(state=state_override, self_mode=is_self_mode)
             if log_bf is not None:
                 c_gate = float(info.get("content_gate", 1.0))
                 s_beta = self.self_stateful_beta if is_self_mode else self.stateful_weight
-                eff_sb = float(s_beta) * float(ent_gate) * float(np.clip(c_gate, 0.15, 1.0))
+                eff_sb = float(s_beta) * float(ent_gate) * float(np.clip(c_gate, 0.20, 1.0))
                 if eff_sb > 0.01:
+                    prev1_sp = int(ctx_tokens[-1]) if len(ctx_tokens) > 0 else 0
+                    if prev1_sp > 0 and ent_gate >= 0.35 and c_gate >= 0.25:
+                        # Admit top context-gated legal candidates at open slots
+                        min_base = min(score_map.values())
+                        sp_top = sp.predict_symbol_map(state=state_override, k=16, self_mode=is_self_mode)
+                        for s_a, _s_p in sp_top.items():
+                            if s_a > 0 and s_a != prev1_sp and s_a not in score_map and float(log_bf[s_a]) >= 0.45:
+                                p_loc, lift = self._local_pair_prob_and_lift(prev1_sp, s_a)
+                                if p_loc > 0.0 and lift >= 0.90:
+                                    score_map[s_a] = max(min(p_loc * 0.45, min_base * 1.4), min_base * 0.35)
                     for a in list(score_map.keys()):
                         if 0 < a < len(log_bf):
                             lbf = float(log_bf[a])
                             if lbf != 0.0:
-                                score_map[a] *= float(np.exp(np.clip(eff_sb * lbf, -1.6, 2.0)))
+                                score_map[a] *= float(np.exp(np.clip(eff_sb * lbf, -1.8, 2.2)))
 
         # 6. Electronic Circuit Differentiator (high-pass V_diff = V_cap - V_int):
         #    propels unexpressed context neighbors (V_diff > 0) and naturally adapts

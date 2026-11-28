@@ -128,7 +128,7 @@ class ContextualIntegratorTests(unittest.TestCase):
         emb = rng.randn(40, 24).astype(np.float32)
         emb[0] = 0.0
 
-        sp = StatefulContextPolicy(vocab_size=40, embed_dim=24, ridge_lambda=5.0).fit_stream(
+        sp = StatefulContextPolicy(vocab_size=40, embed_dim=24, gate_dim=64, lr=0.025).fit_stream(
             arr, emb, sample_stride=1, max_samples=50_000,
         )
         # In-place mutation check: observe() keeps the SAME PersistentContextState object
@@ -153,6 +153,42 @@ class ContextualIntegratorTests(unittest.TestCase):
         # Identical last 6 tokens [1, 2, 3, 4, 5, 6], yet persistent node state cleanly predicts 20 vs 30!
         self.assertGreater(pred_a.get(20, 0.0), pred_a.get(30, 0.0))
         self.assertGreater(pred_b.get(30, 0.0), pred_b.get(20, 0.0))
+
+        # 3. Verify 2nd-order nonlinear XOR/bilinear context-gated transition interaction:
+        #    (Ctx A, Local L1) -> 25,  (Ctx A, Local L2) -> 26
+        #    (Ctx B, Local L1) -> 26,  (Ctx B, Local L2) -> 25
+        #    Provably impossible for any 1st-order linear additive model, cleanly solved by
+        #    our 2nd-order context gate q = tanh(x_loc P_loc) * sigmoid(z_ctx P_ctx)!
+        xor_seq = []
+        for ep in range(320):
+            xor_seq.extend(rng.randint(1, 5, size=14).tolist())
+            m = ep % 4
+            if m == 0:
+                xor_seq.extend([10, 11, 10, 11, 1, 2, 8, 25, 1])   # Ctx A + L1(8) -> 25
+            elif m == 1:
+                xor_seq.extend([10, 11, 10, 11, 1, 2, 9, 26, 1])   # Ctx A + L2(9) -> 26
+            elif m == 2:
+                xor_seq.extend([15, 16, 15, 16, 1, 2, 8, 26, 1])   # Ctx B + L1(8) -> 26
+            else:
+                xor_seq.extend([15, 16, 15, 16, 1, 2, 9, 25, 1])   # Ctx B + L2(9) -> 25
+        sp_xor = StatefulContextPolicy(
+            vocab_size=40, embed_dim=24, gate_dim=64, lr=0.025, seed=7,
+        ).fit_stream(np.asarray(xor_seq, dtype=np.int32), emb, sample_stride=1, max_samples=50_000, epochs=25)
+
+        for prefix, want, avoid in [
+            ([10, 11, 10, 11, 1, 2, 8], 25, 26),
+            ([10, 11, 10, 11, 1, 2, 9], 26, 25),
+            ([15, 16, 15, 16, 1, 2, 8], 26, 25),
+            ([15, 16, 15, 16, 1, 2, 9], 25, 26),
+        ]:
+            sp_xor.reset_state()
+            for tok in prefix:
+                sp_xor.observe(tok, source="external")
+            p_map = sp_xor.predict_symbol_map(k=6)
+            self.assertGreater(p_map.get(want, 0.0), p_map.get(avoid, 0.0))
+            lbf = sp_xor.context_log_bayes_factor()
+            self.assertIsNotNone(lbf)
+            self.assertGreater(float(lbf[want]), float(lbf[avoid]))
 
 
 if __name__ == "__main__":
