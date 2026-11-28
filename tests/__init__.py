@@ -5,6 +5,7 @@ import sys
 _ROOT = Path(__file__).resolve().parents[1]
 for _sub in (
     "core",
+    "core/compute",
     "core/env",
     "core/memory",
     "core/stage",

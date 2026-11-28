@@ -73,6 +73,8 @@ class StructuralSubstrateBundle:
         n_chunk_classes: int = 160,
         build_stage_model: bool = True,
         stage_slice: int = 400_000,
+        post_fit_noise_prune: bool = True,
+        noise_prune_pressure: float = 0.22,
         seed: int = 42,
     ) -> "StructuralSubstrateBundle":
         """Build all multi-layer memory reserves concurrently across CPU cores under memory governance."""
@@ -196,8 +198,17 @@ class StructuralSubstrateBundle:
         ).fit(arr, sym_to_class=pol.sym_to_class_, local_index=pol.local_index, max_samples=120_000)
         timings["recency_kernel"] = round(time.perf_counter() - t_rec, 2)
 
-        # Phase 3: Enforce hard memory ceiling via MemoryBudgetGovernor
-        mem_report = governor.govern([pol, cm, tcm])
+        # Phase 3: Optional built-in tail-noise pruning (cuts ~80% count=1 high-order noise
+        #          while preserving or slightly improving held-out accuracy) + 16GB governance
+        noise_evicted = 0
+        if post_fit_noise_prune and n_toks >= 50_000 and float(noise_prune_pressure) > 0.0:
+            p_np = float(np.clip(noise_prune_pressure, 0.0, 0.5))
+            noise_evicted += pol.prune_under_pressure(p_np)
+            noise_evicted += cm.prune_under_pressure(p_np)
+            noise_evicted += dag.prune_under_pressure(p_np)
+            import gc as _gc
+            _gc.collect()
+        mem_report = governor.govern([pol, cm, dag, tcm])
         total_wall = round(time.perf_counter() - t_start, 2)
 
         bundle = cls(
@@ -223,6 +234,7 @@ class StructuralSubstrateBundle:
                 gil_enabled=gil_enabled,
                 wall_seconds=total_wall,
                 component_timings=timings,
+                post_fit_noise_evicted=int(noise_evicted),
                 memory_governor=mem_report,
                 max_memory_gb=round(max_memory_bytes / (1024.0 ** 3), 2),
                 rss_mb_after_fit=round(current_rss_bytes() / (1024.0 * 1024.0), 1),

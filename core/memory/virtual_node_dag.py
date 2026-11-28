@@ -206,24 +206,102 @@ class BidirectionalVirtualNodeDAG:
         tokens: Sequence[int],
         *,
         max_triggers_for_dag: int = 300,
+        max_bisim_samples: int = 1_500_000,
     ) -> "BidirectionalVirtualNodeDAG":
         """Build bidirectional virtual node DAG + 2-step behavioral statistics from a sequence."""
         arr = np.asarray(tokens, dtype=np.int32).reshape(-1)
-        if len(arr) < 2:
+        n = len(arr)
+        if n < 2:
             return self
-        pairs = list(zip(arr[:-1].tolist(), arr[1:].tolist()))
-        self.fit_transitions(pairs, max_triggers_for_dag=max_triggers_for_dag)
-        # Collect 2-step behavioral continuations (t, m) -> z and (z -> t, m) for bisimulation splitting
+        v = self.vocab_size
+        # Vectorized transition counting (avoids allocating O(N) Python tuple lists on 16M+ streams)
+        valid = (arr[:-1] > 0) & (arr[:-1] < v) & (arr[1:] > 0) & (arr[1:] < v)
+        if not np.any(valid):
+            return self
+        a_arr = arr[:-1][valid].astype(np.int64)
+        b_arr = arr[1:][valid].astype(np.int64)
+        codes = a_arr * int(v) + b_arr
+        uniq_codes, code_cnts = np.unique(codes, return_counts=True)
+
+        counts = np.zeros(v, dtype=float)
+        self._fwd_counts = defaultdict(Counter)
+        self._bwd_counts = defaultdict(Counter)
+        for code_val, cnt_val in zip(uniq_codes.tolist(), code_cnts.tolist()):
+            s = int(code_val // v)
+            d = int(code_val % v)
+            self._fwd_counts[s][d] = cnt_val
+            self._bwd_counts[d][s] = cnt_val
+            counts[s] += float(cnt_val)
+            counts[d] += float(cnt_val)
+        total = float(counts.sum())
+        if total <= 0.0:
+            return self
+        self._global_p = (counts + 1.0) / (total + float(v))
+
+        self.nodes.clear()
+        self.forward_index.clear()
+        self.backward_index.clear()
+        self._member_to_forward.clear()
+        self._member_to_backward.clear()
+
+        fwd_ids: List[str] = []
+        for s, cmap in self._fwd_counts.items():
+            vn = self._build_base_node(s, cmap, "forward", self._global_p)
+            if vn is not None:
+                self._register_node(vn)
+                self.forward_index[s] = vn.node_id
+                fwd_ids.append(vn.node_id)
+
+        bwd_ids: List[str] = []
+        for d, cmap in self._bwd_counts.items():
+            vn = self._build_base_node(d, cmap, "backward", self._global_p)
+            if vn is not None:
+                self._register_node(vn)
+                self.backward_index[d] = vn.node_id
+                bwd_ids.append(vn.node_id)
+
+        top_fwd = sorted(
+            fwd_ids,
+            key=lambda nid: sum(self._fwd_counts[self.nodes[nid].triggers[0]].values()),
+            reverse=True,
+        )[: max(int(max_triggers_for_dag), 1)]
+        top_bwd = sorted(
+            bwd_ids,
+            key=lambda nid: sum(self._bwd_counts[self.nodes[nid].triggers[0]].values()),
+            reverse=True,
+        )[: max(int(max_triggers_for_dag), 1)]
+        self._link_containment_edges(top_fwd)
+        self._link_containment_edges(top_bwd)
+
+        # Collect strided 2-step behavioral continuations for bisimulation splitting (bounded RAM)
         self._pair_fwd_counts = defaultdict(Counter)
         self._pair_bwd_counts = defaultdict(Counter)
-        v = self.vocab_size
-        n = len(arr)
-        for i in range(n - 2):
-            a, b, c = int(arr[i]), int(arr[i + 1]), int(arr[i + 2])
+        stride = max((n - 2) // max(int(max_bisim_samples), 10000), 1)
+        s_list = arr.tolist()
+        for i in range(0, n - 2, stride):
+            a, b, c = s_list[i], s_list[i + 1], s_list[i + 2]
             if 0 < a < v and 0 < b < v and 0 < c < v:
                 self._pair_fwd_counts[(a, b)][c] += 1
                 self._pair_bwd_counts[(b, c)][a] += 1
         return self
+
+    def prune_under_pressure(self, pressure: float) -> int:
+        """Trim auxiliary 2-step bisimulation caches under memory pressure."""
+        p = float(np.clip(pressure, 0.0, 1.0))
+        if p < 0.20:
+            return 0
+        evicted = 0
+        min_c = 2 if p < 0.60 else 5
+        for store in (self._pair_fwd_counts, self._pair_bwd_counts):
+            for k in list(store.keys()):
+                cmap = store[k]
+                for m in list(cmap.keys()):
+                    if cmap[m] < min_c:
+                        del cmap[m]
+                        evicted += 1
+                if not cmap:
+                    del store[k]
+        return evicted
 
     def refine_virtual_node(
         self,
