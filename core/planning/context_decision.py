@@ -36,6 +36,7 @@ import numpy as np
 from class_policy import ClassLevelSequencePolicy
 from compression_tree import HierarchicalStageTree, LearnedDrillDownPolicy
 from recency_kernel import LearnedRecencyLagKernel
+from structural_memory import HierarchicalChunkMemory, StructuralFrameMemory
 from temp_context import TemporaryContextMemory
 from virtual_node_dag import BidirectionalVirtualNodeDAG
 
@@ -120,6 +121,10 @@ class ContextDrivenDecisionController:
         lookahead_stagnation_weight: float = 0.65,
         recency_kernel: Optional[LearnedRecencyLagKernel] = None,
         recency_strength: float = 0.85,
+        chunk_memory: Optional[HierarchicalChunkMemory] = None,
+        chunk_weight: float = 0.45,
+        frame_memory: Optional[StructuralFrameMemory] = None,
+        frame_weight: float = 0.25,
     ):
         self.class_policy = class_policy
         self.virtual_dag = virtual_dag
@@ -149,6 +154,10 @@ class ContextDrivenDecisionController:
         self.lookahead_stagnation_weight = float(lookahead_stagnation_weight)
         self.recency_kernel = recency_kernel
         self.recency_strength = float(recency_strength)
+        self.chunk_memory = chunk_memory
+        self.chunk_weight = float(chunk_weight)
+        self.frame_memory = frame_memory
+        self.frame_weight = float(frame_weight)
 
         self._anchor_state: Optional[np.ndarray] = None
         self._tree_root_slots: Dict[int, float] = {}
@@ -343,13 +352,53 @@ class ContextDrivenDecisionController:
                                 )
                                 bridged += 1
 
-        # 4. Self-learned recency-lag modulation (excitation or inhibition purely from data)
-        if self.recency_kernel is not None and self.recency_strength > 0.0:
-            hist_src = (
-                recent_history
-                if recent_history is not None
-                else (self.temp_memory.recent_history if self.temp_memory.recent_history else ctx_tokens)
+        # 4. Higher-Order Structural Memory (recursive chunks + directional open frames)
+        hist_src = (
+            recent_history
+            if recent_history is not None
+            else (self.temp_memory.recent_history if self.temp_memory.recent_history else ctx_tokens)
+        )
+        chunk_intra = 0.0
+        chunk_inter = 0.0
+        if self.chunk_memory is not None and self.chunk_memory._fitted and self.chunk_weight > 0.0:
+            ch_acts, ch_probs, ch_info = self.chunk_memory.predict_next_atoms(
+                hist_src, k=max(int(k) * 2, 16),
             )
+            chunk_intra = float(ch_info.get("intra_mass", 0.0))
+            chunk_inter = float(ch_info.get("inter_mass", 0.0))
+            chunk_conf = float(ch_info.get("chunk_conf", 0.5))
+            if len(ch_acts) > 0:
+                # Normalize score_map before convex interpolation with chunk distribution
+                sm_sum = float(sum(score_map.values()))
+                if sm_sum > 0.0:
+                    inv_sm = 1.0 / sm_sum
+                    for a in list(score_map.keys()):
+                        score_map[a] *= inv_sm
+                cw = float(np.clip(self.chunk_weight * (0.20 + 0.80 * chunk_conf), 0.0, 0.85))
+                for a in list(score_map.keys()):
+                    score_map[a] *= (1.0 - cw)
+                for a, p_ch in zip(ch_acts, ch_probs):
+                    ai = int(a)
+                    if ai > 0:
+                        score_map[ai] = score_map.get(ai, 0.0) + cw * float(p_ch)
+
+        frame_hits = 0
+        if self.frame_memory is not None and self.frame_memory._fitted and self.frame_weight > 0.0:
+            closers = self.frame_memory.predict_closers_for_history(hist_src)
+            if closers:
+                fw = float(self.frame_weight) * ent_gate
+                for c_sym, f_str in closers.items():
+                    if c_sym <= 0 or c_sym == prev1:
+                        continue
+                    p_loc, lift = self._local_pair_prob_and_lift(prev1, c_sym) if prev1 > 0 else (0.0, 1.0)
+                    if c_sym in score_map or p_loc > 0.0 or f_str >= 1.5:
+                        leg_scale = 0.5 + 0.5 * min(float(lift) / 2.0, 1.5) if p_loc > 0.0 else 0.75
+                        add_f = fw * min(float(f_str) / 3.0, 1.5) * leg_scale
+                        score_map[c_sym] = score_map.get(c_sym, 0.0) + add_f
+                        frame_hits += 1
+
+        # 5. Self-learned recency-lag modulation (excitation or inhibition purely from data)
+        if self.recency_kernel is not None and self.recency_strength > 0.0:
             score_map = self.recency_kernel.modulate_scores(
                 hist_src, score_map, strength=self.recency_strength,
             )
@@ -367,6 +416,9 @@ class ContextDrivenDecisionController:
             active_bridged=float(bridged),
             tree_visited=float(tree_stats["nodes_visited"]),
             lookahead_depth=float(self.lookahead_depth),
+            chunk_intra=chunk_intra,
+            chunk_inter=chunk_inter,
+            frame_closers=float(frame_hits),
         )
         return acts, out_p, info
 
