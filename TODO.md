@@ -1,53 +1,51 @@
-# TODO
+# TODO（多 Agent 协同主线与任务看板）
 
-> **维护约定（2026-11-28 整理）**：本文件只保留**近期核心探索、当前基线结论与将来推进方向**。2026-11-27 及更早的完整过程记录已无损归档至 `docs/archive/TODO-*.md`（见文末「历史归档索引」）。
-
----
-
-## 一、长期原则与默认基准配置
-
-- **严格任务无关（`core/` 硬边界）**：零分词器、零手工语法/词性规则、零人工复读禁令、零任务专用几何/先验，全部机制仅消费离散符号流或通用连续观测流。
-- **原地节点状态演化（In-Place State Dynamics）**：每吐出/接收一个符号，都在**已有持久节点状态**上做连续原地更新（而非无状态从头重建），策略决策深度依赖连续上下文状态。
-- **默认序列训练与评测口径**：
-  - 默认训练规模：**64M 字符**（`wiki_zhihu/corpus.txt` 偏移 `0..64,000,000`，`V=2000`）；
-  - 严格零重叠留出评测：偏移 `@260,000,000`（`ev[5000:11000]`，`n=5876`）+ 三段 100 字盲测续写（`P1 @260M+16367` 立冬/日历、`P2 @260M+19122` 个税/BI数据、`P3 @260M+82` 维基百科大上海时代广场）；
-  - 内存硬红线：**16 GB RSS**（`MemoryBudgetGovernor` 凸压治理）；
-  - 计算底座：Python `3.14.5t`（no-GIL 24 核）+ **AMD Radeon RX 9070 XT（`gfx1201`，32 CUs，13.53 GB VRAM）** 零外部依赖原生 Windows OpenCL 引擎（[core/compute/opencl_gpu.py](core/compute/opencl_gpu.py)）。
+> **维护约定（2026-11-28 整理）**：本文件面向**多 Agent 协同开发**，提供可直接冷启动接手的项目背景、当前现状、代码入口/复现口径、硬约束契约与可认领的下一步任务。2026-11-27 及更早的完整过程记录已无损归档至 `docs/archive/TODO-*.md`（见文末「历史归档索引」）。
 
 ---
 
-## 二、近期探索与已完成里程碑（2026-11-27 ~ 2026-11-28）
+## 一、项目背景与核心研究命题
 
-### 2.1 连续控制 / 长程阶段主线收口（Phase 1–17 摘要）
-> 完整记录已归档至 [TODO-2026-11-27.md](docs/archive/TODO-2026-11-27.md)。
+`algo_core` 的目标是构建一套**严格任务无关（task-agnostic）的通用长程世界模型与决策基座**——不依赖手工任务规则、词法分词器、语法先验或硬编码惩罚，仅从原始离散符号流或连续观测-动作-反馈交互中自监督演化出**多时间尺度结构记忆与长程规划能力**。
 
-- [x] **阶段切分、方差树与在线自适应搜索全栈**：`cap=5000` 600 局均分从初始基线推升至 **`1996.0`**（零调参未见 240 局 **`2512.3`**，p90 打满 `5000.0`），并完成 `DelayedCartPole(lag=2)` 零改动跨任务通关（`369.3`，`18×` 随机）与多世界变物理防遗忘双门验证。
-- [x] **`core/` 六层子包重构**：拆解 `substrate_nodes.py` 与 `node_runtime.py`，按 `env / memory / stage / planning / runner / compute / legacy` 清晰分层。
+项目目前沿两条已打通、正在汇合的主线演进：
+1. **连续控制 / 长程阶段决策主线（Phase 1–17，已阶段性收口）**：解决帧级规划近视与变物理迁移问题。通过自监督阶段切分、生存方差树（`survival_tree`）、串联主动剪枝搜索、在线 LCB 转移/需求校准与节点变量抽象（`DynamicsClassNode`），在延迟控制基准 `cap=5000` 上将 600 局均分推进至 **`1996.0`**（零调参未见 240 局 **`2512.3`**），并在 `DelayedCartPole(lag=2)` 零改动跨任务通关（`369.3`，`18×` 随机）。详见 [TODO-2026-11-27.md](docs/archive/TODO-2026-11-27.md)。
+2. **符号序列 / 语言上下文整合与原地状态空间主线（当前核心发力点）**：
+   - **核心痛点**：早期高阶符号记忆本质上是局部 N-gram/块级统计，续写易退化为“只看前几个字的局部判断”；
+   - **核心理念（用户明确要求）**：每接收或输出一个符号，必须在**已有的持久节点状态上做连续原地修改**（而非每步重建无状态表示），且节点的时间常数（快/慢衰减）与上下文整合策略必须**由数据与反馈端到端自学习**（核心主题自动长成大电容慢衰减、瞬态语法细节自动长成小电容快充快放）。
 
-### 2.2 符号序列结构记忆与电路场加速（2026-11-28）
+---
 
-- [x] **24 核 no-GIL 并行拟合 + 16 GB 内存治理 + 检查点复用**（`377d450`, `4e8e24c`）：
-  - `int64` 位压缩稀疏索引 + 流式分块摄取 + 凸压剪枝，实现 **256M 规模在 11.46 GB / 16 GB 内稳定训练**（534.8s），保存复用检查点 `wiki_zhihu_{4m,16m,64m,256m}_v2000.pkl.gz`。
-- [x] **电子电路节点场（R/C/积分器/微分器）与 RX 9070 XT GPU 束前瞻**（`39aa053`, `ebc077f`, `5b56ff4`, `a25ad74`）：
-  - 实现 `ElectronicCircuitNodeField` 及原生 OpenCL GPU 引擎，并将每个节点的 $(R, C)$ 时间常数改为**由数据与在线反馈自学习**（稳定核心概念自动长成大电容慢衰减、瞬态细节自动长成小电容快充快放），实时同步至 GPU 束前瞻。
-- [x] **工作记忆与结构推进仲裁平衡**（`84dae75`）：
-  - 精确 softmax-mixture 留一法（LOO）跨局仲裁、自生成模式情景缓存衰减与新近度兴奋/抑制分离。
-- [x] **块级多线索上下文整合与整块承诺**（`1aa750a`, `843689e`）：
-  - 新增任务无关的 `ContextualIntegrator`（均值中心化嵌入消除锥体各向异性：`mean_cos 0.363 → 0.028`，内容门控贝叶斯融合）与 14K 领域块扩展 + 整块承诺（Whole-Chunk Commitment），消除半词拼接伪影。
+## 二、当前现状与可复用资产（接手即用）
 
-### 2.3 原地门控 RC 状态空间策略与 RX 9070 XT 端到端 BPTT 突破（2026-11-28）
+### 2.1 运行环境与硬件底座
+- **Python 解释器**：`C:\workspace\code\.venv-ft\Scripts\python.exe`（Python `3.14.5t` free-threaded，`gil_enabled=False`，24 核 CPU，NumPy `2.5.4`）。
+- **GPU 计算底座**：**AMD Radeon RX 9070 XT（`gfx1201`，32 CUs，13.53 GB VRAM）**，通过零外部依赖原生 Windows `OpenCL.dll` 驱动（[core/compute/opencl_gpu.py](core/compute/opencl_gpu.py)）。当前 `32×32` 寄存器分块 SGEMM 实测 **`5.60 TFLOPS`**，支持全量 64M token 流常驻独立显存零拷贝 BPTT（注：Windows 任务管理器需在 GPU 视图切换为 `Compute_0 / Compute_1` 及「专用 GPU 内存」观察）。
+- **语料路径**：`C:\workspace\code\data\wiki_zhihu\corpus.txt`（中文维基 + 知乎混合语料）。
 
-- [x] **持久化原地状态策略演进**（`2ecd7fd` → `6d254d7` → `e2fbe0f` → `843689e`）：
-  - 从 1 阶 Ridge (`8.80%`) → 2 阶上下文门控双线性 (`20.68%`) → GPU 选择性实体锁 RC 结合扫描 (`21.82%`) → 64 维 2 层残差 512 门控 + `UnionBlend`（64M 达 `29.68% / 57.13% / 33.24%`）。
-- [x] **GPU 批量前瞻推理加速**（`57d3cbc`）：
-  - `StatefulContextPolicy.predict_batch_with_pmi` 批量下沉 RX 9070 XT，前瞻延迟下降 **30%–44%**；修复自生成三重叠乘问题（`self_stateful_beta=0.0`）。
-- [x] **5.60 TFLOPS OpenCL SGEMM + 全量显存常驻 2 层 96 步 BPTT `LearnableStateSpacePolicy`**（`57d3cbc`, `c5c91d9`）：
-  - OpenCL `sgemm_tiled_kernel` 升级为 `32×32` 寄存器分块（`2.84 → 5.60 TFLOPS`，2.0× 加速）；新增 VRAM 常驻零拷贝切片内核，将 64M token 流（`244 MB`）与 2 层 96 步 BPTT 激活（合计 **~2.33 GB 专用显存**）全驻 RX 9070 XT GDDR6，吞吐 **`178.2 ktok/s`**（2 epochs = 1.28 亿 token 更新仅 718s，主机 RSS `≤9.6 GB`）。
-  - 1 层与 2 层全部 11 组张量通过 **GPU/CPU 8 步 BPTT 数值一致性验证**（含 `<UNK>` 零梯度掩码）及 16 步随机线索延迟记忆单测（**42/42 核心单测全绿**）。
-  - **两级分层 RC 时间常数自发涌现**（未见 `@260M` 观测 $\tau = 1/\mathrm{mean}(z_t)$）：Layer-1 快/中层 `[p50=1.36, p95=5.43]` 步，Layer-2 慢层 `[p50=5.30, p75=41.71, p95=73.90]` 步。
-  - **自学习高 $\tau$ 慢通道选择性锚定（任务无关）**：`pin_macro_anchor()` 自动识别低写门 $\bar{z}$ 慢电容通道并在 `self_mode` 施加温和恢复拉力，保持快句法通道完全自由。
+### 2.2 现役代码架构速查
+| 模块路径 | 职责 | 关键类 / 入口 |
+|---|---|---|
+| [core/compute/opencl_gpu.py](core/compute/opencl_gpu.py) | 原生 OpenCL 计算内核 | `OpenCLAccelerator`（`5.60 TFLOPS` 32×32 SGEMM、GRU/RC 步进前反向、Softmax-CE-Grad、AdamW、显存常驻 token 切片、GPU 束电路场） |
+| [core/memory/learnable_ssm_policy.py](core/memory/learnable_ssm_policy.py) | **当前核心状态空间策略** | `LearnableStateSpacePolicy`（1/2 层残差门控 RC 状态空间、96 步 GPU-BPTT、原地状态更新、高 $\tau$ 慢通道选择性锚定） |
+| [core/memory/stateful_context_policy.py](core/memory/stateful_context_policy.py) | 前代固定 EMA 门控策略 | `StatefulContextPolicy`（保留兼容与 GPU 批量推理对照） |
+| [core/memory/context_integrator.py](core/memory/context_integrator.py) | 块级多线索上下文整合 | `ContextualIntegrator`（均值中心化嵌入、内容门控贝叶斯融合、14K 领域块与整块承诺） |
+| [core/memory/temp_context.py](core/memory/temp_context.py) | 工作记忆与电路场宿主 | `TemporaryContextMemory`、`ElectronicCircuitNodeField`（自学习每节点 R/C 时间常数） |
+| [core/memory/substrate_bundle.py](core/memory/substrate_bundle.py) | 统一构建与检查点序列化 | `StructuralSubstrateBundle`（24 核并行拟合、流式分块摄取、16 GB 治理、`save/load`、`make_controller`） |
+| [core/planning/context_decision.py](core/planning/context_decision.py) | 统一决策与前瞻控制器 | `ContextDrivenDecisionController`（4 专家 LOO 仲裁 + `UnionBlend` + 深度 2 束宽 5 批量前瞻） |
+| [core/stage/](core/stage/) / [core/env/](core/env/) / [core/runner/](core/runner/) | 连续控制/变物理主线 | `StageRegimeSummarizer`、`OnlineRegimeContinuationUpdater`、`OnlineFeatureDemandUpdater`、`DynamicsClassNode` |
 
-#### 近期 64M 零重叠演进总表（`@260M ev[5000:11000]`, `n=5876`, `V=2000`）
+### 2.3 当前最新检查点与验证基线（HEAD `c5c91d9`）
+- **最新默认 64M 可复用检查点**：`checkpoints/wiki_zhihu_64m_v2000.pkl.gz`（`256.95 MB`，已内含 64M 符号层 + 2 层 96 步 BPTT `LearnableStateSpacePolicy`，`StructuralSubstrateBundle.load(...)` 约 13s 加载即可直接评测/续写/增量实验）。另有 `4m / 16m / 256m` 历史检查点位于 `checkpoints/`。
+- **核心单元测试（42/42 绿灯，~15s）**：
+  ```powershell
+  C:\workspace\code\.venv-ft\Scripts\python.exe -m unittest `
+    tests/test_context_integrator.py tests/test_scalability_and_arbitration.py `
+    tests/test_circuit_gpu.py tests/test_policy_pool.py tests/test_structural_memory.py `
+    tests/test_recency_kernel.py tests/test_context_decision.py tests/test_temp_context.py `
+    tests/test_sequence_stage.py tests/test_class_policy.py tests/test_virtual_node_dag.py -v
+  ```
+- **严格零重叠 64M 演进基线（`@260M ev[5000:11000]`, `n=5876`, `V=2000`）**：
 
 | 阶段 / 模型配置 | 规模 | Top-1 | Top-8 | SameCls | SemAlign | CenteredSem | 留出 CE / PPL |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -62,43 +60,84 @@
 | **2 层 96 步 `SSM_2L_ONLY`（13.80 MB）** | **64M** | **31.76%** | **57.11%** | **35.33%** | 75.05% | 54.77% | **3.805 / 44.9** |
 | **2 层 64M `UnionBlend (a=0.65)`（当前冠军）** | **64M** | **32.93%** | **61.10%** | **36.20%** | 77.28% | **56.57%** | — |
 
-- **3 段 100 字盲测续写最新基线**（2 层 SSM + 高 $\tau$ 锚定，`UnionBlend a=0.65`）：
-  - `P1(立冬/日历)`：`80.7 ms/step` | `3gram_rep=6.1%` | `centered_cos(p)=0.878` | `centered_cos(gt)=0.701`
-  - `P2(个税/BI数据)`：`71.2 ms/step` | `3gram_rep=12.2%` | `centered_cos(p)=0.890` | `centered_cos(gt)=0.842`
-  - `P3(Wiki-上海广场)`：`64.2 ms/step` | `3gram_rep=17.3%` | `spaces=0` | `centered_cos(p)=0.736` | `centered_cos(gt)=0.285`
-- **已保存复用检查点**：`checkpoints/wiki_zhihu_64m_v2000.pkl.gz`（`256.95 MB`，含 2 层 96 步 `LearnableStateSpacePolicy`）。
+- **已验证涌现特性与盲测基线**：
+  - **两级自学习 RC 时间常数**（$\tau = 1/\mathrm{mean}(z_t)$）：Layer-1 快句法 `[p50=1.36, p95=5.43]` 步；Layer-2 慢篇章 `[p50=5.30, p75=41.71, p95=73.90]` 步。
+  - **3 段 100 字盲测续写**（`UnionBlend a=0.65, slow_anchor=0.42`, depth=2 beam=5）：
+    - `P1(立冬/日历 @260M+16367)`：`80.7 ms/step` | `3gram_rep=6.1%` | `centered_cos(p)=0.878` | `centered_cos(gt)=0.701`
+    - `P2(个税/BI数据 @260M+19122)`：`71.2 ms/step` | `3gram_rep=12.2%` | `centered_cos(p)=0.890` | `centered_cos(gt)=0.842`
+    - `P3(Wiki-上海广场 @260M+82)`：`64.2 ms/step` | `3gram_rep=17.3%` | `spaces=0` | `centered_cos(p)=0.736` | `centered_cos(gt)=0.285`
+
+### 2.4 当前明确暴露的 4 个短板
+1. **单篇低频实体长程保真不足**：`P1`（立冬/农历/节假日）在续写第 20–80 字后仍会被高频知乎回答模板（“所以说这个是我们的主题”“我们可以看出”）稀释，纯固定维度的 512 维慢向量难以精确召回单篇低频实词。
+2. **字符级词表 `V=2000` 瓶颈**：`<UNK>` 约 `2.5%`，且纯单字符输入迫使底层状态消耗大量步数拼字成词。
+3. **推理前瞻延迟偏高**：深度 2 束宽 5 前瞻目前 `64–81 ms/step`，2 层 SSM 尚未与符号/电路场统一 GPU 合批前瞻。
+4. **跨模态统一尚未闭环**：端到端 GPU-BPTT `LearnableStateSpacePolicy` 尚未反哺连续控制 / 变物理多世界基准。
 
 ---
 
-## 三、当前遗留短板诊断
+## 三、多 Agent 协同硬约束（所有 Agent 必须遵守）
 
-1. **低频实体长程保真不足**：`P1`（立冬/农历/节假日）在续写进入第 20–80 字后仍容易被高频知乎回答模板（“所以说这个是我们的主题”“我们可以看出”）稀释，纯固定维度的慢向量难以精确召回单篇罕见实词。
-2. **字符级词表瓶颈**：当前 `V=2000` 仍导致约 `2.5%` 的 `<UNK>`，且纯单字符输入迫使底层状态消耗大量步数拼字成词。
-3. **推理前瞻延迟仍有压缩空间**：2 层 SSM + 符号层深度 2 束宽 5 前瞻目前约 `64–81 ms/step`，主要耗时仍在 Python 侧循环与符号表字典查表。
-4. **跨模态统一尚未闭环**：端到端 GPU-BPTT `LearnableStateSpacePolicy` 尚未接入连续控制 / 多世界变物理评测栈做双向验证。
+1. **任务无关红线**：`core/` 内严禁引入中文分词器、正则/标点特判、词性表、硬编码复读惩罚或任务专用几何特征。
+2. **默认规模与零泄漏红线**：序列实验默认使用 **64M**（`0..64M`），评测严格锁定 **`@260M ev[5000:11000]`** 及 `P1/P2/P3`，严禁将 `@260M` 任何片段用于训练或超参过拟合。
+3. **内存与显存红线**：主机 RSS 严格 `≤ 16 GB`（当前 ~`8.2–9.6 GB`）；RX 9070 XT 显存可用空间 `13.53 GB`（当前训练约用 `2.33 GB`，可安全扩至 `4–8 GB`）。
+4. **原地状态与数值一致红线**：所有新状态机制必须支持严格原地 `observe()` 与无副作用 `fork_step()`；新增 OpenCL GPU 内核必须补充 **GPU vs CPU 数值一致性单测**（`atol <= 5e-4`）。
+5. **仓库整洁与提交规范**：临时实验脚本写到 scratch 目录、不提交大体积二进制检查点（`checkpoints/*.pkl.gz` 不入 git）；每次合入前须跑通 42 条核心单测，并如实更新本文件实测数据。
 
 ---
 
-## 四、将来推进方向（Roadmap）
+## 四、下一步可认领任务看板（Next Tasks）
 
-### P0 — 长程实词锁定与表征扩容（最高收益）
-- [ ] **任务无关快权重关联记忆（Fast-Weight Associative Memory / Hebbian Outer-Product State）**：
-  - 在 `LearnableStateSpacePolicy` 的原地状态中增加一块轻量级**可原地更新的键值快权重矩阵** $M_t = \lambda_t M_{t-1} + \eta_t (k_t \otimes v_t)$（完全任务无关、单篇内随阅读自动写入罕见高惊喜度实体的关联，续写时通过当前状态查询 $q_t M_t$ 精确召回 `立冬/农历/节假日`、`九龙仓/淮海中路` 等篇内实体，彻底解决固定维度慢向量稀释问题）。
-- [ ] **双流多粒度输入（Atom + Self-Discovered Chunk 联合嵌入）**：
-  - 将 `HierarchicalChunkMemory` 自发现的高频块 ID 与字符 ID 联合注入 `LearnableStateSpacePolicy` 的原地状态更新，在不引入任何外部分词器的前提下把等效 BPTT 视野从 96 字扩展至 200+ 字。
-- [ ] **充分释放 RX 9070 XT 16 GB 显存的容量与上下文扩容**：
-  - 词表扩至 `V=4000~5000`（将 `<UNK>` 压至 `<0.5%`）；
-  - 探索 **3 层残差门控 RC** 或 **对角选择性状态空间（Mamba/Linear-Recurrence + SwiGLU 门控）**、`H=768/1024`、`T=128~192` 长程 BPTT，并在默认 64M 上验证收益后再跑一轮 256M 全量扩展对比（显存目标 4–8 GB / 16 GB）。
+> 各任务相互解耦，可由不同 Agent 并行认领推进；认领时请在任务标题后标注 `[IN PROGRESS: <agent>]`，完成后勾选并回填实测指标与 commit hash。
 
-### P1 — 测试期原地自适应与推理加速
-- [ ] **测试期原地轻量自适应（Episode-Time Surprise-Gated Adaptation）**：
-  - 阅读外部长 prompt 或长篇流时，利用局部高惊喜度（prediction surprise）对 readout 或快权重做微步、受 LCB 护栏保护的原地更新，使系统对从未见过的专有名词/领域术语具备单次阅读即记住的在线学习能力。
-- [ ] **前瞻与推理全链下沉 GPU**：
-  - 将 `LearnableStateSpacePolicy` 的多分支前瞻 `fork_step` 与 `predict_batch_with_pmi` 也合批驻留 RX 9070 XT，并与 GPU 电路场融合调度，目标将深度 2 束宽 5 前瞻延迟从 `64–81 ms/step` 压降至 **`< 15 ms/step`**。
+### [P0-1] 任务无关快权重关联记忆（Fast-Weight Hebbian Associative State）
+- **目标**：解决固定维度慢向量稀释单篇低频实体（如 `P1` 的“立冬/农历/节假日”）的问题，实现**篇内罕见实体精确长程召回**。
+- **方案要点**：
+  - 在 `LearnableSSMState` 中新增一块可原地演化的轻量低秩快权重矩阵 $M_t \in \mathbb{R}^{d_k \times d_v}$（例如 $64 \times 64$，仅 `16 KB`/状态）：
+    $$M_t = \lambda_t M_{t-1} + \eta_t (k_t \otimes v_t), \qquad m_t = \mathrm{LayerNorm}(q_t M_t)$$
+  - 写入门 $\eta_t$ 与衰减门 $\lambda_t$ 由网络端到端从 BPTT 自学习（自然给低频/高惊喜度实体高写入、给高频虚词低写入），读出 $m_t$ 残差叠加至 `s1 + s2 + m_t`；
+  - 同步实现 OpenCL 前/反向内核并补齐 GPU/CPU 数值一致性单测 + 合成“首次出现即记住（one-shot associative recall）”单测。
+- **涉及文件**：`core/compute/opencl_gpu.py`、`core/memory/learnable_ssm_policy.py`、`tests/test_context_integrator.py`
+- **验收门槛**：
+  - 42+ 核心单测全绿（含 GPU/CPU 数值一致与 one-shot 关联召回单测）；
+  - 64M `@260M` 上 `SSM_ONLY` 留出 PPL 低于 `44.9`，`UnionBlend` Top-1 突破 **`33.5%+`**；
+  - `P1(立冬/日历)` 100 字续写中段能自然维持“立冬/农历/时间/节假日”相关实词，显著减少知乎通用口癖。
 
-### P2 — 跨任务统一状态底座验证
-- [ ] **连续观测版 `LearnableStateSpacePolicy` 跨模态回归**：
-  - 将 `LearnableStateSpacePolicy` 的输入端抽象为通用投影（离散符号嵌入 / 连续观测向量统一），接入 `DelayedCartPole(lag=2)` 与变物理多世界基准，验证同一套**原地门控 RC + 自学习时间常数**机制同时胜任语言序列建模与物理决策控制。
+### [P0-2] 双流多粒度输入（Atom + Self-Discovered Chunk）与 RX 9070 XT 显存扩容
+- **目标**：打破 `V=2000` 纯单字瓶颈，充分利用 RX 9070 XT 剩余 ~11 GB 显存将等效上下文视野推至 **200+ 字**。
+- **方案要点**：
+  - **路径 A（双流输入）**：在 `LearnableStateSpacePolicy` 输入层融合字符嵌入 `E_atom[sym]` 与 `HierarchicalChunkMemory` 自发现的块嵌入 `E_chunk[chunk_id]`（零外部分词器），减少底层拼字消耗；
+  - **路径 B（规模与深度扩容）**：将词表扩至 `V=4000~5000`（`<UNK> < 0.5%`），评估 `H=768` / 3 层残差门控 RC（或对角选择性线性递推 + SwiGLU 门控）与 `T=128~192` 长程 BPTT（目标活跃显存 `4–8 GB / 13.53 GB`），并在默认 64M 跑通后再做一轮 256M 全量扩展对比。
+- **涉及文件**：`core/memory/learnable_ssm_policy.py`、`core/memory/substrate_bundle.py`、`core/compute/opencl_gpu.py`
+- **验收门槛**：
+  - 主机 RSS `≤ 16 GB`，训练吞吐不低于 `100 ktok/s`；
+  - 同口径 `@260M` 上 64M `UnionBlend` Top-1 突破 **`34.5%+`** / Top-8 突破 **`63.0%+`**（扩词表时需同时报告同口径 `V=2000` 子集指标以确保可比）。
+
+### [P1-1] 前瞻推理全链 GPU 合批加速（目标 `< 15 ms/step`）
+- **目标**：消除 `decide_with_lookahead` 当前 `64–81 ms/step` 延迟，为更深前瞻（depth 3–4）与实时交互铺路。
+- **方案要点**：
+  - 分析 `decide_with_lookahead` 逐模块耗时热点（Python 字典查表 vs `LearnableStateSpacePolicy` `fork_step`/readout vs 电路场）；
+  - 将 `LearnableStateSpacePolicy` 的权重常驻 RX 9070 XT 推理缓存，实现批量 `fork_step_batch` + `predict_batch_with_pmi` 一步 GPU 完成，并减少每分支 Python 对象复制开销。
+- **涉及文件**：`core/memory/learnable_ssm_policy.py`、`core/planning/context_decision.py`、`core/compute/opencl_gpu.py`
+- **验收门槛**：
+  - 深度 2 束宽 5 前瞻在 `P1/P2/P3` 上实测 **`≤ 20 ms/step`**（力争 `< 15 ms/step`），且与 CPU 路径预测分布数值等价（单测锁定）。
+
+### [P1-2] 测试期惊喜度门控原地自适应（Episode-Time Fast Adaptation）
+- **目标**：让系统在阅读未见长篇/新专有名词时，仅凭单次前向流就能原地记住篇内新概念，且不污染全局权重、不引发崩溃。
+- **方案要点**：
+  - 阅读外部 prompt/文档时，按 token 预测惊喜度 $-\log p(y_t \mid s_{t-1})$ 门控触发轻量级原地更新（仅更新局部 readout 偏置或 P0-1 快权重，受 Wilson-LCB / KL 散度护栏约束，episode `reset()` 时清空或回滚）；
+  - 设计严格的长文档（如 `@260M` 连续 2000–5000 字）前段 vs 后段 PPL 对比评测。
+- **涉及文件**：`core/memory/learnable_ssm_policy.py`、`core/planning/context_decision.py`
+- **验收门槛**：
+  - 连续未见长文后半段（500–2000 字）留出 PPL 显著低于冻结推理基线，且 100 字自由续写无退化或复读反弹。
+
+### [P2-1] 跨模态统一状态底座验证（语言序列 + 连续控制合体）
+- **目标**：验证 `LearnableStateSpacePolicy` 的原地门控 RC 动力学同样胜任连续控制与变物理环境，实现两条主线的架构统一。
+- **方案要点**：
+  - 将 `LearnableStateSpacePolicy` 输入端泛化为支持连续观测向量投影 `x_t = obs_t @ W_obs`（与离散 `E_[tok]` 并列），接入 `DelayedCartPole(lag=2)` 与变物理多世界基准做多步观测/终局风险预测或隐状态表征；
+  - 验证在变物理切换场景中，门控 RC 隐状态是否自动分化出快动力学通道与慢物理参数通道。
+- **涉及文件**：`core/memory/learnable_ssm_policy.py`、`core/runner/`、`tests/test_cartpole_cross_task.py`
+- **验收门槛**：
+  - 不破坏既有 `DelayedCartPole`（`369.3`）与多世界变物理双门指标，并在隐状态追踪/变物理切换预测上呈现可量化正向增益。
 
 ---
 
