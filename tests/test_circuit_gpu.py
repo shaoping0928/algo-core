@@ -179,6 +179,63 @@ class CircuitFieldAndGPUTests(unittest.TestCase):
         finally:
             cf.close()
 
+    def test_self_learned_rc_differentiates_macro_persistent_vs_transient_and_syncs_gpu(self):
+        from circuit_field import ElectronicCircuitNodeField
+        from opencl_gpu import OpenCLAccelerator
+
+        rng = np.random.RandomState(23)
+        # 3 macro regimes (each 120 steps): macro anchors 20/21/22 recur across long lags inside
+        # their regime, while transient symbols 1..12 occur uniformly at random everywhere.
+        seq = []
+        for ep in range(60):
+            macro_sym = 20 + (ep % 3)
+            for step in range(120):
+                if step % 20 == 0:
+                    seq.append(macro_sym)
+                else:
+                    seq.append(int(rng.randint(1, 13)))
+        tokens = np.asarray(seq, dtype=np.int32)
+
+        acc = OpenCLAccelerator()
+        cf_gpu = ElectronicCircuitNodeField(30, batch_size=1, use_gpu=acc.available, accelerator=acc if acc.available else None)
+        cf_cpu = ElectronicCircuitNodeField(30, batch_size=1, use_gpu=False)
+        try:
+            st_g = cf_gpu.fit_rc_from_stream(tokens)
+            cf_cpu.fit_rc_from_stream(tokens)
+            self.assertGreater(st_g["fitted_nodes"], 10)
+
+            tau_macro = float(np.mean(cf_gpu.R[20:23] * cf_gpu.C[20:23]))
+            tau_trans = float(np.mean(cf_gpu.R[1:13] * cf_gpu.C[1:13]))
+            # Stable macro concepts MUST automatically learn much larger RC time constant than transient noise!
+            self.assertGreater(tau_macro, tau_trans * 2.0)
+
+            # Online feedback: under-charged long-lag target increases R; stale false-positive decreases R
+            r20_before = float(cf_gpu.R[20])
+            r5_before = float(cf_gpu.R[5])
+            cf_gpu.V_cap[0, 20] = 0.05
+            cf_gpu.V_cap[0, 5] = 0.80
+            cf_gpu.learn_rc_feedback(target=20, predicted_top=5, target_lag=18, lr=0.15)
+            cf_cpu.V_cap[0, 20] = 0.05
+            cf_cpu.V_cap[0, 5] = 0.80
+            cf_cpu.learn_rc_feedback(target=20, predicted_top=5, target_lag=18, lr=0.15)
+            self.assertGreater(float(cf_gpu.R[20]), r20_before)
+            self.assertLess(float(cf_gpu.R[5]), r5_before)
+
+            # Verify updated non-uniform (R, C) auto-syncs to GPU beam engine and matches CPU!
+            if acc.available:
+                eng_g = cf_gpu.get_beam_engine(max_branches=16)
+                eng_c = cf_cpu.get_beam_engine(max_branches=16)
+                vc0 = rng.uniform(0.0, 1.0, size=(1, 30)).astype(np.float32)
+                vi0 = rng.uniform(0.0, 0.3, size=(1, 30)).astype(np.float32)
+                eng_g.seed_root(vc0, vi0)
+                eng_c.seed_root(vc0, vi0)
+                vd_g, vo_g = eng_g.fork_and_step([0, 0, 0, 0], [20, 5, 21, 3], [1.0, 1.0, 1.0, 1.0], n_parent_active=1)
+                vd_c, vo_c = eng_c.fork_and_step([0, 0, 0, 0], [20, 5, 21, 3], [1.0, 1.0, 1.0, 1.0], n_parent_active=1)
+                self.assertTrue(np.allclose(vd_g, vd_c, atol=1e-4))
+                self.assertTrue(np.allclose(vo_g, vo_c, atol=1e-4))
+        finally:
+            cf_gpu.close()
+
 
 if __name__ == "__main__":
     unittest.main()

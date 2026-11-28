@@ -51,9 +51,15 @@ class ElectronicCircuitNodeField:
         self.w_diff = float(w_diff)
         self.coupling_gain = float(coupling_gain)
 
-        # Per-node R and C parameters (learnable/adaptable per symbol/node)
+        # Per-node R (resistance) and C (capacitance) parameters — self-learnable from data & feedback
         self.R = np.full(self.n_nodes, float(init_resistance), dtype=np.float32)
         self.C = np.full(self.n_nodes, float(init_capacitance), dtype=np.float32)
+        self.r_min: float = 0.8
+        self.r_max: float = 16.0
+        self.c_min: float = 0.6
+        self.c_max: float = 8.0
+        self._rc_updates: int = 0
+        self._rc_gpu_dirty: bool = False
 
         # Host states [B, N]
         self.V_cap = np.zeros((self.batch_size, self.n_nodes), dtype=np.float32)
@@ -288,6 +294,179 @@ class ElectronicCircuitNodeField:
         self.V_diff[0] = vd
         self.V_out[0] = vout
 
+    def sync_rc_to_gpu(self) -> None:
+        """Push self-learned per-node ``R`` and ``C`` arrays directly to GPU buffers."""
+        if self.gpu is not None and self._bufs:
+            if "R" in self._bufs:
+                self.gpu.write_buffer(self._bufs["R"], np.ascontiguousarray(self.R, dtype=np.float32))
+            if "C" in self._bufs:
+                self.gpu.write_buffer(self._bufs["C"], np.ascontiguousarray(self.C, dtype=np.float32))
+        self._rc_gpu_dirty = False
+
+    def fit_rc_from_stream(
+        self,
+        tokens: Sequence[int],
+        *,
+        short_lag: int = 10,
+        long_lag: int = 72,
+        max_samples: int = 180_000,
+    ) -> Dict[str, float]:
+        """Self-learn per-node ``(R, C)`` purely from empirical temporal persistence in a raw stream.
+
+        Zero task rules:
+          - Nodes with high long-range recurrence lift (recurring across ``[short_lag+1..long_lag]``
+            well above global base rate) automatically grow **large C and large R** (large time
+            constant ``tau = R * C``: stable macro-concepts that decay slowly).
+          - Nodes that occur transiently or uniformly without long-range persistence shrink to
+            **small C and small R** (fast charge & fast discharge).
+        """
+        arr = np.clip(np.asarray(tokens, dtype=np.int32).reshape(-1), 0, self.n_nodes - 1)
+        n = len(arr)
+        if n <= long_lag + 4:
+            return dict(fitted_nodes=0)
+
+        v = self.n_nodes
+        counts = np.bincount(arr, minlength=v).astype(float)
+        counts[0] = 0.0
+        tot = max(float(counts.sum()), 1.0)
+        p_glob = (counts + 1.0) / (tot + float(v))
+
+        trials = np.zeros(v, dtype=float)
+        short_hits = np.zeros(v, dtype=float)
+        long_hits = np.zeros(v, dtype=float)
+        lag_sum = np.zeros(v, dtype=float)
+
+        span = n - long_lag - 1
+        stride = max(span // max(int(max_samples), 2000), 1)
+        s_list = arr.tolist()
+        w_short = float(short_lag)
+        w_long = float(long_lag - short_lag)
+
+        for t in range(0, span, stride):
+            a = s_list[t]
+            if a <= 0:
+                continue
+            trials[a] += 1.0
+            # Check earliest recurrence in short window [1..short_lag] and long window [short_lag+1..long_lag]
+            hit_s = False
+            hit_l = False
+            for d in range(1, short_lag + 1):
+                if s_list[t + d] == a:
+                    hit_s = True
+                    lag_sum[a] += float(d)
+                    break
+            for d in range(short_lag + 1, long_lag + 1):
+                if s_list[t + d] == a:
+                    hit_l = True
+                    if not hit_s:
+                        lag_sum[a] += float(d)
+                    break
+            if hit_s:
+                short_hits[a] += 1.0
+            if hit_l:
+                long_hits[a] += 1.0
+
+        fitted = 0
+        for sym in range(1, v):
+            tr = trials[sym]
+            if tr < 5.0:
+                continue
+            fitted += 1
+            p_l = (long_hits[sym] + 0.5) / (tr + 1.0)
+            p_null_l = 1.0 - float(np.power(max(1.0 - float(p_glob[sym]), 1e-9), w_long))
+            long_lift = float(np.log(max(p_l, 1e-6) / max(p_null_l, 1e-6)))
+
+            p_s = (short_hits[sym] + 0.5) / (tr + 1.0)
+            p_null_s = 1.0 - float(np.power(max(1.0 - float(p_glob[sym]), 1e-9), w_short))
+            short_lift = float(np.log(max(p_s, 1e-6) / max(p_null_s, 1e-6)))
+
+            # Persistence score in [0, 1]: high when long-range lift is strong (macro-topic/state)
+            # and not purely a short-burst transient
+            persist_raw = 0.75 * long_lift + 0.25 * (long_lift - 0.5 * short_lift)
+            persist_sig = 1.0 / (1.0 + float(np.exp(-1.6 * (persist_raw - 0.85))))
+
+            # High persistence -> large R (slow leak) & large C (high inertia)
+            # Low persistence  -> small R (fast clear) & small C (fast charge/discharge)
+            r_val = self.r_min + (self.r_max - self.r_min) * (0.05 + 0.95 * persist_sig)
+            c_val = self.c_min + (self.c_max - self.c_min) * (0.05 + 0.95 * persist_sig)
+            self.R[sym] = np.float32(np.clip(r_val, self.r_min, self.r_max))
+            self.C[sym] = np.float32(np.clip(c_val, self.c_min, self.c_max))
+
+        self.sync_rc_to_gpu()
+        tau = self.R[1:] * self.C[1:]
+        return dict(
+            fitted_nodes=int(fitted),
+            mean_R=round(float(self.R[1:].mean()), 3),
+            mean_C=round(float(self.C[1:].mean()), 3),
+            min_tau=round(float(tau.min()), 2),
+            max_tau=round(float(tau.max()), 2),
+        )
+
+    def learn_rc_feedback(
+        self,
+        target: int,
+        predicted_top: int,
+        *,
+        target_lag: int = -1,
+        lr: float = 0.12,
+    ) -> None:
+        """Online feedback credit assignment on per-node ``(R, C)`` from real prediction outcomes.
+
+        - If ``target`` recurred at long lag (``>= 6``) but its charge had decayed too low
+          (``V_cap[target] < 0.25``): increase ``R[target]`` and ``C[target]`` (slower leak).
+        - If ``target`` occurred at very short lag (``1..5``) with under-charged ``V_cap``:
+          decrease ``C[target]`` slightly (faster charge response).
+        - If ``predicted_top != target`` had stale lingering charge (``V_cap > 0.25``) and
+          misled prediction: decrease ``R[predicted_top]`` (faster resistive clearance).
+        """
+        tgt = int(target)
+        pred = int(predicted_top)
+        changed = False
+        if 0 < tgt < self.n_nodes:
+            vc_t = float(self.V_cap[0, tgt])
+            if target_lag >= 6 and vc_t < 0.25:
+                self.R[tgt] = np.float32(np.clip(float(self.R[tgt]) * (1.0 + lr), self.r_min, self.r_max))
+                self.C[tgt] = np.float32(np.clip(float(self.C[tgt]) * (1.0 + 0.5 * lr), self.c_min, self.c_max))
+                changed = True
+            elif 1 <= target_lag <= 5 and vc_t < 0.20:
+                self.C[tgt] = np.float32(np.clip(float(self.C[tgt]) * (1.0 - 0.6 * lr), self.c_min, self.c_max))
+                changed = True
+
+        if 0 < pred < self.n_nodes and pred != tgt:
+            vc_p = float(self.V_cap[0, pred])
+            if vc_p > 0.25:
+                self.R[pred] = np.float32(np.clip(float(self.R[pred]) * (1.0 - lr), self.r_min, self.r_max))
+                changed = True
+
+        if changed:
+            self._rc_updates += 1
+            self._rc_gpu_dirty = True
+            # Batch GPU upload every 32 updates (or immediately before lookahead)
+            if self._rc_updates % 32 == 0:
+                self.sync_rc_to_gpu()
+
+    def inspect_rc_spectrum(
+        self,
+        itos: Sequence[str],
+        *,
+        top_n: int = 12,
+        valid_mask: Optional[np.ndarray] = None,
+    ) -> Dict[str, List[Tuple[str, float, float, float]]]:
+        """Inspect nodes with largest vs smallest learned time constants ``tau = R * C``."""
+        rows = []
+        lim = min(self.n_nodes, len(itos))
+        for i in range(1, lim):
+            if valid_mask is not None and not bool(valid_mask[i]):
+                continue
+            r_v = float(self.R[i])
+            c_v = float(self.C[i])
+            rows.append((r_v * c_v, itos[i], round(r_v, 2), round(c_v, 2), round(r_v * c_v, 1)))
+        rows.sort(reverse=True)
+        return dict(
+            largest_tau=[(ch, r, c, tau) for _, ch, r, c, tau in rows[:top_n]],
+            smallest_tau=[(ch, r, c, tau) for _, ch, r, c, tau in rows[-top_n:][::-1]],
+        )
+
     def sync_host_to_gpu(self) -> None:
         """Push current host circuit states to GPU buffers (for batched GPU lookahead rollouts)."""
         if self.gpu is not None and self._bufs:
@@ -360,6 +539,8 @@ class ElectronicCircuitBeamEngine:
 
     def seed_root(self, v_cap_root: np.ndarray, v_int_root: np.ndarray) -> None:
         """Load the current live single-stream circuit state into branch slot 0."""
+        if getattr(self.field, "_rc_gpu_dirty", False):
+            self.field.sync_rc_to_gpu()
         vc0 = np.ascontiguousarray(v_cap_root, dtype=np.float32).reshape(1, self.n_nodes)
         vi0 = np.ascontiguousarray(v_int_root, dtype=np.float32).reshape(1, self.n_nodes)
         self._ping = 0

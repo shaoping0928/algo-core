@@ -75,6 +75,7 @@ class TemporaryContextMemory:
         self,
         *,
         use_gpu: bool = True,
+        fit_tokens: Optional[Sequence[int]] = None,
         dt: float = 0.25,
         init_resistance: float = 4.5,
         init_capacitance: float = 2.2,
@@ -100,6 +101,8 @@ class TemporaryContextMemory:
         )
         if self.assoc_graph_:
             cf.set_sparse_coupling(self.assoc_graph_)
+        if fit_tokens is not None:
+            cf.fit_rc_from_stream(fit_tokens)
         self.circuit_field = cf
         return cf
 

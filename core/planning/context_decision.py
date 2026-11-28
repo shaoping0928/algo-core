@@ -524,6 +524,34 @@ class ContextDrivenDecisionController:
             expert_maps, ent, tgt, recency_advantage=rec_adv, k=k,
         )
 
+    def learn_rc_step(
+        self,
+        ctx_tokens: Sequence[int],
+        slow_state: Optional[np.ndarray],
+        actual_target: int,
+        *,
+        predicted_top: Optional[int] = None,
+        lr: float = 0.12,
+    ) -> None:
+        """Online feedback adaptation of per-node ``(R, C)`` parameters on the circuit field."""
+        cf = getattr(self.temp_memory, "circuit_field", None)
+        if cf is None or int(actual_target) <= 0:
+            return
+        tgt = int(actual_target)
+        if predicted_top is None:
+            acts, _, _ = self.decide_distribution(ctx_tokens, slow_state, k=4)
+            pred = int(acts[0]) if acts else 0
+        else:
+            pred = int(predicted_top)
+        # Measure empirical lag since tgt last appeared in recent history
+        hist = self.temp_memory.recent_history
+        tgt_lag = -1
+        for back in range(1, min(len(hist), 80) + 1):
+            if int(hist[-back]) == tgt:
+                tgt_lag = back
+                break
+        cf.learn_rc_feedback(tgt, pred, target_lag=tgt_lag, lr=lr)
+
     def decide_with_lookahead(
         self,
         ctx_tokens: Sequence[int],
