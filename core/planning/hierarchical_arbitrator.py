@@ -54,9 +54,10 @@ class HierarchicalOnlineArbitrator:
             w0 /= w0.sum()
             init_logits = np.log(w0)
         else:
-            # Balanced structural prior: working_memory builds on base_policy,
-            # so avoid over-diluting working_memory with unmodulated base_policy.
-            w0 = np.asarray([0.18, 0.52, 0.25, 0.05], dtype=float)
+            # Structural consensus prior aligned with L3 composition: working_memory
+            # already wraps base_policy, so base_policy acts as a clean regularizer
+            # while chunk_grammar + working_memory share primary structural drive.
+            w0 = np.asarray([0.06, 0.54, 0.34, 0.06], dtype=float)
             init_logits = np.log(w0)
         self._prior_logits = init_logits.copy()
         self.logits = np.tile(init_logits[None, :], (self.n_regimes, 1))
@@ -100,10 +101,26 @@ class HierarchicalOnlineArbitrator:
         normalized_entropy: float,
         *,
         expert_confidences: Optional[Sequence[float]] = None,
+        self_mode: bool = False,
+        self_wm_scale: float = 0.72,
     ) -> Tuple[Dict[int, float], int, np.ndarray]:
-        """Convexly combine active expert probability maps for the current entropy regime."""
+        """Convexly combine active expert probability maps for the current entropy regime.
+
+        When ``self_mode=True`` (open-loop autonomous rollout without external input),
+        damps self-referential ``working_memory`` relative to structural progression
+        experts (``base_policy``, ``chunk_grammar``, ``frame_register``) so the
+        trajectory advances rather than looping on prompt/self echoes.
+        """
         r = self.entropy_regime(normalized_entropy)
-        w = self.weights_for_regime(r)
+        w = self.weights_for_regime(r).copy()
+        if self_mode and self.n_experts >= 3:
+            # Index 1 is working_memory; damp its share so base_policy + chunk_grammar
+            # + frame_register drive forward structural progression in open-loop rollouts.
+            wm_s = float(np.clip(self_wm_scale, 0.10, 1.0))
+            w[1] *= wm_s
+            w_tot = float(w.sum())
+            if w_tot > 1e-12:
+                w /= w_tot
         # Re-normalize weights across experts that produced non-empty distributions
         active_w = np.zeros(self.n_experts, dtype=float)
         norm_maps: List[Dict[int, float]] = []
@@ -157,18 +174,72 @@ class HierarchicalOnlineArbitrator:
         target: int,
         *,
         recency_advantage: float = 0.0,
+        expert_confidences: Optional[Sequence[float]] = None,
         k: int = 8,
     ) -> bool:
-        """Record one feedback step into intra-episode buffer; auto-consolidates at episode window."""
+        """Record one feedback step via marginal mixture-responsibility + LOO credit.
+
+        Instead of grading experts standalone (which biases toward broad experts that
+        wrap ``base_policy`` and penalizes sparse high-precision structural experts
+        like ``chunk_grammar`` and ``frame_register``), each active expert receives:
+          1. Exact Mixture-of-Experts log-likelihood responsibility gradient
+             ``log(P_i(y) / P_mix(y))`` (Online Exponentiated Gradient);
+          2. Counterfactual Leave-One-Out Top-K advantage ``S(P_mix) - S(P_{-i})``.
+        """
         tgt = int(target)
         if tgt <= 0:
             return False
         r = self.entropy_regime(normalized_entropy)
+        blended, _, active_w = self.blend_experts(
+            expert_maps, normalized_entropy, expert_confidences=expert_confidences,
+        )
+        if not blended:
+            return False
+
+        # Normalize active expert maps once for exact mixture responsibility & LOO
+        norm_maps: List[Dict[int, float]] = []
+        active_indices: List[int] = []
         for idx, emap in enumerate(expert_maps[: self.n_experts]):
-            if emap:
-                sc = self._expert_score(emap, tgt, k=k)
-                self._ep_util_sum[r, idx] += sc
-                self._ep_util_cnt[r, idx] += 1.0
+            tot = float(sum(v for v in emap.values() if v > 0.0)) if emap else 0.0
+            if tot > 1e-12 and active_w[idx] > 1e-9:
+                inv_t = 1.0 / tot
+                norm_maps.append({int(a): float(v) * inv_t for a, v in emap.items() if v > 0.0})
+                active_indices.append(idx)
+            else:
+                norm_maps.append({})
+
+        p_mix_y = max(float(blended.get(tgt, 0.0)), 1e-5)
+        s_mix = self._expert_score(blended, tgt, k=k)
+        n_act = len(active_indices)
+
+        for idx in active_indices:
+            nmap = norm_maps[idx]
+            wi = float(active_w[idx])
+            p_i_y = max(float(nmap.get(tgt, 0.0)), 1e-5)
+            # 1. Exact softmax-mixture log-likelihood logit gradient:
+            #    d/dz_i log P_mix(y) = a_i * (P_i(y) / P_mix(y) - 1)
+            #    Naturally scales by active responsibility a_i so sparse low-confidence
+            #    specialists are never unfairly crushed when inactive.
+            ll_grad = float(np.clip(wi * ((p_i_y / p_mix_y) - 1.0), -1.0, 1.5))
+
+            # 2. Counterfactual Leave-One-Out Top-K ensemble advantage
+            loo_adv = 0.0
+            if n_act >= 2:
+                rem_w = max(1.0 - wi, 1e-9)
+                inv_rem = 1.0 / rem_w
+                loo_map: Dict[int, float] = {}
+                for a, pv in blended.items():
+                    rem_p = pv - wi * nmap.get(a, 0.0)
+                    if rem_p > 1e-12:
+                        loo_map[a] = rem_p * inv_rem
+                s_loo = self._expert_score(loo_map, tgt, k=k)
+                loo_adv = float(np.clip(s_mix - s_loo, -1.0, 1.0))
+
+            # Combined exact marginal contribution (log-likelihood gradient + LOO Top-K gain)
+            credit = 0.55 * ll_grad + 0.45 * loo_adv
+            self._ep_util_sum[r, idx] += credit
+            self._ep_util_cnt[r, idx] += 1.0
+
         if recency_advantage != 0.0:
             self._ep_rec_adv_sum[r] += float(recency_advantage)
             self._ep_rec_adv_cnt[r] += 1.0

@@ -278,6 +278,7 @@ class ContextDrivenDecisionController:
         *,
         k: int = 8,
         recent_history: Optional[Sequence[int]] = None,
+        self_mode: bool = False,
     ) -> Tuple[List[Dict[int, float]], float, float, Dict[str, float]]:
         """Compute calibrated probability maps for the 4 orthogonal memory experts."""
         prev1 = int(ctx_tokens[-1]) if len(ctx_tokens) > 0 else 0
@@ -313,6 +314,7 @@ class ContextDrivenDecisionController:
             cache_lambda=self.cache_lambda,
             extra_pool_k=max(int(k) * 2, 16),
             novelty_gated_cache=use_nov_cache,
+            self_mode=self_mode,
         )
         wm_map: Dict[int, float] = {int(a): float(p) for a, p in zip(cand1, probs1) if int(a) > 0}
 
@@ -422,8 +424,12 @@ class ContextDrivenDecisionController:
             if recent_history is not None
             else (self.temp_memory.recent_history if self.temp_memory.recent_history else ctx_tokens)
         )
+        is_self_mode = (
+            vdiff_override is not None
+            or getattr(self.temp_memory, "_last_source", "external") == "self"
+        )
         expert_maps, ent, ent_gate, info = self._compute_expert_maps(
-            ctx_tokens, slow_state, k=k, recent_history=hist_src,
+            ctx_tokens, slow_state, k=k, recent_history=hist_src, self_mode=is_self_mode,
         )
         _base_map, wm_map, chunk_map, frame_map = expert_maps
 
@@ -432,7 +438,7 @@ class ContextDrivenDecisionController:
             chunk_conf = float(info.get("chunk_conf", 0.5))
             exp_confs = (1.0, 1.0, 0.25 + 0.75 * chunk_conf, ent_gate)
             score_map, regime, _w = self.arbitrator.blend_experts(
-                expert_maps, ent, expert_confidences=exp_confs,
+                expert_maps, ent, expert_confidences=exp_confs, self_mode=is_self_mode,
             )
             info["arb_regime"] = float(regime)
             rec_str = self.arbitrator.recency_strength_for_regime(regime)
@@ -457,10 +463,13 @@ class ContextDrivenDecisionController:
                     score_map[c_sym] = score_map.get(c_sym, 0.0) + fw * f_val
             rec_str = self.recency_strength
 
-        # 5. Self-learned recency-lag modulation (excitation or inhibition purely from data)
+        # 5. Self-learned recency-lag modulation (excitation damped in open-loop self_mode
+        #    while preserving data-learned negative refractory inhibition at full strength)
         if self.recency_kernel is not None and rec_str > 0.0:
             score_map = self.recency_kernel.modulate_scores(
-                hist_src, score_map, strength=rec_str,
+                hist_src, score_map,
+                strength=rec_str,
+                excitation_scale=(0.20 if is_self_mode else 1.0),
             )
 
         # 6. Electronic Circuit Differentiator (high-pass V_diff = V_cap - V_int):
@@ -473,14 +482,10 @@ class ContextDrivenDecisionController:
         )
         if v_diff is not None and self.circuit_diff_weight > 0.0:
             dw = float(self.circuit_diff_weight)
-            is_self_mode = (
-                vdiff_override is not None
-                or getattr(self.temp_memory, "_last_source", "external") == "self"
-            )
             eff_dw = dw if is_self_mode else (0.25 * dw)
             for a in list(score_map.keys()):
                 if 0 < a < len(v_diff):
-                    dv = float(np.clip(v_diff[a], -2.0, 1.2))
+                    dv = float(np.clip(v_diff[a], -2.5, 1.2))
                     if dv != 0.0:
                         score_map[a] *= float(np.exp(eff_dw * dv))
 
@@ -510,19 +515,26 @@ class ContextDrivenDecisionController:
             if recent_history is not None
             else (self.temp_memory.recent_history if self.temp_memory.recent_history else ctx_tokens)
         )
-        expert_maps, ent, _ent_gate, _meta = self._compute_expert_maps(
-            ctx_tokens, slow_state, k=k, recent_history=hist_src,
+        expert_maps, ent, ent_gate, meta = self._compute_expert_maps(
+            ctx_tokens, slow_state, k=k, recent_history=hist_src, self_mode=False,
         )
+        chunk_conf = float(meta.get("chunk_conf", 0.5))
+        exp_confs = (1.0, 1.0, 0.25 + 0.75 * chunk_conf, ent_gate)
         rec_adv = 0.0
         if self.recency_kernel is not None and self.recency_kernel._fitted:
-            blended, _r, _w = self.arbitrator.blend_experts(expert_maps, ent)
+            blended, _r, _w = self.arbitrator.blend_experts(
+                expert_maps, ent, expert_confidences=exp_confs,
+            )
             if blended:
                 mod_on = self.recency_kernel.modulate_scores(hist_src, blended, strength=0.85)
                 sc_off = self.arbitrator._expert_score(blended, tgt, k=k)
                 sc_on = self.arbitrator._expert_score(mod_on, tgt, k=k)
                 rec_adv = sc_on - sc_off
         return self.arbitrator.record_step(
-            expert_maps, ent, tgt, recency_advantage=rec_adv, k=k,
+            expert_maps, ent, tgt,
+            recency_advantage=rec_adv,
+            expert_confidences=exp_confs,
+            k=k,
         )
 
     def learn_rc_step(
@@ -644,8 +656,12 @@ class ContextDrivenDecisionController:
         is_c_arr = getattr(self.temp_memory, "_is_content", None)
 
         def _sym_sal(sym_id: int) -> float:
-            if sym_id <= 0 or (is_c_arr is not None and sym_id < len(is_c_arr) and not bool(is_c_arr[sym_id])):
+            if sym_id <= 0:
                 return 0.0
+            if is_c_arr is not None and sym_id < len(is_c_arr) and not bool(is_c_arr[sym_id]):
+                # Non-content symbols still register mild integrator realization (0.45)
+                # so GPU multi-branch lookahead naturally adapts on repeated fillers/spaces.
+                return 0.45
             if sal_arr is not None and sym_id < len(sal_arr):
                 return float(sal_arr[sym_id])
             return 1.0

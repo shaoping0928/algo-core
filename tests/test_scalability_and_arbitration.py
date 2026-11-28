@@ -147,6 +147,53 @@ class ScalabilityAndArbitrationTests(unittest.TestCase):
         self.assertEqual(rep["total_tokens"], len(seq1) + len(seq2))
         self.assertGreater(bun.class_policy.class_index.total_updates, tot_before)
 
+    def test_marginal_loo_arbitrator_and_self_mode_echo_damping(self):
+        from hierarchical_arbitrator import HierarchicalOnlineArbitrator
+        from temp_context import TemporaryContextMemory
+
+        arb = HierarchicalOnlineArbitrator(n_regimes=3, lr=0.45, episode_window=20)
+        # Expert 2 (chunk_grammar) is sparse but high-precision when active;
+        # Expert 1 (working_memory) only echoes broad distribution (similar to base_policy).
+        for _ in range(120):
+            experts = [
+                {1: 0.40, 2: 0.35, 3: 0.25},  # base_policy
+                {1: 0.42, 2: 0.33, 3: 0.25},  # working_memory (redundant)
+                {3: 0.90, 1: 0.10},           # chunk_grammar (high marginal precision on tgt=3)
+                {},                           # frame_register
+            ]
+            arb.record_step(experts, 0.30, target=3, expert_confidences=(1.0, 1.0, 0.9, 0.3), k=4)
+        arb.consolidate_episode()
+        w_ext = arb.weights_for_regime(0)
+        self.assertGreater(w_ext[2], w_ext[1])  # chunk_grammar outranks redundant working_memory
+
+        # In open-loop self_mode, working_memory weight is damped relative to structural experts
+        _, _, w_ext_blend = arb.blend_experts(
+            [{1: 0.5, 2: 0.5}, {1: 0.9, 2: 0.1}, {2: 0.9, 1: 0.1}, {}],
+            0.30, self_mode=False,
+        )
+        _, _, w_self_blend = arb.blend_experts(
+            [{1: 0.5, 2: 0.5}, {1: 0.9, 2: 0.1}, {2: 0.9, 1: 0.1}, {}],
+            0.30, self_mode=True,
+        )
+        self.assertLess(w_self_blend[1], w_ext_blend[1])
+        self.assertGreater(w_self_blend[2], w_ext_blend[2])
+
+        # Episodic prompt cache must decay during self-generated steps & non-content self-emissions
+        # must adapt circuit V_diff downward without hard-coded symbol bans.
+        tcm = TemporaryContextMemory(vocab_size=30, cache_decay=0.80)
+        tcm.enable_circuit_field(use_gpu=False)
+        for s in (2, 3, 4, 2, 3, 4):
+            tcm.observe(s, source="external")
+        ep_before = dict(tcm.episodic_cache_probs([2, 3]))
+        self.assertIn(4, ep_before)
+        for _ in range(15):
+            tcm.observe(2, source="self")
+            tcm.observe(3, source="self")
+        ep_after = tcm.episodic_cache_probs([2, 3])
+        self.assertLess(ep_after.get(4, 0.0), ep_before[4])
+        # Repeated self-emission of symbol 2 drives its circuit differentiator V_diff < 0
+        self.assertLess(float(tcm.circuit_differentiator()[2]), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

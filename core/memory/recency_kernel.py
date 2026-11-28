@@ -302,8 +302,15 @@ class LearnedRecencyLagKernel:
         score_map: Dict[int, float],
         *,
         strength: float = 1.0,
+        excitation_scale: float = 1.0,
     ) -> Dict[int, float]:
-        """Multiply candidate scores by learned lag + count-saturation likelihood ratios."""
+        """Multiply candidate scores by learned lag + count-saturation likelihood ratios.
+
+        ``excitation_scale`` scales only positive self-excitation (``delta_log > 0``)
+        while preserving data-learned negative refractory/saturation inhibition at
+        full strength — preventing runaway positive-feedback loops during open-loop
+        self-generation without altering external-observation inference.
+        """
         if not self._fitted or not recent_history or not score_map or float(strength) <= 0.0:
             return score_map
 
@@ -372,6 +379,8 @@ class LearnedRecencyLagKernel:
                     delta_log += tw * float(tclr[tb, cb2])
 
             if delta_log != 0.0:
+                if delta_log > 0.0 and excitation_scale != 1.0:
+                    delta_log *= float(np.clip(excitation_scale, 0.0, 1.0))
                 delta_log = float(np.clip(delta_log, -3.5, 3.5))
                 out[ai] = float(sc) * float(np.exp(delta_log))
             else:

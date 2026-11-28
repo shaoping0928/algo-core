@@ -393,10 +393,25 @@ class TemporaryContextMemory:
                     del self._anchors[k]
         self._field_dirty = True
 
-        # 2. Update episodic local cache ONLY from verified external observations
-        #    (prevents self-generated tokens from creating episodic echo loops)
+        # 2. Decay episodic cache on EVERY step (including self-rollout so external
+        #    prompt n-grams naturally fade instead of locking in verbatim loops),
+        #    while writing new episodic entries ONLY from verified external observations.
         prev1 = self._recent[-1] if len(self._recent) >= 1 else 0
-        if not is_self:
+        if is_self:
+            # Gently decay the entire external prompt episodic cache on each open-loop
+            # self-generation step (half-life ~8 steps) so verbatim prompt n-grams
+            # naturally yield to structural progression without artificial bans.
+            ep_decay = 0.92
+            for store in (self._ep_bigram, self._ep_trigram):
+                for ek in list(store.keys()):
+                    inner = store[ek]
+                    for s_k in list(inner.keys()):
+                        inner[s_k] *= ep_decay
+                        if inner[s_k] < 0.02:
+                            del inner[s_k]
+                    if not inner:
+                        del store[ek]
+        else:
             if prev1 > 0:
                 bmap = self._ep_bigram[prev1]
                 for k in list(bmap.keys()):
@@ -414,7 +429,9 @@ class TemporaryContextMemory:
         is_c = getattr(self, "_is_content", None)
         sal = float(self.salience_[sym]) if self.salience_ is not None else 1.0
         spread_mul = float(np.clip(self_spread_weight, 0.0, 1.0)) if is_self else 1.0
-        if (is_c is None or bool(is_c[sym])) and spread_mul > 0.0:
+        is_content_sym = (is_c is None or bool(is_c[sym]))
+        cf = getattr(self, "circuit_field", None)
+        if is_content_sym and spread_mul > 0.0:
             self._direct_field[sym] += 0.55 * spread_mul * sal
             pair_k = (prev1, sym) if prev1 > 0 else None
             if pair_k is not None and pair_k in self.assoc_graph_compound_:
@@ -431,7 +448,6 @@ class TemporaryContextMemory:
                 self._anchors = dict(keep)
 
             # Advance electronic circuit node field (R/C/Integrator/Differentiator)
-            cf = getattr(self, "circuit_field", None)
             if cf is not None:
                 edges = (
                     self.assoc_graph_compound_[pair_k]
@@ -439,6 +455,10 @@ class TemporaryContextMemory:
                     else self.assoc_graph_.get(sym, ())
                 )
                 cf.step_single_event(sym, sal, is_self=is_self, assoc_neighbors=edges)
+        elif cf is not None and is_self:
+            # Non-content self-emitted nodes also enter RC integrator adaptation (V_int)
+            # with zero associative spreading, preventing open-loop filler/whitespace stalls.
+            cf.step_single_event(sym, 0.45, is_self=True, assoc_neighbors=())
 
         self._recent.append(sym)
         if len(self._recent) > self.max_recent:
@@ -456,16 +476,18 @@ class TemporaryContextMemory:
             if tmap:
                 tot = float(sum(tmap.values()))
                 if tot > 0.0:
+                    conf = min(tot, 1.0)
                     for s, w in tmap.items():
-                        probs[s] = probs.get(s, 0.0) + 0.65 * (w / tot)
+                        probs[s] = probs.get(s, 0.0) + 0.65 * conf * (w / tot)
         if len(ctx_tokens) >= 1:
             p1 = int(ctx_tokens[-1])
             bmap = self._ep_bigram.get(p1)
             if bmap:
                 tot = float(sum(bmap.values()))
                 if tot > 0.0:
+                    conf = min(tot, 1.0)
                     for s, w in bmap.items():
-                        probs[s] = probs.get(s, 0.0) + 0.35 * (w / tot)
+                        probs[s] = probs.get(s, 0.0) + 0.35 * conf * (w / tot)
         return probs
 
     def apply_to_candidates(
@@ -478,6 +500,7 @@ class TemporaryContextMemory:
         cache_lambda: float = 0.25,
         extra_pool_k: int = 8,
         novelty_gated_cache: bool = False,
+        self_mode: bool = False,
     ) -> Tuple[List[int], np.ndarray]:
         """Re-rank & augment base candidates using active temporary working memory.
 
@@ -486,7 +509,9 @@ class TemporaryContextMemory:
            ``novelty_gated_cache=True``, episodic cache mass is weighted by
            long-term surprise ``(1 - min(4 * p_base, 1))`` so novel episode
            bindings get full recall while already-known transitions are not
-           double-counted alongside a recency-lag kernel.
+           double-counted alongside a recency-lag kernel. When ``self_mode=True``,
+           damps verbatim episodic cache gain so autonomous rollouts advance
+           instead of replaying prompt n-grams.
         2. Modulates candidate probabilities by the spreading-activation
            working-memory field ``self._field[sym]`` (keeping output grounded
            in the current context's active semantic field).
@@ -496,7 +521,8 @@ class TemporaryContextMemory:
 
         # Inject episodic local cache probabilities (interpolated with cache_lambda)
         ep_probs = self.episodic_cache_probs(ctx_tokens)
-        cl = float(cache_lambda) if ep_probs else 0.0
+        eff_cl = float(cache_lambda) * (0.25 if self_mode else 1.0)
+        cl = eff_cl if ep_probs else 0.0
         if cl > 0.0:
             if novelty_gated_cache:
                 added_mass = 0.0
