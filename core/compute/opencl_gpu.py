@@ -151,6 +151,193 @@ __kernel void circuit_beam_branch_kernel(
     V_diff_out[gid] = vd;
     V_out[gid] = tanh(raw);
 }
+
+// 16x16 LDS-tiled SGEMM with bank-conflict-free padding (17) supporting NN/NT/TN
+__kernel void sgemm_tiled_kernel(
+    const int M,
+    const int N,
+    const int K,
+    const int transA,
+    const int transB,
+    const float alpha,
+    const float beta,
+    __global const float* A,
+    __global const float* B,
+    __global float* C
+) {
+    __local float As[16][17];
+    __local float Bs[16][17];
+    int lx = get_local_id(0);
+    int ly = get_local_id(1);
+    int col = get_group_id(0) * 16 + lx;
+    int row = get_group_id(1) * 16 + ly;
+
+    float acc = 0.0f;
+    int n_tiles = (K + 15) / 16;
+    for (int t = 0; t < n_tiles; ++t) {
+        int a_k = t * 16 + lx;
+        int b_k = t * 16 + ly;
+        if (row < M && a_k < K) {
+            As[ly][lx] = (transA == 0) ? A[row * K + a_k] : A[a_k * M + row];
+        } else {
+            As[ly][lx] = 0.0f;
+        }
+        if (b_k < K && col < N) {
+            Bs[ly][lx] = (transB == 0) ? B[b_k * N + col] : B[col * K + b_k];
+        } else {
+            Bs[ly][lx] = 0.0f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            acc = fma(As[ly][k], Bs[k][lx], acc);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (row < M && col < N) {
+        int idx = row * N + col;
+        if (beta == 0.0f) {
+            C[idx] = alpha * acc;
+        } else {
+            C[idx] = fma(alpha, acc, beta * C[idx]);
+        }
+    }
+}
+
+__kernel void gated_bilinear_fwd_kernel(
+    const int B,
+    const int R,
+    __global const float* A_pre,
+    __global const float* b_loc,
+    __global const float* G_pre,
+    __global const float* b_ctx,
+    __global float* A_out,
+    __global float* G_out,
+    __global float* Q_out
+) {
+    int gid = get_global_id(0);
+    int tot = B * R;
+    if (gid >= tot) return;
+    int c = gid % R;
+    float a = tanh(A_pre[gid] + b_loc[c]);
+    float g_in = clamp(G_pre[gid] + b_ctx[c], -16.0f, 16.0f);
+    float g = 1.0f / (1.0f + exp(-g_in));
+    A_out[gid] = a;
+    G_out[gid] = g;
+    Q_out[gid] = a * g;
+}
+
+__kernel void gated_bilinear_bwd_kernel(
+    const int B,
+    const int R,
+    __global const float* dQ,
+    __global const float* A,
+    __global const float* G,
+    __global float* dA_pre,
+    __global float* dG_pre
+) {
+    int gid = get_global_id(0);
+    int tot = B * R;
+    if (gid >= tot) return;
+    float dq = dQ[gid];
+    float a = A[gid];
+    float g = G[gid];
+    dA_pre[gid] = dq * g * (1.0f - a * a);
+    dG_pre[gid] = dq * a * g * (1.0f - g);
+}
+
+// 1 work-group of 256 threads per row: exact parallel Softmax + Cross-Entropy + in-place dL
+__kernel void softmax_ce_grad_kernel(
+    const int B,
+    const int V,
+    const float inv_B,
+    __global const float* b_out,
+    __global const int* targets,
+    __global float* logits_and_dL,
+    __global float* row_losses
+) {
+    int row = get_group_id(0);
+    if (row >= B) return;
+    int lid = get_local_id(0);
+    int base = row * V;
+
+    __local float smem[256];
+    // 1. Add bias & mask col 0, find row max
+    float local_max = -1e30f;
+    for (int c = lid; c < V; c += 256) {
+        float v = (c == 0) ? -1e4f : (logits_and_dL[base + c] + b_out[c]);
+        logits_and_dL[base + c] = v;
+        if (v > local_max) local_max = v;
+    }
+    smem[lid] = local_max;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s && smem[lid + s] > smem[lid]) smem[lid] = smem[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float rmax = smem[0];
+
+    // 2. Exp & row sum
+    float local_sum = 0.0f;
+    for (int c = lid; c < V; c += 256) {
+        float ex = exp(clamp(logits_and_dL[base + c] - rmax, -30.0f, 0.0f));
+        logits_and_dL[base + c] = ex;
+        local_sum += ex;
+    }
+    smem[lid] = local_sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) smem[lid] += smem[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float inv_sum = 1.0f / fmax(smem[0], 1e-12f);
+    int tgt = targets[row];
+
+    // 3. Normalize to probs, record -log(p_true), overwrite with dL = (probs - onehot) / B
+    for (int c = lid; c < V; c += 256) {
+        float p = logits_and_dL[base + c] * inv_sum;
+        if (c == tgt) {
+            row_losses[row] = -log(fmax(p, 1e-9f));
+            p -= 1.0f;
+        }
+        logits_and_dL[base + c] = p * inv_B;
+    }
+}
+
+__kernel void col_sum_kernel(
+    const int B,
+    const int N,
+    __global const float* X,
+    __global float* out_sum
+) {
+    int c = get_global_id(0);
+    if (c >= N) return;
+    float acc = 0.0f;
+    for (int r = 0; r < B; ++r) {
+        acc += X[r * N + c];
+    }
+    out_sum[c] = acc;
+}
+
+__kernel void adamw_update_kernel(
+    const int n_total,
+    const float lr_step,
+    const float wd_scale,
+    __global float* param,
+    __global const float* grad,
+    __global float* m_buf,
+    __global float* v_buf
+) {
+    int gid = get_global_id(0);
+    if (gid >= n_total) return;
+    float g = grad[gid];
+    float m = 0.9f * m_buf[gid] + 0.1f * g;
+    float v = 0.999f * v_buf[gid] + 0.001f * g * g;
+    m_buf[gid] = m;
+    v_buf[gid] = v;
+    float p = param[gid] * wd_scale - lr_step * (m / (sqrt(v) + 1e-7f));
+    param[gid] = p;
+}
 """
 
 
@@ -170,6 +357,12 @@ class OpenCLAccelerator:
         self._k_circuit = None
         self._k_spmv = None
         self._k_beam = None
+        self._k_sgemm = None
+        self._k_gb_fwd = None
+        self._k_gb_bwd = None
+        self._k_softmax_ce = None
+        self._k_col_sum = None
+        self._k_adamw = None
         self._init_opencl(prefer_vendor=prefer_vendor)
 
     def _init_opencl(self, prefer_vendor: str = "AMD") -> None:
@@ -283,6 +476,12 @@ class OpenCLAccelerator:
         k_beam = ocl.clCreateKernel(prog, b"circuit_beam_branch_kernel", ctypes.byref(err))
         if err.value != 0 or not k_beam:
             return
+        k_sgemm = ocl.clCreateKernel(prog, b"sgemm_tiled_kernel", ctypes.byref(err))
+        k_gb_fwd = ocl.clCreateKernel(prog, b"gated_bilinear_fwd_kernel", ctypes.byref(err))
+        k_gb_bwd = ocl.clCreateKernel(prog, b"gated_bilinear_bwd_kernel", ctypes.byref(err))
+        k_sm_ce = ocl.clCreateKernel(prog, b"softmax_ce_grad_kernel", ctypes.byref(err))
+        k_col_s = ocl.clCreateKernel(prog, b"col_sum_kernel", ctypes.byref(err))
+        k_adamw = ocl.clCreateKernel(prog, b"adamw_update_kernel", ctypes.byref(err))
 
         self._ocl = ocl
         self._ctx = ctx
@@ -291,6 +490,12 @@ class OpenCLAccelerator:
         self._k_circuit = k_circ
         self._k_spmv = k_spmv
         self._k_beam = k_beam
+        self._k_sgemm = k_sgemm
+        self._k_gb_fwd = k_gb_fwd
+        self._k_gb_bwd = k_gb_bwd
+        self._k_softmax_ce = k_sm_ce
+        self._k_col_sum = k_col_s
+        self._k_adamw = k_adamw
         self.platform_name = pname
         self.device_name = dname
         self.compute_units = cu_val
@@ -474,6 +679,185 @@ class OpenCLAccelerator:
     def finish(self) -> None:
         if self._ocl is not None and self._queue is not None:
             self._ocl.clFinish(self._queue)
+
+    def create_empty_buffer(self, nbytes: int) -> ctypes.c_void_p:
+        err = ctypes.c_int32(0)
+        buf = self._ocl.clCreateBuffer(self._ctx, CL_MEM_READ_WRITE, max(int(nbytes), 4), None, ctypes.byref(err))
+        if err.value != 0 or not buf:
+            raise RuntimeError(f"clCreateBuffer(empty:{nbytes}) failed: {err.value}")
+        return buf
+
+    def _set_args(self, kernel: ctypes.c_void_p, args: list) -> None:
+        ocl = self._ocl
+        for idx, (val, sz) in enumerate(args):
+            rc = ocl.clSetKernelArg(kernel, idx, sz, ctypes.byref(val))
+            if rc != 0:
+                raise RuntimeError(f"clSetKernelArg({idx}) failed: {rc}")
+
+    def launch_sgemm(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        b_A: ctypes.c_void_p,
+        b_B: ctypes.c_void_p,
+        b_C: ctypes.c_void_p,
+        *,
+        transA: bool = False,
+        transB: bool = False,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+        sync: bool = False,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        self._set_args(self._k_sgemm, [
+            (ctypes.c_int32(M), 4),
+            (ctypes.c_int32(N), 4),
+            (ctypes.c_int32(K), 4),
+            (ctypes.c_int32(1 if transA else 0), 4),
+            (ctypes.c_int32(1 if transB else 0), 4),
+            (ctypes.c_float(alpha), 4),
+            (ctypes.c_float(beta), 4),
+            (ctypes.c_void_p(b_A), vp),
+            (ctypes.c_void_p(b_B), vp),
+            (ctypes.c_void_p(b_C), vp),
+        ])
+        gs = (ctypes.c_size_t * 2)(((int(N) + 15) // 16) * 16, ((int(M) + 15) // 16) * 16)
+        ls = (ctypes.c_size_t * 2)(16, 16)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_sgemm, 2, None, gs, ls, 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(sgemm) failed: {rc}")
+        if sync:
+            self._ocl.clFinish(self._queue)
+
+    def launch_gated_bilinear_fwd(
+        self,
+        B: int,
+        R: int,
+        b_A_pre: ctypes.c_void_p,
+        b_bloc: ctypes.c_void_p,
+        b_G_pre: ctypes.c_void_p,
+        b_bctx: ctypes.c_void_p,
+        b_A: ctypes.c_void_p,
+        b_G: ctypes.c_void_p,
+        b_Q: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(B) * int(R)
+        self._set_args(self._k_gb_fwd, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(R), 4),
+            (ctypes.c_void_p(b_A_pre), vp),
+            (ctypes.c_void_p(b_bloc), vp),
+            (ctypes.c_void_p(b_G_pre), vp),
+            (ctypes.c_void_p(b_bctx), vp),
+            (ctypes.c_void_p(b_A), vp),
+            (ctypes.c_void_p(b_G), vp),
+            (ctypes.c_void_p(b_Q), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_gb_fwd, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(gb_fwd) failed: {rc}")
+
+    def launch_gated_bilinear_bwd(
+        self,
+        B: int,
+        R: int,
+        b_dQ: ctypes.c_void_p,
+        b_A: ctypes.c_void_p,
+        b_G: ctypes.c_void_p,
+        b_dA_pre: ctypes.c_void_p,
+        b_dG_pre: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(B) * int(R)
+        self._set_args(self._k_gb_bwd, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(R), 4),
+            (ctypes.c_void_p(b_dQ), vp),
+            (ctypes.c_void_p(b_A), vp),
+            (ctypes.c_void_p(b_G), vp),
+            (ctypes.c_void_p(b_dA_pre), vp),
+            (ctypes.c_void_p(b_dG_pre), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_gb_bwd, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(gb_bwd) failed: {rc}")
+
+    def launch_softmax_ce_grad(
+        self,
+        B: int,
+        V: int,
+        b_bout: ctypes.c_void_p,
+        b_targets: ctypes.c_void_p,
+        b_logits_dL: ctypes.c_void_p,
+        b_row_losses: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        self._set_args(self._k_softmax_ce, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(V), 4),
+            (ctypes.c_float(1.0 / max(float(B), 1.0)), 4),
+            (ctypes.c_void_p(b_bout), vp),
+            (ctypes.c_void_p(b_targets), vp),
+            (ctypes.c_void_p(b_logits_dL), vp),
+            (ctypes.c_void_p(b_row_losses), vp),
+        ])
+        gs = ctypes.c_size_t(int(B) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_softmax_ce, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(softmax_ce) failed: {rc}")
+
+    def launch_col_sum(
+        self,
+        B: int,
+        N: int,
+        b_X: ctypes.c_void_p,
+        b_out: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        self._set_args(self._k_col_sum, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(N), 4),
+            (ctypes.c_void_p(b_X), vp),
+            (ctypes.c_void_p(b_out), vp),
+        ])
+        gs = ctypes.c_size_t(((int(N) + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_col_sum, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(col_sum) failed: {rc}")
+
+    def launch_adamw_update(
+        self,
+        n_total: int,
+        lr_step: float,
+        wd_scale: float,
+        b_param: ctypes.c_void_p,
+        b_grad: ctypes.c_void_p,
+        b_m: ctypes.c_void_p,
+        b_v: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        self._set_args(self._k_adamw, [
+            (ctypes.c_int32(n_total), 4),
+            (ctypes.c_float(lr_step), 4),
+            (ctypes.c_float(wd_scale), 4),
+            (ctypes.c_void_p(b_param), vp),
+            (ctypes.c_void_p(b_grad), vp),
+            (ctypes.c_void_p(b_m), vp),
+            (ctypes.c_void_p(b_v), vp),
+        ])
+        gs = ctypes.c_size_t(((int(n_total) + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_adamw, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(adamw) failed: {rc}")
 
     def info(self) -> dict:
         return dict(

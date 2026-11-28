@@ -190,6 +190,43 @@ class ContextualIntegratorTests(unittest.TestCase):
             self.assertIsNotNone(lbf)
             self.assertGreater(float(lbf[want]), float(lbf[avoid]))
 
+    def test_selective_associative_scan_and_gpu_cpu_training_parity(self):
+        from stateful_context_policy import StatefulContextPolicy, _selective_associative_scan
+
+        # 1. Exact parity of parallel associative selective scan vs serial recurrence
+        rng = np.random.RandomState(55)
+        X = rng.randn(400, 16).astype(np.float32)
+        wg = rng.uniform(0.01, 1.0, size=400).astype(np.float32)
+        h0 = rng.randn(16).astype(np.float32)
+        H_par = _selective_associative_scan(X, wg, base_alpha=0.22, h0=h0)
+        H_ref = np.zeros_like(X)
+        prev = h0.copy()
+        for t in range(len(X)):
+            w = float(np.clip(0.22 * wg[t], 0.0, 0.95))
+            prev = (1.0 - w) * prev + w * X[t]
+            H_ref[t] = prev
+        self.assertTrue(np.allclose(H_par, H_ref, atol=2e-4))
+
+        # 2. Exact CPU vs OpenCL GPU training parity on identical batch & seed
+        emb = rng.randn(64, 16).astype(np.float32)
+        emb[0] = 0.0
+        sp_cpu = StatefulContextPolicy(vocab_size=64, embed_dim=16, gate_dim=32, batch_size=64, use_gpu=False, seed=9)
+        sp_gpu = StatefulContextPolicy(vocab_size=64, embed_dim=16, gate_dim=32, batch_size=64, use_gpu=True, seed=9)
+        sp_cpu.configure_embeddings(emb)
+        sp_gpu.configure_embeddings(emb)
+        if sp_gpu._ensure_gpu_trainer(64):
+            Xl = rng.randn(64, sp_cpu.loc_dim).astype(np.float32) * 0.2
+            Zc = rng.randn(64, sp_cpu.ctx_dim).astype(np.float32) * 0.2
+            yb = rng.randint(1, 64, size=64, dtype=np.int32)
+            for _ in range(3):
+                lc = sp_cpu._cpu_train_batch(Xl, Zc, yb)
+                lg = sp_gpu._gpu_train_batch(Xl, Zc, yb, read_loss=True)
+                self.assertAlmostEqual(lc, lg, places=3)
+            sp_gpu._sync_weights_from_gpu()
+            self.assertTrue(np.allclose(sp_cpu.W_q_, sp_gpu.W_q_, atol=2e-4))
+            self.assertTrue(np.allclose(sp_cpu.P_ctx_, sp_gpu.P_ctx_, atol=2e-4))
+            sp_gpu.close_gpu()
+
 
 if __name__ == "__main__":
     unittest.main()
