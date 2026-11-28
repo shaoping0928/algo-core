@@ -260,6 +260,14 @@ __kernel void softmax_ce_grad_kernel(
     if (row >= B) return;
     int lid = get_local_id(0);
     int base = row * V;
+    int tgt = targets[row];
+    if (tgt <= 0 || tgt >= V) {
+        if (lid == 0) row_losses[row] = 0.0f;
+        for (int c = lid; c < V; c += 256) {
+            logits_and_dL[base + c] = 0.0f;
+        }
+        return;
+    }
 
     __local float smem[256];
     // 1. Add bias & mask col 0, find row max
@@ -291,7 +299,6 @@ __kernel void softmax_ce_grad_kernel(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     float inv_sum = 1.0f / fmax(smem[0], 1e-12f);
-    int tgt = targets[row];
 
     // 3. Normalize to probs, record -log(p_true), overwrite with dL = (probs - onehot) / B
     for (int c = lid; c < V; c += 256) {
@@ -437,6 +444,165 @@ __kernel void embed_grad_reduce_2_kernel(
     }
     dE_dyn[gid] = acc;
 }
+
+// Gather single token embedding E[tok[i]] -> X[i, :] over N = B*T tokens
+__kernel void embed_gather_1_kernel(
+    const int N,
+    const int D,
+    __global const int* tok_ids,
+    __global const float* E,
+    __global float* X_out
+) {
+    int gid = get_global_id(0);
+    int tot = N * D;
+    if (gid >= tot) return;
+    int r = gid / D;
+    int d = gid - r * D;
+    int t = tok_ids[r];
+    X_out[gid] = (t > 0) ? E[t * D + d] : 0.0f;
+}
+
+// Deterministic per-vocab-row gather-reduce gradient for E[V, D] over N = B*T tokens
+__kernel void embed_grad_reduce_1_kernel(
+    const int N,
+    const int V,
+    const int D,
+    __global const int* tok_ids,
+    __global const float* dX,
+    __global float* dE
+) {
+    int gid = get_global_id(0);
+    int tot = V * D;
+    if (gid >= tot) return;
+    int v = gid / D;
+    int d = gid - v * D;
+    if (v == 0) {
+        dE[gid] = 0.0f;
+        return;
+    }
+    float acc = 0.0f;
+    for (int r = 0; r < N; ++r) {
+        if (tok_ids[r] == v) {
+            acc += dX[r * D + d];
+        }
+    }
+    dE[gid] = acc;
+}
+
+// Fused Gated RC / CuDNN-GRU-v2 forward step at timestep t for B parallel streams
+// Xg_all: [T, B, 3H], Sg_t: [B, 3H], s_prev: [B, H], s_all: [T, B, H], cache_zrh: [T, B, 3H]
+__kernel void gru_step_fwd_kernel(
+    const int B,
+    const int H,
+    const int t,
+    __global const float* Xg_all,
+    __global const float* Sg_t,
+    __global const float* b_x,
+    __global const float* b_s,
+    __global const float* s_prev,
+    __global float* s_all,
+    __global float* cache_zrh
+) {
+    int gid = get_global_id(0);
+    int tot = B * H;
+    if (gid >= tot) return;
+    int b = gid / H;
+    int h = gid - b * H;
+    int H3 = 3 * H;
+    int xg_base = (t * B + b) * H3;
+    int sg_base = b * H3;
+
+    float z_pre = clamp(Xg_all[xg_base + h] + Sg_t[sg_base + h] + b_x[h] + b_s[h], -16.0f, 16.0f);
+    float r_pre = clamp(Xg_all[xg_base + H + h] + Sg_t[sg_base + H + h] + b_x[H + h] + b_s[H + h], -16.0f, 16.0f);
+    float z = 1.0f / (1.0f + exp(-z_pre));
+    float r = 1.0f / (1.0f + exp(-r_pre));
+
+    float sg_h = Sg_t[sg_base + 2 * H + h] + b_s[2 * H + h];
+    float h_tilde = tanh(Xg_all[xg_base + 2 * H + h] + b_x[2 * H + h] + r * sg_h);
+    float sp = s_prev[b * H + h];
+    float s_new = (1.0f - z) * sp + z * h_tilde;
+
+    s_all[(t * B + b) * H + h] = s_new;
+    cache_zrh[xg_base + h] = z;
+    cache_zrh[xg_base + H + h] = r;
+    cache_zrh[xg_base + 2 * H + h] = h_tilde;
+}
+
+// Fused Gated RC / CuDNN-GRU-v2 backward step at timestep t for B parallel streams
+__kernel void gru_step_bwd_kernel(
+    const int B,
+    const int H,
+    const int t,
+    __global const float* dS_out_all,
+    __global const float* dS_carry,
+    __global const float* cache_zrh,
+    __global const float* s_prev,
+    __global const float* Sg_all,
+    __global const float* b_s,
+    __global float* dXg_all,
+    __global float* dSg_all,
+    __global float* dS_prev_direct
+) {
+    int gid = get_global_id(0);
+    int tot = B * H;
+    if (gid >= tot) return;
+    int b = gid / H;
+    int h = gid - b * H;
+    int H3 = 3 * H;
+    int tb_h = (t * B + b) * H + h;
+    int tb_3h = (t * B + b) * H3;
+
+    float ds = dS_out_all[tb_h] + dS_carry[b * H + h];
+    float z = cache_zrh[tb_3h + h];
+    float r = cache_zrh[tb_3h + H + h];
+    float ht = cache_zrh[tb_3h + 2 * H + h];
+    float sp = s_prev[b * H + h];
+    float sg_h = Sg_all[tb_3h + 2 * H + h] + b_s[2 * H + h];
+
+    float dz_pre = ds * (ht - sp) * z * (1.0f - z);
+    float dh_pre = ds * z * (1.0f - ht * ht);
+    float dr_pre = dh_pre * sg_h * r * (1.0f - r);
+    float dsg_h = dh_pre * r;
+
+    dXg_all[tb_3h + h] = dz_pre;
+    dXg_all[tb_3h + H + h] = dr_pre;
+    dXg_all[tb_3h + 2 * H + h] = dh_pre;
+
+    dSg_all[tb_3h + h] = dz_pre;
+    dSg_all[tb_3h + H + h] = dr_pre;
+    dSg_all[tb_3h + 2 * H + h] = dsg_h;
+
+    dS_prev_direct[b * H + h] = ds * (1.0f - z);
+}
+
+// Elementwise gradient clipping for rock-solid 48-step BPTT
+__kernel void clip_grad_kernel(
+    const int n_total,
+    const float clip_val,
+    __global float* grad
+) {
+    int gid = get_global_id(0);
+    if (gid >= n_total) return;
+    grad[gid] = clamp(grad[gid], -clip_val, clip_val);
+}
+
+// Copy slice of [T, B, C] at timestep t into/from [B, C] (dir=0: src[t]->dst, dir=1: src->dst[t])
+__kernel void copy_slice_kernel(
+    const int slice_elems,
+    const int t,
+    const int dir,
+    __global float* seq_buf,
+    __global float* step_buf
+) {
+    int gid = get_global_id(0);
+    if (gid >= slice_elems) return;
+    int off = t * slice_elems + gid;
+    if (dir == 0) {
+        step_buf[gid] = seq_buf[off];
+    } else {
+        seq_buf[off] = step_buf[gid];
+    }
+}
 """
 
 
@@ -466,6 +632,12 @@ class OpenCLAccelerator:
         self._k_res_bwd = None
         self._k_emb_gather = None
         self._k_emb_grad = None
+        self._k_emb_gather_1 = None
+        self._k_emb_grad_1 = None
+        self._k_gru_fwd = None
+        self._k_gru_bwd = None
+        self._k_clip_grad = None
+        self._k_copy_slice = None
         self._init_opencl(prefer_vendor=prefer_vendor)
 
     def _init_opencl(self, prefer_vendor: str = "AMD") -> None:
@@ -589,6 +761,12 @@ class OpenCLAccelerator:
         k_res_bwd = ocl.clCreateKernel(prog, b"res_gated_bwd_kernel", ctypes.byref(err))
         k_emb_g = ocl.clCreateKernel(prog, b"embed_gather_2_kernel", ctypes.byref(err))
         k_emb_gr = ocl.clCreateKernel(prog, b"embed_grad_reduce_2_kernel", ctypes.byref(err))
+        k_emb_g1 = ocl.clCreateKernel(prog, b"embed_gather_1_kernel", ctypes.byref(err))
+        k_emb_gr1 = ocl.clCreateKernel(prog, b"embed_grad_reduce_1_kernel", ctypes.byref(err))
+        k_gru_fwd = ocl.clCreateKernel(prog, b"gru_step_fwd_kernel", ctypes.byref(err))
+        k_gru_bwd = ocl.clCreateKernel(prog, b"gru_step_bwd_kernel", ctypes.byref(err))
+        k_clip_g = ocl.clCreateKernel(prog, b"clip_grad_kernel", ctypes.byref(err))
+        k_cp_sl = ocl.clCreateKernel(prog, b"copy_slice_kernel", ctypes.byref(err))
 
         self._ocl = ocl
         self._ctx = ctx
@@ -607,6 +785,12 @@ class OpenCLAccelerator:
         self._k_res_bwd = k_res_bwd
         self._k_emb_gather = k_emb_g
         self._k_emb_grad = k_emb_gr
+        self._k_emb_gather_1 = k_emb_g1
+        self._k_emb_grad_1 = k_emb_gr1
+        self._k_gru_fwd = k_gru_fwd
+        self._k_gru_bwd = k_gru_bwd
+        self._k_clip_grad = k_clip_g
+        self._k_copy_slice = k_cp_sl
         self.platform_name = pname
         self.device_name = dname
         self.compute_units = cu_val
@@ -1085,6 +1269,159 @@ class OpenCLAccelerator:
         rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_emb_grad, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
         if rc != 0:
             raise RuntimeError(f"clEnqueueNDRangeKernel(emb_grad) failed: {rc}")
+
+    def launch_embed_gather_1(
+        self,
+        N: int,
+        D: int,
+        b_tok_ids: ctypes.c_void_p,
+        b_E: ctypes.c_void_p,
+        b_X: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(N) * int(D)
+        self._set_args(self._k_emb_gather_1, [
+            (ctypes.c_int32(N), 4),
+            (ctypes.c_int32(D), 4),
+            (ctypes.c_void_p(b_tok_ids), vp),
+            (ctypes.c_void_p(b_E), vp),
+            (ctypes.c_void_p(b_X), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_emb_gather_1, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(emb_gather_1) failed: {rc}")
+
+    def launch_embed_grad_reduce_1(
+        self,
+        N: int,
+        V: int,
+        D: int,
+        b_tok_ids: ctypes.c_void_p,
+        b_dX: ctypes.c_void_p,
+        b_dE: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(V) * int(D)
+        self._set_args(self._k_emb_grad_1, [
+            (ctypes.c_int32(N), 4),
+            (ctypes.c_int32(V), 4),
+            (ctypes.c_int32(D), 4),
+            (ctypes.c_void_p(b_tok_ids), vp),
+            (ctypes.c_void_p(b_dX), vp),
+            (ctypes.c_void_p(b_dE), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_emb_grad_1, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(emb_grad_1) failed: {rc}")
+
+    def launch_gru_step_fwd(
+        self,
+        B: int,
+        H: int,
+        t: int,
+        b_Xg_all: ctypes.c_void_p,
+        b_Sg_t: ctypes.c_void_p,
+        b_bx: ctypes.c_void_p,
+        b_bs: ctypes.c_void_p,
+        b_s_prev: ctypes.c_void_p,
+        b_s_all: ctypes.c_void_p,
+        b_cache_zrh: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(B) * int(H)
+        self._set_args(self._k_gru_fwd, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(H), 4),
+            (ctypes.c_int32(t), 4),
+            (ctypes.c_void_p(b_Xg_all), vp),
+            (ctypes.c_void_p(b_Sg_t), vp),
+            (ctypes.c_void_p(b_bx), vp),
+            (ctypes.c_void_p(b_bs), vp),
+            (ctypes.c_void_p(b_s_prev), vp),
+            (ctypes.c_void_p(b_s_all), vp),
+            (ctypes.c_void_p(b_cache_zrh), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_gru_fwd, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(gru_fwd) failed: {rc}")
+
+    def launch_gru_step_bwd(
+        self,
+        B: int,
+        H: int,
+        t: int,
+        b_dS_out_all: ctypes.c_void_p,
+        b_dS_carry: ctypes.c_void_p,
+        b_cache_zrh: ctypes.c_void_p,
+        b_s_prev: ctypes.c_void_p,
+        b_Sg_all: ctypes.c_void_p,
+        b_bs: ctypes.c_void_p,
+        b_dXg_all: ctypes.c_void_p,
+        b_dSg_all: ctypes.c_void_p,
+        b_dS_prev_direct: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(B) * int(H)
+        self._set_args(self._k_gru_bwd, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(H), 4),
+            (ctypes.c_int32(t), 4),
+            (ctypes.c_void_p(b_dS_out_all), vp),
+            (ctypes.c_void_p(b_dS_carry), vp),
+            (ctypes.c_void_p(b_cache_zrh), vp),
+            (ctypes.c_void_p(b_s_prev), vp),
+            (ctypes.c_void_p(b_Sg_all), vp),
+            (ctypes.c_void_p(b_bs), vp),
+            (ctypes.c_void_p(b_dXg_all), vp),
+            (ctypes.c_void_p(b_dSg_all), vp),
+            (ctypes.c_void_p(b_dS_prev_direct), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_gru_bwd, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(gru_bwd) failed: {rc}")
+
+    def launch_clip_grad(self, n_total: int, clip_val: float, b_grad: ctypes.c_void_p) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        self._set_args(self._k_clip_grad, [
+            (ctypes.c_int32(n_total), 4),
+            (ctypes.c_float(clip_val), 4),
+            (ctypes.c_void_p(b_grad), vp),
+        ])
+        gs = ctypes.c_size_t(((int(n_total) + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_clip_grad, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(clip_grad) failed: {rc}")
+
+    def launch_copy_slice(
+        self,
+        slice_elems: int,
+        t: int,
+        direction: int,
+        b_seq: ctypes.c_void_p,
+        b_step: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        self._set_args(self._k_copy_slice, [
+            (ctypes.c_int32(slice_elems), 4),
+            (ctypes.c_int32(t), 4),
+            (ctypes.c_int32(direction), 4),
+            (ctypes.c_void_p(b_seq), vp),
+            (ctypes.c_void_p(b_step), vp),
+        ])
+        gs = ctypes.c_size_t(((int(slice_elems) + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_copy_slice, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(copy_slice) failed: {rc}")
 
     def info(self) -> dict:
         return dict(

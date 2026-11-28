@@ -132,8 +132,8 @@ class ContextDrivenDecisionController:
         context_fusion_beta: float = 0.42,
         self_context_beta: float = 1.25,
         stateful_policy: Optional[object] = None,
-        stateful_weight: float = 0.30,
-        self_stateful_beta: float = 0.90,
+        stateful_weight: float = 0.45,
+        self_stateful_beta: float = 0.0,
     ):
         self.class_policy = class_policy
         self.virtual_dag = virtual_dag
@@ -439,6 +439,7 @@ class ContextDrivenDecisionController:
         recent_history: Optional[Sequence[int]] = None,
         vdiff_override: Optional[np.ndarray] = None,
         state_override: Optional[object] = None,
+        sp_override: Optional[Tuple[Dict[int, float], Optional[np.ndarray]]] = None,
     ) -> Tuple[List[int], np.ndarray, Dict[str, float]]:
         """Compute context-driven top-k candidate distribution + telemetry."""
         hist_src = (
@@ -545,7 +546,19 @@ class ContextDrivenDecisionController:
         #     counterfactual conditional PMI in open-loop self_mode to steer context coherence.
         sp = self.stateful_policy
         if sp is not None and getattr(sp, "_fitted", False) and score_map:
-            sp_map = sp.predict_symbol_map(state=state_override, k=max(int(k) * 2, 16), self_mode=is_self_mode)
+            if sp_override is not None:
+                sp_map, log_bf = sp_override
+            elif hasattr(sp, "predict_map_and_pmi"):
+                sp_map, log_bf = sp.predict_map_and_pmi(
+                    state=state_override, k=max(int(k) * 2, 16),
+                    self_mode=is_self_mode, need_pmi=(is_self_mode and self.self_stateful_beta > 0.01),
+                )
+            else:
+                sp_map = sp.predict_symbol_map(state=state_override, k=max(int(k) * 2, 16), self_mode=is_self_mode)
+                log_bf = (
+                    sp.context_log_bayes_factor(state=state_override, self_mode=True)
+                    if (is_self_mode and self.self_stateful_beta > 0.01) else None
+                )
             alpha_sp = float(np.clip(self.stateful_weight, 0.0, 0.50))
             if sp_map and alpha_sp > 0.01:
                 sm_sum = float(sum(score_map.values()))
@@ -558,22 +571,19 @@ class ContextDrivenDecisionController:
                     if s_a <= 0:
                         continue
                     if is_self_mode and s_a not in score_map and prev1_sp > 0:
-                        # In open-loop self_mode, gate brand-new proposals by observed local legality
                         p_loc, _ = self._local_pair_prob_and_lift(prev1_sp, s_a)
                         if p_loc <= 0.0:
                             continue
                     score_map[s_a] = score_map.get(s_a, 0.0) + alpha_sp * float(p_sa)
 
-            if is_self_mode and self.self_stateful_beta > 0.01:
-                log_bf = sp.context_log_bayes_factor(state=state_override, self_mode=True)
-                if log_bf is not None:
-                    c_gate = float(info.get("content_gate", 1.0))
-                    eff_sb = float(self.self_stateful_beta) * float(ent_gate) * float(np.clip(c_gate, 0.20, 1.0))
-                    for a in list(score_map.keys()):
-                        if 0 < a < len(log_bf):
-                            lbf = float(log_bf[a])
-                            if lbf != 0.0:
-                                score_map[a] *= float(np.exp(np.clip(eff_sb * lbf, -1.6, 2.0)))
+            if is_self_mode and self.self_stateful_beta > 0.01 and log_bf is not None:
+                c_gate = float(info.get("content_gate", 1.0))
+                eff_sb = float(self.self_stateful_beta) * float(ent_gate) * float(np.clip(c_gate, 0.20, 1.0))
+                for a in list(score_map.keys()):
+                    if 0 < a < len(log_bf):
+                        lbf = float(log_bf[a])
+                        if lbf != 0.0:
+                            score_map[a] *= float(np.exp(np.clip(eff_sb * lbf, -1.6, 2.0)))
 
         # 6. Electronic Circuit Differentiator (high-pass V_diff = V_cap - V_int):
         #    propels unexpressed context neighbors (V_diff > 0) and naturally adapts
@@ -821,12 +831,26 @@ class ContextDrivenDecisionController:
         for _step in range(1, d):
             next_beam = []
             n_parents_cur = len(beam)
-            for sc, first_a, r_ctx, r_hist, r_h, p_slot, r_ps in beam:
+            # Single batched GPU/BLAS forward pass for ALL active lookahead branch states!
+            batch_sp_maps = None
+            batch_sp_pmis = None
+            if sp_active and hasattr(sp, "predict_batch_with_pmi") and beam:
+                b_states = [b_ent[6] for b_ent in beam]
+                if any(st is not None for st in b_states):
+                    batch_sp_maps, batch_sp_pmis = sp.predict_batch_with_pmi(
+                        b_states, k=max(bw * 2, 16), self_mode=True,
+                        need_pmi=(self.self_stateful_beta > 0.01),
+                    )
+            for b_idx, (sc, first_a, r_ctx, r_hist, r_h, p_slot, r_ps) in enumerate(beam):
                 b_vd = vd_cur[p_slot] if (vd_cur is not None and p_slot < len(vd_cur)) else None
                 b_vo = vo_cur[p_slot] if (vo_cur is not None and p_slot < len(vo_cur)) else None
+                b_sp_ov = (
+                    (batch_sp_maps[b_idx], batch_sp_pmis[b_idx] if batch_sp_pmis is not None else None)
+                    if batch_sp_maps is not None else None
+                )
                 a_sub, p_sub, _ = self.decide_distribution(
                     r_ctx, r_h, k=bw, recent_history=r_hist,
-                    vdiff_override=b_vd, state_override=r_ps,
+                    vdiff_override=b_vd, state_override=r_ps, sp_override=b_sp_ov,
                 )
                 prev_r = r_ctx[-1] if r_ctx else 0
                 for a2, p2 in zip(a_sub[:bw], p_sub[:bw]):

@@ -10,6 +10,7 @@ for dp, _, _ in os.walk(os.path.join(ROOT, "core")):
         sys.path.insert(0, dp)
 
 from context_integrator import ContextualIntegrator
+from learnable_ssm_policy import LearnableStateSpacePolicy
 from substrate_bundle import StructuralSubstrateBundle
 
 
@@ -256,6 +257,76 @@ class ContextualIntegratorTests(unittest.TestCase):
         ci.update_chunk_commitment(21, is_self=True)
         nxt_after, _ = ci.committed_continuation()
         self.assertEqual(nxt_after, 0)
+
+    def test_learnable_ssm_gpu_cpu_bptt_parity_and_long_range_memory(self):
+        rng = np.random.RandomState(17)
+        V, D, H, B, T = 48, 16, 32, 16, 8
+        emb = rng.randn(V, D).astype(np.float32) * 0.5
+        emb[0] = 0.0
+
+        # 1. Exact CPU vs OpenCL GPU 8-step BPTT parity (including <UNK>=0 target masking!)
+        m_cpu = LearnableStateSpacePolicy(
+            vocab_size=V, embed_dim=D, hidden_dim=H, bptt_len=T, batch_streams=B,
+            lr=0.005, use_gpu=False, seed=13,
+        )
+        m_gpu = LearnableStateSpacePolicy(
+            vocab_size=V, embed_dim=D, hidden_dim=H, bptt_len=T, batch_streams=B,
+            lr=0.005, use_gpu=True, seed=13,
+        )
+        m_cpu.init_params(init_embeddings=emb)
+        m_gpu.init_params(init_embeddings=emb)
+        if m_gpu._ensure_gpu_trainer(B, T):
+            s_cpu = np.zeros((B, H), dtype=np.float32)
+            for step in range(3):
+                t_in = rng.randint(0, V, size=(T, B), dtype=np.int32)
+                t_tg = rng.randint(0, V, size=(T, B), dtype=np.int32)
+                # Ensure some <UNK>=0 targets exist so UNK masking parity is strictly tested
+                t_tg[0, 0] = 0
+                t_tg[-1, -1] = 0
+                lc, s_cpu = m_cpu._cpu_bptt_step(t_in, t_tg, s_init=s_cpu)
+                lg = m_gpu._gpu_bptt_step(t_in, t_tg, reset_hidden=(step == 0), read_loss=True)
+                self.assertAlmostEqual(lc, lg, places=3)
+            m_gpu._sync_weights_from_gpu()
+            for pname in ("E_", "W_x_", "b_x_", "U_s_", "b_s_", "W_out_", "b_out_"):
+                self.assertTrue(
+                    np.allclose(getattr(m_cpu, pname), getattr(m_gpu, pname), atol=4e-4),
+                    msg=f"BPTT GPU/CPU mismatch on {pname}: max_diff={np.max(np.abs(getattr(m_cpu, pname) - getattr(m_gpu, pname))):.6f}",
+                )
+            m_gpu.close_gpu()
+
+        # 2. Pure in-place state dynamics solve a 16-step delayed long-range context memory task!
+        # Stream rule: Cue A (1) or Cue B (2), followed by 14 identical distractor tokens (5..8),
+        # then trigger (3) -> must predict Target A (10) if Cue A or Target B (11) if Cue B!
+        seq: list[int] = []
+        distractors = [5, 6, 7, 8, 5, 6, 7, 8, 5, 6, 7, 8, 5, 6]
+        for _ in range(1200):
+            cue = 1 if rng.rand() < 0.5 else 2
+            tgt = 10 if cue == 1 else 11
+            seq.append(cue)
+            seq.extend(distractors)
+            seq.append(3)
+            seq.append(tgt)
+        pol = LearnableStateSpacePolicy(
+            vocab_size=16, embed_dim=16, hidden_dim=32,
+            bptt_len=34, batch_streams=16, lr=0.015, use_gpu=True, seed=5,
+        )
+        pol.fit_stream(seq, epochs=24)
+        pol.close_gpu()
+
+        # Verify pure IN-PLACE state update & non-mutating fork_step
+        for cue, expected_tgt in ((1, 10), (2, 11)):
+            pol.reset_state()
+            st_obj_id = id(pol.state)
+            pol.observe(cue)
+            for d_tok in distractors:
+                pol.observe(d_tok)
+            snap = pol.state.s.copy()
+            child = pol.fork_step(pol.state, 3)
+            self.assertEqual(id(pol.state), st_obj_id)
+            self.assertTrue(np.allclose(pol.state.s, snap))
+            pred_map = pol.predict_symbol_map(state=child, k=4)
+            best_sym = max(pred_map.items(), key=lambda kv: kv[1])[0]
+            self.assertEqual(best_sym, expected_tgt, msg=f"Failed 16-step memory for cue={cue}: {pred_map}")
 
 
 if __name__ == "__main__":

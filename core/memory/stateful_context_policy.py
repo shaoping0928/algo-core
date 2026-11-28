@@ -233,6 +233,8 @@ class StatefulContextPolicy:
         self._gpu: Optional[OpenCLAccelerator] = None
         self._gpu_bufs: Dict[str, object] = {}
         self._gpu_bs: int = 0
+        self._gpu_infer_bufs: Dict[str, object] = {}
+        self._gpu_infer_cap: int = 0
         self.train_backend: str = "cpu"
         self.total_samples: int = 0
         self.last_loss_: float = 0.0
@@ -248,6 +250,8 @@ class StatefulContextPolicy:
         st["_gpu"] = None
         st["_gpu_bufs"] = {}
         st["_gpu_bs"] = 0
+        st["_gpu_infer_bufs"] = {}
+        st["_gpu_infer_cap"] = 0
         return st
 
     def __setstate__(self, state: dict) -> None:
@@ -257,13 +261,20 @@ class StatefulContextPolicy:
         self._gpu = None
         self._gpu_bufs = {}
         self._gpu_bs = 0
+        self._gpu_infer_bufs = {}
+        self._gpu_infer_cap = 0
 
     def close_gpu(self) -> None:
-        if self._gpu is not None and self._gpu_bufs:
+        if self._gpu is not None:
             for buf in self._gpu_bufs.values():
+                self._gpu.release_buffer(buf)
+            for buf in getattr(self, "_gpu_infer_bufs", {}).values():
                 self._gpu.release_buffer(buf)
         self._gpu_bufs.clear()
         self._gpu_bs = 0
+        if hasattr(self, "_gpu_infer_bufs"):
+            self._gpu_infer_bufs.clear()
+        self._gpu_infer_cap = 0
 
     def _make_zero_state(self) -> PersistentContextState:
         d = self.embed_dim
@@ -1009,6 +1020,193 @@ class StatefulContextPolicy:
         delta = np.clip(lp_full - lp_null, -2.5, 2.5).astype(np.float32)
         delta[0] = 0.0
         return delta
+
+    def _ensure_gpu_infer(self, min_cap: int = 32) -> bool:
+        """Upload read-only inference weights to RX 9070 XT VRAM for batched lookahead evaluation."""
+        if not self.use_gpu or not self._fitted or self.W_loc_ is None:
+            return False
+        if self._gpu is None:
+            acc = OpenCLAccelerator()
+            if acc.available and acc._k_sgemm is not None and acc._k_res_fwd is not None:
+                self._gpu = acc
+            else:
+                return False
+        g = self._gpu
+        cap = max(int(min_cap), 32)
+        if getattr(self, "_gpu_infer_bufs", None) and self._gpu_infer_cap >= cap:
+            return True
+        if getattr(self, "_gpu_infer_bufs", None):
+            for buf in self._gpu_infer_bufs.values():
+                g.release_buffer(buf)
+            self._gpu_infer_bufs.clear()
+
+        ld, cd, r, v = self.loc_dim, self.ctx_dim, self.gate_dim, self.vocab_size
+        bufs: Dict[str, object] = {}
+        for name in ("P_loc", "b_loc", "P_ctx", "b_ctx", "W_loc", "W_ctx", "W_q", "b_out"):
+            arr = getattr(self, f"{name}_")
+            bufs[name] = g.create_buffer_from_array(arr, read_only=True)
+        if self.P_h2_ is not None:
+            for name in ("P_h2", "b_h2", "P_ctx2", "b_ctx2"):
+                arr = getattr(self, f"{name}_")
+                bufs[name] = g.create_buffer_from_array(arr, read_only=True)
+        # Compact inference scratchpads for up to ``cap`` concurrent lookahead branches
+        bufs["Xl"] = g.create_empty_buffer(cap * ld * 4)
+        bufs["Zc"] = g.create_empty_buffer(cap * cd * 4)
+        bufs["A_pre"] = g.create_empty_buffer(cap * r * 4)
+        bufs["G_pre"] = g.create_empty_buffer(cap * r * 4)
+        bufs["A"] = g.create_empty_buffer(cap * r * 4)
+        bufs["G"] = g.create_empty_buffer(cap * r * 4)
+        bufs["Q1"] = g.create_empty_buffer(cap * r * 4)
+        bufs["H2_pre"] = g.create_empty_buffer(cap * r * 4)
+        bufs["G2_pre"] = g.create_empty_buffer(cap * r * 4)
+        bufs["H2"] = g.create_empty_buffer(cap * r * 4)
+        bufs["G2"] = g.create_empty_buffer(cap * r * 4)
+        bufs["Q2"] = g.create_empty_buffer(cap * r * 4)
+        bufs["loc_logits"] = g.create_empty_buffer(cap * v * 4)
+        bufs["logits"] = g.create_empty_buffer(cap * v * 4)
+        self._gpu_infer_bufs = bufs
+        self._gpu_infer_cap = cap
+        return True
+
+    def predict_batch_with_pmi(
+        self,
+        states: Sequence[PersistentContextState],
+        *,
+        k: int = 16,
+        self_mode: bool = True,
+        need_pmi: bool = True,
+        context_band_gain: float = 1.0,
+    ) -> Tuple[List[Dict[int, float]], Optional[np.ndarray]]:
+        """Evaluate ``B`` persistent lookahead states in ONE fused GPU/BLAS pass.
+
+        Computes BOTH calibrated Top-K probability maps AND exact counterfactual
+        conditional PMI ``log P(y | x_loc, z_ctx) - log P(y | x_loc, 0)`` while
+        sharing ``A_h`` and ``Xl @ W_loc`` across full & null paths (~6x fewer ops).
+        """
+        n_b = len(states)
+        if n_b == 0 or not self._fitted or self.W_loc_ is None:
+            return [{} for _ in range(n_b)], None
+
+        gain = max(float(context_band_gain), 1.25) if self_mode else float(context_band_gain)
+        a_blend = 0.40 if self_mode else 0.0
+        xl_list, zc_list = [], []
+        valid_rows = []
+        for idx_s, st in enumerate(states):
+            if st is not None and st.steps > 0:
+                xl, zc = st.split_local_context(context_band_gain=gain, anchor_blend=a_blend)
+                xl_list.append(xl)
+                zc_list.append(zc)
+                valid_rows.append(idx_s)
+        if not valid_rows:
+            return [{} for _ in range(n_b)], None
+
+        Xl = np.ascontiguousarray(np.stack(xl_list, axis=0), dtype=np.float32)  # [M, 3D]
+        Zc = np.ascontiguousarray(np.stack(zc_list, axis=0), dtype=np.float32)  # [M, 5D]
+        m_b = Xl.shape[0]
+        ld, cd, r, v = self.loc_dim, self.ctx_dim, self.gate_dim, self.vocab_size
+
+        # Use RX 9070 XT GPU when batch >= 4 (amortizes PCIe launch cleanly); single batched BLAS otherwise
+        use_gpu_path = (m_b >= 4) and self._ensure_gpu_infer(m_b)
+        if use_gpu_path:
+            g = self._gpu
+            bufs = self._gpu_infer_bufs
+            g.write_buffer(bufs["Xl"], Xl)
+            g.write_buffer(bufs["Zc"], Zc)
+            # Shared local path: A_pre = Xl @ P_loc, loc_logits = Xl @ W_loc
+            g.launch_sgemm(m_b, r, ld, bufs["Xl"], bufs["P_loc"], bufs["A_pre"], beta=0.0)
+            g.launch_sgemm(m_b, r, cd, bufs["Zc"], bufs["P_ctx"], bufs["G_pre"], beta=0.0)
+            g.launch_gated_bilinear_fwd(
+                m_b, r, bufs["A_pre"], bufs["b_loc"], bufs["G_pre"], bufs["b_ctx"],
+                bufs["A"], bufs["G"], bufs["Q1"],
+            )
+            q_out_key = "Q1"
+            if self.P_h2_ is not None:
+                g.launch_sgemm(m_b, r, r, bufs["Q1"], bufs["P_h2"], bufs["H2_pre"], beta=0.0)
+                g.launch_sgemm(m_b, r, cd, bufs["Zc"], bufs["P_ctx2"], bufs["G2_pre"], beta=0.0)
+                g.launch_res_gated_fwd(
+                    m_b, r, bufs["Q1"], bufs["H2_pre"], bufs["b_h2"], bufs["G2_pre"], bufs["b_ctx2"],
+                    bufs["H2"], bufs["G2"], bufs["Q2"],
+                )
+                q_out_key = "Q2"
+            g.launch_sgemm(m_b, v, ld, bufs["Xl"], bufs["W_loc"], bufs["loc_logits"], beta=0.0)
+            g.launch_sgemm(m_b, v, cd, bufs["Zc"], bufs["W_ctx"], bufs["logits"], beta=0.0)
+            g.launch_sgemm(m_b, v, r, bufs[q_out_key], bufs["W_q"], bufs["logits"], beta=1.0)
+            g.finish()
+            loc_l = g.read_buffer(bufs["loc_logits"], np.empty((m_b, v), dtype=np.float32))
+            ctx_q_l = g.read_buffer(bufs["logits"], np.empty((m_b, v), dtype=np.float32))
+            logits_full = loc_l + ctx_q_l + self.b_out_[None, :]
+            if need_pmi:
+                A_host = g.read_buffer(bufs["A"], np.empty((m_b, r), dtype=np.float32))
+                g1_0 = _sigmoid(self.b_ctx_)[None, :]
+                q1_0 = A_host * g1_0
+                if self.P_h2_ is not None:
+                    h2_0 = np.tanh(q1_0 @ self.P_h2_ + self.b_h2_)
+                    q2_0 = q1_0 + h2_0 * _sigmoid(self.b_ctx2_)[None, :]
+                else:
+                    q2_0 = q1_0
+                logits_null = loc_l + (q2_0 @ self.W_q_) + self.b_out_[None, :]
+            else:
+                logits_null = None
+        else:
+            A_h = np.tanh(Xl @ self.P_loc_ + self.b_loc_)
+            loc_l = (Xl @ self.W_loc_) + self.b_out_[None, :]
+            G1 = _sigmoid(Zc @ self.P_ctx_ + self.b_ctx_)
+            Q1 = A_h * G1
+            if self.P_h2_ is not None:
+                H2 = np.tanh(Q1 @ self.P_h2_ + self.b_h2_)
+                G2 = _sigmoid(Zc @ self.P_ctx2_ + self.b_ctx2_)
+                Q2 = Q1 + H2 * G2
+            else:
+                Q2 = Q1
+            logits_full = loc_l + (Zc @ self.W_ctx_) + (Q2 @ self.W_q_)
+            if need_pmi:
+                q1_0 = A_h * _sigmoid(self.b_ctx_)[None, :]
+                if self.P_h2_ is not None:
+                    q2_0 = q1_0 + np.tanh(q1_0 @ self.P_h2_ + self.b_h2_) * _sigmoid(self.b_ctx2_)[None, :]
+                else:
+                    q2_0 = q1_0
+                logits_null = loc_l + (q2_0 @ self.W_q_)
+            else:
+                logits_null = None
+
+        logits_full[:, 0] = -1e4
+        k_eff = min(max(int(k), 1), v - 1)
+        out_maps: List[Dict[int, float]] = [{} for _ in range(n_b)]
+        out_pmis = np.zeros((n_b, v), dtype=np.float32) if need_pmi else None
+
+        for j, orig_i in enumerate(valid_rows):
+            lf = logits_full[j]
+            top_idx = np.argpartition(-lf, k_eff)[:k_eff]
+            top_l = lf[top_idx].astype(np.float64)
+            top_l -= float(top_l.max())
+            probs = np.exp(np.clip(top_l, -30.0, 0.0))
+            ps = float(probs.sum())
+            if ps > 1e-12:
+                probs /= ps
+                out_maps[orig_i] = {
+                    int(idx): float(pr) for idx, pr in zip(top_idx.tolist(), probs.tolist())
+                    if int(idx) > 0 and pr > 1e-9
+                }
+            if need_pmi and logits_null is not None and out_pmis is not None:
+                ln = logits_null[j]
+                ln[0] = -1e4
+                delta = np.clip(_log_softmax_1d(lf) - _log_softmax_1d(ln), -2.5, 2.5)
+                delta[0] = 0.0
+                out_pmis[orig_i] = delta
+
+        return out_maps, out_pmis
+
+    def predict_map_and_pmi(
+        self,
+        *,
+        state: Optional[PersistentContextState] = None,
+        k: int = 16,
+        self_mode: bool = True,
+        need_pmi: bool = True,
+    ) -> Tuple[Dict[int, float], Optional[np.ndarray]]:
+        st = state if state is not None else self.state
+        maps, pmis = self.predict_batch_with_pmi([st], k=k, self_mode=self_mode, need_pmi=need_pmi)
+        return maps[0], (pmis[0] if pmis is not None else None)
 
     def param_bytes(self) -> int:
         tot = 0

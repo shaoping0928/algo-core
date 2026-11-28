@@ -29,6 +29,7 @@ from compression_tree import HierarchicalStageTree, LearnedDrillDownPolicy, Self
 from context_decision import ContextDrivenDecisionController, LearnedClassContextGate
 from context_integrator import ContextualIntegrator
 from hierarchical_arbitrator import HierarchicalOnlineArbitrator
+from learnable_ssm_policy import LearnableStateSpacePolicy
 from memory_governor import MemoryBudgetGovernor, current_rss_bytes
 from recency_kernel import LearnedRecencyLagKernel
 from sequence_stage import HierarchicalSequenceStageModel
@@ -79,6 +80,8 @@ class StructuralSubstrateBundle:
         stage_slice: int = 400_000,
         post_fit_noise_prune: bool = True,
         noise_prune_pressure: float = 0.22,
+        use_learnable_ssm: bool = False,
+        ssm_hidden_dim: int = 512,
         seed: int = 42,
     ) -> "StructuralSubstrateBundle":
         """Build all multi-layer memory reserves concurrently across CPU cores under memory governance."""
@@ -227,18 +230,33 @@ class StructuralSubstrateBundle:
 
         def _fit_stateful_policy():
             t = time.perf_counter()
-            sp = StatefulContextPolicy(
-                vocab_size=vocab_size,
-                embed_dim=pol.feature_map.embeddings_.shape[1],
-                n_classes=pol.n_classes,
-            ).fit_stream(
-                arr,
-                pol.feature_map.embeddings_,
-                chunk_memory=cm,
-                sym_to_class=pol.sym_to_class_,
-                sample_stride=2 if n_toks >= 500_000 else 1,
-                max_samples=4_000_000,
-            )
+            if use_learnable_ssm:
+                sp = LearnableStateSpacePolicy(
+                    vocab_size=vocab_size,
+                    embed_dim=pol.feature_map.embeddings_.shape[1],
+                    hidden_dim=int(ssm_hidden_dim),
+                    bptt_len=48,
+                    batch_streams=256,
+                    use_gpu=True,
+                    seed=seed,
+                ).fit_stream(
+                    arr,
+                    init_embeddings=pol.feature_map.embeddings_,
+                    epochs=1,
+                )
+            else:
+                sp = StatefulContextPolicy(
+                    vocab_size=vocab_size,
+                    embed_dim=pol.feature_map.embeddings_.shape[1],
+                    n_classes=pol.n_classes,
+                ).fit_stream(
+                    arr,
+                    pol.feature_map.embeddings_,
+                    chunk_memory=cm,
+                    sym_to_class=pol.sym_to_class_,
+                    sample_stride=2 if n_toks >= 500_000 else 1,
+                    max_samples=4_000_000,
+                )
             timings["stateful_policy"] = round(time.perf_counter() - t, 2)
             return sp
 
@@ -351,6 +369,7 @@ class StructuralSubstrateBundle:
             arbitrator=self.arbitrator if use_arbitrator else None,
             context_integrator=self.context_integrator,
             stateful_policy=self.stateful_policy,
+            stateful_weight=(0.45 if isinstance(self.stateful_policy, LearnableStateSpacePolicy) else 0.35),
         )
 
     def govern_memory(self, max_bytes: int = 16 * (1024 ** 3), *, rss_bytes: Optional[int] = None) -> dict:
@@ -386,9 +405,12 @@ class StructuralSubstrateBundle:
 
         def _ingest_stateful():
             if self.stateful_policy is not None:
-                self.stateful_policy.ingest_chunk(
-                    arr, chunk_memory=self.chunk_memory, sample_stride=4, max_samples=2_000_000,
-                )
+                if isinstance(self.stateful_policy, LearnableStateSpacePolicy):
+                    self.stateful_policy.ingest_chunk(arr, epochs=1)
+                else:
+                    self.stateful_policy.ingest_chunk(
+                        arr, chunk_memory=self.chunk_memory, sample_stride=4, max_samples=2_000_000,
+                    )
 
         with ThreadPoolExecutor(max_workers=3) as ex:
             f1 = ex.submit(
