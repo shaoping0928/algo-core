@@ -131,6 +131,9 @@ class ContextDrivenDecisionController:
         context_integrator: Optional[object] = None,
         context_fusion_beta: float = 0.42,
         self_context_beta: float = 1.25,
+        stateful_policy: Optional[object] = None,
+        stateful_weight: float = 0.22,
+        self_stateful_beta: float = 0.85,
     ):
         self.class_policy = class_policy
         self.virtual_dag = virtual_dag
@@ -173,6 +176,13 @@ class ContextDrivenDecisionController:
         )
         self.context_fusion_beta = float(context_fusion_beta)
         self.self_context_beta = float(self_context_beta)
+        self.stateful_policy = (
+            stateful_policy
+            if stateful_policy is not None
+            else getattr(temp_memory, "_stateful_policy", None)
+        )
+        self.stateful_weight = float(stateful_weight)
+        self.self_stateful_beta = float(self_stateful_beta)
 
         self._anchor_state: Optional[np.ndarray] = None
         self._tree_root_slots: Dict[int, float] = {}
@@ -289,6 +299,7 @@ class ContextDrivenDecisionController:
         k: int = 8,
         recent_history: Optional[Sequence[int]] = None,
         self_mode: bool = False,
+        state_override: Optional[object] = None,
     ) -> Tuple[List[Dict[int, float]], float, float, Dict[str, float]]:
         """Compute calibrated probability maps for the 4 orthogonal memory experts."""
         prev1 = int(ctx_tokens[-1]) if len(ctx_tokens) > 0 else 0
@@ -427,6 +438,7 @@ class ContextDrivenDecisionController:
         k: int = 8,
         recent_history: Optional[Sequence[int]] = None,
         vdiff_override: Optional[np.ndarray] = None,
+        state_override: Optional[object] = None,
     ) -> Tuple[List[int], np.ndarray, Dict[str, float]]:
         """Compute context-driven top-k candidate distribution + telemetry."""
         hist_src = (
@@ -436,10 +448,12 @@ class ContextDrivenDecisionController:
         )
         is_self_mode = (
             vdiff_override is not None
+            or state_override is not None
             or getattr(self.temp_memory, "_last_source", "external") == "self"
         )
         expert_maps, ent, ent_gate, info = self._compute_expert_maps(
-            ctx_tokens, slow_state, k=k, recent_history=hist_src, self_mode=is_self_mode,
+            ctx_tokens, slow_state, k=k, recent_history=hist_src,
+            self_mode=is_self_mode, state_override=state_override,
         )
         _base_map, wm_map, chunk_map, frame_map = expert_maps
 
@@ -511,6 +525,24 @@ class ContextDrivenDecisionController:
                         llr_a = atom_llr.get(a, 0.0)
                         if llr_a > 0.0:
                             score_map[a] *= float(np.exp(min(eff_beta * llr_a, cap_exp)))
+
+        # 5c. Persistent In-Place Multi-Scale Stateful Bayes-Factor Modulation (Product-of-Experts):
+        #     Multiplies syntactically legal candidates by unbiased log(1 + delta_ctx / P_0)
+        #     from the continuously evolved node state z_t — zero unigram double-counting and
+        #     zero illegal-token leakage!
+        sp = self.stateful_policy
+        if sp is not None and getattr(sp, "_fitted", False) and score_map:
+            log_bf = sp.context_log_bayes_factor(state=state_override, self_mode=is_self_mode)
+            if log_bf is not None:
+                c_gate = float(info.get("content_gate", 1.0))
+                s_beta = self.self_stateful_beta if is_self_mode else self.stateful_weight
+                eff_sb = float(s_beta) * float(ent_gate) * float(np.clip(c_gate, 0.15, 1.0))
+                if eff_sb > 0.01:
+                    for a in list(score_map.keys()):
+                        if 0 < a < len(log_bf):
+                            lbf = float(log_bf[a])
+                            if lbf != 0.0:
+                                score_map[a] *= float(np.exp(np.clip(eff_sb * lbf, -1.6, 2.0)))
 
         # 6. Electronic Circuit Differentiator (high-pass V_diff = V_cap - V_int):
         #    propels unexpressed context neighbors (V_diff > 0) and naturally adapts
@@ -715,8 +747,22 @@ class ContextDrivenDecisionController:
 
         root_vdiff = cf.V_diff[0] if cf is not None else None
         root_vout = cf.V_out[0] if cf is not None else None
+        sp = self.stateful_policy
+        sp_active = (sp is not None and getattr(sp, "_fitted", False))
+        root_pstate = sp.state if sp_active else None
+        cm_ref = self.chunk_memory
 
-        # Beam entries: (cum_score, first_action, rolled_ctx, rolled_hist, rolled_slow, gpu_slot_id)
+        def _fork_pstate(parent_ps, ctx_before: Sequence[int], sym_next: int):
+            if not sp_active or parent_ps is None:
+                return None
+            cid = 0
+            if cm_ref is not None and hasattr(cm_ref, "match_suffix_units"):
+                mu = cm_ref.match_suffix_units(list(ctx_before[-5:]) + [sym_next])
+                if mu and mu[0] >= cm_ref.vocab_size:
+                    cid = int(mu[0])
+            return sp.fork_step(parent_ps, sym_next, chunk_id=cid, is_self=True)
+
+        # Beam entries: (cum_score, first_action, rolled_ctx, rolled_hist, rolled_slow, gpu_slot_id, rolled_pstate)
         beam = []
         prev0 = base_ctx[-1] if base_ctx else 0
         first_acts = [int(a) for a in acts1[:bw]]
@@ -726,8 +772,9 @@ class ContextDrivenDecisionController:
                 self.class_policy.update_slow_state(slow_state, a)
                 if slow_state is not None else None
             )
+            ps_next = _fork_pstate(root_pstate, base_ctx, a)
             sc0 = _step_utility(prev0, a, p, slow_state, h_next, root_vdiff, root_vout)
-            beam.append((sc0, a, base_ctx + [a], base_hist + [a], h_next, slot_i))
+            beam.append((sc0, a, base_ctx + [a], base_hist + [a], h_next, slot_i, ps_next))
 
         if cf is not None and len(beam) > 0:
             beam_eng = cf.get_beam_engine(max_branches=max(keep_cap, len(beam), 32))
@@ -743,11 +790,12 @@ class ContextDrivenDecisionController:
         for _step in range(1, d):
             next_beam = []
             n_parents_cur = len(beam)
-            for sc, first_a, r_ctx, r_hist, r_h, p_slot in beam:
+            for sc, first_a, r_ctx, r_hist, r_h, p_slot, r_ps in beam:
                 b_vd = vd_cur[p_slot] if (vd_cur is not None and p_slot < len(vd_cur)) else None
                 b_vo = vo_cur[p_slot] if (vo_cur is not None and p_slot < len(vo_cur)) else None
                 a_sub, p_sub, _ = self.decide_distribution(
-                    r_ctx, r_h, k=bw, recent_history=r_hist, vdiff_override=b_vd,
+                    r_ctx, r_h, k=bw, recent_history=r_hist,
+                    vdiff_override=b_vd, state_override=r_ps,
                 )
                 prev_r = r_ctx[-1] if r_ctx else 0
                 for a2, p2 in zip(a_sub[:bw], p_sub[:bw]):
@@ -756,6 +804,7 @@ class ContextDrivenDecisionController:
                         self.class_policy.update_slow_state(r_h, ai2)
                         if r_h is not None else None
                     )
+                    ps2 = _fork_pstate(r_ps, r_ctx, ai2) if (_step + 1) < d else None
                     u2 = _step_utility(prev_r, ai2, float(p2), r_h, h2, b_vd, b_vo)
                     next_beam.append((
                         sc + 0.75 * u2,
@@ -765,6 +814,7 @@ class ContextDrivenDecisionController:
                         h2,
                         p_slot,
                         ai2,
+                        ps2,
                     ))
             next_beam.sort(key=lambda item: item[0], reverse=True)
             top_nb = next_beam[:keep_cap]
@@ -777,13 +827,13 @@ class ContextDrivenDecisionController:
                     n_parent_active=n_parents_cur,
                 )
             beam = [
-                (item[0], item[1], item[2], item[3], item[4], new_slot)
+                (item[0], item[1], item[2], item[3], item[4], new_slot, item[7])
                 for new_slot, item in enumerate(top_nb)
             ]
 
         # Aggregate best lookahead path score per first action
         best_by_first: Dict[int, float] = {}
-        for sc, first_a, _rc, _rhi, _rh, _sl in beam:
+        for sc, first_a, _rc, _rhi, _rh, _sl, _ps in beam:
             if first_a not in best_by_first or sc > best_by_first[first_a]:
                 best_by_first[first_a] = sc
 

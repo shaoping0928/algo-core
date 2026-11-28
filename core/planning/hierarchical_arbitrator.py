@@ -114,10 +114,12 @@ class HierarchicalOnlineArbitrator:
         r = self.entropy_regime(normalized_entropy)
         w = self.weights_for_regime(r).copy()
         if self_mode and self.n_experts >= 3:
-            # Index 1 is working_memory; damp its share so base_policy + chunk_grammar
-            # + frame_register drive forward structural progression in open-loop rollouts.
+            # Index 1 is working_memory; damp its share while amplifying persistent
+            # stateful_context (index 4) so open-loop rollouts follow evolving context state.
             wm_s = float(np.clip(self_wm_scale, 0.10, 1.0))
             w[1] *= wm_s
+            if self.n_experts >= 5:
+                w[4] *= 1.35
             w_tot = float(w.sum())
             if w_tot > 1e-12:
                 w /= w_tot

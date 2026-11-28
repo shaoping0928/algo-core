@@ -307,17 +307,27 @@ class TemporaryContextMemory:
         ci = getattr(self, "_context_integrator", None)
         if ci is not None:
             ci.reset()
+        sp = getattr(self, "_stateful_policy", None)
+        if sp is not None:
+            sp.reset_state()
 
     def attach_context_integrator(self, context_integrator: object, chunk_memory: object) -> None:
         """Bind a ``ContextualIntegrator`` + ``HierarchicalChunkMemory`` for live chunk-slot updates."""
         self._context_integrator = context_integrator
         self._chunk_memory_ref = chunk_memory
 
+    def attach_stateful_policy(self, stateful_policy: object) -> None:
+        """Bind a ``StatefulContextPolicy`` so every ``observe`` updates its node state in-place."""
+        self._stateful_policy = stateful_policy
+
     def pin_root_context(self) -> None:
         """Snapshot the current active field as persistent episode root summary."""
         if self._field_dirty:
             self._rebuild_corroborated_field()
         np.copyto(self._root_field, self._field)
+        sp = getattr(self, "_stateful_policy", None)
+        if sp is not None and hasattr(sp, "pin_macro_anchor"):
+            sp.pin_macro_anchor()
 
     def pin_stage_anchors(self, anchor_weights: Dict[int, float], *, spread_scale: float = 0.5) -> None:
         """Merge persistent hierarchical stage-tree anchor slots into ``_root_field``."""
@@ -473,21 +483,26 @@ class TemporaryContextMemory:
             self._recent = self._recent[-self.max_recent :]
         self._steps += 1
         # Feed live matched chunk unit (or salient atom) into persistent ContextualIntegrator
+        # and update StatefulContextPolicy's multi-scale node state strictly IN-PLACE!
         ci = getattr(self, "_context_integrator", None)
-        if ci is not None:
-            cm_ref = getattr(self, "_chunk_memory_ref", None)
+        sp = getattr(self, "_stateful_policy", None)
+        cm_ref = getattr(self, "_chunk_memory_ref", None)
+        top_chunk_id = 0
+        if ci is not None or sp is not None:
             replaced: List[int] = []
             if cm_ref is not None and hasattr(cm_ref, "match_suffix_units"):
                 matched_u = cm_ref.match_suffix_units(self._recent[-6:])
                 if matched_u and matched_u[0] >= self.vocab_size:
-                    # A multi-symbol chunk just completed -> upgrade its constituent prefix atoms
-                    atoms_c = cm_ref.chunk_to_atoms_.get(matched_u[0], ())
+                    top_chunk_id = int(matched_u[0])
+                    atoms_c = cm_ref.chunk_to_atoms_.get(top_chunk_id, ())
                     if len(atoms_c) >= 2:
                         replaced = [int(a) for a in atoms_c[:-1]]
             else:
                 matched_u = [sym]
-            if matched_u:
+            if ci is not None and matched_u:
                 ci.observe_units(matched_u, source=source, replaced_atoms=replaced)
+            if sp is not None:
+                sp.observe(sym, chunk_id=top_chunk_id, source=source)
         self._rebuild_corroborated_field()
 
     def episodic_cache_probs(self, ctx_tokens: Sequence[int]) -> Dict[int, float]:

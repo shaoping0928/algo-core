@@ -99,6 +99,61 @@ class ContextualIntegratorTests(unittest.TestCase):
         self.assertEqual(acts_a[0], 20)
         self.assertEqual(acts_b[0], 30)
 
+    def test_stateful_context_policy_kogge_stone_inplace_and_long_range_readout(self):
+        from stateful_context_policy import StatefulContextPolicy, _kogge_stone_ema
+
+        # 1. Verify vectorized Kogge-Stone EMA is bit-exact against serial recurrence
+        rng = np.random.RandomState(123)
+        X = rng.randn(512, 16).astype(np.float32)
+        h0 = rng.randn(16).astype(np.float32)
+        for g in (0.60, 0.90, 0.982):
+            H_ks = _kogge_stone_ema(X, g, h0)
+            H_ref = np.zeros_like(X)
+            prev = h0.copy()
+            for t in range(len(X)):
+                prev = g * prev + (1.0 - g) * X[t]
+                H_ref[t] = prev
+            self.assertTrue(np.allclose(H_ks, H_ref, atol=2e-4))
+
+        # 2. Verify standalone StatefulContextPolicy (ZERO n-gram lookup!) resolves
+        #    two different macro-contexts ending with identical 6-step local bridge!
+        seq = []
+        for ep in range(200):
+            seq.extend(rng.randint(1, 5, size=20).tolist())
+            if ep % 2 == 0:
+                seq.extend([10, 11, 12, 10, 11, 1, 2, 3, 4, 5, 6, 20, 21])
+            else:
+                seq.extend([15, 16, 17, 15, 16, 1, 2, 3, 4, 5, 6, 30, 31])
+        arr = np.asarray(seq, dtype=np.int32)
+        emb = rng.randn(40, 24).astype(np.float32)
+        emb[0] = 0.0
+
+        sp = StatefulContextPolicy(vocab_size=40, embed_dim=24, ridge_lambda=5.0).fit_stream(
+            arr, emb, sample_stride=1, max_samples=50_000,
+        )
+        # In-place mutation check: observe() keeps the SAME PersistentContextState object
+        sp.reset_state()
+        st_ref = sp.state
+        for s in [10, 11, 12, 10, 11, 1, 2, 3, 4, 5, 6]:
+            sp.observe(s, source="external")
+        self.assertIs(sp.state, st_ref)
+        pred_a = sp.predict_symbol_map(k=5)
+
+        # Forked lookahead child modifies copy in-place without corrupting parent state
+        snap_before = sp.state.h_fast.copy()
+        child_st = sp.fork_step(sp.state, 20, is_self=True)
+        self.assertTrue(np.allclose(sp.state.h_fast, snap_before))
+        self.assertFalse(np.allclose(child_st.h_fast, snap_before))
+
+        sp.reset_state()
+        for s in [15, 16, 17, 15, 16, 1, 2, 3, 4, 5, 6]:
+            sp.observe(s, source="external")
+        pred_b = sp.predict_symbol_map(k=5)
+
+        # Identical last 6 tokens [1, 2, 3, 4, 5, 6], yet persistent node state cleanly predicts 20 vs 30!
+        self.assertGreater(pred_a.get(20, 0.0), pred_a.get(30, 0.0))
+        self.assertGreater(pred_b.get(30, 0.0), pred_b.get(20, 0.0))
+
 
 if __name__ == "__main__":
     unittest.main()

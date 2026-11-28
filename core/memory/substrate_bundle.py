@@ -32,6 +32,7 @@ from hierarchical_arbitrator import HierarchicalOnlineArbitrator
 from memory_governor import MemoryBudgetGovernor, current_rss_bytes
 from recency_kernel import LearnedRecencyLagKernel
 from sequence_stage import HierarchicalSequenceStageModel
+from stateful_context_policy import StatefulContextPolicy
 from structural_memory import HierarchicalChunkMemory, StructuralFrameMemory
 from temp_context import TemporaryContextMemory
 from virtual_node_dag import BidirectionalVirtualNodeDAG
@@ -54,6 +55,7 @@ class StructuralSubstrateBundle:
     role_extractor: Optional[SelfDiscoveredRoleExtractor] = None
     drill_policy: Optional[LearnedDrillDownPolicy] = None
     context_integrator: Optional[ContextualIntegrator] = None
+    stateful_policy: Optional[StatefulContextPolicy] = None
     vocab: Optional[Dict[str, int]] = None
     itos: Optional[List[str]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -223,17 +225,38 @@ class StructuralSubstrateBundle:
             timings["context_integrator"] = round(time.perf_counter() - t, 2)
             return ci
 
+        def _fit_stateful_policy():
+            t = time.perf_counter()
+            sp = StatefulContextPolicy(
+                vocab_size=vocab_size,
+                embed_dim=pol.feature_map.embeddings_.shape[1],
+                n_classes=pol.n_classes,
+            ).fit_stream(
+                arr,
+                pol.feature_map.embeddings_,
+                chunk_memory=cm,
+                sym_to_class=pol.sym_to_class_,
+                sample_stride=2 if n_toks >= 500_000 else 1,
+                max_samples=4_000_000,
+            )
+            timings["stateful_policy"] = round(time.perf_counter() - t, 2)
+            return sp
+
         if outer_workers > 1:
-            with ThreadPoolExecutor(max_workers=2) as ex:
+            with ThreadPoolExecutor(max_workers=3) as ex:
                 f_rec = ex.submit(_fit_recency)
                 f_ci = ex.submit(_fit_ctx_integrator)
+                f_sp = ex.submit(_fit_stateful_policy)
                 rec_kern = f_rec.result()
                 ctx_int = f_ci.result()
+                st_pol = f_sp.result()
         else:
             rec_kern = _fit_recency()
             ctx_int = _fit_ctx_integrator()
+            st_pol = _fit_stateful_policy()
 
         tcm.attach_context_integrator(ctx_int, cm)
+        tcm.attach_stateful_policy(st_pol)
 
         # Phase 3: Optional built-in tail-noise pruning (cuts ~80% count=1 high-order noise
         #          while preserving or slightly improving held-out accuracy) + 16GB governance
@@ -262,6 +285,7 @@ class StructuralSubstrateBundle:
             role_extractor=role_ext,
             drill_policy=drill_pol,
             context_integrator=ctx_int,
+            stateful_policy=st_pol,
             vocab=vocab,
             itos=list(itos) if itos is not None else None,
             metadata=dict(
@@ -326,6 +350,7 @@ class StructuralSubstrateBundle:
             frame_weight=0.15,
             arbitrator=self.arbitrator if use_arbitrator else None,
             context_integrator=self.context_integrator,
+            stateful_policy=self.stateful_policy,
         )
 
     def govern_memory(self, max_bytes: int = 16 * (1024 ** 3), *, rss_bytes: Optional[int] = None) -> dict:
@@ -359,14 +384,22 @@ class StructuralSubstrateBundle:
             if self.context_integrator is not None:
                 self.context_integrator.ingest_unit_chunk(parsed, stride=4, max_centers=300_000)
 
-        with ThreadPoolExecutor(max_workers=2) as ex:
+        def _ingest_stateful():
+            if self.stateful_policy is not None:
+                self.stateful_policy.ingest_chunk(
+                    arr, chunk_memory=self.chunk_memory, sample_stride=4, max_samples=2_000_000,
+                )
+
+        with ThreadPoolExecutor(max_workers=3) as ex:
             f1 = ex.submit(
                 self.class_policy.ingest_chunk, arr,
                 n_workers=nw_each, min_high_order_count=min_high_order_count,
             )
             f2 = ex.submit(_ingest_chunks_and_ctx)
+            f3 = ex.submit(_ingest_stateful)
             f1.result()
             f2.result()
+            f3.result()
         self.metadata["train_tokens"] = int(self.metadata.get("train_tokens", 0)) + len(arr)
         mem_rep = self.govern_memory(max_bytes=max_memory_bytes)
         return dict(
