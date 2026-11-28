@@ -235,7 +235,8 @@ class StructuralSubstrateBundle:
                     vocab_size=vocab_size,
                     embed_dim=pol.feature_map.embeddings_.shape[1],
                     hidden_dim=int(ssm_hidden_dim),
-                    bptt_len=48,
+                    num_layers=2,
+                    bptt_len=96,
                     batch_streams=256,
                     use_gpu=True,
                     seed=seed,
@@ -369,7 +370,11 @@ class StructuralSubstrateBundle:
             arbitrator=self.arbitrator if use_arbitrator else None,
             context_integrator=self.context_integrator,
             stateful_policy=self.stateful_policy,
-            stateful_weight=(0.45 if isinstance(self.stateful_policy, LearnableStateSpacePolicy) else 0.35),
+            stateful_weight=(
+                (0.60 if getattr(self.stateful_policy, "num_layers", 1) >= 2 else 0.45)
+                if isinstance(self.stateful_policy, LearnableStateSpacePolicy)
+                else 0.35
+            ),
         )
 
     def govern_memory(self, max_bytes: int = 16 * (1024 ** 3), *, rss_bytes: Optional[int] = None) -> dict:

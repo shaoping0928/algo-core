@@ -152,7 +152,7 @@ __kernel void circuit_beam_branch_kernel(
     V_out[gid] = tanh(raw);
 }
 
-// 16x16 LDS-tiled SGEMM with bank-conflict-free padding (17) supporting NN/NT/TN
+// 32x32 register-tiled (2x2/thread) LDS SGEMM with bank-conflict-free padding supporting NN/NT/TN
 __kernel void sgemm_tiled_kernel(
     const int M,
     const int N,
@@ -165,42 +165,63 @@ __kernel void sgemm_tiled_kernel(
     __global const float* B,
     __global float* C
 ) {
-    __local float As[16][17];
-    __local float Bs[16][17];
+    __local float As[32][17];
+    __local float Bs[16][33];
     int lx = get_local_id(0);
     int ly = get_local_id(1);
-    int col = get_group_id(0) * 16 + lx;
-    int row = get_group_id(1) * 16 + ly;
+    int col0 = get_group_id(0) * 32 + lx;
+    int col1 = col0 + 16;
+    int row0 = get_group_id(1) * 32 + ly;
+    int row1 = row0 + 16;
 
-    float acc = 0.0f;
+    float c00 = 0.0f, c01 = 0.0f, c10 = 0.0f, c11 = 0.0f;
     int n_tiles = (K + 15) / 16;
     for (int t = 0; t < n_tiles; ++t) {
         int a_k = t * 16 + lx;
         int b_k = t * 16 + ly;
-        if (row < M && a_k < K) {
-            As[ly][lx] = (transA == 0) ? A[row * K + a_k] : A[a_k * M + row];
+        if (a_k < K) {
+            As[ly][lx] = (row0 < M) ? ((transA == 0) ? A[row0 * K + a_k] : A[a_k * M + row0]) : 0.0f;
+            As[ly + 16][lx] = (row1 < M) ? ((transA == 0) ? A[row1 * K + a_k] : A[a_k * M + row1]) : 0.0f;
         } else {
             As[ly][lx] = 0.0f;
+            As[ly + 16][lx] = 0.0f;
         }
-        if (b_k < K && col < N) {
-            Bs[ly][lx] = (transB == 0) ? B[b_k * N + col] : B[col * K + b_k];
+        if (b_k < K) {
+            Bs[ly][lx] = (col0 < N) ? ((transB == 0) ? B[b_k * N + col0] : B[col0 * K + b_k]) : 0.0f;
+            Bs[ly][lx + 16] = (col1 < N) ? ((transB == 0) ? B[b_k * N + col1] : B[col1 * K + b_k]) : 0.0f;
         } else {
             Bs[ly][lx] = 0.0f;
+            Bs[ly][lx + 16] = 0.0f;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
         #pragma unroll
         for (int k = 0; k < 16; ++k) {
-            acc = fma(As[ly][k], Bs[k][lx], acc);
+            float a0 = As[ly][k];
+            float a1 = As[ly + 16][k];
+            float b0 = Bs[k][lx];
+            float b1 = Bs[k][lx + 16];
+            c00 = fma(a0, b0, c00);
+            c01 = fma(a0, b1, c01);
+            c10 = fma(a1, b0, c10);
+            c11 = fma(a1, b1, c11);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (row < M && col < N) {
-        int idx = row * N + col;
-        if (beta == 0.0f) {
-            C[idx] = alpha * acc;
-        } else {
-            C[idx] = fma(alpha, acc, beta * C[idx]);
-        }
+    if (row0 < M && col0 < N) {
+        int idx = row0 * N + col0;
+        C[idx] = (beta == 0.0f) ? (alpha * c00) : fma(alpha, c00, beta * C[idx]);
+    }
+    if (row0 < M && col1 < N) {
+        int idx = row0 * N + col1;
+        C[idx] = (beta == 0.0f) ? (alpha * c01) : fma(alpha, c01, beta * C[idx]);
+    }
+    if (row1 < M && col0 < N) {
+        int idx = row1 * N + col0;
+        C[idx] = (beta == 0.0f) ? (alpha * c10) : fma(alpha, c10, beta * C[idx]);
+    }
+    if (row1 < M && col1 < N) {
+        int idx = row1 * N + col1;
+        C[idx] = (beta == 0.0f) ? (alpha * c11) : fma(alpha, c11, beta * C[idx]);
     }
 }
 
@@ -603,6 +624,48 @@ __kernel void copy_slice_kernel(
         seq_buf[off] = step_buf[gid];
     }
 }
+
+// Zero-copy on-GPU slice of [T, B] time-major tok_in & tok_tgt directly from VRAM-resident [B, stream_len] stream
+__kernel void slice_tokens_kernel(
+    const int B,
+    const int T,
+    const int stream_len,
+    const int s0,
+    __global const int* full_stream,
+    __global int* tok_in,
+    __global int* tok_tgt
+) {
+    int gid = get_global_id(0);
+    int tot = B * T;
+    if (gid >= tot) return;
+    int t = gid / B;
+    int b = gid - t * B;
+    int pos = b * stream_len + s0 + t;
+    tok_in[gid] = full_stream[pos];
+    tok_tgt[gid] = full_stream[pos + 1];
+}
+
+// On-GPU buffer zeroing (eliminates blocking host->device PCIe syncs in BPTT loops)
+__kernel void zero_buf_kernel(
+    const int n_total,
+    __global float* buf
+) {
+    int gid = get_global_id(0);
+    if (gid >= n_total) return;
+    buf[gid] = 0.0f;
+}
+
+// Elementwise residual addition out[i] = a[i] + b[i]
+__kernel void vec_add_kernel(
+    const int n_total,
+    __global const float* a,
+    __global const float* b,
+    __global float* out
+) {
+    int gid = get_global_id(0);
+    if (gid >= n_total) return;
+    out[gid] = a[gid] + b[gid];
+}
 """
 
 
@@ -767,6 +830,9 @@ class OpenCLAccelerator:
         k_gru_bwd = ocl.clCreateKernel(prog, b"gru_step_bwd_kernel", ctypes.byref(err))
         k_clip_g = ocl.clCreateKernel(prog, b"clip_grad_kernel", ctypes.byref(err))
         k_cp_sl = ocl.clCreateKernel(prog, b"copy_slice_kernel", ctypes.byref(err))
+        k_sl_tok = ocl.clCreateKernel(prog, b"slice_tokens_kernel", ctypes.byref(err))
+        k_zero = ocl.clCreateKernel(prog, b"zero_buf_kernel", ctypes.byref(err))
+        k_vadd = ocl.clCreateKernel(prog, b"vec_add_kernel", ctypes.byref(err))
 
         self._ocl = ocl
         self._ctx = ctx
@@ -791,6 +857,9 @@ class OpenCLAccelerator:
         self._k_gru_bwd = k_gru_bwd
         self._k_clip_grad = k_clip_g
         self._k_copy_slice = k_cp_sl
+        self._k_slice_tokens = k_sl_tok
+        self._k_zero_buf = k_zero
+        self._k_vec_add = k_vadd
         self.platform_name = pname
         self.device_name = dname
         self.compute_units = cu_val
@@ -1017,7 +1086,7 @@ class OpenCLAccelerator:
             (ctypes.c_void_p(b_B), vp),
             (ctypes.c_void_p(b_C), vp),
         ])
-        gs = (ctypes.c_size_t * 2)(((int(N) + 15) // 16) * 16, ((int(M) + 15) // 16) * 16)
+        gs = (ctypes.c_size_t * 2)(((int(N) + 31) // 32) * 16, ((int(M) + 31) // 32) * 16)
         ls = (ctypes.c_size_t * 2)(16, 16)
         rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_sgemm, 2, None, gs, ls, 0, None, None)
         if rc != 0:
@@ -1422,6 +1491,65 @@ class OpenCLAccelerator:
         rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_copy_slice, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
         if rc != 0:
             raise RuntimeError(f"clEnqueueNDRangeKernel(copy_slice) failed: {rc}")
+
+    def launch_slice_tokens(
+        self,
+        B: int,
+        T: int,
+        stream_len: int,
+        s0: int,
+        b_full_stream: ctypes.c_void_p,
+        b_tok_in: ctypes.c_void_p,
+        b_tok_tgt: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        tot = int(B) * int(T)
+        self._set_args(self._k_slice_tokens, [
+            (ctypes.c_int32(B), 4),
+            (ctypes.c_int32(T), 4),
+            (ctypes.c_int32(stream_len), 4),
+            (ctypes.c_int32(s0), 4),
+            (ctypes.c_void_p(b_full_stream), vp),
+            (ctypes.c_void_p(b_tok_in), vp),
+            (ctypes.c_void_p(b_tok_tgt), vp),
+        ])
+        gs = ctypes.c_size_t(((tot + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_slice_tokens, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(slice_tokens) failed: {rc}")
+
+    def launch_zero_buf(self, n_total: int, b_buf: ctypes.c_void_p) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        self._set_args(self._k_zero_buf, [
+            (ctypes.c_int32(n_total), 4),
+            (ctypes.c_void_p(b_buf), vp),
+        ])
+        gs = ctypes.c_size_t(((int(n_total) + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_zero_buf, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(zero_buf) failed: {rc}")
+
+    def launch_vec_add(
+        self,
+        n_total: int,
+        b_a: ctypes.c_void_p,
+        b_b: ctypes.c_void_p,
+        b_out: ctypes.c_void_p,
+    ) -> None:
+        vp = ctypes.sizeof(ctypes.c_void_p)
+        self._set_args(self._k_vec_add, [
+            (ctypes.c_int32(n_total), 4),
+            (ctypes.c_void_p(b_a), vp),
+            (ctypes.c_void_p(b_b), vp),
+            (ctypes.c_void_p(b_out), vp),
+        ])
+        gs = ctypes.c_size_t(((int(n_total) + 255) // 256) * 256)
+        ls = ctypes.c_size_t(256)
+        rc = self._ocl.clEnqueueNDRangeKernel(self._queue, self._k_vec_add, 1, None, ctypes.byref(gs), ctypes.byref(ls), 0, None, None)
+        if rc != 0:
+            raise RuntimeError(f"clEnqueueNDRangeKernel(vec_add) failed: {rc}")
 
     def info(self) -> dict:
         return dict(

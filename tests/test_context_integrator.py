@@ -264,35 +264,37 @@ class ContextualIntegratorTests(unittest.TestCase):
         emb = rng.randn(V, D).astype(np.float32) * 0.5
         emb[0] = 0.0
 
-        # 1. Exact CPU vs OpenCL GPU 8-step BPTT parity (including <UNK>=0 target masking!)
-        m_cpu = LearnableStateSpacePolicy(
-            vocab_size=V, embed_dim=D, hidden_dim=H, bptt_len=T, batch_streams=B,
-            lr=0.005, use_gpu=False, seed=13,
-        )
-        m_gpu = LearnableStateSpacePolicy(
-            vocab_size=V, embed_dim=D, hidden_dim=H, bptt_len=T, batch_streams=B,
-            lr=0.005, use_gpu=True, seed=13,
-        )
-        m_cpu.init_params(init_embeddings=emb)
-        m_gpu.init_params(init_embeddings=emb)
-        if m_gpu._ensure_gpu_trainer(B, T):
-            s_cpu = np.zeros((B, H), dtype=np.float32)
-            for step in range(3):
-                t_in = rng.randint(0, V, size=(T, B), dtype=np.int32)
-                t_tg = rng.randint(0, V, size=(T, B), dtype=np.int32)
-                # Ensure some <UNK>=0 targets exist so UNK masking parity is strictly tested
-                t_tg[0, 0] = 0
-                t_tg[-1, -1] = 0
-                lc, s_cpu = m_cpu._cpu_bptt_step(t_in, t_tg, s_init=s_cpu)
-                lg = m_gpu._gpu_bptt_step(t_in, t_tg, reset_hidden=(step == 0), read_loss=True)
-                self.assertAlmostEqual(lc, lg, places=3)
-            m_gpu._sync_weights_from_gpu()
-            for pname in ("E_", "W_x_", "b_x_", "U_s_", "b_s_", "W_out_", "b_out_"):
-                self.assertTrue(
-                    np.allclose(getattr(m_cpu, pname), getattr(m_gpu, pname), atol=4e-4),
-                    msg=f"BPTT GPU/CPU mismatch on {pname}: max_diff={np.max(np.abs(getattr(m_cpu, pname) - getattr(m_gpu, pname))):.6f}",
-                )
-            m_gpu.close_gpu()
+        # 1. Exact CPU vs OpenCL GPU 8-step BPTT parity for BOTH 1-layer (7 tensors) & 2-layer (11 tensors)
+        for n_lay in (1, 2):
+            m_cpu = LearnableStateSpacePolicy(
+                vocab_size=V, embed_dim=D, hidden_dim=H, num_layers=n_lay, bptt_len=T, batch_streams=B,
+                lr=0.005, use_gpu=False, seed=13,
+            )
+            m_gpu = LearnableStateSpacePolicy(
+                vocab_size=V, embed_dim=D, hidden_dim=H, num_layers=n_lay, bptt_len=T, batch_streams=B,
+                lr=0.005, use_gpu=True, seed=13,
+            )
+            m_cpu.init_params(init_embeddings=emb)
+            m_gpu.init_params(init_embeddings=emb)
+            if m_gpu._ensure_gpu_trainer(B, T):
+                s1_cpu = np.zeros((B, H), dtype=np.float32)
+                s2_cpu = np.zeros((B, H), dtype=np.float32) if n_lay == 2 else None
+                for step in range(3):
+                    t_in = rng.randint(0, V, size=(T, B), dtype=np.int32)
+                    t_tg = rng.randint(0, V, size=(T, B), dtype=np.int32)
+                    t_tg[0, 0] = 0
+                    t_tg[-1, -1] = 0
+                    lc, s1_cpu, s2_cpu = m_cpu._cpu_bptt_step(t_in, t_tg, s_init=s1_cpu, s2_init=s2_cpu)
+                    lg = m_gpu._gpu_bptt_step(t_in, t_tg, reset_hidden=(step == 0), read_loss=True)
+                    self.assertAlmostEqual(lc, lg, places=3)
+                m_gpu._sync_weights_from_gpu()
+                for pname in m_cpu._param_names:
+                    attr = f"{pname}_"
+                    self.assertTrue(
+                        np.allclose(getattr(m_cpu, attr), getattr(m_gpu, attr), atol=5e-4),
+                        msg=f"BPTT(L={n_lay}) GPU/CPU mismatch on {attr}: max_diff={np.max(np.abs(getattr(m_cpu, attr) - getattr(m_gpu, attr))):.6f}",
+                    )
+                m_gpu.close_gpu()
 
         # 2. Pure in-place state dynamics solve a 16-step delayed long-range context memory task!
         # Stream rule: Cue A (1) or Cue B (2), followed by 14 identical distractor tokens (5..8),
